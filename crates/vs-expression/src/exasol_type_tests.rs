@@ -1,4 +1,6 @@
 use super::*;
+use crate::udf_column_test_support::measured_column;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 
 /// One row per type spelling a producer emits or Exasol sends: the type, its SQL rendering, its
 /// `dataType` JSON, and whether a scan UDF can emit it.
@@ -536,5 +538,128 @@ fn exasol_type_from_json_reads_each_wire_form() {
     ];
     for (data_type, expected) in cases {
         assert_eq!(valid(&data_type), expected, "{data_type}");
+    }
+}
+
+fn known(column: &ColumnInfo) -> ExasolType {
+    match exasol_type_from_column_info(column) {
+        UdfColumnType::Known(exasol_type) => exasol_type,
+        unrecognized => panic!(
+            "{} must be recognized, got {unrecognized:?}",
+            column.type_name
+        ),
+    }
+}
+
+/// Each `type_name` spelling Exasol reported for a UDF column, with the type it stands for.
+fn measured_spellings() -> Vec<(&'static str, ExasolType)> {
+    vec![
+        ("DECIMAL(9,0)", ExasolType::decimal(9, 0)),
+        ("DECIMAL(12,0)", ExasolType::decimal(12, 0)),
+        ("DECIMAL(18,0)", ExasolType::decimal(18, 0)),
+        ("DECIMAL(19,0)", ExasolType::decimal(19, 0)),
+        ("DECIMAL(9,2)", ExasolType::decimal(9, 2)),
+        ("DECIMAL(18,2)", ExasolType::decimal(18, 2)),
+        ("DECIMAL(36,6)", ExasolType::decimal(36, 6)),
+        ("DOUBLE", ExasolType::DoublePrecision),
+        ("BOOLEAN", ExasolType::Boolean),
+        ("DATE", ExasolType::Date),
+        ("VARCHAR(20) UTF8", ExasolType::varchar(20)),
+        (
+            "VARCHAR(10) ASCII",
+            ExasolType::Varchar {
+                size: 10,
+                ascii: true,
+            },
+        ),
+        ("CHAR(5) UTF8", ExasolType::char(5)),
+        ("TIMESTAMP(0)", ExasolType::timestamp(0)),
+        ("TIMESTAMP(3)", ExasolType::timestamp(3)),
+        ("TIMESTAMP(6)", ExasolType::timestamp(6)),
+        ("TIMESTAMP(9)", ExasolType::timestamp(9)),
+    ]
+}
+
+#[test]
+fn column_info_reads_each_measured_spelling() {
+    for (type_name, expected) in measured_spellings() {
+        assert_eq!(known(&measured_column(type_name)), expected, "{type_name}");
+    }
+}
+
+#[test]
+fn only_the_spelling_exasol_reports_for_a_type_is_its_reported_spelling() {
+    let mut cases: Vec<_> = measured_spellings()
+        .into_iter()
+        .map(|(type_name, exasol_type)| (type_name, exasol_type, true))
+        .collect();
+    cases.extend([
+        ("TIMESTAMP", ExasolType::BARE_TIMESTAMP, true),
+        (
+            "TIMESTAMP(3) WITH LOCAL TIME ZONE",
+            ExasolType::timestamp(3),
+            false,
+        ),
+    ]);
+    for (type_name, exasol_type, reported) in cases {
+        assert_eq!(
+            is_reported_spelling(exasol_type, type_name),
+            reported,
+            "{type_name} as {exasol_type:?}"
+        );
+    }
+}
+
+#[test]
+fn column_info_reads_an_integer_decimal_precision_from_type_name_when_precision_is_absent() {
+    let column = ColumnInfo {
+        precision: None,
+        ..measured_column("DECIMAL(9,0)")
+    };
+
+    assert_eq!(known(&column), ExasolType::decimal(9, 0));
+}
+
+#[test]
+fn column_info_reads_a_bare_timestamp_as_precision_3() {
+    let column = ColumnInfo {
+        type_name: "TIMESTAMP".to_string(),
+        typ: ExaType::Timestamp { precision: 0 },
+        precision: Some(0),
+        ..measured_column("TIMESTAMP(3)")
+    };
+
+    assert_eq!(known(&column), ExasolType::BARE_TIMESTAMP);
+}
+
+#[test]
+fn column_info_outside_exasols_types_comes_back_unrecognized_with_its_type_name() {
+    let cases = [
+        ColumnInfo {
+            typ: ExaType::Unsupported,
+            type_name: "HASHTYPE(16 BYTE)".to_string(),
+            ..measured_column("DOUBLE")
+        },
+        ColumnInfo {
+            typ: ExaType::Numeric {
+                precision: 39,
+                scale: 0,
+            },
+            type_name: "DECIMAL(39,0)".to_string(),
+            ..measured_column("DECIMAL(36,6)")
+        },
+        ColumnInfo {
+            precision: None,
+            type_name: "Int32".to_string(),
+            ..measured_column("DECIMAL(9,0)")
+        },
+    ];
+    for column in cases {
+        assert_eq!(
+            exasol_type_from_column_info(&column),
+            UdfColumnType::Unrecognized {
+                type_name: column.type_name.clone()
+            }
+        );
     }
 }
