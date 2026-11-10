@@ -45,25 +45,26 @@ fn signed_request_does_not_leak_keys_in_headers() {
 
 /// Scenario: Static bearer token is attached to unsigned catalog requests
 /// Scenario: Catalog requests carry no authorization when neither token nor OAuth credentials are supplied
-#[test]
-fn catalog_auth_sets_the_authorization_header_per_mode() {
+async fn authorization(auth: &CatalogAuth) -> Option<String> {
     let client = reqwest::Client::new();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
-    let authorization = |auth: &CatalogAuth| {
-        let request = build_signed_request(client.get(url), auth, &creds_no_auth())
-            .expect("an unsigned request builds");
-        assert!(request.headers().get("x-amz-date").is_none());
-        request
-            .headers()
-            .get("authorization")
-            .map(|v| v.to_str().unwrap().to_string())
-    };
+    let (request, _) = build_signed_request(client.get(url), auth, &creds_no_auth())
+        .await
+        .expect("an unsigned request builds");
+    assert!(request.headers().get("x-amz-date").is_none());
+    request
+        .headers()
+        .get("authorization")
+        .map(|v| v.to_str().unwrap().to_string())
+}
 
+#[tokio::test]
+async fn catalog_auth_sets_the_authorization_header_per_mode() {
     assert_eq!(
-        authorization(&CatalogAuth::Bearer(BEARER_TOK.into())),
+        authorization(&CatalogAuth::Bearer(BEARER_TOK.into())).await,
         Some(format!("Bearer {BEARER_TOK}"))
     );
-    assert_eq!(authorization(&CatalogAuth::None), None);
+    assert_eq!(authorization(&CatalogAuth::None).await, None);
 }
 
 #[tokio::test]
@@ -189,7 +190,7 @@ async fn a_post_sends_its_json_body_with_the_bearer_and_returns_the_answer() {
     let (answer, requests) = post_to(200, r#"{"ok":true}"#.into()).await;
 
     assert!(
-        matches!(answer, Ok(PostAnswer::Accepted { status: 200, ref body }) if body == r#"{"ok":true}"#)
+        matches!(answer, Ok(PostAnswer::Accepted { status: 200, ref body, .. }) if body == r#"{"ok":true}"#)
     );
     let request = requests.lock().unwrap()[0].to_lowercase();
     assert!(request.starts_with("post /check"), "{request}");

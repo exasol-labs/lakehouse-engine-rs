@@ -1,5 +1,6 @@
 use crate::auth::{CatalogAuth, resolve_catalog_auth};
 use crate::catalog_http::{CatalogHttp, CatalogRequestError};
+use crate::expiring::system_clock;
 use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
@@ -84,7 +85,8 @@ async fn resolve_load_table_prefix(
 }
 
 /// Catalog HTTP state resolved once per query and reused across every table's
-/// `loadTable` GET, so the OAuth grant and config lookup run once per query.
+/// `loadTable` GET, so the OAuth grant and config lookup run once per query. Its OAuth2 token is
+/// granted anew only when it reaches its renewal point.
 pub struct CatalogSession {
     http: CatalogHttp,
     catalog_uri: String,
@@ -103,7 +105,7 @@ impl CatalogSession {
         creds: &ConnectionCreds,
     ) -> Result<CatalogSession, UdfError> {
         let http = CatalogHttp::new();
-        let auth = resolve_catalog_auth(&http, catalog_uri, creds).await?;
+        let auth = resolve_catalog_auth(&http, catalog_uri, creds, system_clock()).await?;
         let prefix = match catalog_prefix {
             Some(prefix) => prefix,
             None => resolve_load_table_prefix(&http, catalog_uri, warehouse, &auth, creds).await?,

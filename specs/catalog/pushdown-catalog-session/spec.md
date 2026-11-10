@@ -7,7 +7,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 * The catalog-auth token is catalog-scoped, so the session obtains it once per statement and virtual schema. The prefix changes only when the CONNECTION names another catalog or warehouse, so createVirtualSchema, refresh, and setProperties look it up and record it as `CATALOG_PREFIX` (`vs-properties/create-virtual-schema-adapter-notes`), and every pushdown reuses it. The `loadTable` GET stays per-table because each response carries that table's own vended storage credentials.
 * Scoped exception to the Iceberg REST OpenAPI `getConfig`: "All REST clients should first call this route to get catalog configuration properties from the server". The adapter calls it when it writes the schema metadata and treats that as the client's startup. After an `ALTER CONNECTION` to another catalog or warehouse, the user runs `ALTER VIRTUAL SCHEMA ... REFRESH`.
 * A `CatalogSession` is valid for one `(catalog_uri, warehouse)` tuple. Join legs override only `CatalogProps.table`.
-* The session holds the live OAuth2 bearer token in its auth strategy. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and that token.
+* The session holds the live OAuth2 bearer token in its auth strategy, and renews it before it expires (`catalog/rest-catalog-oauth-auth`), so one more grant runs for each token that reaches its renewal point. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and the bearer token the failed request carried.
 * The adapter validates every involved-table identifier before its first catalog request. A malformed identifier issues no catalog HTTP request.
 * The scan spec's `storage` value is the only part of the scan-driving SQL that depends on how the credential is delivered. `storage-access/scan-spec-credential-reference` encodes it as a connection reference or as a sealed envelope over the backend's encoding. Each table's own vended keys still land in that table's storage block, field for field, before sealing. `storage-access/pushdown-planning-cloud-credentials` owns that gate.
 * `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait, runs the namespace enumeration for `createVirtualSchema` and the pushdown loads. It resolves its one `CatalogSession` at its first catalog request. That session serves a `createVirtualSchema` request's namespace listing and every `loadTable` GET of a statement's pushdowns, so a `createVirtualSchema`, `refresh`, or `setProperties` request runs one OAuth2 grant and one `/v1/config` lookup, and a statement's pushdowns run one OAuth2 grant and none. `architecture.md` states the crate boundary.
@@ -76,7 +76,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 * *GIVEN* a `CatalogSession` whose resolved auth is an OAuth2-obtained bearer token
 * *WHEN* a `loadTable` GET issued on that session returns a transport, HTTP-status, or parse error
 * *THEN* the returned error message MUST NOT contain any static catalog-auth secret from the CONNECTION
-* *AND* the returned error message MUST NOT contain the live bearer token held in the session's auth strategy
+* *AND* the returned error message MUST NOT contain the bearer token the failed request carried
 * *AND* neither the static secrets nor the obtained token SHALL appear in any returned SQL string
 
 ### Scenario: The Lakekeeper permission check reuses the statement's one catalog session
@@ -84,7 +84,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 * *GIVEN* a single-table or an N-table join pushdown request under OAuth2 client-credentials catalog auth, on a virtual schema with `PERMISSION_CHECK = 'LAKEKEEPER'` whose Lakekeeper answer allows every table
 * *WHEN* the adapter checks permissions and resolves every table's file list
 * *THEN* the OAuth2 grant SHALL run at most once for the statement and the adapter SHALL send no `/v1/config` request, as with the check off
-* *AND* the batch-check SHALL carry the bearer token of that one grant
+* *AND* the batch-check SHALL carry the bearer token that the session holds at that moment, as the Background states
 * *AND* a request that reads a table that no earlier pushdown of the statement checked SHALL add exactly one request, the batch-check, after the session resolves and before the first `loadTable` GET of those tables, and SHALL leave every other request of "Single-table pushdown builds one catalog session and reuses it" and "N-table join reuses one session across all legs" unchanged
 * *AND* a request whose tables earlier pushdowns of the statement all checked SHALL add no request
 

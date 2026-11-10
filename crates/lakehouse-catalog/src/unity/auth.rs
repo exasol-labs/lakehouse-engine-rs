@@ -2,18 +2,11 @@
 //! must never appear in any returned error.
 
 use crate::ConnectionCreds;
+use crate::auth::{ClientAuthentication, ClientCredentialsGrant, OAuth2Token};
 use crate::catalog_http::CatalogHttp;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
-use crate::error_chain;
-use crate::redaction::redact_error_text;
+use crate::expiring::system_clock;
 use exasol_udf_sdk::error::UdfError;
-use serde::Deserialize;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-/// Refresh this early so a bearer never expires in flight; the grant returns no
-/// refresh token, so renewal is a fresh mint.
-const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
 
 const OAUTH_DEFAULT_SCOPE: &str = "all-apis";
 
@@ -22,7 +15,7 @@ const GRANT: &str = "Unity Catalog OAuth client-credentials grant";
 pub(crate) enum UnityAuth {
     None,
     Pat(String),
-    OAuth(Box<OAuthTokenSource>),
+    OAuth(Box<OAuth2Token>),
 }
 
 impl UnityAuth {
@@ -41,80 +34,6 @@ impl UnityAuth {
             }
         }
     }
-}
-
-struct CachedToken {
-    token: String,
-    refresh_at: Instant,
-}
-
-/// Injected so the refresh decision is testable without a real clock.
-type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
-
-/// One source per session, so a whole enumeration reuses one minted token.
-pub(crate) struct OAuthTokenSource {
-    http: CatalogHttp,
-    token_url: String,
-    client_id: String,
-    client_secret: String,
-    scope: String,
-    cache: Mutex<Option<CachedToken>>,
-    clock: Clock,
-}
-
-impl OAuthTokenSource {
-    pub(crate) async fn bearer(&self) -> Result<String, UdfError> {
-        {
-            // Guard dropped before `.await` so the future stays `Send`.
-            let cache = self.cache.lock().unwrap();
-            if let Some(cached) = cache.as_ref()
-                && (self.clock)() < cached.refresh_at
-            {
-                return Ok(cached.token.clone());
-            }
-        }
-        let (token, expires_in) = self.mint().await?;
-        let refresh_at = (self.clock)()
-            + Duration::from_secs(expires_in.saturating_sub(OAUTH_REFRESH_SKEW_SECS));
-        *self.cache.lock().unwrap() = Some(CachedToken {
-            token: token.clone(),
-            refresh_at,
-        });
-        Ok(token)
-    }
-
-    async fn mint(&self) -> Result<(String, u64), UdfError> {
-        let redact = |msg: &str| redact_error_text(msg, &[self.client_secret.as_str()]);
-        let form = [
-            ("grant_type", "client_credentials"),
-            ("scope", self.scope.as_str()),
-        ];
-        let request = self
-            .http
-            .post(&self.token_url)
-            .basic_auth(&self.client_id, Some(&self.client_secret))
-            .header("accept", "application/json")
-            .form(&form)
-            .build()
-            .map_err(|e| UdfError::User(format!("{GRANT} failed: {}", redact(&error_chain(&e)))))?;
-        let parsed: OAuthTokenResponse = self.http.send_json(request, GRANT, redact).await?;
-        if parsed.access_token.is_empty() {
-            return Err(UdfError::User(format!("{GRANT} returned no access_token")));
-        }
-        // A zero/absent lifetime would re-mint on every request.
-        let expires_in = parsed
-            .expires_in
-            .filter(|&secs| secs > 0)
-            .ok_or_else(|| UdfError::User(format!("{GRANT} returned no usable expires_in")))?;
-        Ok((parsed.access_token, expires_in))
-    }
-}
-
-#[derive(Deserialize)]
-struct OAuthTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    expires_in: Option<u64>,
 }
 
 /// Synchronous by design: the OAuth grant is deferred to the first request, so
@@ -138,15 +57,17 @@ pub(crate) fn resolve_unity_auth(
             let scope = non_empty(&creds.scope)
                 .unwrap_or(OAUTH_DEFAULT_SCOPE)
                 .to_string();
-            UnityAuth::OAuth(Box::new(OAuthTokenSource {
+            let grant = ClientCredentialsGrant {
                 http: http.clone(),
                 token_url,
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
-                scope,
-                cache: Mutex::new(None),
-                clock: Arc::new(Instant::now),
-            }))
+                scope: Some(scope),
+                authentication: ClientAuthentication::Basic,
+                label: GRANT,
+                require_expiry: true,
+            };
+            UnityAuth::OAuth(Box::new(OAuth2Token::lazy(grant, system_clock())))
         }
     }
 }
