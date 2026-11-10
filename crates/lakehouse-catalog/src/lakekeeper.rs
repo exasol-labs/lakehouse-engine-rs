@@ -69,16 +69,18 @@ pub async fn lakekeeper_batch_check(
         })?;
 
     match answer {
-        PostAnswer::Accepted { status, body } => {
-            read_decisions(&distinct, &body).ok_or_else(|| {
-                let shown = quote_catalog_body(&body, session.auth(), creds);
-                UdfError::User(format!(
-                    "the Lakekeeper batch-check at {url} answered HTTP {status} with a body that \
+        PostAnswer::Accepted {
+            status,
+            body,
+            bearer,
+        } => read_decisions(&distinct, &body).ok_or_else(|| {
+            let shown = quote_catalog_body(&body, creds, bearer.as_deref());
+            UdfError::User(format!(
+                "the Lakekeeper batch-check at {url} answered HTTP {status} with a body that \
                      is not a batch-check answer for its {} checks: {shown}. {NEEDS_LAKEKEEPER}",
-                    distinct.len()
-                ))
-            })
-        }
+                distinct.len()
+            ))
+        }),
         PostAnswer::Refused { status, body } => Err(refusal(&url, status, &body)),
     }
 }

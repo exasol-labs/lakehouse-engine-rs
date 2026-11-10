@@ -133,8 +133,9 @@ fn the_decision_keeps_renews_or_fails_by_expiry_endpoint_and_last_renewal() {
 async fn credentials_within_five_minutes_of_expiry_are_renewed_through_one_load_credentials_request()
  {
     let (uri, requests) = catalog(OFFERING_CONFIG, fixture_answer).await;
-    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS - 5 * MINUTE_MS - 1));
+    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS - 60 * MINUTE_MS));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
+    time.store(SEED_EXPIRES_AT_MS - 5 * MINUTE_MS - 1, Ordering::SeqCst);
 
     let early = provide(&source).await.unwrap();
     time.store(SEED_EXPIRES_AT_MS - 4 * MINUTE_MS, Ordering::SeqCst);
