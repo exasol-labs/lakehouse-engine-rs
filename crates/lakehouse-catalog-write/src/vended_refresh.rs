@@ -85,7 +85,11 @@ impl VendedCredentials {
         clock: EpochClock,
     ) -> Result<Self, UdfError> {
         let lease = vended_lease(seed, &vended).map_err(UdfError::User)?;
-        let endpoint_offered = vended.session.offers_endpoint(CREDENTIALS_ROUTE);
+        // A session that never read `/v1/config` cannot say, so try the endpoint and fail loudly.
+        let endpoint_offered = vended
+            .session
+            .offers_endpoint(CREDENTIALS_ROUTE)
+            .unwrap_or(true);
         Ok(Self {
             inner: Arc::new(Source {
                 holder: ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock),
