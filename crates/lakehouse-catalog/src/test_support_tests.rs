@@ -2,10 +2,12 @@
 //! fault injection, and readers for the HTTP requests those servers receive.
 
 use crate::catalog_http::RetryPolicy;
+use crate::expiring::EpochClock;
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +22,12 @@ pub(crate) fn rest_client(
     creds: ConnectionCreds,
 ) -> crate::IcebergRestCatalogClient {
     crate::IcebergRestCatalogClient::new(uri.into(), creds, None, METADATA_READ_CONCURRENCY)
+}
+
+/// A clock that reads `time`, so a test moves it by storing a new epoch millisecond.
+pub(crate) fn clock_reading(time: &Arc<AtomicU64>) -> EpochClock {
+    let time = time.clone();
+    Arc::new(move || time.load(Ordering::SeqCst))
 }
 
 pub(crate) fn base_creds() -> ConnectionCreds {

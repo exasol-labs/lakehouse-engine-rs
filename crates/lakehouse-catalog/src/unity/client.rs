@@ -1,4 +1,4 @@
-use crate::catalog_http::CatalogHttp;
+use crate::catalog_http::{CatalogHttp, RepeatSafety};
 use crate::error_chain;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -154,7 +154,10 @@ impl UnityCatalogSession {
         let request = builder
             .build()
             .map_err(|e| UdfError::User(format!("{what} failed: {}", redact(&error_chain(&e)))))?;
-        Ok(self.http.send_json(request, &what, redact).await?)
+        Ok(self
+            .http
+            .send_json(request, RepeatSafety::Safe, &what, redact)
+            .await?)
     }
 }
 

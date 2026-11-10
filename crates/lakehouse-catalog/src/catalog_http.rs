@@ -40,6 +40,19 @@ const CATALOG_POLICY: RetryPolicy = RetryPolicy {
     backoff_base: Duration::from_millis(250),
 };
 
+/// Whether a catalog request may be sent again after a transient failure. Every request states it,
+/// so a request that changes catalog state is never repeated by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepeatSafety {
+    /// The request only reads, or reserves nothing, so a second attempt changes nothing.
+    Safe,
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// The request changes catalog state. Nothing sends it yet: the Iceberg write path that does
+    /// lands in a later change. The client sends it once, and the operation that can
+    /// check its outcome decides whether to send it again.
+    Unsafe,
+}
+
 /// The most of an answer body an error quotes. The quote is cut only after the whole read is
 /// redacted, so a secret that the cut splits was already replaced.
 pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
@@ -47,9 +60,9 @@ pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 /// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
 /// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
 /// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
-/// re-sends a clone of the request as the caller built and signed it: every retry starts within the
-/// window, long before a SigV4 signature or a cached OAuth token expires, so this type needs no
-/// knowledge of auth or signing.
+/// re-sends a clone of the request as the caller built and signed it, `Authorization` included, so
+/// this type needs no knowledge of auth or signing. A token whose lifetime is under twice the retry
+/// window can expire between attempts, and the catalog then answers 401, which is not retried.
 #[derive(Clone)]
 pub(crate) struct CatalogHttp {
     client: reqwest::Client,
@@ -107,11 +120,16 @@ impl CatalogHttp {
         self.client.post(url)
     }
 
-    /// Sends `request` and reads its whole answer body, retrying a transient failure within the
-    /// policy's window. Every HTTP answer is `Ok`, the last one when the retries run out; only a
-    /// transport failure is an error. A request whose body cannot be cloned is sent once.
-    pub(crate) async fn send(&self, request: Request) -> Result<CatalogAnswer, CatalogHttpError> {
-        self.send_capped(request, usize::MAX).await
+    /// Sends `request` and reads its whole answer body. A request that is safe to repeat is sent
+    /// again after a transient failure within the policy's window. Every HTTP answer is `Ok`, the
+    /// last one when the retries run out; only a transport failure is an error. A request whose
+    /// body cannot be cloned is sent once.
+    pub(crate) async fn send(
+        &self,
+        request: Request,
+        safety: RepeatSafety,
+    ) -> Result<CatalogAnswer, CatalogHttpError> {
+        self.send_capped(request, safety, usize::MAX).await
     }
 
     /// [`Self::send`], then parses a 2xx answer's body as JSON. Every failure is an error whose
@@ -120,10 +138,11 @@ impl CatalogHttp {
     pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         request: Request,
+        safety: RepeatSafety,
         what: &str,
         redact: impl Fn(&str) -> String,
     ) -> Result<T, CatalogRequestError> {
-        let answer = self.send(request).await.map_err(|error| {
+        let answer = self.send(request, safety).await.map_err(|error| {
             CatalogRequestError::new(
                 error.status(),
                 format!("{what} failed: {}", error.render(&redact)),
@@ -152,13 +171,18 @@ impl CatalogHttp {
     pub(crate) async fn send_capped(
         &self,
         mut request: Request,
+        safety: RepeatSafety,
         max_bytes: usize,
     ) -> Result<CatalogAnswer, CatalogHttpError> {
+        let attempts = match safety {
+            RepeatSafety::Safe => self.policy.attempts,
+            RepeatSafety::Unsafe => 1,
+        };
         let window_end = Instant::now() + self.policy.retry_window;
         let mut attempts_made = 0;
         loop {
             attempts_made += 1;
-            let resend = (attempts_made < self.policy.attempts)
+            let resend = (attempts_made < attempts)
                 .then(|| request.try_clone())
                 .flatten();
             let outcome = self.exchange(request, max_bytes).await;

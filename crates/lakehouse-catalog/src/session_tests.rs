@@ -576,7 +576,12 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
     let oauth_session = CatalogSession::resolve(&grant_uri, "wh", None, &oauth_creds)
         .await
         .expect("a 503 on the grant and the config lookup is retried to success");
-    assert!(matches!(oauth_session.auth, CatalogAuth::Bearer(ref t) if t == OAUTH_ACCESS_TOKEN));
+    let (_, carried) = oauth_session
+        .auth
+        .apply(reqwest::Client::new().get("http://catalog.example/v1/config"))
+        .await
+        .expect("the granted token needs no renewal");
+    assert_eq!(carried.as_deref(), Some(OAUTH_ACCESS_TOKEN));
     let posts: Vec<String> = grant_requests
         .lock()
         .unwrap()

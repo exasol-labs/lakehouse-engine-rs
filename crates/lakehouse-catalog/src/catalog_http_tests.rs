@@ -275,7 +275,10 @@ async fn a_catalog_that_never_answers_fails_within_the_retry_window() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap_err();
 
@@ -302,7 +305,10 @@ async fn a_stalled_attempt_is_retried() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let answer = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap();
 
@@ -336,7 +342,10 @@ async fn a_body_that_keeps_arriving_is_read_past_the_retry_window() {
     let started = Instant::now();
 
     let answer = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap();
 
@@ -351,7 +360,10 @@ async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
 
-    let error = http.send(get(&http, &base_uri)).await.unwrap_err();
+    let error = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .await
+        .unwrap_err();
 
     let elapsed = started.elapsed();
     assert!(
@@ -375,7 +387,10 @@ async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap_err();
 
@@ -402,11 +417,19 @@ async fn a_capped_read_keeps_the_first_bytes_and_reports_the_cut() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let long = http
-        .send_capped(get(&http, &format!("{base_uri}/long")), 10)
+        .send_capped(
+            get(&http, &format!("{base_uri}/long")),
+            RepeatSafety::Safe,
+            10,
+        )
         .await
         .unwrap();
     let exact = http
-        .send_capped(get(&http, &format!("{base_uri}/exact")), 10)
+        .send_capped(
+            get(&http, &format!("{base_uri}/exact")),
+            RepeatSafety::Safe,
+            10,
+        )
         .await
         .unwrap();
 
@@ -425,7 +448,10 @@ async fn a_body_that_breaks_off_fails_once_and_keeps_the_answer_status() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let error = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap_err();
 
@@ -459,7 +485,7 @@ async fn transient_statuses_are_retried_until_an_answer_succeeds() {
             .build()
             .unwrap();
 
-        let answer = http.send(request).await.unwrap();
+        let answer = http.send(request, RepeatSafety::Safe).await.unwrap();
 
         assert_eq!(answer.status, StatusCode::OK, "after HTTP {status}");
         assert_eq!(answer.body, b"{\"ok\":true}");
@@ -484,7 +510,10 @@ async fn a_retry_after_wait_is_honored() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
 
-    let answer = http.send(get(&http, &base_uri)).await.unwrap();
+    let answer = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .await
+        .unwrap();
 
     assert_eq!(answer.status, StatusCode::OK);
     assert!(
@@ -509,7 +538,10 @@ async fn a_wait_past_the_budget_ends_the_retries_at_once() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
 
-    let answer = http.send(get(&http, &base_uri)).await.unwrap();
+    let answer = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .await
+        .unwrap();
 
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.body, b"{\"error\":\"busy\"}");
@@ -535,7 +567,10 @@ async fn a_wait_that_leaves_less_than_a_read_timeout_keeps_the_answer_at_hand() 
     });
     let started = Instant::now();
 
-    let answer = http.send(get(&http, &base_uri)).await.unwrap();
+    let answer = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .await
+        .unwrap();
 
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(started.elapsed() < ms(500), "{:?}", started.elapsed());
@@ -549,9 +584,12 @@ async fn a_refused_json_answer_quotes_its_body_redacted_and_cut() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let error = http
-        .send_json::<serde_json::Value>(get(&http, &base_uri), "catalog request", |msg| {
-            msg.replace(BEARER_TOK, "***")
-        })
+        .send_json::<serde_json::Value>(
+            get(&http, &base_uri),
+            RepeatSafety::Safe,
+            "catalog request",
+            |msg| msg.replace(BEARER_TOK, "***"),
+        )
         .await
         .unwrap_err();
 
@@ -580,7 +618,10 @@ async fn a_non_transient_answer_is_sent_once() {
         .await;
         let http = CatalogHttp::with_policy(SHORT_POLICY);
 
-        let answer = http.send(get(&http, &base_uri)).await.unwrap();
+        let answer = http
+            .send(get(&http, &base_uri), RepeatSafety::Safe)
+            .await
+            .unwrap();
 
         assert_eq!(answer.status.as_u16(), status);
         assert_eq!(answer.body, format!("{{\"code\":{status}}}").into_bytes());
@@ -599,13 +640,16 @@ async fn a_refused_connection_is_retried_until_attempts_run_out() {
     });
     let started = Instant::now();
 
-    let error = http.send(get(&http, CLOSED_PORT_URI)).await.unwrap_err();
+    let error = http
+        .send(get(&http, CLOSED_PORT_URI), RepeatSafety::Safe)
+        .await
+        .unwrap_err();
 
     let elapsed = started.elapsed();
     let four_shortest_waits = ms(5 + 10 + 20 + 40);
     assert!(elapsed >= four_shortest_waits, "{elapsed:?}");
     let single_error = single
-        .send(get(&single, CLOSED_PORT_URI))
+        .send(get(&single, CLOSED_PORT_URI), RepeatSafety::Safe)
         .await
         .unwrap_err();
     assert_eq!(error.render(identity), single_error.render(identity));
@@ -629,7 +673,10 @@ async fn a_connection_reset_after_the_request_is_retried() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let answer = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap();
 
@@ -653,7 +700,10 @@ async fn a_connection_closed_cleanly_after_the_request_is_retried() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let answer = http
-        .send(get(&http, &format!("http://{address}/")))
+        .send(
+            get(&http, &format!("http://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap();
 
@@ -693,7 +743,10 @@ async fn a_tls_client_against_a_plain_http_listener_connects_once() {
     let http = CatalogHttp::with_policy(SHORT_POLICY);
 
     let error = http
-        .send(get(&http, &format!("https://{address}/")))
+        .send(
+            get(&http, &format!("https://{address}/")),
+            RepeatSafety::Safe,
+        )
         .await
         .unwrap_err();
 
@@ -716,7 +769,7 @@ async fn an_unresolvable_host_fails_at_the_first_attempt() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, "http://catalog.invalid/"))
+        .send(get(&http, "http://catalog.invalid/"), RepeatSafety::Safe)
         .await
         .unwrap_err();
 
@@ -779,4 +832,66 @@ async fn transport_failures_are_classified_by_their_typed_cause() {
             error_chain(&error)
         );
     }
+}
+
+/// A commit's path; the client never reads the path, so one request kind stands for all three.
+const COMMIT_PATH: &str = "/v1/wh/namespaces/db/tables/t";
+
+fn post(http: &CatalogHttp, url: &str) -> Request {
+    http.post(url)
+        .bearer_auth(BEARER_TOK)
+        .body("{}")
+        .build()
+        .expect("a valid request")
+}
+
+/// Scenario: A request that changes catalog state is sent once after a transient failure
+#[tokio::test]
+async fn only_a_request_safe_to_repeat_is_sent_again_after_a_504() {
+    for (safety, attempts, status) in [
+        (RepeatSafety::Unsafe, 1, StatusCode::GATEWAY_TIMEOUT),
+        (RepeatSafety::Safe, 2, StatusCode::OK),
+    ] {
+        let answered = AtomicUsize::new(0);
+        let (base_uri, requests) = spawn_server("application/json", move |_| {
+            match answered.fetch_add(1, Ordering::SeqCst) {
+                0 => (504, "{\"error\":\"gateway\"}".into()),
+                _ => (200, "{}".into()),
+            }
+        })
+        .await;
+        let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+        let answer = http
+            .send(post(&http, &format!("{base_uri}{COMMIT_PATH}")), safety)
+            .await
+            .unwrap();
+
+        assert_eq!(answer.status, status, "{safety:?}");
+        assert_eq!(requests.lock().unwrap().len(), attempts, "{safety:?}");
+    }
+}
+
+/// Scenario: A request that changes catalog state is sent once after a transient failure
+#[tokio::test]
+async fn a_request_unsafe_to_repeat_is_sent_once_after_a_timeout() {
+    let (address, accepted) = spawn_listener(|stream, index| async move {
+        match index {
+            0 => hold_open(stream).await,
+            _ => answer_ok(stream).await,
+        }
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let error = http
+        .send(
+            post(&http, &format!("http://{address}{COMMIT_PATH}")),
+            RepeatSafety::Unsafe,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.render(identity).contains(TIMED_OUT_CAUSE));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
