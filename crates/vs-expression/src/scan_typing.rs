@@ -406,15 +406,15 @@ fn integer_digits(text: &str) -> Option<u8> {
     u8::try_from(digits.len()).ok()
 }
 
-/// A literal of at most 18 digits reads as the same integer in every session, so comparing it with
-/// an integer needs no session setting.
-fn is_session_free_integer_text(node: &Json) -> bool {
+/// A literal of at most `max_digits` digits reads as the same integer in every session, so
+/// comparing it with an integer needs no session setting.
+fn is_session_free_integer_text(node: &Json, max_digits: u8) -> bool {
     kind(node) == "literal_string"
         && node
             .get("value")
             .and_then(Json::as_str)
             .and_then(integer_digits)
-            .is_some_and(|digits| digits <= 18)
+            .is_some_and(|digits| digits <= max_digits)
 }
 
 /// Exasol parses text compared with a date or number by the session's NLS settings. A digits-only
@@ -437,10 +437,14 @@ fn compare_without_session_parse(
     if text.is_empty() || non_text.is_empty() {
         return Ok(());
     }
-    let integer_against_digits = non_text
-        .iter()
-        .all(|c| matches!(c, TypeClass::Integer { .. }))
-        && text.iter().all(|n| is_session_free_integer_text(n));
+    // A multi-value IN converts the text to the integer's type, which fails natively on a literal
+    // wider than its precision, so only a literal that fits reaches the scan.
+    let max_digits = non_text.iter().try_fold(18, |max, c| match c {
+        TypeClass::Integer { precision } => Some(precision.map_or(max, |p| max.min(p))),
+        _ => None,
+    });
+    let integer_against_digits =
+        max_digits.is_some_and(|max| text.iter().all(|n| is_session_free_integer_text(n, max)));
     if !integer_against_digits {
         return Err(decline(format!(
             "comparing text with another type parses the text by the session's NLS settings: {}",
@@ -448,7 +452,7 @@ fn compare_without_session_parse(
         )));
     }
     let to_number = |operand: &mut Json| {
-        if is_session_free_integer_text(operand) {
+        if kind(operand) == "literal_string" {
             *operand = integer_literal(operand["value"].as_str().unwrap_or_default());
         }
     };

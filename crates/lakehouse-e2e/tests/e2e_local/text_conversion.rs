@@ -393,6 +393,43 @@ fn digits_literal_beyond_an_int_column_matches_no_row_in_the_scan() {
     assert!(explain_virtual_sql(&mut conn, &query).contains(SCAN_FILTER));
 }
 
+/// Scenario: A digits-only literal wider than the integer's precision runs in Exasol
+#[test]
+fn digits_literal_wider_than_an_int_column_matches_native() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = format!("{LAKEHOUSE_VS}.ALL_TYPES");
+    create_native_copy(&mut conn, &table, "C_INT");
+    let cases = [
+        ("C_INT IN ('7', '8', '99999999999')", Expect::Error),
+        ("C_INT * 1 IN ('1', '99999999999')", Expect::Error),
+        ("C_INT = '99999999999'", Expect::Rows),
+        ("C_INT BETWEEN '-5' AND '99999999999'", Expect::Rows),
+        ("C_INT IN ('1', '00000000002')", Expect::Rows),
+        ("C_INT IN ('10', 8)", Expect::Rows),
+        ("C_INT + 1 IN ('1', '99999999999')", Expect::Rows),
+        (
+            "CASE WHEN C_INT > 0 THEN C_INT ELSE 0 END IN ('1', '99999999999')",
+            Expect::Rows,
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(filter, expect)| {
+            let query = format!("SELECT ID FROM {{T}} WHERE {filter}");
+            native_copy_mismatch(
+                &mut conn,
+                &table,
+                NATIVE_COPY,
+                &query,
+                PathCheck::Unchecked,
+                *expect,
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Scenario: A CAST of text to a shorter VARCHAR runs unchecked in the scan
 #[test]
 fn shorter_varchar_cast_runs_unchecked_in_the_scan() {

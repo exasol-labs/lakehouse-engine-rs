@@ -28,9 +28,16 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 
 ### Scenario: A digits-only literal compares with an integer as a number
 
-* *GIVEN* a comparison, `IN`, or `BETWEEN` of integer operands with a text literal of 1 to 18 digits and an optional minus sign, such as `int_col = '2147483648'`
+* *GIVEN* a comparison, `IN`, or `BETWEEN` of integer operands with a text literal of 1 to 18 digits and an optional minus sign, and no more digits than any operand's precision, such as `int_col = '2147483648'` against `DECIMAL(10,0)`
 * *WHEN* the adapter renders it for the scan
 * *THEN* the scan SHALL compare the literal as an integer literal, so a value outside the column's range matches no row instead of failing the scan
+
+### Scenario: A digits-only literal wider than the integer's precision runs in Exasol
+
+* *GIVEN* a comparison, `IN`, or `BETWEEN` of an integer operand of precision p with a digits-only text literal of more than p digits, such as `qty IN ('7', '99999999999')` against `DECIMAL(10,0)`
+* *WHEN* the adapter plans the request
+* *THEN* the scan SHALL NOT compute the expression, and the path's fallback SHALL apply it in Exasol
+* *AND* the result SHALL equal native Exasol, including the numeric out-of-range error Exasol raises when it converts the literal to the operand's type
 
 ### Scenario: A CAST of text to CHAR runs in Exasol
 

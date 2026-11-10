@@ -10,6 +10,7 @@ fn columns() -> TypedColumns {
         ("F", ExasolType::DoublePrecision),
         ("N", ExasolType::decimal(9, 2)),
         ("I", ExasolType::decimal(9, 0)),
+        ("I18", ExasolType::decimal(18, 0)),
         ("S", ExasolType::WIDEST_VARCHAR),
         ("S10", ExasolType::varchar(10)),
     ])
@@ -347,9 +348,9 @@ fn a_comparison_without_text_conversion_is_untouched() {
 fn a_digits_only_literal_against_an_integer_renders_as_the_number_it_reads_as() {
     let cases = [
         (
-            "overflowing the column",
-            predicate_equal(col("I"), str_lit("2147483648")),
-            r#"("I" = 2147483648)"#,
+            "as many digits as the precision",
+            predicate_equal(col("I"), str_lit("-999999999")),
+            r#"("I" = -999999999)"#,
         ),
         (
             "leading zeros",
@@ -373,8 +374,8 @@ fn a_digits_only_literal_against_an_integer_renders_as_the_number_it_reads_as() 
         ),
         (
             "18 digits",
-            predicate_equal(col("I"), str_lit("123456789012345678")),
-            r#"("I" = 123456789012345678)"#,
+            predicate_equal(col("I18"), str_lit("123456789012345678")),
+            r#"("I18" = 123456789012345678)"#,
         ),
     ];
     for (label, expr, expected) in cases {
@@ -382,9 +383,31 @@ fn a_digits_only_literal_against_an_integer_renders_as_the_number_it_reads_as() 
     }
     for literal in ["1234567890123456789", "", "-", "1-2"] {
         assert!(
-            render(&predicate_equal(col("I"), str_lit(literal))).is_err(),
+            render(&predicate_equal(col("I18"), str_lit(literal))).is_err(),
             "'{literal}' is not a session-free integer"
         );
+    }
+}
+
+/// Scenario: A digits-only literal wider than the integer's precision runs in Exasol
+#[test]
+fn a_digits_only_literal_wider_than_the_integer_precision_declines() {
+    let cases = [
+        (
+            "IN",
+            in_list(col("I"), [str_lit("7"), str_lit("2147483648")]),
+        ),
+        (
+            "comparison",
+            predicate_equal(col("I"), str_lit("2147483648")),
+        ),
+        (
+            "BETWEEN",
+            between(col("I"), str_lit("1"), str_lit("-2147483648")),
+        ),
+    ];
+    for (label, expr) in cases {
+        assert!(render(&expr).is_err(), "{label} must decline");
     }
 }
 
