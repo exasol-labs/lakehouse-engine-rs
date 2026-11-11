@@ -1,9 +1,10 @@
 use super::*;
 use crate::scan::test_support::invoke_scalar_udf;
 
-/// One batch of `documents`, with `constants` after them.
+/// One batch of `documents` as `document_type`, with `constants` after them.
 fn invoke(
     returning: Returning,
+    document_type: &DataType,
     documents: Vec<Option<&str>>,
     constants: Vec<ScalarValue>,
 ) -> ArrayRef {
@@ -17,7 +18,9 @@ fn invoke(
         signature: Signature::any(constants.len() + 1, Volatility::Immutable),
     };
     let rows = documents.len();
-    let mut args = vec![ColumnarValue::Array(Arc::new(StringArray::from(documents)))];
+    let documents: ArrayRef = Arc::new(StringArray::from(documents));
+    let documents = cast(&documents, document_type).expect("a string type");
+    let mut args = vec![ColumnarValue::Array(documents)];
     args.extend(constants.into_iter().map(ColumnarValue::Scalar));
     invoke_scalar_udf(&udf, args, rows)
         .and_then(|values| values.to_array(rows))
@@ -29,26 +32,17 @@ fn text(value: &str) -> ScalarValue {
 }
 
 #[test]
-fn text_function_applies_the_behaviors() {
-    let values = invoke(
-        Returning::Text,
-        vec![
-            None,
-            Some(""),
-            Some("{"),
-            Some(r#"{"b":1}"#),
-            Some(r#"{"a":"abcd"}"#),
-            Some(r#"{"a":"ab"}"#),
-            Some(r#"{"a":null}"#),
-            Some(r#"{"a":""}"#),
-        ],
-        vec![
-            text("$.a"),
-            ScalarValue::Int64(Some(3)),
-            text("e"),
-            text("x"),
-        ],
-    );
+fn text_function_applies_the_behaviors_to_every_string_type() {
+    let documents = vec![
+        None,
+        Some(""),
+        Some("{"),
+        Some(r#"{"b":1}"#),
+        Some(r#"{"a":"abcd"}"#),
+        Some(r#"{"a":"ab"}"#),
+        Some(r#"{"a":null}"#),
+        Some(r#"{"a":""}"#),
+    ];
     let expected = StringArray::from(vec![
         None,
         None,
@@ -59,13 +53,32 @@ fn text_function_applies_the_behaviors() {
         None,
         None,
     ]);
-    assert_eq!(values.as_string::<i32>(), &expected);
+    for document_type in [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+    ] {
+        let values = invoke(
+            Returning::Text,
+            &document_type,
+            documents.clone(),
+            vec![
+                text("$.a"),
+                ScalarValue::Int64(Some(3)),
+                text("e"),
+                text("x"),
+            ],
+        );
+        assert_eq!(values.as_string::<i32>(), &expected, "{document_type}");
+    }
 }
 
 #[test]
 fn boolean_function_applies_the_behaviors() {
     let values = invoke(
         Returning::Boolean,
+        &DataType::Utf8,
         vec![
             None,
             Some(r#"{"a":"yes"}"#),

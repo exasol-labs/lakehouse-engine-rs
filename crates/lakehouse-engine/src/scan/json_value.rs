@@ -196,6 +196,16 @@ fn boolean_values(args: &ScalarFunctionArgs, items: &[Option<Item>]) -> Result<A
     Ok(Arc::new(values))
 }
 
+fn select_each<'a>(
+    documents: impl Iterator<Item = Option<&'a str>>,
+    path: &[JsonPathStep],
+) -> Vec<Option<Item<'a>>> {
+    // Exasol reads the empty string as NULL.
+    documents
+        .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, path)))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Returning {
     Text,
@@ -226,18 +236,23 @@ impl ScalarUDFImpl for JsonUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let documents = cast(&args.args[0].to_array(args.number_rows)?, &DataType::Utf8)?;
         let path = scalar_argument(&args, 1)?
             .try_as_str()
             .flatten()
             .and_then(parse_json_path)
             .ok_or_else(|| DataFusionError::Execution(format!("{} path", self.name)))?;
-        // Exasol reads the empty string as NULL.
-        let items: Vec<Option<Item>> = documents
-            .as_string::<i32>()
-            .iter()
-            .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, &path)))
-            .collect();
+        let documents = args.args[0].to_array(args.number_rows)?;
+        let other;
+        // String arrays are read in place: a cast would copy every document of the batch.
+        let items = match documents.data_type() {
+            DataType::Utf8 => select_each(documents.as_string::<i32>().iter(), &path),
+            DataType::LargeUtf8 => select_each(documents.as_string::<i64>().iter(), &path),
+            DataType::Utf8View => select_each(documents.as_string_view().iter(), &path),
+            _ => {
+                other = cast(&documents, &DataType::Utf8)?;
+                select_each(other.as_string::<i32>().iter(), &path)
+            }
+        };
         let values = match self.returning {
             Returning::Text => text_values(&args, &items)?,
             Returning::Boolean => boolean_values(&args, &items)?,
