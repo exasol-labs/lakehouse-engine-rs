@@ -275,6 +275,65 @@ fn a_boolean_column_converts_to_exasol_casing() {
     assert!(render(&cast_to(ExasolType::varchar(5), col("B"))).is_ok());
 }
 
+const B_AS_NUMBER: &str = r#"(CASE "B" WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)"#;
+
+#[test]
+fn a_boolean_casts_to_decimal_as_one_or_zero() {
+    assert_eq!(
+        render(&cast_to(ExasolType::decimal(18, 0), col("B"))).unwrap(),
+        format!("CAST({B_AS_NUMBER} AS DECIMAL(18,0))")
+    );
+    assert_eq!(
+        render(&cast_to(ExasolType::DoublePrecision, col("B"))).unwrap(),
+        r#"CAST("B" AS DOUBLE)"#
+    );
+    assert!(render(&cast_to(ExasolType::decimal(1, 0), col("B"))).is_ok());
+    assert!(render(&cast_to(ExasolType::decimal(2, 2), col("B"))).is_err());
+}
+
+#[test]
+fn a_boolean_compares_with_a_number_as_one_or_zero() {
+    let cases = [
+        (
+            "literal",
+            predicate_equal(col("B"), num_lit(2)),
+            format!("({B_AS_NUMBER} = 2)"),
+        ),
+        (
+            "column",
+            compare("predicate_less", col("F"), col("B")),
+            format!(r#"("F" < {B_AS_NUMBER})"#),
+        ),
+        (
+            "BETWEEN",
+            between(col("B"), num_lit(0), col("N")),
+            format!(r#"({B_AS_NUMBER} BETWEEN 0 AND "N")"#),
+        ),
+        (
+            "IN over a number",
+            in_list(col("I"), [bool_lit(true), num_lit(5)]),
+            r#"("I" IN ((CASE TRUE WHEN TRUE THEN 1 WHEN FALSE THEN 0 END), 5))"#.to_string(),
+        ),
+        (
+            "simple CASE",
+            case_of(col("B"), [num_lit(1)], [bool_lit(true)]),
+            format!("(CASE {B_AS_NUMBER} WHEN 1 THEN TRUE END)"),
+        ),
+        (
+            "boolean against boolean",
+            predicate_equal(col("B"), bool_lit(true)),
+            r#"("B" = TRUE)"#.to_string(),
+        ),
+    ];
+    for (label, expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected, "{label}");
+    }
+    assert!(
+        render(&in_list(col("B"), [num_lit(0), num_lit(1)])).is_err(),
+        "an IN over a BOOLEAN converts its numbers to BOOLEAN"
+    );
+}
+
 #[test]
 fn text_casts_to_shorter_or_ascii_varchar_unchecked_and_decline_char() {
     let ascii = ascii_varchar;

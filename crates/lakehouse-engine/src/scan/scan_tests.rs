@@ -1,4 +1,4 @@
-use super::test_support::minimal_spec;
+use super::test_support::{current_thread_runtime, minimal_spec};
 use super::*;
 
 #[test]
@@ -19,6 +19,28 @@ fn session_config_applies_batch_size_and_clamps_floor() {
         1,
         "df_batch_size of 0 must be clamped to 1"
     );
+}
+
+#[test]
+fn datafusion_still_rejects_a_boolean_as_a_number() {
+    let ctx = scan_session_context(SessionConfig::new(), Arc::default());
+    for (sql, reason) in [
+        (
+            "SELECT CAST(b AS DECIMAL(18,0)) FROM (VALUES (true)) t(b)",
+            "Unsupported CAST from Boolean to Decimal",
+        ),
+        ("SELECT b = 1 FROM (VALUES (true)) t(b)", "Boolean = Int64"),
+    ] {
+        match current_thread_runtime().block_on(async { ctx.sql(sql).await?.collect().await }) {
+            Ok(_) => panic!(
+                "DataFusion now runs `{sql}`, so the scan typing's BOOLEAN_NUMBER_NODE rewrite can go (#613)"
+            ),
+            Err(e) => assert!(
+                e.to_string().contains(reason),
+                "`{sql}` must fail for `{reason}`, not: {e}"
+            ),
+        }
+    }
 }
 
 #[test]

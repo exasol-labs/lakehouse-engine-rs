@@ -71,6 +71,9 @@ impl TypeClass {
 pub(crate) const INTEGER_TEXT_NODE: &str = "scan_integer_text";
 /// Synthetic node: a boolean operand converted to Exasol's `TRUE`/`FALSE`.
 pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
+/// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
+/// (apache/datafusion#16797).
+pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
 /// a `name` identifier to its visitor.
@@ -322,14 +325,7 @@ fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
         | "predicate_greaterequal"
         | "predicate_between"
         | "predicate_in_constlist" => {
-            let mut operands: Vec<(&Json, TypeClass)> = ["expression", "left", "right"]
-                .iter()
-                .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
-                .collect();
-            if let Some(Json::Array(args)) = node.get("arguments") {
-                operands.extend(args.iter().zip(children.of("arguments")));
-            }
-            compare_without_session_parse(node, out, &operands)?;
+            type_comparison(node, out, children)?;
             TypeClass::Boolean
         }
         "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
@@ -377,16 +373,11 @@ fn exact_numeric_class(node: &Json) -> TypeClass {
 }
 
 fn case_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
-    match (node.get("basis"), children.one("basis")) {
-        // A simple CASE compares its basis with each WHEN value.
-        (Some(basis), Some(basis_class)) => {
-            let mut operands = vec![(basis, basis_class)];
-            if let Some(Json::Array(whens)) = node.get("arguments") {
-                operands.extend(whens.iter().zip(children.of("arguments")));
-            }
-            compare_without_session_parse(node, out, &operands)?;
-        }
-        _ => refuse_implicit_text(node, &children.of("arguments"))?,
+    // A simple CASE compares its basis with each WHEN value.
+    if children.one("basis").is_some() {
+        type_comparison(node, out, children)?;
+    } else {
+        refuse_implicit_text(node, &children.of("arguments"))?;
     }
     unify_branches(node, &children.of("results"))
 }
@@ -465,6 +456,23 @@ fn is_session_free_integer_text(node: &Json, max_digits: u8) -> bool {
             .is_some_and(|digits| digits <= max_digits)
 }
 
+/// The fields that hold a predicate's operands or a simple CASE's basis. `arguments` holds the
+/// rest: an IN list or the WHEN values.
+const COMPARED_FIELDS: [&str; 4] = ["expression", "left", "right", "basis"];
+
+/// Types the operands that a predicate or a simple CASE compares with each other.
+fn type_comparison(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<(), UdfError> {
+    let mut operands: Vec<(&Json, TypeClass)> = COMPARED_FIELDS
+        .iter()
+        .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
+        .collect();
+    if let Some(Json::Array(args)) = node.get("arguments") {
+        operands.extend(args.iter().zip(children.of("arguments")));
+    }
+    compare_without_session_parse(node, out, &operands)?;
+    compare_booleans_as_numbers(node, out, children, &operands)
+}
+
 /// Exasol parses text compared with a date or number by the session's NLS settings. A digits-only
 /// literal against integers reads the same in every session, so it renders as that number.
 fn compare_without_session_parse(
@@ -504,13 +512,49 @@ fn compare_without_session_parse(
             *operand = integer_literal(operand["value"].as_str().unwrap_or_default());
         }
     };
-    for field in ["expression", "left", "right", "basis"] {
+    for field in COMPARED_FIELDS {
         if let Some(operand) = out.get_mut(field) {
             to_number(operand);
         }
     }
     if let Some(Json::Array(args)) = out.get_mut("arguments") {
         args.iter_mut().for_each(to_number);
+    }
+    Ok(())
+}
+
+/// Exasol compares a BOOLEAN with a number as 1 or 0, except a multi-value IN over a BOOLEAN,
+/// which converts its numbers to BOOLEAN and fails on any but 0 and 1.
+fn compare_booleans_as_numbers(
+    node: &Json,
+    out: &mut Json,
+    children: &ChildClasses,
+    operands: &[(&Json, TypeClass)],
+) -> Result<(), UdfError> {
+    let has_number = operands
+        .iter()
+        .any(|(_, c)| matches!(c, TypeClass::Integer { .. } | TypeClass::Number));
+    let has_boolean = operands.iter().any(|(_, c)| *c == TypeClass::Boolean);
+    if !has_number || !has_boolean {
+        return Ok(());
+    }
+    if kind(node) == "predicate_in_constlist"
+        && children.one("expression") == Some(TypeClass::Boolean)
+    {
+        return Err(decline(format!(
+            "an IN list converts its numbers to the BOOLEAN it tests: {}",
+            short(node)
+        )));
+    }
+    for field in COMPARED_FIELDS {
+        if children.one(field) == Some(TypeClass::Boolean) {
+            out[field] = wrap(BOOLEAN_NUMBER_NODE, out[field].take());
+        }
+    }
+    for (i, class) in children.of("arguments").into_iter().enumerate() {
+        if class == TypeClass::Boolean {
+            out["arguments"][i] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][i].take());
+        }
     }
     Ok(())
 }
@@ -597,6 +641,15 @@ fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError>
         }
         ExasolType::Varchar { size, .. } => {
             *source = cast_to_text(source.take(), source_class, target, size, false)?;
+        }
+        ExasolType::Decimal(d) if source_class == TypeClass::Boolean => {
+            if d.precision() == d.scale() {
+                return Err(decline(format!(
+                    "CAST of {} to {target} cannot hold 1",
+                    short(source)
+                )));
+            }
+            *source = wrap(BOOLEAN_NUMBER_NODE, source.take());
         }
         _ => cast_from_text(source, source_class, target)?,
     }

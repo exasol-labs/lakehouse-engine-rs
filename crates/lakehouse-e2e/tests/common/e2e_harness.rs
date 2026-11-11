@@ -637,10 +637,8 @@ pub fn join_query(vs_name: &str) -> String {
     )
 }
 
-/// The compact lowercase `"join":{` token is unique to the generated ScanSpec JSON:
-/// Exasol's echoed request uses `"type" : "join"` and capabilities use `"JOIN"`.
 pub fn has_broadcast_join_block(pushed_sql: &str) -> bool {
-    pushed_sql.contains("\"join\":{")
+    pushed_sql.contains(BROADCAST_JOIN)
 }
 
 /// Only the N-scan wrapper emits the subquery alias form `AS "LHS_T{i}"`. The broadcast
@@ -897,6 +895,9 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
 
 /// The scan spec's filter key: the scan applies at least one WHERE conjunct.
 pub const SCAN_FILTER: &str = r#""filter":""#;
+/// The scan spec's join block: the join takes the broadcast plan. Unique to the scan spec, because
+/// Exasol's echoed request uses `"type" : "join"` and capabilities use `"JOIN"`.
+pub const BROADCAST_JOIN: &str = r#""join":{"#;
 /// The alias of a select expression the scan computes; absent when the projection widens to the
 /// base row and Exasol computes the expression.
 pub const SCAN_ITEM: &str = "_LH_PROJ_";
