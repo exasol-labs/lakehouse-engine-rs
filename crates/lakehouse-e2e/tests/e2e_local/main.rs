@@ -26,6 +26,7 @@ mod refresh;
 mod scan;
 mod statement_reuse;
 mod table_filter;
+mod text_conversion;
 mod timestamp_precision;
 mod two_entry_points;
 mod type_relaxation;

@@ -117,11 +117,7 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
     let spec = CommonScanSpec {
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }]),
+        aggregates: Some(vec![count_plan()]),
         group_keys: Some(group_keys.clone()),
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
@@ -151,7 +147,10 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 
     let filter_json = like(col("name"), "A%");
 
-    let df_filter = render_df_filter_safe(&filter_json);
+    let df_filter = scan_filter_sql(
+        &filter_json,
+        &column_types(&[("NAME", ExasolType::WIDEST_VARCHAR)]),
+    );
     assert!(
         df_filter.is_some(),
         "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
@@ -166,101 +165,41 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 }
 
 #[test]
-fn where_filter_decimal_stringification_rewritten_to_trim() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = compare(
-        "predicate_greater",
-        scalar_fn("LENGTH", [col("c_decimal_a")]),
-        num_lit(5),
-    );
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
-        .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
-
-    let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
-    assert_eq!(
-        rendered.matches(trim_wrapper).count(),
-        1,
-        "the rewritten filter must carry the Exasol decimal-trim form EXACTLY ONCE \
-             (string-fn guard wraps it, decimal rewrite must then no-op): {rendered}"
-    );
-    assert!(
-        !rendered.contains(r#"character_length("C_DECIMAL_A")"#),
-        "the filter must NOT stringify the bare decimal column untrimmed: {rendered}"
-    );
-}
-
-#[test]
-fn filter_decimal_comparison_not_rewritten() {
+fn a_decimal_compared_with_a_number_renders_its_bare_column() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = compare("predicate_greater", col("c_decimal_a"), num_lit(5));
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
     assert_eq!(
         rendered, r#"("C_DECIMAL_A" > 5)"#,
         "a DECIMAL column in a comparison must stay a bare, unwrapped column reference: {rendered}"
     );
-    assert!(
-        !rendered.contains("regexp_replace"),
-        "a non-stringifying filter context must not be trimmed: {rendered}"
-    );
 }
 
 #[test]
-fn where_filter_string_fn_under_comparison_predicate_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_decimal_a")]), str_lit("X"));
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
-        .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
-
-    assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested under predicate_equal's left must be coerced \
-             into the Exasol decimal-trim form: {rendered}"
-    );
-}
-
-#[test]
-fn where_filter_string_fn_over_double_declines() {
-    let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
-    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_double_a")]), str_lit("X"));
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
-
-    assert!(
-        rendered.is_none(),
-        "UPPER over a DOUBLE PRECISION column must decline the whole filter, \
-             not push a possibly-wrong text comparison: {rendered:?}"
-    );
-}
-
-#[test]
-fn where_filter_upper_decimal_inside_like_subject_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = like(scalar_fn("UPPER", [col("c_decimal_a")]), "1%");
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
-        .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
-
-    assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested inside the LIKE subject's UPPER call must be \
-             coerced into the Exasol decimal-trim form, even though guard_like_subject \
-             itself leaves this non-bare-column LIKE subject untouched: {rendered}"
-    );
+fn where_filter_string_fn_over_session_formatted_number_declines() {
+    let col_types = vec![
+        ("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision),
+        ("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2)),
+    ];
+    for column in ["c_double_a", "c_decimal_a"] {
+        let cases = [
+            predicate_equal(scalar_fn("UPPER", [col(column)]), str_lit("X")),
+            compare(
+                "predicate_greater",
+                scalar_fn("LENGTH", [col(column)]),
+                num_lit(5),
+            ),
+            like(scalar_fn("UPPER", [col(column)]), "1%"),
+        ];
+        for filter in cases {
+            let rendered = scan_filter_sql(&filter, &column_types(&col_types));
+            assert!(rendered.is_none(), "{column}: {rendered:?}");
+        }
+    }
 }
 
 #[test]
@@ -271,9 +210,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
         num_lit(1),
     );
 
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
+    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
     assert!(
         rendered.is_none(),
@@ -720,6 +657,70 @@ fn guard_dispatch_sql(
         .to_string()
 }
 
+/// [`build_dispatch_sql`] over the sample file list and scan settings, as the dispatcher calls it.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with(
+    request: &Json,
+    projection: Vec<ProjectedColumn>,
+    projection_widened: bool,
+    col_types: &ColumnTypes,
+    (filter, declined_filter): (Option<String>, Option<&Json>),
+    limit: Option<u64>,
+    logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
+) -> Result<Json, UdfError> {
+    let pushdown_req = pd(request);
+    build_dispatch_sql(
+        request,
+        &PushdownRequest::parse(pushdown_req.clone())?,
+        projection,
+        projection_widened,
+        ScanTranslator::new(col_types),
+        filter,
+        declined_filter,
+        limit,
+        order_by_present(&pushdown_req),
+        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+        "s3://warehouse/db/events".to_string(),
+        logical_schema,
+        Vec::new(),
+        Vec::new(),
+        scan_storage,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+        false,
+    )
+}
+
+/// [`dispatch_with`] after the dispatcher's own projection and WHERE split of `request`.
+fn dispatch_planned(
+    request: &Json,
+    col_types: &ColumnTypes,
+    logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
+) -> Result<Json, UdfError> {
+    let pushdown_req = pd(request);
+    let (proj_cols, proj_types, projection_widened) =
+        project_first_table(request, &pushdown_req).expect("the fixture must project");
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    dispatch_with(
+        request,
+        projected_columns(&proj_cols, &proj_types),
+        projection_widened,
+        col_types,
+        ScanTranslator::new(col_types).split_where(filter),
+        extract_limit(&pushdown_req),
+        logical_schema,
+        scan_storage,
+    )
+}
+
 /// An unrenderable pushed sort key is a `User` error, not SQL.
 fn guard_dispatch_result(
     request: &Json,
@@ -729,37 +730,19 @@ fn guard_dispatch_result(
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
 ) -> Result<Json, UdfError> {
-    let pushdown_req = pd(request);
-    let has_order_by = order_by_present(&pushdown_req);
-    build_dispatch_sql(
+    dispatch_with(
         request,
-        &PushdownRequest::parse(pushdown_req.clone())?,
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
         &column_types(&guard_col_types()),
-        None,
-        None,
+        (None, None),
         limit,
-        has_order_by,
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
         logical_schema,
-        Vec::new(),
-        Vec::new(),
         &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
     )
 }
 
-/// A shape `like_subject_type_guard` declines though Exasol renders it.
+/// A filter the scan declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
     like(table_col("EVENTS", "AMOUNT"), "1%")
 }
@@ -767,46 +750,38 @@ fn declined_like_on_decimal() -> Json {
 /// The empty logical schema declines the bounded top-N unconditionally, so the
 /// decline route must win on its own.
 fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
-    let (request, _) = request.build();
-    let pushdown_req = pd(&request);
-    let col_types = guard_col_types();
-    let (proj_cols, proj_types, projection_widened) =
-        project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
-    let result = build_dispatch_sql(
-        &request,
-        &parsed_pushdown(&request),
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        &column_types(&col_types),
-        filter,
-        declined_filter,
-        extract_limit(&pushdown_req),
-        order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
-    )
-    .expect("build_dispatch_sql must succeed for this fixture");
+    let result =
+        dispatch_for_body(request).expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
         .as_str()
         .expect("pushdown response must carry a sql field")
         .to_string()
+}
+
+fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
+    let (request, _) = request.build();
+    dispatch_planned(
+        &request,
+        &first_table_column_types(&request),
+        Vec::new(),
+        &sample_scan_storage(),
+    )
+}
+
+#[test]
+fn grouped_request_with_an_invalid_cast_key_type_fails() {
+    let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
+    // The engine's `cast_to` takes an `ExasolType`, which cannot hold this invalid type.
+    let request = pushdown_request("T", &[("NAME", ExasolType::varchar(10))])
+        .group_by(vec![cast_json(invalid.clone(), col("NAME"))])
+        .count_star();
+
+    match dispatch_for_body(request) {
+        Err(UdfError::User(message)) => {
+            assert!(message.contains(&invalid.to_string()), "{message}")
+        }
+        other => panic!("the invalid key type must fail the query, got {other:?}"),
+    }
 }
 
 #[test]
@@ -862,7 +837,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = bool_lit(true);
     let (filter, declined) =
-        classify_where_filter(Some(&trivially_true), &column_types(&guard_col_types()));
+        ScanTranslator::new(&column_types(&guard_col_types())).split_where(Some(&trivially_true));
     assert!(
         filter.is_none() && declined.is_none(),
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
@@ -939,7 +914,9 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     ));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
+        sql.starts_with(
+            r#"SELECT CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(29,2)), 2) AS DECIMAL(36,2)) FROM ("#
+        ),
         "the merge SELECT must wrap the merged partial in the scalar structure, \
          not emit a bare unwrapped SUM: {sql}"
     );
@@ -987,14 +964,8 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    assert_ne!(
-        apply_type_rewrites(&filter, &column_types(&col_types)).as_ref(),
-        Some(&filter),
-        "fixture precondition: the type rewrites must CHANGE this tree, so the \
-             assertion below can tell the original from the rewritten one"
-    );
-
-    let (scan_filter, declined) = classify_where_filter(Some(&filter), &column_types(&col_types));
+    let (scan_filter, declined) =
+        ScanTranslator::new(&column_types(&col_types)).split_where(Some(&filter));
 
     assert!(
         scan_filter.is_none(),
@@ -1517,7 +1488,9 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 
 fn timestamp_cast_select_request(precision: u8) -> PushdownRequestBuilder {
     let target = ExasolType::timestamp(precision);
-    guard_events().item(cast_to(target, table_col("EVENTS", "NAME")), target)
+    let mut columns = guard_col_types();
+    columns.push(("TS".to_string(), ExasolType::timestamp(9)));
+    pushdown_request("EVENTS", &columns).item(cast_to(target, table_col("EVENTS", "TS")), target)
 }
 
 #[test]
@@ -1525,7 +1498,7 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST("LHS_T0"."NAME" AS TIMESTAMP(2)) FROM ("#),
+        sql.starts_with(r#"SELECT CAST("LHS_T0"."TS" AS TIMESTAMP(2)) FROM ("#),
         "the declined CAST must be computed in the wrapper's outer select list: {sql}"
     );
     assert!(
@@ -1537,7 +1510,7 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
         .map(|at| &sql[at..])
         .unwrap_or_else(|| panic!("the wrapper must still drive the scan UDF: {sql}"));
     assert!(
-        emits.contains(r#""NAME" VARCHAR(2000000)"#) && !emits.contains("TIMESTAMP"),
+        emits.contains(r#""TS" TIMESTAMP(9)"#) && !emits.contains("TIMESTAMP(2)"),
         "the scan must emit the raw column, never the declined CAST target: {sql}"
     );
 }
@@ -1847,7 +1820,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         widened,
-        &column_types(&guard_col_types()),
+        ScanTranslator::new(&column_types(&guard_col_types())),
         None,
         None,
         None,
@@ -1977,62 +1950,6 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 }
 
 #[test]
-fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = char_grouped_request(
-        cast_to(ExasolType::char(20), col("NAME")),
-        ExasolType::char(20),
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "the scan spec must carry the blank-padded group key {padded}: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(20))"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(20): {sql}"
-    );
-}
-
-#[test]
-fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = unprojected_char_grouped_request(cast_to(ExasolType::char(20), col("NAME")));
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "an unprojected CHAR(20) group key must still reach the scan padded: {sql}"
-    );
-}
-
-#[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = unprojected_char_grouped_request(cast_to(ExasolType::varchar(10), col("NAME")));
 
@@ -2058,47 +1975,6 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 }
 
 #[test]
-fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
-    let request = char_grouped_request(
-        cast_to(
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            col("NAME"),
-        ),
-        ExasolType::Char {
-            size: 3,
-            ascii: true,
-        },
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "a `CHAR(3) ASCII` group key must reach the scan padded to 3: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(3) ASCII)"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(3) ASCII: {sql}"
-    );
-}
-
-#[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(col("REGION"), ExasolType::varchar(10), None);
 
@@ -2118,38 +1994,6 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     assert!(
         !sql.contains("rpad("),
         "no pad may be emitted for a VARCHAR-declared group key: {sql}"
-    );
-}
-
-#[test]
-fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
-    let request = char_grouped_request(
-        col("NAME"),
-        ExasolType::char(20),
-        Some(serde_json::json!([order_by_element(
-            col("NAME"),
-            true,
-            true
-        )])),
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    assert!(
-        sql.contains("ORDER BY 1"),
-        "the sort on the CHAR-declared group key must resolve to output ordinal 1: {sql}"
-    );
-    assert!(
-        sql.contains("rpad("),
-        "the DataFusion-side copy must still be padded alongside the resolved \
-             ORDER BY: {sql}"
     );
 }
 
@@ -2394,39 +2238,11 @@ fn dispatch_result_for_body(
     scan_storage: &ScanStorage,
 ) -> Result<String, UdfError> {
     let (request, _) = request.build();
-    let pushdown_req = pd(&request);
-    let col_types = guard_col_types();
-    let (proj_cols, proj_types, projection_widened) =
-        project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
-    let result = build_dispatch_sql(
+    let result = dispatch_planned(
         &request,
-        &parsed_pushdown(&request),
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        &column_types(&col_types),
-        filter,
-        declined_filter,
-        extract_limit(&pushdown_req),
-        order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
+        &column_types(&guard_col_types()),
         logical_schema,
-        Vec::new(),
-        Vec::new(),
         scan_storage,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
     )?;
     Ok(result["sql"]
         .as_str()

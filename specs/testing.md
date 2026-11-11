@@ -99,6 +99,7 @@ Test code gets the same design care as production code. A test reads as the one 
 - Tests do not re-verify iceberg-rust, DataFusion, Arrow, or Parquet. The row oracles guard their integration with the engine.
 - A fixture guard proves only that a fixture has the shape its row test needs, so the row test cannot pass vacuously. It reads the fixture through the library that wrote or plans it, or asks the catalog server over its own REST API.
 - A row assertion compares against one of three oracles: the seeded source data, the same query without pushdown or on a single DataFusion node, or the key-first ordering of the same grouped query with the column positions transposed.
+- A comparison with a native copy states whether the native query returns rows or an error, so a query that fails on both sides for a reason the case did not intend does not pass.
 - Row deletes, such as positional deletes and deletion vectors, are proved by the absence of the deleted rows. How delete references reach the scan UDF is a wire contract that unit tests prove.
 - A test that must prove a query reached the scan UDF asserts on the pushdown SQL, so a silent fallback to an unaccelerated wrapper fails instead of passing on correct rows. When a declined filter would return the same rows as a pushed one, the test also asserts the SQL, not the rows.
 - A pushdown shape the adapter advertises is proved against a live Exasol, never inferred from the capability registry or from code.

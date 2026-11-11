@@ -11,20 +11,15 @@ use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::adapter::pushdown::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql,
-    detect_aggregates, ordinary_plans,
-};
+use lakehouse_engine::adapter::pushdown::{ProjectedColumn, build_scan_driving_sql};
 use lakehouse_engine::scan::spec::{
-    AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
-    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
+    ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem, ScanSpec,
+    ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
 use lakehouse_engine::types::exasol_type::ExasolType;
-use vs_expression::exasol_type::exasol_type_to_json;
-use vs_expression::test_support::{agg_item_expr, col, scalar_fn};
 
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -318,85 +313,6 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     );
 }
 
-fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
-    CommonScanSpec {
-        filter: Some(
-            r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
-        ),
-        aggregates: Some(aggregates),
-        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            allow_http: true,
-            ..Default::default()
-        })),
-        ..Default::default()
-    }
-    .with_files(Vec::new())
-}
-
-#[test]
-fn sum_two_column_product_emits_aggregates_not_raw_scan() {
-    let req = serde_json::json!({
-        "selectList": [agg_item_expr(
-            "SUM",
-            scalar_fn("MULT", [col("L_EXTENDEDPRICE"), col("L_DISCOUNT")]),
-            false,
-        )],
-        "selectListDataTypes": [exasol_type_to_json(&ExasolType::decimal(36, 4))],
-    });
-
-    let pushdown =
-        PushdownRequest::parse(req).expect("the request declares a valid selectListDataTypes");
-    let items = detect_aggregates(&pushdown)
-        .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
-    let plans = ordinary_plans(&items);
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].kind, AggKind::Sum);
-    assert!(
-        plans[0].column.is_none() && plans[0].arg_expr.is_some(),
-        "the two-column product must be carried in arg_expr, not as a bare column"
-    );
-    assert_eq!(
-        plans[0].arg_expr.as_deref(),
-        Some(r#"("L_EXTENDEDPRICE" * "L_DISCOUNT")"#)
-    );
-
-    let spec = aggregate_spec(plans);
-    let shards = vec![vec![("lineitem/data/f0.parquet".to_string(), 4096u64)]];
-    let merge_inputs = AggregateMergeInputs::new(
-        vec![ExasolType::decimal(36, 4)],
-        vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
-        None,
-    )
-    .expect("one merge item for one select-list item");
-    let sql = build_scan_driving_sql(
-        &spec,
-        &shards,
-        &[],
-        None,
-        &ColumnTypes::default(),
-        Some(&merge_inputs),
-        "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_DISTRIBUTE_FILES",
-    );
-
-    assert!(
-        sql.contains(r#""PARTIAL_sum_0" DECIMAL(36,4)"#),
-        "partial SUM column must be the declared DECIMAL(36,4):\n{sql}"
-    );
-    assert!(
-        sql.contains("arg_expr"),
-        "the aggregate plan must carry the product argument (arg_expr):\n{sql}"
-    );
-    assert!(
-        !sql.contains("SELECT * FROM"),
-        "must not be a raw two-column row-scan fallback:\n{sql}"
-    );
-}
-
 fn row_scan_spec() -> ScanSpec {
     CommonScanSpec {
         storage: ScanStorage::Inline(test_storage()),
@@ -423,7 +339,6 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         &shards,
         &projection,
         None,
-        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
@@ -474,7 +389,6 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
         &shards,
         &projection,
         Some(20),
-        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
@@ -555,7 +469,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         &shards,
         &projection,
         None,
-        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",

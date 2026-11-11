@@ -4,7 +4,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
+The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_scan_expression`, `render_scan_filter`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
 
 In the DataFusion dialect, most Exasol `FN_*` names lower-case to the DataFusion function of the same name. These need explicit aliasing: `SIGN`→`signum`, `LENGTH`→`character_length`, `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
@@ -56,6 +56,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `LENGTH`→`character_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
 * *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string"
+* *AND* an `INSTR` or `LOCATE` node with more than two arguments SHALL decline, because `strpos` takes no start position or occurrence
 * *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-functions/vs-expression-translator-concat`, not by this name-mapping table
 
 ### Scenario: String scalar functions render verbatim in the Exasol dialect
@@ -64,7 +65,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<args_sql>)` using the function's own uppercased Exasol name and its arguments in the order received, with no name mapping and no operand reordering
 * *AND* `INSTR` and `LOCATE` in particular MUST keep Exasol's own argument order and MUST NOT render as `strpos(...)`, which Exasol rejects with `function or script STRPOS not found` (SQL code 42000)
-* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it, this is what lets the arity decline in `pushdown-types/pushdown-planning-string-fn-type-coercion` still evaluate correctly on the Exasol side
+* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it
 * *AND* the DataFusion-dialect rendering of every listed name MUST remain byte-identical to the preceding scenario
 
 ### Scenario: CASE expression translates to SQL CASE WHEN
@@ -96,5 +97,5 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
-* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
 * *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

@@ -2438,7 +2438,7 @@ fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
 
 fn scalar_over_aggregate_round_select_list() -> &'static str {
     "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
-     ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
+     ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2)"
 }
 
 fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::BTreeSet<String> {
@@ -2535,7 +2535,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
 
     let sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
-         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2) \
          FROM {} GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
         vs_lineitem_table()
     );
@@ -2573,7 +2573,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
     ensure_ground_truth_lineitem_table(&mut conn);
     let ground_truth_sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
-         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2) \
          FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG"
     );
@@ -3288,7 +3288,7 @@ fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     let mut conn = exa_conn();
 
     let select_list = "SUM(L_QUANTITY), ROUND(AVG(L_EXTENDEDPRICE), 3), MIN(L_QUANTITY), \
-                       ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END) \
+                       ROUND(100.0 * SUM(L_QUANTITY) \
                        / COUNT(*), 2)";
     let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
     assert_single_group_aggregate_pushed_down(&mut conn, &sql);
@@ -3814,7 +3814,8 @@ fn outer_merge_select_list(pushdown_sql: &str) -> &str {
 /// Scenario: The merge casts a merged value only when merging can change its type
 /// Scenario: Expression-argument partial and merge column types come from the declared aggregate type
 /// Scenario: Scalar-over-aggregate and plain aggregate items interleave in select-list order with per-item declared types
-/// Scenario: A MIN or MAX over a CHAR-typed expression declares a CHAR partial column
+/// Scenario: A group key travels with its exact type
+/// Scenario: A MIN or MAX over a CAST to CHAR runs in the qualified wrapper
 #[test]
 fn merge_casts_only_values_whose_type_merging_changes() {
     lakehouse_vs();
@@ -3822,13 +3823,13 @@ fn merge_casts_only_values_whose_type_merging_changes() {
     let table = typed_table();
 
     let single_group = "SELECT MIN(C_TS), MAX(C_TS), SUM(C_QTY), COUNT(*), MIN(C_QTY + 1), \
-                        ROUND(SUM(C_QTY), 2) FROM {}";
-    let char_group = "SELECT C_VARCHAR, MIN(CAST(C_VARCHAR AS CHAR(20))), SUM(C_QTY) FROM {} \
+                        ROUND(SUM(C_QTY), 2) FROM {T}";
+    let char_group = "SELECT C_VARCHAR, MIN(CAST(C_VARCHAR AS CHAR(20))), SUM(C_QTY) FROM {T} \
                       GROUP BY C_VARCHAR";
-    let date_group = "SELECT C_DATE, SUM(C_QTY) FROM {} GROUP BY C_DATE";
+    let date_group = "SELECT C_DATE, SUM(C_QTY) FROM {T} GROUP BY C_DATE";
 
     let single_group_sql =
-        isolated_pushdown_statement(&mut conn, &single_group.replace("{}", &table));
+        isolated_pushdown_statement(&mut conn, &single_group.replace("{T}", &table));
     let merge = outer_merge_select_list(&single_group_sql);
     assert!(
         merge.starts_with(
@@ -3839,7 +3840,7 @@ fn merge_casts_only_values_whose_type_merging_changes() {
     );
     for fragment in [
         "CAST(SUM(\"PARTIAL_count_3\") AS DECIMAL(",
-        ", MIN(\"PARTIAL_min_4\"), CAST(ROUND(SUM(\"PARTIAL_sum_2\"), 2) AS DECIMAL(",
+        ", MIN(\"PARTIAL_min_4\"), CAST(ROUND(CAST(SUM(\"PARTIAL_sum_2\") AS DECIMAL(",
     ] {
         assert!(
             merge.contains(fragment),
@@ -3852,27 +3853,20 @@ fn merge_casts_only_values_whose_type_merging_changes() {
         "no MIN or MAX merge may be cast: {merge}"
     );
 
-    let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{}", &table));
-    let merge = outer_merge_select_list(&char_group_sql);
+    let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{T}", &table));
     assert!(
-        merge.starts_with(
-            "\"GK_0\", MIN(\"PARTIAL_min_0\"), CAST(SUM(\"PARTIAL_sum_1\") AS DECIMAL("
-        ),
-        "a key declared VARCHAR(2000000), the type the scan emits, stays uncast, and the CHAR \
-         MIN merge too: {merge}"
-    );
-    let emits = emits_clause(&char_group_sql);
-    assert!(
-        emits.contains("\"PARTIAL_min_0\" CHAR(20)") && emits.contains("\"GK_0\" VARCHAR(2000000)"),
-        "the partial of the CHAR MIN must declare CHAR(20) and the key VARCHAR(2000000): {emits}"
+        PathCheck::Wrapper.holds(char_group, &char_group_sql),
+        "the scan does not blank-pad, so a MIN over a CAST to CHAR runs in the qualified \
+         wrapper: {char_group_sql}"
     );
 
-    let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{}", &table));
+    let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{T}", &table));
     let merge = outer_merge_select_list(&date_group_sql);
     assert!(
-        merge.starts_with("CAST(\"GK_0\" AS DATE), CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),
-        "a DATE key travels as text, so its merge casts it back: {merge}"
+        merge.starts_with("\"GK_0\", CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),
+        "a DATE key travels typed, so the merge reads it uncast: {merge}"
     );
+    assert!(emits_clause(&date_group_sql).contains("\"GK_0\" DATE"));
 
     assert_queries_match_native_copy(
         &mut conn,

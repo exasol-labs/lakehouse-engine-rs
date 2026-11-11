@@ -1,13 +1,40 @@
 use crate::scan::spec::ProjectionItem;
+use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::{
-    render_df_filter_exasol_safe, render_expression_exasol_safe, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, conjoin_scan_filters, exact_expression_type,
+    render_df_filter_exasol_safe, render_expression_exasol_safe, strip_table_alias,
+    walk_column_nodes,
 };
 
-use super::super::support::{
-    ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite,
-};
+use super::super::support::{ColumnTypes, ScanTranslator, quote_ident};
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
+
+/// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
+/// leg's type.
+struct LegColumnTypes<'a> {
+    legs: &'a JoinLegs,
+    cols_per_leg: &'a [&'a ColumnTypes],
+}
+
+impl ColumnTypeLookup for LegColumnTypes<'_> {
+    fn column_type(&self, column: &Json) -> Option<ExasolType> {
+        let ColumnLeg::Leg(leg) = self.legs.resolve_column(ColumnNode::parse(column)?) else {
+            return None;
+        };
+        self.cols_per_leg.get(leg)?.column_type(column)
+    }
+}
+
+/// A qualified-wrapper select item's type, read from the raw request node, whose columns still
+/// name their own tables.
+pub(super) fn select_item_type(
+    item: &Json,
+    legs: &JoinLegs,
+    cols_per_leg: &[&ColumnTypes],
+) -> Option<ExasolType> {
+    exact_expression_type(item, &LegColumnTypes { legs, cols_per_leg })
+}
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
     match item {
@@ -49,15 +76,20 @@ fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
     out.push(filter);
 }
 
-/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(filter, &mut conjuncts);
-    let mut kept: Vec<Json> = conjuncts
-        .into_iter()
-        .filter(|&c| keep(c))
-        .cloned()
-        .collect();
+    conjoin(
+        conjuncts
+            .into_iter()
+            .filter(|&c| keep(c))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
+fn conjoin(mut kept: Vec<Json>) -> Option<Json> {
     match kept.len() {
         0 => None,
         1 => kept.pop(),
@@ -75,9 +107,8 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 /// Its consumers deliberately receive different trees:
 /// (a) manifest pruning gets it raw, so every leg-local conjunct prunes even when
 /// DataFusion cannot render it;
-/// (b) the leg's `ScanSpec.filter` gets it screened by [`renderable_only`] and then
-/// [`type_screened_leg_filter`];
-/// (c) the outer wrapper's WHERE gets the raw type-declined conjuncts (Exasol dialect).
+/// (b) the leg's `ScanSpec.filter` gets the conjuncts [`screen_leg_filter`] renders;
+/// (c) the outer wrapper's WHERE gets the raw declined conjuncts (Exasol dialect).
 /// Cross-leg and OR-spanning conjuncts go only to the outer WHERE.
 pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
     partition_conjuncts(filter, |c| legs.conjunct_leg(c) == Some(leg))
@@ -85,48 +116,30 @@ pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Op
 
 /// `None` when every conjunct is leg-local. An unattributable conjunct is withheld from every
 /// leg and surfaces as a hard decline when the wrapper renders it, never guessed onto a leg.
-/// It complements [`leg_local_filter`] over the tree it is given; only composed with
-/// [`renderable_only`]/[`declined_only`] does the whole filter get applied exactly once.
+/// It complements [`leg_local_filter`] over the tree it is given.
 pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Option<Json> {
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// The sole renderability screen on the N-scan path, applied only at
-/// [`super::sql_builders::build_n_scan_join_sql`]'s render sites, not inside
-/// [`leg_local_filter`]: manifest pruning must see unscreened conjuncts, and dropping one
-/// there would silently open more files with no test catching it.
-pub(super) fn renderable_only(filter: &Json) -> Option<Json> {
-    partition_conjuncts(filter, datafusion_renderable)
-}
-
-/// The complement of [`renderable_only`], applied by the outer wrapper's WHERE.
-pub(super) fn declined_only(filter: &Json) -> Option<Json> {
-    partition_conjuncts(filter, |c| !datafusion_renderable(c))
-}
-
-/// Returns `(leg_filter, type_declined)`: a total per-conjunct partition, the first half
-/// rewritten for the leg, the second raw for the Exasol-dialect outer WHERE.
-///
-/// Not [`classify_where_filter`](super::super::support::classify_where_filter), which
-/// classifies a whole filter against one type universe: an N-scan leg's conjuncts name only
-/// that leg's columns, so the leg's own unqualified `col_types`, known only after
-/// attribution, binds each one by name. Per conjunct, so one declined conjunct doesn't
-/// forfeit its siblings. Renderability is established on the rewritten tree via
-/// [`type_accepted_rewrite`]; if the re-formed tree fails it, the whole side-local set
-/// becomes residual (fail closed: applied in the wrapper is slower, applied nowhere is wrong).
-pub(super) fn type_screened_leg_filter(
+/// Returns `(leg_filter_sql, declined)`. Each conjunct renders once against the leg's own
+/// columns, so one declined conjunct costs only itself and no later render can decline the rest.
+pub(super) fn screen_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
-) -> (Option<Json>, Option<Json>) {
-    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
-    let declined = partition_conjuncts(side_local, |c| !accepts(c));
-    match partition_conjuncts(side_local, accepts) {
-        None => (None, declined),
-        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
-            Some(rewritten) => (Some(rewritten), declined),
-            None => (None, Some(side_local.clone())),
-        },
+) -> (Option<String>, Option<Json>) {
+    let scan = ScanTranslator::new(col_types);
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(side_local, &mut conjuncts);
+    let mut rendered = Vec::new();
+    let mut declined = Vec::new();
+    for conjunct in conjuncts {
+        // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
+        match scan.expression(&strip_table_alias(conjunct)) {
+            Some(fragment) => rendered.push(fragment.sql),
+            None => declined.push(conjunct.clone()),
+        }
     }
+    (conjoin_scan_filters(rendered), conjoin(declined))
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.

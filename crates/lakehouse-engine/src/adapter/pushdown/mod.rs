@@ -25,12 +25,12 @@ pub(crate) use binary_filter::literal_binary_bytes;
 
 mod support;
 pub use support::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, build_fan_out_inner,
-    build_scan_driving_sql, shard_count,
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
+    build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_limit,
-    involved_columns, order_by_present, project_columns, projection_items, scan_storage_for,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_limit, involved_columns, order_by_present,
+    project_columns, projection_items, scan_storage_for,
 };
 use vs_expression::strip_table_alias;
 
@@ -57,19 +57,17 @@ mod topn;
 use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
-pub use single_group_agg::{detect_aggregates, ordinary_plans};
-use single_group_agg::{
-    has_distinct, is_lone_count_distinct, single_group_merge_select, single_group_plan_types,
-};
+pub use single_group_agg::{detect_aggregates, single_group_plans};
+use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_select};
 
 mod grouped_agg;
 pub use grouped_agg::{
     GroupedAggregateDetection, GroupedSelectItem, build_grouped_aggregate_scan_sql,
-    detect_group_by_aggregates, validate_agg_col_types,
+    detect_group_by_aggregates,
 };
-use grouped_agg::{blank_pad_char_group_keys, group_key_exasol_types};
 
 mod scalar_over_agg;
+pub use scalar_over_agg::TypedPlans;
 
 mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
@@ -88,11 +86,8 @@ use joins::{
 
 #[cfg(test)]
 use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
-// Imported for the test mirrors of `classify_where_filter`'s two halves.
 #[cfg(test)]
-use support::apply_type_rewrites;
-#[cfg(test)]
-use vs_expression::render_df_filter_safe;
+use test_support::scan_filter_sql;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
@@ -190,11 +185,12 @@ pub(crate) async fn handle_pushdown(
     ) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
-    let (projection, projection_widened) = project_columns(&pushdown, &col_types)?;
+    let scan = ScanTranslator::new(&col_types);
+    let (projection, projection_widened) = project_columns(&pushdown, scan)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
-    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
+    let (filter, declined_filter) = scan.split_where(filter_json_raw);
     let conn = statement.connection();
     let scan_storage = scan_storage_for(
         &conn.creds,
@@ -219,7 +215,7 @@ pub(crate) async fn handle_pushdown(
             &pushdown,
             &projection,
             projection_widened,
-            &col_types,
+            scan,
             &EmptyRelation::single_scan(request, &col_types),
         );
     }
@@ -237,7 +233,7 @@ pub(crate) async fn handle_pushdown(
         &pushdown,
         projection,
         projection_widened,
-        &col_types,
+        scan,
         filter,
         declined_filter,
         limit,
@@ -269,7 +265,7 @@ pub(crate) fn build_dispatch_sql(
     pushdown: &PushdownRequest,
     mut projection: Vec<ProjectedColumn>,
     projection_widened: bool,
-    col_types: &ColumnTypes,
+    scan: ScanTranslator<'_>,
     filter: Option<String>,
     declined_filter: Option<&Json>,
     limit: Option<u64>,
@@ -323,14 +319,28 @@ pub(crate) fn build_dispatch_sql(
             &base,
             None,
             shards,
-            col_types,
+            scan.columns(),
             udf_name,
             distribute_udf_name,
             Some(declined),
         );
     }
 
-    let single_group_merge = match classify_request_shape(pushdown, col_types) {
+    let fallback = || {
+        qualified_single_table_fallback_pushdown(
+            request,
+            pushdown,
+            &base,
+            filter.clone(),
+            shards,
+            scan.columns(),
+            udf_name,
+            distribute_udf_name,
+            None,
+        )
+    };
+
+    let single_group_merge = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {
             detection,
             having,
@@ -338,46 +348,45 @@ pub(crate) fn build_dispatch_sql(
         } => {
             let GroupedAggregateDetection {
                 group_keys,
-                plans: grouped_agg_plans,
-                plan_types: grouped_agg_types,
+                group_key_types,
+                aggregates,
                 select_items,
             } = detection;
             // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
             // per-shard partial never carries a LIMIT (decision [4]).
             let grouped_limit = limit;
-            // A CHAR(n) key must be blank-padded to reproduce Exasol's CHAR grouping (#192).
-            // Only the spec copy is padded; ORDER BY matching uses the unpadded fragments.
-            let group_key_types = group_key_exasol_types(pushdown, &group_keys, &select_items)?;
             // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
-                    filter,
+                    filter: filter.clone(),
                     limit: grouped_limit,
-                    aggregates: Some(grouped_agg_plans.clone()),
-                    group_keys: Some(blank_pad_char_group_keys(&group_keys, &group_key_types)),
+                    aggregates: Some(aggregates.plans.clone()),
+                    group_keys: Some(group_keys.clone()),
                     ..base.clone()
                 },
                 files: vec![],
             };
-            // From detection, never a `selectList`-keyed lookup: nested aggregates would
-            // misalign it.
-            let aggregate_types = grouped_agg_types;
+            // Types come from detection, never a `selectList`-keyed lookup: nested aggregates
+            // would misalign it.
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
                 shards,
-                &group_keys,
                 &group_key_types,
-                &grouped_agg_plans,
-                &aggregate_types,
+                &aggregates,
                 &select_items,
+                pushdown.select_types(),
                 grouped_limit,
                 support::extract_offset(pushdown_req),
-                col_types,
+                scan,
                 udf_name,
                 distribute_udf_name,
                 having.as_deref(),
                 grouped_order_by.as_deref(),
             );
+            let Some(sql) = sql else {
+                // Defensive: a shortened select list fails Exasol's positional validation.
+                return fallback();
+            };
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
         RequestShape::GroupByWrapper | RequestShape::SingleGroupWrapper => {
@@ -385,19 +394,13 @@ pub(crate) fn build_dispatch_sql(
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
             // aggregate the materialized rows (#82). No outer WHERE is needed: an
             // untranslatable filter never reaches this arm.
-            return qualified_single_table_fallback_pushdown(
-                request,
-                pushdown,
-                &base,
-                filter.clone(),
-                shards,
-                col_types,
-                udf_name,
-                distribute_udf_name,
-                None,
-            );
+            return fallback();
         }
-        RequestShape::SingleGroupAgg { items, having } => {
+        RequestShape::SingleGroupAgg {
+            items,
+            aggregates,
+            having,
+        } => {
             // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
             // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
             // Exasol rejects OFFSET in an ungrouped aggregate (`42000`) before the adapter
@@ -416,15 +419,17 @@ pub(crate) fn build_dispatch_sql(
                     },
                     files: vec![],
                 };
-                let sql = support::build_count_distinct_scan_sql(
+                let Some(sql) = support::build_count_distinct_scan_sql(
                     &base_spec,
                     shards,
                     &items,
-                    col_types,
+                    scan.columns(),
                     limit,
                     udf_name,
                     distribute_udf_name,
-                );
+                ) else {
+                    return fallback();
+                };
                 return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
             }
             // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
@@ -432,39 +437,18 @@ pub(crate) fn build_dispatch_sql(
             // subqueries ("emitting function in expression"). Use the qualified wrapper,
             // narrowed to referenced columns (#160).
             if has_distinct(&items) {
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    col_types,
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             }
-            let plans = ordinary_plans(&items);
-            let plan_types = single_group_plan_types(pushdown.select_types(), &items);
-            // Assembled here because it depends on select-list classification.
-            let merge_inputs = single_group_merge_select(&items, &plans, &plan_types, col_types)
-                .and_then(|merge_select| {
-                    AggregateMergeInputs::new(plan_types, merge_select, limit)
-                        .map(|inputs| inputs.with_having(having))
-                });
+            let merge_select =
+                single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
+            let TypedPlans { plans, emits, .. } = aggregates;
+            let merge_inputs = merge_select.and_then(|merge_select| {
+                AggregateMergeInputs::new(emits, merge_select, limit)
+                    .map(|inputs| inputs.with_having(having))
+            });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    col_types,
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             };
             Some((plans, merge_inputs))
         }
@@ -474,17 +458,7 @@ pub(crate) fn build_dispatch_sql(
             // widening signal, never by comparing column counts, which misses widenings
             // whose base-row width equals the select-list arity (#196).
             if projection_widened {
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    col_types,
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             }
             None
         }
@@ -534,7 +508,7 @@ pub(crate) fn build_dispatch_sql(
         // Exasol does not re-sort a delegated ordering, so an unrenderable key must
         // decline before any SQL is built (#198).
         topn::ensure_every_sort_key_renders(&keys)?;
-        topn::extend_projection_with_sort_keys(&mut projection, &keys, col_types);
+        topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
         Vec::new()
@@ -572,7 +546,6 @@ pub(crate) fn build_dispatch_sql(
         shards,
         &projection,
         effective_limit,
-        col_types,
         merge_inputs.as_ref(),
         udf_name,
         distribute_udf_name,
