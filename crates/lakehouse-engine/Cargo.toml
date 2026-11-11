@@ -48,7 +48,7 @@ delta_kernel_default_engine = { version = "0.30.0", default-features = false, fe
 # rt-multi-thread: DATAFUSION_THREADS_PER_UDF > 1. sync: shared delete-read Semaphore.
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 chrono  = { workspace = true }
 futures = { workspace = true }

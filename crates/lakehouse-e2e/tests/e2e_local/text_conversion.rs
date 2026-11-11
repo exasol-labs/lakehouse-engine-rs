@@ -6,10 +6,8 @@ use crate::common::e2e_harness::PathCheck::{Has, Lacks, NScan, Split, Wrapper};
 use crate::common::e2e_harness::*;
 use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS};
 use crate::fixtures::{
-    LAKEHOUSE_VS, TYPED_COLUMNS, json_differences_table, json_table, lakehouse_vs, typed_table,
-    vs_char_pad_table,
+    LAKEHOUSE_VS, TYPED_COLUMNS, json_table, lakehouse_vs, typed_table, vs_char_pad_table,
 };
-use serde_json::{Value, json};
 
 const YDM: &str = "NLS_DATE_FORMAT = 'YYYY-DD-MM'";
 const TS_DMY: &str = "NLS_TIMESTAMP_FORMAT = 'DD.MM.YYYY HH24:MI:SS.FF6'";
@@ -467,27 +465,6 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 
 /// Scenario: Text the session format converts runs in Exasol
 /// Scenario: Integer and boolean text runs in the scan
-/// Scenario: JSON_VALUE in the scan differs from Exasol on number text, duplicate keys, and deep nesting
-#[test]
-fn json_value_reads_parsed_documents_as_documented() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-    let query = format!(
-        "SELECT JSON_VALUE(DOC, '$.n') FROM {} ORDER BY ID",
-        json_differences_table()
-    );
-    // Native Exasol returns 1.50, 1e2, 12345678901234567890123, NULL (ON ERROR), and 1.
-    let expected = [
-        json!("1.5"),
-        json!("100.0"),
-        json!("1.2345678901234568e+22"),
-        json!("2"),
-        Value::Null,
-    ];
-    assert_eq!(conn.query_columns(&query)[0], expected);
-    assert!(explain_virtual_sql(&mut conn, &query).contains(SCAN_ITEM));
-}
-
 /// Scenario: A digits-only literal compares with an integer as a number
 /// Scenario: A group key travels with its exact type
 /// Scenario: A CAST of text to CHAR runs in Exasol

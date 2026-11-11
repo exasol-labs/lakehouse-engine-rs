@@ -1,8 +1,7 @@
-//! `JSON_VALUE` in the scan (#574): each document parses into a `serde_json::Value`, paths run in
-//! lax mode over item sequences, and the result converts to the `RETURNING` type.
-//! docs/semantic-differences.md lists what this parse changes.
+//! `JSON_VALUE` in the scan with Exasol's semantics (#574): the whole document must be JSON, paths
+//! run in lax mode over item sequences, and the result converts to the `RETURNING` type.
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, StringArray};
+use arrow::array::{ArrayRef, AsArray, BooleanArray, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
@@ -11,7 +10,9 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use serde_json::Value;
+use serde::Deserializer as _;
+use serde::de::{MapAccess, Visitor};
+use serde_json::value::RawValue;
 use std::borrow::Cow;
 use std::sync::Arc;
 use vs_expression::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
@@ -24,47 +25,83 @@ enum Item<'a> {
     /// Not JSON, several items, or a non-scalar item: `ON ERROR` applies.
     Error,
     Null,
-    /// A string's text, or the text of a number, `true`, or `false`.
+    /// A string's text, or the source text of a number, `true`, or `false`.
     Text(Cow<'a, str>),
 }
 
-/// `None` for a document that is not strict JSON.
-fn parse(document: &str) -> Option<Value> {
-    serde_json::from_str(document).ok()
+/// Every member of one name, duplicates included, which a JSON object type would collapse.
+struct Members<'p>(&'p str);
+
+impl<'de> Visitor<'de> for Members<'_> {
+    type Value = Vec<&'de RawValue>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value: &RawValue = map.next_value()?;
+            if key == self.0 {
+                found.push(value);
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn members<'a>(object: &'a RawValue, name: &str) -> Vec<&'a RawValue> {
+    serde_json::Deserializer::from_str(object.get())
+        .deserialize_map(Members(name))
+        .unwrap_or_default()
+}
+
+fn elements(array: &RawValue) -> Vec<&RawValue> {
+    serde_json::from_str(array.get()).unwrap_or_default()
+}
+
+fn kind(value: &RawValue) -> u8 {
+    value.get().as_bytes()[0]
 }
 
 /// Lax mode: a member step looks into the objects of an array, an index step treats a non-array
-/// as a one-item array, and a structural mismatch selects nothing.
-fn select<'a>(root: Option<&'a Value>, path: &[JsonPathStep]) -> Item<'a> {
-    let Some(root) = root else {
+/// as a one-item array, and a structural mismatch selects nothing. Raw values keep each number's
+/// source text, and serde_json skips them without recursion, so no nesting depth overflows.
+fn select<'a>(doc: &'a str, path: &[JsonPathStep]) -> Item<'a> {
+    let Ok(root) = serde_json::from_str::<&RawValue>(doc) else {
         return Item::Error;
     };
     let mut items = vec![root];
     for step in path {
         items = items
             .into_iter()
-            .flat_map(|item| match (step, item) {
-                (JsonPathStep::Member(name), Value::Object(members)) => {
-                    members.get(name).into_iter().collect()
-                }
-                (JsonPathStep::Member(name), Value::Array(elements)) => elements
-                    .iter()
-                    .filter_map(|element| element.as_object()?.get(name))
+            .flat_map(|item| match (step, kind(item)) {
+                (JsonPathStep::Member(name), b'{') => members(item, name),
+                (JsonPathStep::Member(name), b'[') => elements(item)
+                    .into_iter()
+                    .filter(|element| kind(element) == b'{')
+                    .flat_map(|object| members(object, name))
                     .collect(),
-                (JsonPathStep::Index(index), Value::Array(elements)) => {
-                    elements.get(*index as usize).into_iter().collect()
-                }
-                (JsonPathStep::Index(0), item) => vec![item],
+                (JsonPathStep::Index(index), b'[') => elements(item)
+                    .into_iter()
+                    .skip(*index as usize)
+                    .take(1)
+                    .collect(),
+                (JsonPathStep::Index(0), _) => vec![item],
                 _ => Vec::new(),
             })
             .collect();
     }
     match items.as_slice() {
         [] => Item::Empty,
-        [Value::Null] => Item::Null,
-        [Value::String(text)] => Item::Text(Cow::Borrowed(text)),
-        [Value::Bool(value)] => Item::Text(Cow::Borrowed(if *value { "true" } else { "false" })),
-        [Value::Number(number)] => Item::Text(Cow::Owned(number.to_string())),
+        [item] => match kind(item) {
+            b'n' => Item::Null,
+            b'"' => serde_json::from_str::<String>(item.get())
+                .map_or(Item::Error, |text| Item::Text(text.into())),
+            b'{' | b'[' => Item::Error,
+            _ => Item::Text(item.get().into()),
+        },
         _ => Item::Error,
     }
 }
@@ -159,22 +196,6 @@ fn boolean_values(args: &ScalarFunctionArgs, items: &[Option<Item>]) -> Result<A
     Ok(Arc::new(values))
 }
 
-/// The parsed documents of one batch. String arrays are read in place, without a copy.
-fn parse_documents(documents: &ArrayRef) -> Result<Vec<Option<Option<Value>>>> {
-    // Exasol reads the empty string as NULL.
-    let parse = |document: Option<&str>| document.filter(|d| !d.is_empty()).map(parse);
-    Ok(match documents.data_type() {
-        DataType::Utf8 => documents.as_string::<i32>().iter().map(parse).collect(),
-        DataType::LargeUtf8 => documents.as_string::<i64>().iter().map(parse).collect(),
-        DataType::Utf8View => documents.as_string_view().iter().map(parse).collect(),
-        _ => cast(documents, &DataType::Utf8)?
-            .as_string::<i32>()
-            .iter()
-            .map(parse)
-            .collect(),
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Returning {
     Text,
@@ -205,15 +226,17 @@ impl ScalarUDFImpl for JsonUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let documents = cast(&args.args[0].to_array(args.number_rows)?, &DataType::Utf8)?;
         let path = scalar_argument(&args, 1)?
             .try_as_str()
             .flatten()
             .and_then(parse_json_path)
             .ok_or_else(|| DataFusionError::Execution(format!("{} path", self.name)))?;
-        let documents = parse_documents(&args.args[0].to_array(args.number_rows)?)?;
+        // Exasol reads the empty string as NULL.
         let items: Vec<Option<Item>> = documents
+            .as_string::<i32>()
             .iter()
-            .map(|root| root.as_ref().map(|root| select(root.as_ref(), &path)))
+            .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, &path)))
             .collect();
         let values = match self.returning {
             Returning::Text => text_values(&args, &items)?,

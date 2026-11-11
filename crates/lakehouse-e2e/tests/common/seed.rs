@@ -2129,59 +2129,34 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
 }
 
 /// `JSON_VALUE` parity fixture: one document per `id`, starting at 1.
-pub const E2E_JSON_TABLE: &str = "json_value_docs";
+pub const E2E_JSON_TABLE: &str = "json_docs";
 
 pub const JSON_DOCS: [Option<&str>; 10] = [
     Some(
-        r#"{"order":{"id":42,"price":1.5,"tags":["a","b"]},"locale":"de_DE","active":true,"note":"héllo €","day":"2024-01-02"}"#,
+        r#"{"order":{"id":42,"price":1.50,"tags":["a","b"]},"locale":"de_DE","active":true,"note":"héllo €","day":"2024-01-02"}"#,
     ),
     Some(
-        r#"{"order":{"id":43.7,"price":100,"tags":[]},"locale":"en_US","active":"no","note":"","day":"02.01.2024"}"#,
+        r#"{"order":{"id":43.7,"price":1e2,"tags":[]},"locale":"en_US","active":"no","note":"","day":"02.01.2024"}"#,
     ),
     None,
     Some(""),
     Some(r#"{"order":[{"id":7},{"id":8}],"locale":null,"active":1,"note":[1]}"#),
-    Some(r#"{"order":{"id":1234567890123456789,"price":0},"locale":"fr_FR","active":" yes "}"#),
+    Some(
+        r#"{"order":{"id":12345678901234567890123,"price":-0},"locale":"de_DE","locale":"fr_FR","active":" yes "}"#,
+    ),
     Some(r#"{"order":{"id":44},"locale":"de_DE""#),
     Some(r#"[{"locale":"it_IT","active":"001","order":{"id":"9"}}]"#),
-    Some(r#"{"locale":"é😀","active":false,"note":"x","order":{"id":-1.5}}"#),
+    Some(r#"{"locale":"é😀","active":false,"note":"x","order":{"id":-1.5E+3}}"#),
     Some(r#"{"locale":"de_DE","active":"on","order":{"id":true}}"#),
 ];
 
-/// Documents whose `$.n` the scan reads differently from native Exasol, one per `id`.
-pub const E2E_JSON_DIFFERENCES_TABLE: &str = "json_parse_differences";
-
-pub fn json_parse_difference_docs() -> Vec<Option<String>> {
-    let depth = 200;
-    [
-        r#"{"n":1.50}"#.to_string(),
-        r#"{"n":1e2}"#.to_string(),
-        r#"{"n":12345678901234567890123}"#.to_string(),
-        r#"{"n":1,"n":2}"#.to_string(),
-        format!(
-            r#"{{"d":{}0{},"n":1}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        ),
-    ]
-    .into_iter()
-    .map(Some)
-    .collect()
-}
-
-/// One `(id, doc)` row per document, with `id` starting at 1.
-pub async fn seed_json_docs(
-    catalog_url: &str,
-    warehouse: &str,
-    table: &str,
-    docs: &[Option<impl AsRef<str>>],
-) -> Result<()> {
+pub async fn seed_json_docs(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-json").await?;
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
     if !catalog
         .namespace_exists(&ns)
         .await
-        .with_context(|| format!("check namespace for {table}"))?
+        .context("check namespace for json_docs")?
     {
         let _ = catalog.create_namespace(&ns, HashMap::new()).await;
     }
@@ -2192,7 +2167,7 @@ pub async fn seed_json_docs(
             NestedField::optional(2, "doc", Type::Primitive(PrimitiveType::String)).into(),
         ])
         .build()
-        .with_context(|| format!("build {table} Iceberg schema"))?;
+        .context("build json_docs Iceberg schema")?;
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("doc", DataType::Utf8, true),
@@ -2200,14 +2175,20 @@ pub async fn seed_json_docs(
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from_iter_values(1..=docs.len() as i64)),
-            Arc::new(StringArray::from_iter(docs.iter().map(|d| d.as_ref()))),
+            Arc::new(Int64Array::from_iter_values(1..=JSON_DOCS.len() as i64)),
+            Arc::new(StringArray::from(JSON_DOCS.to_vec())),
         ],
     )
-    .with_context(|| format!("build {table} batch"))?;
-    create_and_append(&catalog, E2E_NAMESPACE, table, iceberg_schema, [batch])
-        .await
-        .with_context(|| format!("seed {table} table"))?;
+    .context("build json_docs batch")?;
+    create_and_append(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_JSON_TABLE,
+        iceberg_schema,
+        [batch],
+    )
+    .await
+    .context("seed json_docs table")?;
     Ok(())
 }
 

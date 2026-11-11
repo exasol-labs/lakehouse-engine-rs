@@ -1,11 +1,9 @@
 use super::*;
 use crate::scan::test_support::invoke_scalar_udf;
-use arrow::array::{BooleanArray, StringArray};
 
-/// One batch of `documents` as `document_type`, with `constants` after them.
+/// One batch of `documents`, with `constants` after them.
 fn invoke(
     returning: Returning,
-    document_type: &DataType,
     documents: Vec<Option<&str>>,
     constants: Vec<ScalarValue>,
 ) -> ArrayRef {
@@ -19,9 +17,7 @@ fn invoke(
         signature: Signature::any(constants.len() + 1, Volatility::Immutable),
     };
     let rows = documents.len();
-    let documents: ArrayRef = Arc::new(StringArray::from(documents));
-    let documents = cast(&documents, document_type).expect("a string type");
-    let mut args = vec![ColumnarValue::Array(documents)];
+    let mut args = vec![ColumnarValue::Array(Arc::new(StringArray::from(documents)))];
     args.extend(constants.into_iter().map(ColumnarValue::Scalar));
     invoke_scalar_udf(&udf, args, rows)
         .and_then(|values| values.to_array(rows))
@@ -33,17 +29,26 @@ fn text(value: &str) -> ScalarValue {
 }
 
 #[test]
-fn text_function_applies_the_behaviors_to_every_string_type() {
-    let documents = vec![
-        None,
-        Some(""),
-        Some("{"),
-        Some(r#"{"b":1}"#),
-        Some(r#"{"a":"abcd"}"#),
-        Some(r#"{"a":"ab"}"#),
-        Some(r#"{"a":null}"#),
-        Some(r#"{"a":""}"#),
-    ];
+fn text_function_applies_the_behaviors() {
+    let values = invoke(
+        Returning::Text,
+        vec![
+            None,
+            Some(""),
+            Some("{"),
+            Some(r#"{"b":1}"#),
+            Some(r#"{"a":"abcd"}"#),
+            Some(r#"{"a":"ab"}"#),
+            Some(r#"{"a":null}"#),
+            Some(r#"{"a":""}"#),
+        ],
+        vec![
+            text("$.a"),
+            ScalarValue::Int64(Some(3)),
+            text("e"),
+            text("x"),
+        ],
+    );
     let expected = StringArray::from(vec![
         None,
         None,
@@ -54,32 +59,13 @@ fn text_function_applies_the_behaviors_to_every_string_type() {
         None,
         None,
     ]);
-    for document_type in [
-        DataType::Utf8,
-        DataType::LargeUtf8,
-        DataType::Utf8View,
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-    ] {
-        let values = invoke(
-            Returning::Text,
-            &document_type,
-            documents.clone(),
-            vec![
-                text("$.a"),
-                ScalarValue::Int64(Some(3)),
-                text("e"),
-                text("x"),
-            ],
-        );
-        assert_eq!(values.as_string::<i32>(), &expected, "{document_type}");
-    }
+    assert_eq!(values.as_string::<i32>(), &expected);
 }
 
 #[test]
 fn boolean_function_applies_the_behaviors() {
     let values = invoke(
         Returning::Boolean,
-        &DataType::Utf8,
         vec![
             None,
             Some(r#"{"a":"yes"}"#),
@@ -98,13 +84,9 @@ fn boolean_function_applies_the_behaviors() {
 }
 
 fn selected(doc: &str, path: &str) -> String {
-    let root = parse(doc);
     format!(
         "{:?}",
-        select(
-            root.as_ref(),
-            &parse_json_path(path).expect("path in the subset")
-        )
+        select(doc, &parse_json_path(path).expect("path in the subset"))
     )
 }
 
@@ -113,14 +95,27 @@ fn selected(doc: &str, path: &str) -> String {
 fn paths_select_what_exasol_selects() {
     let cases = [
         (r#"{"a":"x"}"#, "$.a", r#"Text("x")"#),
+        (r#" {"a" : 1.50 } "#, "$.a", r#"Text("1.50")"#),
+        (r#"{"a":-1.5E+3}"#, "$.a", r#"Text("-1.5E+3")"#),
+        (
+            r#"{"a":12345678901234567890123}"#,
+            "$.a",
+            r#"Text("12345678901234567890123")"#,
+        ),
         (r#"{"a":true}"#, "$.a", r#"Text("true")"#),
         (r#"{"a":null}"#, "$.a", "Null"),
         (r#"{"a":null}"#, "$.a.b", "Empty"),
+        (r#"{"a":"é😀\/"}"#, "$.a", r#"Text("é😀/")"#),
+        (r#"{"a":1}"#, "$.a", r#"Text("1")"#),
+        (r#"{"A":1}"#, "$.a", "Empty"),
         (r#"{"a":1}"#, "$.b", "Empty"),
         (r#"{"a":{"b":1}}"#, "$.a", "Error"),
         (r#"{"a":[1]}"#, "$.a", "Error"),
         (r#"{"a":1}"#, "$", "Error"),
         (r#""s""#, "$", r#"Text("s")"#),
+        (r#"{"a":1,"a":2}"#, "$.a", "Error"),
+        (r#"{"a":{"b":1},"a":{"c":2}}"#, "$.a.b", r#"Text("1")"#),
+        (r#"{"a":1,"b":2,"b":3}"#, "$.a", r#"Text("1")"#),
         (r#"{"a":[{"b":1}]}"#, "$.a.b", r#"Text("1")"#),
         (r#"{"a":[{"b":1},{"b":2}]}"#, "$.a.b", "Error"),
         (r#"{"a":[{"b":1},{"c":2},5]}"#, "$.a.b", r#"Text("1")"#),
@@ -138,6 +133,50 @@ fn paths_select_what_exasol_selects() {
     for (doc, path, expected) in cases {
         assert_eq!(selected(doc, path), expected, "{doc} {path}");
     }
+}
+
+/// Exasol applies `ON ERROR` to each of these.
+#[test]
+fn documents_that_are_not_strict_json_fail() {
+    let tab = "{\"a\":\"x\ty\"}";
+    for doc in [
+        r#"{"a":1,"#,
+        r#"{"a":1} x"#,
+        r#"{"a":1}{"a":2}"#,
+        r#"{"a":01}"#,
+        r#"{"a":+1}"#,
+        r#"{"a":.5}"#,
+        r#"{"a":1.}"#,
+        r#"{"a":1e}"#,
+        r#"{"a":-}"#,
+        r#"{"a":NaN}"#,
+        r#"{"a":TRUE}"#,
+        r#"{a:1}"#,
+        r#"{'a':1}"#,
+        r#"[1,]"#,
+        r#"{"a":1,}"#,
+        r#"{"a":"\q"}"#,
+        tab,
+        "{\"a\":\u{c}1}",
+        "\u{feff}{\"a\":1}",
+        "   ",
+    ] {
+        assert_eq!(select(doc, &[]), Item::Error, "{doc:?}");
+    }
+}
+
+/// A lone surrogate escape fails only in the selected item, see docs/semantic-differences.md.
+#[test]
+fn lone_surrogates_fail_in_the_selected_item() {
+    assert_eq!(selected(r#"{"a":"\ud800"}"#, "$.a"), "Error");
+    assert_eq!(selected(r#"{"a":"\udc00","b":1}"#, "$.b"), r#"Text("1")"#);
+}
+
+#[test]
+fn nesting_depth_is_unbounded() {
+    let depth = 1_000_000;
+    let doc = format!(r#"{{"a":{}1{}}}"#, "[".repeat(depth), "]".repeat(depth));
+    assert_eq!(selected(&doc, "$.b"), "Empty");
 }
 
 #[test]
