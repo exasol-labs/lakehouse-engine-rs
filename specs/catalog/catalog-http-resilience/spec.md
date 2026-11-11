@@ -10,7 +10,7 @@ Every HTTP request that the adapter sends to an Iceberg REST catalog, a Lakekeep
 * A DNS resolution failure and a TLS failure, one that the TLS library reports, are not transient.
 * RFC 9110 § 10.2.3: `Retry-After = HTTP-date / delay-seconds`.
 * A request states whether it is safe to repeat. Every request that only reads is safe, the POST-shaped reads included (the OAuth2 grants, the batch-check, the temporary-credentials request), and so is any request that reserves nothing. A request that changes catalog state, such as a namespace creation, a table creation, or a commit, is not safe: the client sends it once, and the operation that can check its own outcome decides whether to send it again.
-* A retry re-sends the request as signed, `Authorization` included, and a catalog answers HTTP 401 to a bearer that expired in between. Only a token whose lifetime is under twice the 30-second retry window can expire between attempts, because a token is renewed half its lifetime early at most.
+* A retry re-sends the request as signed, except that a request carrying an OAuth2 bearer takes the bearer from the token's holder again before each retry, so a retry never carries an expired token. A token that cannot be renewed ends the retries with the failure already in hand.
 
 ## Scenarios
 

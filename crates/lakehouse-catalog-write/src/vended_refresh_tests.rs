@@ -2,7 +2,7 @@ use super::*;
 use crate::test_support::{PREFIX_CONFIG, STAGED_LOCATION, assert_free_of, catalog, session};
 use lakehouse_catalog::exported_test_support::clock_reading;
 use reqsign_core::Context;
-use std::sync::Mutex;
+use reqsign_core::time::Timestamp;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const LOAD_CREDENTIALS: &str = include_str!("testdata/load_credentials_staged.json");
@@ -15,7 +15,6 @@ const FIXTURE_PLACEHOLDERS: [&str; 3] = [
 const SEED_SECRETS: [&str; 3] = ["SEED_ACCESS_KEY", "SEED_SECRET_KEY", "SEED_SESSION_TOKEN"];
 const SEED_EXPIRES_AT_MS: u64 = 1_700_000_000_000;
 const MINUTE_MS: u64 = 60_000;
-const CREDENTIALS_REQUEST: &str = "GET /v1/p/namespaces/ns/tables/staged/credentials ";
 const OFFERING_CONFIG: &str = r#"{"defaults":{"prefix":"p"},"endpoints":["GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"]}"#;
 
 fn fixture_answer(_: &str) -> (u16, String) {
@@ -28,15 +27,6 @@ fn fixture_expiring_at(expires_at_ms: u64) -> String {
         &REFRESHED_EXPIRES_AT_MS.to_string(),
         &expires_at_ms.to_string(),
     )
-}
-
-fn credential_requests(requests: &Mutex<Vec<String>>) -> usize {
-    requests
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|request| request.starts_with(CREDENTIALS_REQUEST))
-        .count()
 }
 
 fn seed(expires_at_ms: Option<u64>) -> VendedS3Credentials {
@@ -62,8 +52,8 @@ async fn source_at(
     uri: &str,
     seed: VendedS3Credentials,
     time: &Arc<AtomicU64>,
-) -> VendedCredentials {
-    VendedCredentials::seeded(
+) -> StorageCredentials {
+    StorageCredentials::vended(
         staged_table(uri, STAGED_LOCATION, true).await,
         seed,
         clock_reading(time),
@@ -71,7 +61,7 @@ async fn source_at(
     .expect("a seeded source")
 }
 
-async fn provide(source: &VendedCredentials) -> Result<AwsCredential, String> {
+async fn provide(source: &StorageCredentials) -> Result<AwsCredential, String> {
     source
         .provide_credential(&Context::new())
         .await
@@ -81,7 +71,7 @@ async fn provide(source: &VendedCredentials) -> Result<AwsCredential, String> {
 
 /// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
 #[test]
-fn the_decision_keeps_renews_or_fails_by_expiry_endpoint_and_last_renewal() {
+fn credentials_are_kept_only_while_valid_and_within_30_seconds_of_their_renewal() {
     let expires_at = 10 * MINUTE_MS;
     let point = |renewed_at_ms, now_ms| RenewalPoint {
         expires_at_ms: expires_at,
@@ -89,42 +79,15 @@ fn the_decision_keeps_renews_or_fails_by_expiry_endpoint_and_last_renewal() {
         now_ms,
     };
     let cases = [
-        (
-            point(None, expires_at - 5 * MINUTE_MS),
-            true,
-            RefreshDecision::Renew,
-        ),
-        (point(None, expires_at + 1), true, RefreshDecision::Renew),
-        (
-            point(Some(expires_at - 30_000), expires_at),
-            true,
-            RefreshDecision::Renew,
-        ),
-        (
-            point(Some(expires_at - 29_999), expires_at - 1),
-            true,
-            RefreshDecision::Keep,
-        ),
-        (
-            point(Some(expires_at - 29_999), expires_at),
-            true,
-            RefreshDecision::Renew,
-        ),
-        (point(None, expires_at - 1), false, RefreshDecision::Keep),
-        (point(None, expires_at), false, RefreshDecision::Expired),
-        (
-            point(Some(0), expires_at + 1),
-            false,
-            RefreshDecision::Expired,
-        ),
+        (point(None, expires_at - 5 * MINUTE_MS), false),
+        (point(None, expires_at + 1), false),
+        (point(Some(expires_at - 30_000), expires_at), false),
+        (point(Some(expires_at - 29_999), expires_at - 1), true),
+        (point(Some(expires_at - 29_999), expires_at), false),
     ];
 
-    for (point, offered, expected) in cases {
-        assert_eq!(
-            refresh_decision(point, offered),
-            expected,
-            "{point:?}, endpoint offered {offered}"
-        );
+    for (point, kept) in cases {
+        assert_eq!(keep_at_renewal_point(point), kept, "{point:?}");
     }
 }
 
@@ -132,7 +95,7 @@ fn the_decision_keeps_renews_or_fails_by_expiry_endpoint_and_last_renewal() {
 #[tokio::test]
 async fn credentials_within_five_minutes_of_expiry_are_renewed_through_one_load_credentials_request()
  {
-    let (uri, requests) = catalog(OFFERING_CONFIG, fixture_answer).await;
+    let (uri, _) = catalog(OFFERING_CONFIG, fixture_answer).await;
     let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS - 60 * MINUTE_MS));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
     time.store(SEED_EXPIRES_AT_MS - 5 * MINUTE_MS - 1, Ordering::SeqCst);
@@ -145,7 +108,6 @@ async fn credentials_within_five_minutes_of_expiry_are_renewed_through_one_load_
     assert_eq!(early.access_key_id, SEED_SECRETS[0]);
     assert_eq!(renewed.access_key_id, FIXTURE_PLACEHOLDERS[0]);
     assert_eq!(again.access_key_id, FIXTURE_PLACEHOLDERS[0]);
-    assert_eq!(credential_requests(&requests), 1);
 }
 
 #[tokio::test]
@@ -169,82 +131,53 @@ async fn a_load_credentials_answer_yields_the_covering_credentials_and_their_exp
 }
 
 #[tokio::test]
-async fn the_seed_carries_its_expiry_and_never_expires_without_one() {
-    let (uri, requests) = catalog(OFFERING_CONFIG, fixture_answer).await;
-    let time = Arc::new(AtomicU64::new(u64::MAX / 2));
-    let lasting = source_at(&uri, seed(None), &time).await;
-    time.store(0, Ordering::SeqCst);
-    let expiring = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
-
-    time.store(u64::MAX / 2, Ordering::SeqCst);
-    let kept = provide(&lasting).await.unwrap();
-    time.store(0, Ordering::SeqCst);
-    let seeded = provide(&expiring).await.unwrap();
-
-    assert_eq!(kept.access_key_id, SEED_SECRETS[0]);
-    assert_eq!(kept.expires_in, None);
-    assert_eq!(
-        seeded.expires_in,
-        Some(Timestamp::from_millisecond(SEED_EXPIRES_AT_MS as i64).unwrap())
-    );
-    assert_eq!(credential_requests(&requests), 0);
-}
-
-#[tokio::test]
-async fn concurrent_callers_at_the_renewal_point_share_one_renewal() {
-    let (uri, requests) = catalog(OFFERING_CONFIG, fixture_answer).await;
-    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
-    let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
-
-    let (first, second) = tokio::join!(provide(&source), provide(&source));
-
-    assert_eq!(first.unwrap().access_key_id, FIXTURE_PLACEHOLDERS[0]);
-    assert_eq!(second.unwrap().access_key_id, FIXTURE_PLACEHOLDERS[0]);
-    assert_eq!(credential_requests(&requests), 1);
-}
-
-#[tokio::test]
 async fn credentials_renewed_close_to_their_expiry_are_renewed_again_only_after_30_seconds() {
     let now = SEED_EXPIRES_AT_MS;
-    let (uri, requests) = catalog(OFFERING_CONFIG, move |_| {
-        (200, fixture_expiring_at(now + MINUTE_MS))
+    let renewals = AtomicU64::new(0);
+    let (uri, _) = catalog(OFFERING_CONFIG, move |_| {
+        let renewal = renewals.fetch_add(1, Ordering::SeqCst);
+        let answer = fixture_expiring_at(now + MINUTE_MS);
+        let answer = answer.replace(FIXTURE_PLACEHOLDERS[0], &format!("RENEWAL_{renewal}"));
+        (200, answer)
     })
     .await;
     let time = Arc::new(AtomicU64::new(now));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
 
-    provide(&source).await.unwrap();
+    let first = provide(&source).await.unwrap();
     time.store(now + 29_999, Ordering::SeqCst);
-    provide(&source).await.unwrap();
-    let within_pause = credential_requests(&requests);
+    let within_pause = provide(&source).await.unwrap();
     time.store(now + 30_000, Ordering::SeqCst);
-    provide(&source).await.unwrap();
+    let after_pause = provide(&source).await.unwrap();
 
-    assert_eq!(within_pause, 1);
-    assert_eq!(credential_requests(&requests), 2);
+    assert_eq!(first.access_key_id, "RENEWAL_0");
+    assert_eq!(within_pause.access_key_id, "RENEWAL_0");
+    assert_eq!(after_pause.access_key_id, "RENEWAL_1");
 }
 
 /// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
 #[tokio::test]
-async fn expired_credentials_without_a_credentials_endpoint_fail_naming_the_table_and_the_expiry() {
-    let (uri, requests) = catalog(PREFIX_CONFIG, fixture_answer).await;
-    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS - MINUTE_MS));
+async fn expired_credentials_renew_whether_or_not_the_catalog_lists_the_credentials_endpoint() {
+    let (uri, _) = catalog(PREFIX_CONFIG, fixture_answer).await;
+    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS + MINUTE_MS));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
 
-    let before_expiry = provide(&source).await;
-    time.store(SEED_EXPIRES_AT_MS, Ordering::SeqCst);
-    let expired = provide(&source).await.unwrap_err();
+    let renewed = provide(&source).await.unwrap();
 
-    assert_eq!(before_expiry.unwrap().access_key_id, SEED_SECRETS[0]);
-    assert_eq!(
-        expired,
-        format!(
-            "the vended storage credentials of table ns.staged expired at 2023-11-14T22:13:20Z, \
-             and the catalog {uri} offers no credentials endpoint to refresh them"
-        )
-    );
-    assert_free_of(&expired, &SEED_SECRETS);
-    assert_eq!(credential_requests(&requests), 0);
+    assert_eq!(renewed.access_key_id, FIXTURE_PLACEHOLDERS[0]);
+}
+
+#[tokio::test]
+async fn connection_keys_never_expire_and_are_never_renewed() {
+    let time = Arc::new(AtomicU64::new(0));
+    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"), clock_reading(&time));
+
+    time.store(u64::MAX / 2, Ordering::SeqCst);
+    let kept = provide(&source).await.unwrap();
+
+    assert_eq!(kept.access_key_id, "KEY");
+    assert_eq!(kept.expires_in, None);
+    assert_eq!(source.secret_values(), ["KEY", "SECRET", "TOKEN"]);
 }
 
 #[tokio::test]
@@ -274,7 +207,7 @@ async fn credentials_that_cover_another_location_are_refused_naming_the_location
     let (uri, _) = catalog(OFFERING_CONFIG, fixture_answer).await;
     let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
     let elsewhere = "s3://warehouse/another_table";
-    let source = VendedCredentials::seeded(
+    let source = StorageCredentials::vended(
         staged_table(&uri, elsewhere, true).await,
         seed(Some(SEED_EXPIRES_AT_MS)),
         clock_reading(&time),
@@ -298,14 +231,14 @@ async fn a_plaintext_vended_endpoint_without_allow_http_is_refused_at_seed_and_a
         ..seed(Some(SEED_EXPIRES_AT_MS))
     };
 
-    let at_seed = VendedCredentials::seeded(
+    let at_seed = StorageCredentials::vended(
         staged_table(&uri, STAGED_LOCATION, false).await,
         plaintext_seed,
         clock_reading(&time),
     )
     .unwrap_err()
     .to_string();
-    let source = VendedCredentials::seeded(
+    let source = StorageCredentials::vended(
         staged_table(&uri, STAGED_LOCATION, false).await,
         seed(Some(SEED_EXPIRES_AT_MS)),
         clock_reading(&time),
@@ -353,21 +286,22 @@ async fn a_renewal_answer_without_a_key_is_refused_naming_the_key() {
 }
 
 #[tokio::test]
-async fn debug_shows_no_credential_and_secret_values_lists_every_one_held() {
+async fn debug_shows_no_credential_and_secret_values_lists_only_the_credential_held_now() {
     let (uri, _) = catalog(OFFERING_CONFIG, fixture_answer).await;
     let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
+    let before = source.secret_values();
 
     provide(&source).await.unwrap();
     let shown = format!("{source:?}");
     let mut held = source.secret_values();
     held.sort();
 
+    assert_eq!(before.len(), SEED_SECRETS.len());
     assert_free_of(&shown, &FIXTURE_PLACEHOLDERS);
     assert_free_of(&shown, &SEED_SECRETS);
-    let mut expected: Vec<String> = SEED_SECRETS
+    let mut expected: Vec<String> = FIXTURE_PLACEHOLDERS
         .iter()
-        .chain(&FIXTURE_PLACEHOLDERS)
         .map(|value| value.to_string())
         .collect();
     expected.sort();

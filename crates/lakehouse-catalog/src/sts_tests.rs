@@ -26,7 +26,9 @@ fn role_creds(sts_endpoint: &str) -> ConnectionCreds {
 }
 
 async fn assume(creds: ConnectionCreds) -> Result<ConnectionCreds, UdfError> {
-    resolve_aws_identity(creds, PLAIN_CATALOG_URI, true).await
+    resolve_aws_identity(creds, PLAIN_CATALOG_URI, true)
+        .await
+        .map(|identity| identity.creds)
 }
 
 async fn assume_error(creds: ConnectionCreds, timeout: Duration) -> String {
@@ -123,6 +125,8 @@ async fn no_role_identity_is_returned_unchanged_without_a_request() {
         let resolved = resolve_aws_identity(stated.clone(), PLAIN_CATALOG_URI, false)
             .await
             .expect("a set naming no role resolves without STS");
+        assert!(resolved.role.is_none());
+        let resolved = resolved.creds;
 
         assert_same_creds(&resolved, &stated);
     }
@@ -231,4 +235,23 @@ async fn assume_role_failure_is_credential_safe_for_denial_refusal_and_timeout()
             );
         }
     }
+}
+
+#[tokio::test]
+async fn an_expired_role_session_is_assumed_again_and_keeps_the_base_secrets() {
+    let (sts, heads) = spawn_recording_sts(200, ASSUME_ROLE_RESPONSE).await;
+    let stated = role_creds(&sts);
+    let base_secret = stated.secret_key.clone();
+
+    let identity = resolve_aws_identity(stated, PLAIN_CATALOG_URI, true)
+        .await
+        .expect("the stub answers a well-formed AssumeRoleResponse");
+    let role = identity.role.expect("a CONNECTION that names a role");
+    let renewed = role.credential().await.expect("the role is assumed again");
+
+    assert_eq!(heads.lock().unwrap().len(), 2);
+    assert_eq!(renewed.access_key_id, identity.creds.access_key);
+    let secrets = role.secret_values();
+    assert!(secrets.contains(&base_secret), "{secrets:?}");
+    assert!(secrets.contains(&renewed.secret_access_key), "{secrets:?}");
 }

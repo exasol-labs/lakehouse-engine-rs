@@ -4,12 +4,13 @@ use crate::expiring::system_clock;
 use crate::iceberg_io::{authed_get_json, build_signed_request, redact_catalog_text};
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
+use crate::sts::AssumedRole;
 use crate::vended::{covering_credential, s3_credentials};
 use crate::{CatalogProps, ConnectionCreds, VendedS3Credentials};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use iceberg::{NamespaceIdent, TableIdent};
-use iceberg_catalog_rest::{Endpoint, LoadTableResult, StorageCredential};
+use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use reqwest::{Method, Request};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -104,48 +105,17 @@ fn prefix_from_config(config: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// The endpoints a `/v1/config` answer lists, or `None` when it lists none. An entry that is no
-/// `<method> <path>` route offers nothing.
-fn endpoints_from_config(config: &serde_json::Value) -> Option<Vec<Endpoint>> {
-    let listed = config.get("endpoints")?.as_array()?;
-    Some(
-        listed
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .filter_map(|route| route.parse().ok())
-            .collect(),
-    )
-}
-
-/// What a session knows of the endpoints its catalog offers.
-enum ServedEndpoints {
-    /// The session took its prefix from a stored note and never called `/v1/config`.
-    NotAsked,
-    /// `/v1/config` answered without an `endpoints` list, so only the spec's default set is served.
-    Unlisted,
-    Listed(Vec<Endpoint>),
-}
-
-/// What `/v1/config` tells a session: its REST prefix and the endpoints the catalog lists.
-struct ServedConfig {
-    prefix: String,
-    endpoints: ServedEndpoints,
-}
-
 /// A config without a prefix yields an EMPTY prefix, never the warehouse: a warehouse like
 /// `s3://…` as a path segment gives HTTP 400.
-async fn resolve_served_config(
+async fn resolve_load_table_prefix(
     http: &CatalogHttp,
     catalog_uri: &str,
     warehouse: &str,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
-) -> Result<ServedConfig, UdfError> {
+) -> Result<String, UdfError> {
     if let CatalogAuth::Sigv4 { .. } = auth {
-        return Ok(ServedConfig {
-            prefix: glue_catalog_prefix(warehouse),
-            endpoints: ServedEndpoints::NotAsked,
-        });
+        return Ok(glue_catalog_prefix(warehouse));
     }
     let encoded_warehouse: String =
         url::form_urlencoded::byte_serialize(warehouse.as_bytes()).collect();
@@ -156,11 +126,7 @@ async fn resolve_served_config(
     );
     authed_get_json::<serde_json::Value>(http, &config_url, auth, false, creds)
         .await
-        .map(|config| ServedConfig {
-            prefix: prefix_from_config(&config),
-            endpoints: endpoints_from_config(&config)
-                .map_or(ServedEndpoints::Unlisted, ServedEndpoints::Listed),
-        })
+        .map(|config| prefix_from_config(&config))
         .map_err(|e| {
             UdfError::User(format!(
                 "failed to read the catalog config for warehouse '{warehouse}': {}",
@@ -177,7 +143,6 @@ pub struct CatalogSession {
     catalog_uri: String,
     auth: CatalogAuth,
     prefix: String,
-    endpoints: ServedEndpoints,
     creds: ConnectionCreds,
 }
 
@@ -224,22 +189,32 @@ impl CatalogSession {
         catalog_prefix: Option<String>,
         creds: &ConnectionCreds,
     ) -> Result<CatalogSession, UdfError> {
+        Self::resolve_with_role(catalog_uri, warehouse, catalog_prefix, creds, None).await
+    }
+
+    /// [`Self::resolve`] for a CONNECTION that names an IAM role: SigV4 signing reads `role`'s
+    /// credentials, which are assumed again as they expire, instead of the CONNECTION's keys.
+    pub async fn resolve_with_role(
+        catalog_uri: &str,
+        warehouse: &str,
+        catalog_prefix: Option<String>,
+        creds: &ConnectionCreds,
+        role: Option<AssumedRole>,
+    ) -> Result<CatalogSession, UdfError> {
         let http = CatalogHttp::new();
-        let auth = resolve_catalog_auth(&http, catalog_uri, creds, system_clock()).await?;
-        let (prefix, endpoints) = match catalog_prefix {
-            Some(prefix) => (prefix, ServedEndpoints::NotAsked),
-            None => {
-                let config =
-                    resolve_served_config(&http, catalog_uri, warehouse, &auth, creds).await?;
-                (config.prefix, config.endpoints)
-            }
+        let mut auth = resolve_catalog_auth(&http, catalog_uri, creds, system_clock()).await?;
+        if let CatalogAuth::Sigv4 { role: signer, .. } = &mut auth {
+            *signer = role;
+        }
+        let prefix = match catalog_prefix {
+            Some(prefix) => prefix,
+            None => resolve_load_table_prefix(&http, catalog_uri, warehouse, &auth, creds).await?,
         };
         Ok(CatalogSession {
             http,
             catalog_uri: catalog_uri.to_string(),
             auth,
             prefix,
-            endpoints,
             creds: creds.clone(),
         })
     }
@@ -259,22 +234,6 @@ impl CatalogSession {
 
     pub(crate) fn prefix(&self) -> &str {
         &self.prefix
-    }
-
-    /// Whether the catalog's `/v1/config` answer lists `route`, such as
-    /// `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials`. `None` means the
-    /// session never read that answer, because it took its prefix from a stored note, so the
-    /// catalog may offer the route. Without an `endpoints` list the answer is `Some(false)`, so
-    /// ask only about a route outside the spec's default set.
-    pub fn offers_endpoint(&self, route: &str) -> Option<bool> {
-        let route = route.parse::<Endpoint>().ok();
-        match &self.endpoints {
-            ServedEndpoints::NotAsked => None,
-            ServedEndpoints::Unlisted => Some(false),
-            ServedEndpoints::Listed(endpoints) => {
-                Some(route.is_some_and(|route| endpoints.contains(&route)))
-            }
-        }
     }
 
     /// POSTs a state-changing request, such as a namespace or table creation, a stage-create, or a
@@ -304,17 +263,21 @@ impl CatalogSession {
             .await
             .map_err(|error| CatalogSendError::Unsent(error.to_string()))?;
         let target = format!("{} {}", request.method(), request.url());
-        let answer = self.http.send(request, safety).await.map_err(|error| {
-            let message = format!(
-                "the catalog request {target} failed: {}",
-                error.render(|msg| redact_catalog_text(msg, &self.creds, bearer.as_deref()))
-            );
-            if error.is_unsent() {
-                CatalogSendError::Unsent(message)
-            } else {
-                CatalogSendError::OutcomeUnknown(message)
-            }
-        })?;
+        let answer = self
+            .http
+            .send(request, safety, self.auth.renewable())
+            .await
+            .map_err(|error| {
+                let message = format!(
+                    "the catalog request {target} failed: {}",
+                    error.render(|msg| redact_catalog_text(msg, &self.creds, bearer.as_deref()))
+                );
+                if error.is_unsent() {
+                    CatalogSendError::Unsent(message)
+                } else {
+                    CatalogSendError::OutcomeUnknown(message)
+                }
+            })?;
         Ok(CatalogResponse {
             status: answer.status.as_u16(),
             body: answer.body,
@@ -347,6 +310,39 @@ impl CatalogSession {
                 ident, self.catalog_uri, answer.status
             ))
         })
+    }
+
+    /// Whether the catalog holds `namespace`: a 2xx answer to `GET` on it is yes, 404 is no, and any
+    /// other answer is an error.
+    pub async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool, UdfError> {
+        let path = format!("namespaces/{}", namespace.to_url_string());
+        let answer = self
+            .send(Method::GET, &path, None, RepeatSafety::Safe)
+            .await?;
+        table_existence(answer.status).ok_or_else(|| {
+            UdfError::User(format!(
+                "checking whether namespace '{}' exists failed: the catalog {} answered HTTP {}",
+                namespace.to_url_string(),
+                self.catalog_uri,
+                answer.status
+            ))
+        })
+    }
+
+    /// Drops table `ident` without purging its files; a table that is already gone counts as
+    /// dropped, so a repeat is safe.
+    pub async fn drop_table(&self, ident: &TableIdent) -> Result<(), UdfError> {
+        let path = format!("{}?purgeRequested=false", table_ident_path(ident));
+        let answer = self
+            .send(Method::DELETE, &path, None, RepeatSafety::Safe)
+            .await?;
+        match answer.status {
+            200..=299 | 404 => Ok(()),
+            status => Err(UdfError::User(format!(
+                "dropping table '{ident}' failed: the catalog {} answered HTTP {status}",
+                self.catalog_uri
+            ))),
+        }
     }
 
     /// Loads table `ident` with every snapshot, not only the referenced ones, so a writer can

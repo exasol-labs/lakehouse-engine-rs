@@ -121,11 +121,11 @@ async fn a_failed_renewal_keeps_the_held_lease_and_returns_the_error() {
 
     assert_eq!(failed, Err("grant refused".to_string()));
     assert_eq!(retried, Ok("renewed".to_string()));
-    assert_eq!(holder.held_values(), ["seed", "renewed"]);
+    assert_eq!(holder.current(), Some("renewed".to_string()));
 }
 
 #[tokio::test]
-async fn held_values_lists_every_value_held_oldest_first() {
+async fn current_shows_only_the_value_held_now() {
     let time = Arc::new(AtomicU64::new(0));
     let holder = ExpiringCredential::seeded(lease("seed", Some(0)), SKEW, clock_reading(&time));
     let renewals = AtomicUsize::new(0);
@@ -137,7 +137,7 @@ async fn held_values_lists_every_value_held_oldest_first() {
     holder.get(|_| renew_to("third", &renewals)).await.unwrap();
     holder.get(|_| renew_to("unused", &renewals)).await.unwrap();
 
-    assert_eq!(holder.held_values(), ["seed", "second", "third"]);
+    assert_eq!(holder.current(), Some("third".to_string()));
     assert_eq!(renewals.load(Ordering::SeqCst), 1);
 }
 
@@ -200,7 +200,7 @@ async fn a_decision_that_fails_returns_its_error_and_keeps_the_lease() {
 
     assert_eq!(failed, Err("expired".to_string()));
     assert_eq!(renewals.load(Ordering::SeqCst), 0);
-    assert_eq!(holder.held_values(), ["seed"]);
+    assert_eq!(holder.current(), Some("seed".to_string()));
 }
 
 #[tokio::test]
