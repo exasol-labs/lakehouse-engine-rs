@@ -203,11 +203,14 @@ fn resolve_connection_config(
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
     permission.require_management_url(&resolved.uri)?;
     let allow_http = resolve_allow_http(props);
-    let creds = rt.block_on(resolve_aws_identity(
-        resolved.creds,
-        &resolved.uri,
-        allow_http,
-    ))?;
+    // A scan finishes well within the session's lifetime, so it needs no renewing role source.
+    let creds = rt
+        .block_on(resolve_aws_identity(
+            resolved.creds,
+            &resolved.uri,
+            allow_http,
+        ))?
+        .creds;
     let storage = storage_block(&creds, allow_http);
     Ok(ResolvedConnectionConfig {
         catalog_uri: resolved.uri,

@@ -3433,12 +3433,29 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "reqsign-core",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "lakehouse-catalog-write"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exasol-udf-sdk",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "lakehouse-catalog",
+ "rand 0.8.6",
+ "reqsign-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ fn build_load_table_url_with_warehouse_prefix() {
         "123456789012",
         "db",
         "events",
+        Snapshots::Referenced,
     );
     assert_eq!(
         url,
@@ -19,7 +20,13 @@ fn build_load_table_url_with_warehouse_prefix() {
 /// Scenario: A pushdown's loadTable asks only for the referenced snapshots
 #[test]
 fn build_load_table_url_without_warehouse() {
-    let url = build_load_table_url("https://rest.example.com", "", "db", "events");
+    let url = build_load_table_url(
+        "https://rest.example.com",
+        "",
+        "db",
+        "events",
+        Snapshots::Referenced,
+    );
     assert_eq!(
         url, "https://rest.example.com/v1/namespaces/db/tables/events?snapshots=refs",
         "URL must omit prefix when warehouse is empty"
@@ -34,6 +41,7 @@ fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
         prefix,
         "mydb",
         "orders",
+        Snapshots::Referenced,
     );
     assert_eq!(
         url,
@@ -61,6 +69,7 @@ fn build_load_table_url_glue_carries_catalogs_prefix() {
         &prefix,
         "db",
         "events",
+        Snapshots::Referenced,
     );
     assert_eq!(
         url,
@@ -137,6 +146,7 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     creds.use_sigv4 = true;
     let auth = CatalogAuth::Sigv4 {
         region: "us-east-1".into(),
+        role: None,
     };
 
     let http = CatalogHttp::new();
@@ -241,7 +251,13 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
         "warehouse must NOT be used as the URL prefix for non-SigV4 no-override path"
     );
 
-    let url = build_load_table_url(&catalog_uri, &result, "e2e_lakehouse", "events");
+    let url = build_load_table_url(
+        &catalog_uri,
+        &result,
+        "e2e_lakehouse",
+        "events",
+        Snapshots::Referenced,
+    );
     assert!(
         url.contains("/v1/namespaces/e2e_lakehouse/tables/events"),
         "URL must not contain a warehouse path segment: {url}"
@@ -298,7 +314,8 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
 
         let session_creds = crate::resolve_aws_identity(stated, &load_table_uri, true)
             .await
-            .expect("the stub answers a well-formed AssumeRoleResponse");
+            .expect("the stub answers a well-formed AssumeRoleResponse")
+            .creds;
         let session = CatalogSession::resolve(&load_table_uri, WAREHOUSE, None, &session_creds)
             .await
             .expect("a SigV4 session resolves without any network access");
@@ -306,7 +323,7 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
             warehouse: WAREHOUSE.into(),
             table: "db.events".into(),
         };
-        load_table_any_auth(&session, &catalog, &session_creds)
+        load_table_any_auth(&session, &catalog)
             .await
             .expect("the session-signed loadTable must succeed");
         let enumeration_session =
@@ -377,7 +394,7 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
         .expect("sigv4 session resolution must not fail without any network access");
 
     assert!(
-        matches!(&session.auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
+        matches!(&session.auth, CatalogAuth::Sigv4 { region, .. } if region == "us-east-1"),
         "sigv4 creds must resolve to CatalogAuth::Sigv4 carrying the endpoint's region"
     );
     assert_eq!(
@@ -423,7 +440,13 @@ async fn a_failed_config_lookup_fails_the_session() {
 #[test]
 fn catalog_urls_ignore_a_trailing_slash_on_the_address() {
     assert_eq!(
-        build_load_table_url("http://host/catalog/", "wh", "db", "t"),
+        build_load_table_url(
+            "http://host/catalog/",
+            "wh",
+            "db",
+            "t",
+            Snapshots::Referenced
+        ),
         "http://host/catalog/v1/wh/namespaces/db/tables/t?snapshots=refs"
     );
     assert_eq!(
@@ -440,6 +463,7 @@ fn session_over(http: CatalogHttp, catalog_uri: &str) -> CatalogSession {
         catalog_uri: catalog_uri.to_string(),
         auth: CatalogAuth::None,
         prefix: String::new(),
+        creds: creds_no_auth(),
     }
 }
 
@@ -451,11 +475,10 @@ async fn a_failed_load_table_names_the_table() {
         warehouse: "wh".into(),
         table: IDENT.into(),
     };
-    let creds = creds_no_auth();
 
     let (uri_500, _) = spawn_server("application/json", |_| (500, "boom".into())).await;
     let session = session_over(CatalogHttp::new(), &uri_500);
-    let message = load_table_any_auth(&session, &catalog, &creds)
+    let message = load_table_any_auth(&session, &catalog)
         .await
         .unwrap_err()
         .to_string();
@@ -466,7 +489,7 @@ async fn a_failed_load_table_names_the_table() {
 
     let (uri_404, _) = spawn_server("application/json", |_| (404, "not found".into())).await;
     let session = session_over(CatalogHttp::new(), &uri_404);
-    let message = load_table_any_auth(&session, &catalog, &creds)
+    let message = load_table_any_auth(&session, &catalog)
         .await
         .unwrap_err()
         .to_string();
@@ -477,14 +500,14 @@ async fn a_failed_load_table_names_the_table() {
 
     let (uri_bad_json, _) = spawn_server("application/json", |_| (200, "not json".into())).await;
     let session = session_over(CatalogHttp::new(), &uri_bad_json);
-    let message = load_table_any_auth(&session, &catalog, &creds)
+    let message = load_table_any_auth(&session, &catalog)
         .await
         .unwrap_err()
         .to_string();
     assert!(message.contains(IDENT), "{message}");
 
     let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), CLOSED_PORT_URI);
-    let message = load_table_any_auth(&session, &catalog, &creds)
+    let message = load_table_any_auth(&session, &catalog)
         .await
         .unwrap_err()
         .to_string();
@@ -495,7 +518,7 @@ async fn a_failed_load_table_names_the_table() {
 
     let stalling_uri = spawn_header_stalling_server().await;
     let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), &stalling_uri);
-    let message = load_table_any_auth(&session, &catalog, &creds)
+    let message = load_table_any_auth(&session, &catalog)
         .await
         .unwrap_err()
         .to_string();
@@ -529,7 +552,7 @@ async fn a_resent_sigv4_load_table_carries_its_first_signature() {
         table: "db.events".into(),
     };
 
-    load_table_any_auth(&session, &catalog, &creds)
+    load_table_any_auth(&session, &catalog)
         .await
         .expect("the retried loadTable must succeed");
 
@@ -671,7 +694,147 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         warehouse: "wh".into(),
         table: "db.events".into(),
     };
-    load_table_any_auth(&pushdown_session, &catalog, &creds_no_auth())
+    load_table_any_auth(&pushdown_session, &catalog)
         .await
         .expect("a 503 on the pushdown load is retried to success");
+}
+
+#[test]
+fn a_table_name_is_one_percent_encoded_path_segment() {
+    let table = |name: &str| TableIdent::new(NamespaceIdent::new("db".into()), name.into());
+    for (name, segment) in [
+        ("orders", "orders"),
+        ("orders#2026", "orders%232026"),
+        ("a?b", "a%3Fb"),
+        ("a/b", "a%2Fb"),
+        ("a b", "a%20b"),
+        ("a+b", "a%2Bb"),
+    ] {
+        assert_eq!(
+            table_ident_path(&table(name)),
+            format!("namespaces/db/tables/{segment}")
+        );
+    }
+    assert_eq!(
+        namespace_tables_path(&NamespaceIdent::new("db".into())),
+        "namespaces/db/tables"
+    );
+}
+
+#[test]
+fn a_load_of_all_snapshots_asks_for_snapshots_all() {
+    assert_eq!(
+        build_load_table_url("http://host", "wh", "db", "t", Snapshots::All),
+        "http://host/v1/wh/namespaces/db/tables/t?snapshots=all"
+    );
+}
+
+#[test]
+fn a_table_exists_on_a_2xx_answer_and_is_absent_on_404() {
+    for (status, existence) in [
+        (200, Some(true)),
+        (204, Some(true)),
+        (404, Some(false)),
+        (403, None),
+        (409, None),
+        (500, None),
+    ] {
+        assert_eq!(table_existence(status), existence, "HTTP {status}");
+    }
+}
+
+const CREDENTIALS_ANSWER: &str = r#"{"storage-credentials": [
+  {"prefix": "s3://bucket/", "config": {"s3.access-key-id": "WIDE_AK", "s3.secret-access-key": "WIDE_SK"}},
+  {"prefix": "S3://bucket/db/t", "config": {"s3.access-key-id": "TABLE_AK", "s3.secret-access-key": "TABLE_SK"}}
+]}"#;
+
+#[test]
+fn a_credentials_answer_yields_the_longest_covering_entry() {
+    let credentials = read_credentials(CREDENTIALS_ANSWER.as_bytes(), "s3://bucket/db/t/data")
+        .expect("an entry covers the location");
+
+    assert_eq!(credentials["s3.access-key-id"], "TABLE_AK");
+}
+
+#[test]
+fn a_credentials_answer_that_covers_nothing_or_is_malformed_fails_quoting_none_of_it() {
+    for (body, location, cause) in [
+        (
+            CREDENTIALS_ANSWER,
+            "s3://other/db/t",
+            "covers s3://other/db/t",
+        ),
+        (
+            r#"{"storage-credentials": "WIDE_AK"}"#,
+            "s3://bucket/db/t",
+            "invalid JSON at line 1",
+        ),
+    ] {
+        let error = read_credentials(body.as_bytes(), location).unwrap_err();
+
+        assert!(error.contains(cause), "{error}");
+        assert!(
+            !error.contains("WIDE_AK") && !error.contains("TABLE_AK"),
+            "{error}"
+        );
+    }
+}
+
+/// A request's `Authorization` and access-delegation headers come from the session's one `creds`.
+#[tokio::test]
+async fn a_request_carries_the_session_auth_and_the_delegation_header_when_the_connection_vends() {
+    for vends in [false, true] {
+        let session = CatalogSession {
+            auth: CatalogAuth::Bearer(BEARER_TOK.into()),
+            creds: ConnectionCreds {
+                use_vended_credentials: vends,
+                ..creds_no_auth()
+            },
+            ..session_over(CatalogHttp::new(), "https://catalog.example.com")
+        };
+
+        let (request, bearer) = session
+            .build_request(Method::GET, "namespaces", None)
+            .await
+            .expect("the request builds");
+
+        assert_eq!(bearer.as_deref(), Some(BEARER_TOK));
+        assert_eq!(
+            request.headers()["authorization"],
+            format!("Bearer {BEARER_TOK}")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .contains_key("x-iceberg-access-delegation"),
+            vends
+        );
+    }
+}
+
+#[test]
+fn a_quoted_answer_is_stripped_of_the_session_secrets_and_the_bearer_it_carried() {
+    let creds = ConnectionCreds {
+        client_secret: Some(CLIENT_SECRET.into()),
+        ..creds_no_auth()
+    };
+    let session = CatalogSession {
+        creds,
+        ..session_over(CatalogHttp::new(), "https://catalog.example.com")
+    };
+    let body = format!(
+        "{BEARER_TOK} {CLIENT_SECRET} {}",
+        "x".repeat(crate::catalog_http::MAX_QUOTED_BODY_BYTES)
+    );
+    let answer = CatalogResponse {
+        status: 400,
+        body: body.into_bytes(),
+        bearer: Some(BEARER_TOK.into()),
+    };
+
+    let quoted = session.quote(&answer);
+
+    assert!(!quoted.contains(BEARER_TOK), "{quoted}");
+    assert!(!quoted.contains(CLIENT_SECRET), "{quoted}");
+    assert!(quoted.contains("truncated"), "{quoted}");
 }

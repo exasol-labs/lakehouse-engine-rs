@@ -1,0 +1,27 @@
+[package]
+name = "lakehouse-catalog-write"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+name = "lakehouse_catalog_write"
+
+[dependencies]
+lakehouse-catalog = { path = "../lakehouse-catalog" }
+exasol-udf-sdk    = { workspace = true }
+
+iceberg              = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+# `ProvideCredential::provide_credential` takes its `Context`; the same pin iceberg-storage-opendal resolves.
+reqsign-core         = { workspace = true }
+
+async-trait = { workspace = true }
+rand        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+lakehouse-catalog = { path = "../lakehouse-catalog", features = ["test-support"] }
+tokio             = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util", "net", "io-util"] }

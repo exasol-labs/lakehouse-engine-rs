@@ -1,11 +1,12 @@
 //! The one HTTP path of every catalog request. It owns the timeouts, the retries of a transient
 //! failure, and their window, so each caller keeps only its own error text and redaction.
 
+use crate::auth::OAuth2Token;
 use crate::error_chain::{causes, error_chain};
 use aws_smithy_types::date_time::{DateTime, Format};
 use exasol_udf_sdk::error::UdfError;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
-use reqwest::{IntoUrl, Request, RequestBuilder, Response, StatusCode};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::{IntoUrl, Method, Request, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
@@ -43,12 +44,10 @@ const CATALOG_POLICY: RetryPolicy = RetryPolicy {
 /// Whether a catalog request may be sent again after a transient failure. Every request states it,
 /// so a request that changes catalog state is never repeated by accident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RepeatSafety {
+pub enum RepeatSafety {
     /// The request only reads, or reserves nothing, so a second attempt changes nothing.
     Safe,
-    #[cfg_attr(not(test), allow(dead_code))]
-    /// The request changes catalog state. Nothing sends it yet: the Iceberg write path that does
-    /// lands in a later change. The client sends it once, and the operation that can
+    /// The request changes catalog state. The client sends it once, and the operation that can
     /// check its outcome decides whether to send it again.
     Unsafe,
 }
@@ -57,12 +56,12 @@ pub(crate) enum RepeatSafety {
 /// redacted, so a secret that the cut splits was already replaced.
 pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
-/// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
-/// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
+/// The HTTP client of one catalog session. Callers build a request with [`Self::get`],
+/// [`Self::post`], or [`Self::request`] and send it only through [`Self::send_json`], [`Self::send`], or
 /// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
-/// re-sends a clone of the request as the caller built and signed it, `Authorization` included, so
-/// this type needs no knowledge of auth or signing. A token whose lifetime is under twice the retry
-/// window can expire between attempts, and the catalog then answers 401, which is not retried.
+/// re-sends a clone of the request as the caller built and signed it, so this type needs no
+/// knowledge of signing. A request that carries a renewable OAuth2 token takes the bearer from the
+/// token's holder again before each retry, so a retry never carries an expired one.
 #[derive(Clone)]
 pub(crate) struct CatalogHttp {
     client: reqwest::Client,
@@ -120,6 +119,10 @@ impl CatalogHttp {
         self.client.post(url)
     }
 
+    pub(crate) fn request(&self, method: Method, url: impl IntoUrl) -> RequestBuilder {
+        self.client.request(method, url)
+    }
+
     /// Sends `request` and reads its whole answer body. A request that is safe to repeat is sent
     /// again after a transient failure within the policy's window. Every HTTP answer is `Ok`, the
     /// last one when the retries run out; only a transport failure is an error. A request whose
@@ -128,8 +131,10 @@ impl CatalogHttp {
         &self,
         request: Request,
         safety: RepeatSafety,
+        renewable: Option<&OAuth2Token>,
     ) -> Result<CatalogAnswer, CatalogHttpError> {
-        self.send_capped(request, safety, usize::MAX).await
+        self.send_capped(request, safety, usize::MAX, renewable)
+            .await
     }
 
     /// [`Self::send`], then parses a 2xx answer's body as JSON. Every failure is an error whose
@@ -139,15 +144,19 @@ impl CatalogHttp {
         &self,
         request: Request,
         safety: RepeatSafety,
+        renewable: Option<&OAuth2Token>,
         what: &str,
         redact: impl Fn(&str) -> String,
     ) -> Result<T, CatalogRequestError> {
-        let answer = self.send(request, safety).await.map_err(|error| {
-            CatalogRequestError::new(
-                error.status(),
-                format!("{what} failed: {}", error.render(&redact)),
-            )
-        })?;
+        let answer = self
+            .send(request, safety, renewable)
+            .await
+            .map_err(|error| {
+                CatalogRequestError::new(
+                    error.status(),
+                    format!("{what} failed: {}", error.render(&redact)),
+                )
+            })?;
         if !answer.status.is_success() {
             return Err(CatalogRequestError::new(
                 Some(answer.status),
@@ -173,6 +182,7 @@ impl CatalogHttp {
         mut request: Request,
         safety: RepeatSafety,
         max_bytes: usize,
+        renewable: Option<&OAuth2Token>,
     ) -> Result<CatalogAnswer, CatalogHttpError> {
         let attempts = match safety {
             RepeatSafety::Safe => self.policy.attempts,
@@ -194,6 +204,14 @@ impl CatalogHttp {
             };
             sleep(wait).await;
             request = resend;
+            if let Some(token) = renewable {
+                // A token that cannot be renewed ends the retries with the failure already in hand.
+                // Boxed: a token's own grant sends through this client, so the futures nest.
+                let Ok(bearer) = Box::pin(token.bearer()).await else {
+                    return outcome;
+                };
+                set_bearer(&mut request, &bearer);
+            }
         }
     }
 
@@ -290,6 +308,11 @@ impl CatalogHttpError {
         self.status
     }
 
+    /// No connection was made, so the catalog never saw the request.
+    pub(crate) fn is_unsent(&self) -> bool {
+        self.error.is_connect()
+    }
+
     /// The whole error chain passed through `redact`, preceded by the answer's HTTP status when its
     /// body broke off.
     pub(crate) fn render(&self, redact: impl Fn(&str) -> String) -> String {
@@ -322,6 +345,13 @@ async fn read_body(
         body.extend_from_slice(&chunk);
     }
     Ok((body, false))
+}
+
+fn set_bearer(request: &mut Request, bearer: &str) {
+    if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {bearer}")) {
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
 }
 
 /// `body` as an error may show it: passed through `redact`, then cut to

@@ -267,6 +267,72 @@ fn identity(text: &str) -> String {
     text.to_owned()
 }
 
+/// A retry carries the bearer the token's holder gives then, not the one the first attempt carried.
+#[tokio::test]
+async fn a_retry_carries_the_current_oauth2_bearer() {
+    use crate::auth::{ClientAuthentication, ClientCredentialsGrant};
+    use std::sync::atomic::AtomicU64;
+
+    let grants = Arc::new(AtomicUsize::new(0));
+    let granted = grants.clone();
+    let (token_uri, _) = spawn_server("application/json", move |_| {
+        let n = granted.fetch_add(1, Ordering::SeqCst);
+        (
+            200,
+            format!(r#"{{"access_token":"TOKEN_{n}","expires_in":3600}}"#),
+        )
+    })
+    .await;
+    let time = Arc::new(AtomicU64::new(0));
+    let moved = time.clone();
+    let answered = Arc::new(AtomicUsize::new(0));
+    let (catalog_uri, requests) = spawn_server("application/json", move |_| {
+        // The first attempt fails transiently, and the token expires before the retry.
+        if answered.fetch_add(1, Ordering::SeqCst) == 0 {
+            moved.store(4_000_000, Ordering::SeqCst);
+            (503, "{}".into())
+        } else {
+            (200, "{}".into())
+        }
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let token = OAuth2Token::lazy(
+        ClientCredentialsGrant {
+            http: http.clone(),
+            token_url: token_uri,
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            scope: None,
+            authentication: ClientAuthentication::Form,
+            label: "OAuth2 token request",
+            require_expiry: false,
+        },
+        crate::exported_test_support::clock_reading(&time),
+    );
+    let first = token.bearer().await.unwrap();
+    let request = http.get(&catalog_uri).bearer_auth(&first).build().unwrap();
+
+    let answer = http
+        .send(request, RepeatSafety::Safe, Some(&token))
+        .await
+        .unwrap();
+
+    assert_eq!(answer.status, StatusCode::OK);
+    let sent = requests.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[0].to_lowercase().contains("bearer token_0"),
+        "{}",
+        sent[0]
+    );
+    assert!(
+        sent[1].to_lowercase().contains("bearer token_1"),
+        "{}",
+        sent[1]
+    );
+}
+
 /// Scenario: A catalog that stays silent fails the request within 30 seconds
 #[tokio::test]
 async fn a_catalog_that_never_answers_fails_within_the_retry_window() {
@@ -278,6 +344,7 @@ async fn a_catalog_that_never_answers_fails_within_the_retry_window() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap_err();
@@ -308,6 +375,7 @@ async fn a_stalled_attempt_is_retried() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap();
@@ -345,6 +413,7 @@ async fn a_body_that_keeps_arriving_is_read_past_the_retry_window() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap();
@@ -361,7 +430,7 @@ async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
         .await
         .unwrap_err();
 
@@ -390,6 +459,7 @@ async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap_err();
@@ -421,6 +491,7 @@ async fn a_capped_read_keeps_the_first_bytes_and_reports_the_cut() {
             get(&http, &format!("{base_uri}/long")),
             RepeatSafety::Safe,
             10,
+            None,
         )
         .await
         .unwrap();
@@ -429,6 +500,7 @@ async fn a_capped_read_keeps_the_first_bytes_and_reports_the_cut() {
             get(&http, &format!("{base_uri}/exact")),
             RepeatSafety::Safe,
             10,
+            None,
         )
         .await
         .unwrap();
@@ -451,6 +523,7 @@ async fn a_body_that_breaks_off_fails_once_and_keeps_the_answer_status() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap_err();
@@ -485,7 +558,7 @@ async fn transient_statuses_are_retried_until_an_answer_succeeds() {
             .build()
             .unwrap();
 
-        let answer = http.send(request, RepeatSafety::Safe).await.unwrap();
+        let answer = http.send(request, RepeatSafety::Safe, None).await.unwrap();
 
         assert_eq!(answer.status, StatusCode::OK, "after HTTP {status}");
         assert_eq!(answer.body, b"{\"ok\":true}");
@@ -511,7 +584,7 @@ async fn a_retry_after_wait_is_honored() {
     let started = Instant::now();
 
     let answer = http
-        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
         .await
         .unwrap();
 
@@ -539,7 +612,7 @@ async fn a_wait_past_the_budget_ends_the_retries_at_once() {
     let started = Instant::now();
 
     let answer = http
-        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
         .await
         .unwrap();
 
@@ -568,7 +641,7 @@ async fn a_wait_that_leaves_less_than_a_read_timeout_keeps_the_answer_at_hand() 
     let started = Instant::now();
 
     let answer = http
-        .send(get(&http, &base_uri), RepeatSafety::Safe)
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
         .await
         .unwrap();
 
@@ -587,6 +660,7 @@ async fn a_refused_json_answer_quotes_its_body_redacted_and_cut() {
         .send_json::<serde_json::Value>(
             get(&http, &base_uri),
             RepeatSafety::Safe,
+            None,
             "catalog request",
             |msg| msg.replace(BEARER_TOK, "***"),
         )
@@ -619,7 +693,7 @@ async fn a_non_transient_answer_is_sent_once() {
         let http = CatalogHttp::with_policy(SHORT_POLICY);
 
         let answer = http
-            .send(get(&http, &base_uri), RepeatSafety::Safe)
+            .send(get(&http, &base_uri), RepeatSafety::Safe, None)
             .await
             .unwrap();
 
@@ -641,7 +715,7 @@ async fn a_refused_connection_is_retried_until_attempts_run_out() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, CLOSED_PORT_URI), RepeatSafety::Safe)
+        .send(get(&http, CLOSED_PORT_URI), RepeatSafety::Safe, None)
         .await
         .unwrap_err();
 
@@ -649,7 +723,7 @@ async fn a_refused_connection_is_retried_until_attempts_run_out() {
     let four_shortest_waits = ms(5 + 10 + 20 + 40);
     assert!(elapsed >= four_shortest_waits, "{elapsed:?}");
     let single_error = single
-        .send(get(&single, CLOSED_PORT_URI), RepeatSafety::Safe)
+        .send(get(&single, CLOSED_PORT_URI), RepeatSafety::Safe, None)
         .await
         .unwrap_err();
     assert_eq!(error.render(identity), single_error.render(identity));
@@ -676,6 +750,7 @@ async fn a_connection_reset_after_the_request_is_retried() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap();
@@ -703,6 +778,7 @@ async fn a_connection_closed_cleanly_after_the_request_is_retried() {
         .send(
             get(&http, &format!("http://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap();
@@ -746,6 +822,7 @@ async fn a_tls_client_against_a_plain_http_listener_connects_once() {
         .send(
             get(&http, &format!("https://{address}/")),
             RepeatSafety::Safe,
+            None,
         )
         .await
         .unwrap_err();
@@ -769,7 +846,11 @@ async fn an_unresolvable_host_fails_at_the_first_attempt() {
     let started = Instant::now();
 
     let error = http
-        .send(get(&http, "http://catalog.invalid/"), RepeatSafety::Safe)
+        .send(
+            get(&http, "http://catalog.invalid/"),
+            RepeatSafety::Safe,
+            None,
+        )
         .await
         .unwrap_err();
 
@@ -863,7 +944,11 @@ async fn only_a_request_safe_to_repeat_is_sent_again_after_a_504() {
         let http = CatalogHttp::with_policy(SHORT_POLICY);
 
         let answer = http
-            .send(post(&http, &format!("{base_uri}{COMMIT_PATH}")), safety)
+            .send(
+                post(&http, &format!("{base_uri}{COMMIT_PATH}")),
+                safety,
+                None,
+            )
             .await
             .unwrap();
 
@@ -888,10 +973,24 @@ async fn a_request_unsafe_to_repeat_is_sent_once_after_a_timeout() {
         .send(
             post(&http, &format!("http://{address}{COMMIT_PATH}")),
             RepeatSafety::Unsafe,
+            None,
         )
         .await
         .unwrap_err();
 
     assert!(error.render(identity).contains(TIMED_OUT_CAUSE));
+    assert!(!error.is_unsent());
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_refused_connection_sent_nothing() {
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let error = http
+        .send(post(&http, CLOSED_PORT_URI), RepeatSafety::Unsafe, None)
+        .await
+        .unwrap_err();
+
+    assert!(error.is_unsent(), "{}", error.render(identity));
 }

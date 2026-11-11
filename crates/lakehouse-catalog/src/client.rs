@@ -301,8 +301,7 @@ impl IcebergRestCatalogClient {
                 catalog_identifier_string(ident)
             ))
         })?;
-        let metadata =
-            load_table_schema_metadata(session, &namespace, &ident.name, &self.creds).await?;
+        let metadata = load_table_schema_metadata(session, &namespace, &ident.name).await?;
         Ok(iceberg_catalog_table(ident.clone(), &metadata, None))
     }
 }

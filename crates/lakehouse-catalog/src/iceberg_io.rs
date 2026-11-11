@@ -41,20 +41,40 @@ pub(crate) async fn build_signed_request(
     })?;
 
     let signed = match auth {
-        CatalogAuth::Sigv4 { region } => crate::sigv4::sign_request(
-            request,
-            &creds.access_key,
-            &creds.secret_key,
-            creds.session_token.as_deref(),
-            region,
-            "glue",
-        )
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to sign catalog request: {}",
-                redact(&e.to_string())
-            ))
-        })?,
+        CatalogAuth::Sigv4 { region, role } => {
+            let (access_key, secret_key, session_token) = match role {
+                Some(role) => {
+                    let held = role
+                        .credential()
+                        .await
+                        .map_err(|e| UdfError::User(redact(&e.to_string())))?;
+                    (
+                        held.access_key_id,
+                        held.secret_access_key,
+                        held.session_token,
+                    )
+                }
+                None => (
+                    creds.access_key.clone(),
+                    creds.secret_key.clone(),
+                    creds.session_token.clone(),
+                ),
+            };
+            crate::sigv4::sign_request(
+                request,
+                &access_key,
+                &secret_key,
+                session_token.as_deref(),
+                region,
+                "glue",
+            )
+            .map_err(|e| {
+                UdfError::User(format!(
+                    "failed to sign catalog request: {}",
+                    redact(&e.to_string())
+                ))
+            })?
+        }
         CatalogAuth::Bearer(_) | CatalogAuth::OAuth2(_) | CatalogAuth::None => request,
     };
     Ok((signed, bearer))
@@ -74,9 +94,13 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     let (request, bearer) = build_signed_request(builder, auth, creds)
         .await
         .map_err(|e| CatalogRequestError::without_status(e.to_string()))?;
-    http.send_json(request, RepeatSafety::Safe, "catalog request", |msg| {
-        redact_catalog_text(msg, creds, bearer.as_deref())
-    })
+    http.send_json(
+        request,
+        RepeatSafety::Safe,
+        auth.renewable(),
+        "catalog request",
+        |msg| redact_catalog_text(msg, creds, bearer.as_deref()),
+    )
     .await
 }
 
@@ -109,7 +133,12 @@ pub(crate) async fn authed_post_json(
         .body(body);
     let (request, bearer) = build_signed_request(builder, auth, creds).await?;
     let answer = http
-        .send_capped(request, RepeatSafety::Safe, MAX_ANSWER_BYTES)
+        .send_capped(
+            request,
+            RepeatSafety::Safe,
+            MAX_ANSWER_BYTES,
+            auth.renewable(),
+        )
         .await
         .map_err(|error| {
             UdfError::User(format!(
