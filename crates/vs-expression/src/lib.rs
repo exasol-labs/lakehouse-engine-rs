@@ -13,9 +13,7 @@ use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use json_value::{Fallback, JsonValueCall, Returning};
-pub use json_value::{
-    JSON_PARSE_FN, JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path,
-};
+pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{
@@ -284,15 +282,15 @@ fn render_json_value(expr: &Json, dialect: Dialect) -> Result<String, UdfError> 
         Fallback::Text(text) => format!("'{}'", sql_escape(text)),
         Fallback::Boolean(value) => value.to_string().to_uppercase(),
     };
-    let tape = format!("{JSON_PARSE_FN}({})", operand(call.document)?);
+    let doc = operand(call.document)?;
     let path = format!("'{}'", sql_escape(call.path));
     let (on_empty, on_error) = (fallback(&call.on_empty), fallback(&call.on_error));
     Ok(match call.returning {
         Returning::Text { max_chars } => {
-            format!("{JSON_VALUE_TEXT_FN}({tape}, {path}, {max_chars}, {on_empty}, {on_error})")
+            format!("{JSON_VALUE_TEXT_FN}({doc}, {path}, {max_chars}, {on_empty}, {on_error})")
         }
         Returning::Boolean => {
-            format!("{JSON_VALUE_BOOLEAN_FN}({tape}, {path}, {on_empty}, {on_error})")
+            format!("{JSON_VALUE_BOOLEAN_FN}({doc}, {path}, {on_empty}, {on_error})")
         }
     })
 }

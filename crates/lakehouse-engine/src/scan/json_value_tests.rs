@@ -1,13 +1,9 @@
 use super::*;
-use crate::scan::scan_session_context;
-use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionConfig;
 
 fn selected(doc: &str, path: &str) -> String {
-    let tape = parse(doc).unwrap_or_default();
     format!(
         "{:?}",
-        select(&tape, &parse_json_path(path).expect("path in the subset"))
+        select(doc, &parse_json_path(path).expect("path in the subset"))
     )
 }
 
@@ -77,15 +73,20 @@ fn documents_that_are_not_strict_json_fail() {
         r#"[1,]"#,
         r#"{"a":1,}"#,
         r#"{"a":"\q"}"#,
-        r#"{"a":"\ud800"}"#,
-        r#"{"a":"\udc00"}"#,
         tab,
         "{\"a\":\u{c}1}",
         "\u{feff}{\"a\":1}",
         "   ",
     ] {
-        assert_eq!(parse(doc), None, "{doc:?}");
+        assert_eq!(select(doc, &[]), Item::Error, "{doc:?}");
     }
+}
+
+/// A lone surrogate escape fails only in the selected item, see docs/semantic-differences.md.
+#[test]
+fn lone_surrogates_fail_in_the_selected_item() {
+    assert_eq!(selected(r#"{"a":"\ud800"}"#, "$.a"), "Error");
+    assert_eq!(selected(r#"{"a":"\udc00","b":1}"#, "$.b"), r#"Text("1")"#);
 }
 
 #[test]
@@ -126,39 +127,14 @@ fn text_to_boolean_follows_exasol_cast() {
 #[test]
 fn text_results_count_characters_and_read_empty_as_null() {
     for (item, max_chars, expected) in [
-        (Item::Text("éé€"), 3, Some(Ok("éé€"))),
-        (Item::Text("😀x"), 1, Some(Err(()))),
-        (Item::Text("12345"), 3, Some(Err(()))),
+        (Item::Text("éé€".into()), 3, Some(Ok("éé€"))),
+        (Item::Text("😀x".into()), 1, Some(Err(()))),
+        (Item::Text("12345".into()), 3, Some(Err(()))),
         (Item::Boolean(false), 3, Some(Err(()))),
         (Item::Boolean(false), 5, Some(Ok("false"))),
-        (Item::Text(""), 3, None),
+        (Item::Text("".into()), 3, None),
         (Item::Null, 3, None),
     ] {
         assert_eq!(text_value(&item, max_chars), expected, "{item:?}");
     }
-}
-
-/// Scenario: Several JSON_VALUE calls on one document parse it once
-#[tokio::test]
-async fn calls_on_one_document_parse_it_once() {
-    let ctx = scan_session_context(SessionConfig::new(), Arc::default());
-    let docs: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":"x","b":true}"#]));
-    let batch = arrow::record_batch::RecordBatch::try_from_iter([("doc", docs)]).unwrap();
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
-    ctx.register_table("t", Arc::new(table)).unwrap();
-    let sql = format!(
-        "SELECT {JSON_VALUE_TEXT_FN}({JSON_PARSE_FN}(doc), '$.a', 10, NULL, NULL), \
-         {JSON_VALUE_BOOLEAN_FN}({JSON_PARSE_FN}(doc), '$.b', NULL, NULL) FROM t"
-    );
-    let df = ctx.sql(&sql).await.unwrap();
-    let plan = df.clone().create_physical_plan().await.unwrap();
-    let rendered = datafusion::physical_plan::displayable(plan.as_ref())
-        .indent(true)
-        .to_string();
-    let evaluated = format!("{JSON_PARSE_FN}(doc@");
-    assert_eq!(rendered.matches(&evaluated).count(), 1, "{rendered}");
-
-    let rows = df.collect().await.unwrap();
-    assert_eq!(rows[0].column(0).as_string::<i32>().value(0), "x");
-    assert!(rows[0].column(1).as_boolean().value(0));
 }

@@ -6,12 +6,9 @@ use serde_json::Value as Json;
 use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE, exasol_type_from_json};
 use crate::scan_typing::decline;
 
-/// Parses a document once into the tape the value functions read, so DataFusion's common
-/// subexpression elimination shares one parse among the calls on one document.
-pub const JSON_PARSE_FN: &str = "lakehouse_json_parse";
-/// `(tape, path, max_chars, on_empty, on_error)`, returning text.
+/// `(document, path, max_chars, on_empty, on_error)`, returning text.
 pub const JSON_VALUE_TEXT_FN: &str = "lakehouse_json_value_text";
-/// `(tape, path, on_empty, on_error)`, returning BOOLEAN.
+/// `(document, path, on_empty, on_error)`, returning BOOLEAN.
 pub const JSON_VALUE_BOOLEAN_FN: &str = "lakehouse_json_value_boolean";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

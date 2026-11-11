@@ -116,3 +116,11 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 | `WHERE CAST(val \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | returns rows | error |
 
 A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
+
+## JSON_VALUE on a document with a lone surrogate escape
+
+Native Exasol rejects a document that contains a lone UTF-16 surrogate escape such as `"\ud800"`, and `JSON_VALUE` takes its `ON ERROR` behavior. The scan rejects such an escape only in the item the path selects, and returns the selected value otherwise.
+
+| Expression | Virtual schema | Native Exasol |
+|---|---|---|
+| `JSON_VALUE('{"a":"\ud800","b":1}', '$.b')` | `'1'` | `NULL` (`ON ERROR`) |

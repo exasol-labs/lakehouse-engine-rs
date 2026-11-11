@@ -74,7 +74,7 @@ fn session_free_calls_render_to_the_scan_functions() {
     let cases = [
         (
             json_value(doc(), "$.a"),
-            "lakehouse_json_value_text(lakehouse_json_parse(\"DOC\"), '$.a', 2000000, NULL, NULL)",
+            "lakehouse_json_value_text(\"DOC\", '$.a', 2000000, NULL, NULL)",
         ),
         (
             json_value_as(
@@ -84,7 +84,7 @@ fn session_free_calls_render_to_the_scan_functions() {
                 json_default(str_lit("it's")),
                 json_default(str_lit("")),
             ),
-            "lakehouse_json_value_text(lakehouse_json_parse(\"DOC\"), '$.\"it''s\"', 4, 'it''s', NULL)",
+            "lakehouse_json_value_text(\"DOC\", '$.\"it''s\"', 4, 'it''s', NULL)",
         ),
         (
             json_value_as(
@@ -94,7 +94,7 @@ fn session_free_calls_render_to_the_scan_functions() {
                 json_default(bool_lit(true)),
                 json_default(null_lit()),
             ),
-            "lakehouse_json_value_boolean(lakehouse_json_parse(\"DOC\"), '$[0]', TRUE, NULL)",
+            "lakehouse_json_value_boolean(\"DOC\", '$[0]', TRUE, NULL)",
         ),
     ];
     for (call, sql) in cases {

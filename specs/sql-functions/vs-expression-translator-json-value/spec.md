@@ -24,7 +24,7 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 
 * *GIVEN* a `JSON_VALUE` call that runs in the scan
 * *WHEN* the scan evaluates it on a document
-* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON, at any nesting depth, SHALL take the `ON ERROR` behavior
+* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON, at any nesting depth, SHALL take the `ON ERROR` behavior, except that a lone surrogate escape outside the selected item SHALL NOT
 * *AND* the path SHALL run in lax mode over item sequences: a member step selects every member of that name, also duplicates, in an object or in the objects of an array, and an index step treats a non-array as a one-item array
 * *AND* no item SHALL take the `ON EMPTY` behavior, and several items or an object or array item SHALL take the `ON ERROR` behavior
 
@@ -42,9 +42,3 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 * *WHEN* the call appears in the select list or the WHERE clause
 * *THEN* the adapter SHALL render the call in Exasol SQL with every clause Exasol sent, so Exasol returns its own result or error
 * *AND* the scan SHALL project only the columns the query reads
-
-### Scenario: Several JSON_VALUE calls on one document parse it once
-
-* *GIVEN* a select list with several `JSON_VALUE` calls on one document
-* *WHEN* the scan evaluates them
-* *THEN* the scan SHALL parse each document once and read every call's result from that parse
