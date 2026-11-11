@@ -5,14 +5,13 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{render_df_filter_safe, render_expression_safe, strip_table_alias};
+use vs_expression::{SqlFragment, render_expression_exasol};
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql, cast_to_declared_type,
-    classify_where_filter, collect_all_column_names, extract_limit, extract_offset,
-    project_columns, projection_items, quote_ident, render_limit_offset, scan_storage_for,
-    shard_count,
+    ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator, build_scan_driving_sql,
+    collect_all_column_names, extract_limit, extract_offset, output_select_list, project_columns,
+    projection_items, quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -20,10 +19,9 @@ use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, declined_only, leg_local_filter,
-    projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
-    render_df_filter_qualified, render_expression_qualified, renderable_only,
-    type_screened_leg_filter,
+    conjoin_filters, cross_leg_residual_filter, leg_local_filter, projection_item_select_sql,
+    referenced_clause_values, referenced_leg_columns, render_df_filter_qualified,
+    render_expression_qualified, screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -44,7 +42,7 @@ pub(crate) struct RenderedJoinPushdown {
 
 /// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, the
 /// projection widened to the full row (#196), a projected output name exceeds Exasol's
-/// identifier limit, or the WHERE filter declines through [`classify_where_filter`]: broadcast
+/// identifier limit, or the WHERE filter declines through [`ScanTranslator::split_where`]: broadcast
 /// has no outer WHERE to apply a declined predicate. `Err` for a request with no column
 /// metadata at all, or with a column no single leg owns.
 ///
@@ -62,24 +60,25 @@ pub(crate) fn render_broadcast_join(
         .qualify_every_column(&join.conditions[0])
         .map_err(unattributable_decline)?;
     let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs)?);
-    // Not the filter renderer, which would suppress a trivially-true boolean.
-    let Some(condition) = render_expression_safe(&condition_tree) else {
-        return Ok(None);
-    };
-
     let col_types = ColumnTypes::per_relation(
         sides
             .iter()
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
+    let scan = ScanTranslator::new(&col_types);
+    // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
+    // loses broadcast eligibility and takes the N-scan fallback (#587).
+    let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
+        return Ok(None);
+    };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(filter_json, &col_types);
+    let (filter, declined) = scan.split_where(filter_json);
     if declined.is_some() {
         return Ok(None);
     }
 
-    let (projection, widened) = project_columns(&qualified, &col_types)?;
+    let (projection, widened) = project_columns(&qualified, scan)?;
     // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
     // (#196).
     if widened
@@ -228,9 +227,8 @@ fn render_self_applied_where(
     )))
 }
 
-/// An absent/empty select list projects every column of every leg. Exasol sends
-/// `CAST(NULL AS <type>)` as a bare NULL item and checks its column against `<type>`, so that
-/// item renders cast to its declared type: a bare NULL would take a type Exasol infers itself.
+/// An absent/empty select list projects every column of every leg. An item without a stated type
+/// is cast to its declared type: Exasol sends `''` and `NULL` alike as `literal_null` (#587).
 fn n_scan_join_select_items(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
@@ -238,26 +236,22 @@ fn n_scan_join_select_items(
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     match pushdown.json().get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
-            let mut items = Vec::with_capacity(list.len());
-            for (select_index, item) in list.iter().enumerate() {
-                let sql = if item.get("type").and_then(Json::as_str) == Some("literal_null") {
-                    let declared = pushdown.select_type(select_index).ok_or_else(|| {
-                        join_render_decline("a NULL select-list item has no declared type")
-                    })?;
-                    cast_to_declared_type("NULL", declared)
-                } else {
-                    render_expression_qualified(item, legs)
-                        .map_err(unattributable_decline)?
-                        .ok_or_else(|| {
-                            join_render_decline(
-                                "a select-list item could not be rendered for the qualified \
-                                 N-scan join",
-                            )
-                        })?
-                };
-                items.push(ProjectionItem::Expr { expr: sql });
+            let mut fragments = Vec::with_capacity(list.len());
+            for item in list {
+                let sql = render_required_clause(item, legs, "a select-list item")?;
+                fragments.push(SqlFragment::new(
+                    sql,
+                    select_item_type(item, legs, cols_per_leg),
+                ));
             }
-            Ok(items)
+            let items =
+                output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
+                    join_render_decline("the select list and its declared types differ in length")
+                })?;
+            Ok(items
+                .into_iter()
+                .map(|expr| ProjectionItem::Expr { expr })
+                .collect())
         }
         _ => Ok(n_full_row_qualified_items(legs, cols_per_leg)),
     }
@@ -321,11 +315,8 @@ fn outer_wrapper_clauses(
 /// owned by [`JoinLegs`], so self-join occurrences stay distinct legs (#361). All references
 /// render leg-qualified (`"LHS_T{i}"."COL"`), so shared column or table names are safe.
 ///
-/// Each leg receives only leg-local conjuncts passing [`renderable_only`] and
-/// [`type_screened_leg_filter`] (which also rewrites them). Everything else (cross-leg,
-/// OR-spanning, untagged, declined, type-declined, unattachable conditions) goes to the
-/// outer WHERE, each parenthesized; nothing is omitted. The fan-out loop must run before the
-/// residual is assembled, since the type screen can hand conjuncts back.
+/// Each leg receives the leg-local conjuncts [`screen_leg_filter`] renders; every other conjunct,
+/// declined ones included, goes to the outer WHERE, so the fan-out loop runs first.
 ///
 /// `Err` (hard, no native re-plan) only when the wrapper cannot be built, including a
 /// residual neither dialect renders: a predicate applicable nowhere must fail the query.
@@ -372,44 +363,36 @@ pub(in super::super) fn build_n_scan_join_sql(
 
     let pushdown_req = pushdown.json();
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let leg_eligible = where_filter.and_then(renderable_only);
 
     // All conditions go in as one array so `referenced_leg_columns` keeps any side column a
     // condition references.
     let all_conditions = Json::Array(join.conditions.clone());
     let mut fan_outs = Vec::with_capacity(sides.len());
-    let mut type_declined: Option<Json> = None;
+    let mut declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
         let narrowed =
             referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
-        let (side_filter, side_declined) = match leg_eligible
-            .as_ref()
-            .and_then(|f| leg_local_filter(f, &legs, i))
-        {
-            Some(side_local) => type_screened_leg_filter(&side_local, cols_per_side[i]),
-            None => (None, None),
-        };
+        let (side_filter, side_declined) =
+            match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
+                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i]),
+                None => (None, None),
+            };
         // Disjoint by attribution, so no conjunct is double-applied.
-        type_declined = conjoin_filters(type_declined, side_declined);
+        declined = conjoin_filters(declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(
             side,
             &narrowed,
-            side_filter.as_ref(),
+            side_filter,
             inputs,
             udf_name,
             distribute_udf_name,
         )?);
     }
 
-    // Three disjoint sets that, with the per-side leg filters, partition the request's filter.
+    // With the per-side leg filters, these partition the request's filter.
     let residual = conjoin_filters(
-        conjoin_filters(
-            leg_eligible
-                .as_ref()
-                .and_then(|f| cross_leg_residual_filter(f, &legs)),
-            where_filter.and_then(declined_only),
-        ),
-        type_declined,
+        where_filter.and_then(|f| cross_leg_residual_filter(f, &legs)),
+        declined,
     );
     let filter = match &residual {
         None => None,
@@ -509,13 +492,12 @@ fn scan_storage_for_side(
     )
 }
 
-/// `side_filter` arrives pre-screened and pre-rewritten by the caller: this function cannot
-/// route a decline to the outer wrapper, so a decline swallowed here would be applied
-/// nowhere. `columns` must expose every column any outer clause references.
+/// `filter` is the leg filter [`screen_leg_filter`] rendered. `columns` must expose every
+/// column any outer clause references.
 pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
     columns: &ColumnTypes,
-    side_filter: Option<&Json>,
+    filter: Option<String>,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -523,18 +505,12 @@ pub(super) fn build_side_fan_out_sql(
     let projection = columns.projection();
 
     let shards = shard_side(side, inputs);
-
-    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
-    let filter = side_filter
-        .map(strip_table_alias)
-        .and_then(|f| render_df_filter_safe(&f));
     let spec = join_fan_out_scan_spec(side, projection_items(&projection), filter, None, inputs)?;
     Ok(build_scan_driving_sql(
         &spec,
         &shards,
         &projection,
         None,
-        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,
@@ -658,7 +634,6 @@ pub(in super::super) fn build_broadcast_join_sql(
         &shards,
         &rendered.projection,
         placement.merge_cap,
-        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,
@@ -697,35 +672,30 @@ fn qualified_join_group_by(
         Some(keys) => keys,
         None => return Ok(None),
     };
-    let mut parts = Vec::with_capacity(keys.len());
-    for key in keys {
-        parts.push(
-            render_expression_qualified(key, legs)
-                .map_err(unattributable_decline)?
-                .ok_or_else(|| {
-                    join_render_decline(
-                        "a GROUP BY key could not be rendered for the qualified N-scan join",
-                    )
-                })?,
-        );
-    }
+    let parts = keys
+        .iter()
+        .map(|key| render_required_clause(key, legs, "a GROUP BY key"))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(parts.join(", ")))
 }
 
 /// Unrenderable is a hard error: dropping it would return wrong rows.
 fn qualified_join_having(pushdown_req: &Json, legs: &JoinLegs) -> Result<Option<String>, UdfError> {
-    match pushdown_req.get("having").filter(|h| !h.is_null()) {
-        Some(having) => Ok(Some(
-            render_expression_qualified(having, legs)
-                .map_err(unattributable_decline)?
-                .ok_or_else(|| {
-                    join_render_decline(
-                        "HAVING could not be rendered for the qualified N-scan join",
-                    )
-                })?,
-        )),
-        None => Ok(None),
-    }
+    pushdown_req
+        .get("having")
+        .filter(|h| !h.is_null())
+        .map(|having| render_required_clause(having, legs, "HAVING"))
+        .transpose()
+}
+
+/// The error names the render's reason, such as an invalid CAST `dataType`.
+fn render_required_clause(expr: &Json, legs: &JoinLegs, clause: &str) -> Result<String, UdfError> {
+    let qualified = legs.qualify(expr).map_err(unattributable_decline)?;
+    render_expression_exasol(&qualified).map_err(|err| {
+        join_render_decline(&format!(
+            "{clause} could not be rendered for the qualified N-scan join ({err})"
+        ))
+    })
 }
 
 /// An unrenderable element (or missing sort flags) is a hard error: Exasol does not
@@ -837,7 +807,6 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         shards,
         &fan_out.columns.projection(),
         None,
-        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,

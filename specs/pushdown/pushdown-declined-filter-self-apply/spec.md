@@ -5,23 +5,23 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 ## Background
 
 * Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
-* Three sites render the DataFusion-bound WHERE filter, and each returns `Option<String>`: the single-table path (`handle_pushdown`), the broadcast-join path (`render_broadcast_join`) and the N-scan per-leg path (`build_side_fan_out_sql`). `None` covers three outcomes: no filter, a filter that renders trivially true, and a declined filter. Only the declined filter must not be omitted.
-* A filter declines when an adapter type-rewrite guard returns `None` or when the DataFusion-dialect renderer cannot express a node.
-* `render_expression_safe` does not suppress a trivially-true result, so it returns `None` only for a declined filter. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
-* Self-application renders the original request filter tree, not the type-rewritten tree. Exasol applies its own implicit coercions, including non-string-to-VARCHAR, which DataFusion refuses.
+* Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers three outcomes: no filter, a filter that renders trivially true, and a declined filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
+* A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
+* `render_scan_filter` returns `Err` only for a declined filter and `Ok(None)` for a trivially-true one. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
+* Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
 * A predicate unrenderable under both the DataFusion and the Exasol dialect is applied nowhere. The adapter returns a clean error, the same refusal as `pushdown/pushdown-planning-selectlist-expressions`. A self-applied predicate whose Exasol render is trivially true emits no clause and is not an error, so the adapter decides the error from a non-suppressing render.
 * `handle_pushdown` computes the decline classification once per path and passes it down.
 * The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
 * On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row.
 * Iceberg file pruning keeps every conjunct, renderable or not, at both pruning inputs: the single-table scan-resolution tree and each join side's side-local predicate. Pruning only removes files that cannot match.
-* The N-scan partition runs the type screen per side and per conjunct after attribution, because it needs the owning side's column metadata. `pushdown-joins/pushdown-planning-join-fallback` owns the leg-eligibility rule.
+* The N-scan partition screens per side and per conjunct after attribution, because it needs the owning side's column metadata. `pushdown-joins/pushdown-planning-join-fallback` owns the leg-eligibility rule.
 
 ## Scenarios
 
 ### Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
 
 * *GIVEN* a single-table `pushdown` request carrying a non-null `filter` whose capability the adapter advertises, for example `WHERE SECOND(c_ts, 3) > 1`, delegated because `FN_SECOND` is advertised
-* *AND* the DataFusion-bound render of that filter declines, either because a type-rewrite guard returned `None` or because the DataFusion dialect cannot express a node in the tree
+* *AND* the DataFusion-bound render of that filter declines
 * *WHEN* the adapter builds the pushdown SQL
 * *THEN* the adapter SHALL route the request to the qualified single-table wrapper and render the ORIGINAL request filter tree as that wrapper's own `WHERE`, table-qualified against the wrapper's single subquery alias
 * *AND* the per-shard scan spec SHALL carry NO `filter`, so the predicate is applied exactly once
@@ -65,28 +65,24 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 ### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 
 * *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two legs, an equi-condition, no Exasol postprocessing, a byte size at or below the broadcast threshold
-* *AND* the request carries a non-null `filter` whose DataFusion-bound render declines, either because a type-rewrite guard returned `None` when run against the two legs' column metadata keyed by (relation alias, column) or because the DataFusion dialect cannot express a node in the tree
+* *AND* the request carries a non-null `filter` whose DataFusion-bound render declines against the two legs' column metadata keyed by (relation alias, column)
 * *WHEN* the adapter renders the join pushdown
 * *THEN* the adapter SHALL decline the broadcast plan and fall through to the unified unaccelerated N-scan fallback, which applies the predicate itself, honouring the recorded broadcast contract that a filter the translator cannot render is served by the fallback
 * *AND* the adapter MUST NOT emit a broadcast plan whose scan spec carries no filter, because the broadcast SQL has no outer `WHERE` in which the predicate could be applied
 * *AND* the decline SHALL be a clean `Ok(None)`-shaped fall-through, NOT an error, matching the unrenderable-condition and widened-projection declines already on that path
-* *AND* both trigger classes SHALL reach this ONE outcome, so the adapter SHALL NOT grow a second broadcast-decline route for a type decline, REPLACING the recorded "whose DataFusion-bound render declines", which named only the dialect trigger because the broadcast site ran no type screen
-* *AND* a filter the type-rewrite pipeline REWRITES rather than declines SHALL NOT trigger this decline, and SHALL keep the broadcast plan with the REWRITTEN tree carried in the common spec
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join
 
 ### Scenario: An N-scan side-local conjunct whose DataFusion render declines becomes a residual conjunct
 
-* *GIVEN* an N-scan unaccelerated join over N ≥ 2 involved tables whose WHERE filter carries a top-level conjunct that references only ONE table and whose DataFusion-bound render declines, either because the DataFusion dialect cannot express a node in it or because a type-rewrite guard returned `None` when run against THAT SIDE's own column metadata
+* *GIVEN* an N-scan unaccelerated join over N ≥ 2 involved tables whose WHERE filter carries a top-level conjunct that references only ONE table and whose DataFusion-bound render declines against THAT SIDE's own column metadata
 * *WHEN* the adapter partitions the filter's top-level conjuncts between the per-leg fan-outs and the outer wrapper's `WHERE`
 * *THEN* that conjunct SHALL be classified as RESIDUAL and rendered into the outer wrapper's `WHERE` table-qualified, NOT pushed into its side's fan-out leg
-* *AND* the partition SHALL remain total and disjoint: a conjunct is pushed into a leg if and only if it is side-local to exactly one table AND the type-rewrite pipeline run against that side's own column metadata accepts it AND the DataFusion dialect can render that pipeline's REWRITTEN form of it; every other conjunct is residual, so no conjunct is dropped and none is applied twice, REPLACING the recorded two-condition rule "side-local to exactly one table AND the DataFusion dialect can render it", whose purely syntactic second condition admitted a conjunct DataFusion cannot type-check
-* *AND* the renderability condition SHALL be evaluated on the REWRITTEN conjunct, because that is the tree the leg renders; a conjunct the pipeline ACCEPTS but whose REWRITTEN form is unrenderable SHALL become RESIDUAL in RAW form and MUST NOT fall out of both halves, which would apply it nowhere and return extra rows with no error, the same defect #279 found at the broadcast site, which `classify_where_filter`'s `(Some(raw), Some(tree)) if !datafusion_renderable(tree)` arm already prevents there
-* *AND* the type screen SHALL run PER SIDE and PER CONJUNCT AFTER attribution, because two N-scan sides MAY declare the same column name with different Exasol types and only the owning side's metadata resolves it correctly
-* *AND* a side-local conjunct that DOES render and IS type-accepted SHALL still be pushed into its leg exactly as before, so per-leg row-group pruning and row filtering are unchanged for every conjunct the adapter can push
-* *AND* the filter each leg receives SHALL be pre-screened by that partition as type-accepted AND, in its REWRITTEN form, DataFusion-renderable, and SHALL BE that REWRITTEN tree, so the leg's own render cannot decline
-* *AND* if a side's re-formed accepted-conjunct tree does not itself survive the pipeline, OR survives but is not DataFusion-renderable, that side's ENTIRE side-local set SHALL become residual, so no conjunct is ever applied nowhere
+* *AND* the partition SHALL remain total and disjoint: a conjunct is pushed into a leg if and only if it is side-local to exactly one table AND the scan translator renders it against that side's own column metadata; every other conjunct is residual, so no conjunct is dropped and none is applied twice
+* *AND* the screen SHALL run PER SIDE and PER CONJUNCT AFTER attribution, because two N-scan sides MAY declare the same column name with different Exasol types and only the owning side's metadata resolves it correctly
+* *AND* a side-local conjunct the scan translator renders SHALL still be pushed into its leg exactly as before, so per-leg row-group pruning and row filtering are unchanged for every conjunct the adapter can push
+* *AND* each side-local conjunct SHALL be rendered exactly once, against its side's column types, and the filter each leg receives SHALL be the conjunction of the accepted conjuncts' rendered SQL, so no second render can decline it
 * *AND* the side-local predicate each side forwards to Iceberg manifest pruning SHALL still carry the declined conjunct in RAW form, because the screen governs only what a leg renders and pruning only ever removes files that provably cannot match
-* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, which is renderable by construction for a type decline because Exasol applies the implicit non-string-to-VARCHAR coercion DataFusion refuses
+* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, so Exasol applies its own conversions with the session's settings
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join
 
 ### Scenario: A predicate unrenderable under both dialects returns a clean error

@@ -340,12 +340,12 @@ fn cast_to_timestamp_with_local_time_zone_matches_native() {
     } else {
         "TIMESTAMP WITH LOCAL TIME ZONE"
     };
-    let query = format!("SELECT ID, CAST(TS AS {target}) FROM {{}} ORDER BY ID");
+    let query = format!("SELECT ID, CAST(TS AS {target}) FROM {{T}} ORDER BY ID");
     let table = qualified_probe();
 
     assert_queries_match_native_copy(&mut conn, &table, "TS", &[query.as_str()]);
 
-    let projection_sql = query.replace("{}", &table);
+    let projection_sql = query.replace("{T}", &table);
     assert_pushed_to_scan_udf(&mut conn, &projection_sql, "the TSLTZ cast projection");
     let pushed = isolated_pushdown_statement(&mut conn, &projection_sql);
     let emits = emits_clause(&pushed);

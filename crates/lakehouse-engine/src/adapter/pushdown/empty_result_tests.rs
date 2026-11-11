@@ -56,77 +56,16 @@ fn empty_pushdown_sql_repeated_literals_unique_aliases() {
 }
 
 #[test]
-fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
-    let select_items = vec![
-        GroupedSelectItem::GroupKey {
-            group_key_slot: 0,
-            select_index: 0,
-        },
-        GroupedSelectItem::Aggregate {
-            plan_slot: 0,
-            select_index: 1,
-        },
-    ];
-    let group_key_types = vec![ExasolType::decimal(20, 0)];
-    let aggregate_types = vec![ExasolType::decimal(18, 0)];
-    let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
-    let sql = resp["sql"].as_str().unwrap();
-    assert!(
-        sql.contains("WHERE 1=0"),
-        "grouped empty is zero rows: {sql}"
-    );
-    assert!(
-        sql.contains("CAST(NULL AS DECIMAL(20,0))"),
-        "group-key column typed from group_key_types: {sql}"
-    );
-    assert!(
-        sql.contains("CAST(NULL AS DECIMAL(18,0))"),
-        "aggregate column typed from aggregate_types: {sql}"
-    );
-    let select_clause = sql
-        .strip_prefix("SELECT ")
-        .and_then(|s| s.split(" FROM").next())
-        .unwrap();
+fn empty_select_list_casts_a_null_to_each_declared_type_in_order() {
+    let resp = empty_select_list_typed_sql(&[
+        ExasolType::decimal(20, 0),
+        ExasolType::Boolean,
+        ExasolType::decimal(18, 0),
+    ]);
     assert_eq!(
-        select_clause.matches("CAST(NULL AS").count(),
-        2,
-        "one output column per grouped select item: {sql}"
-    );
-}
-
-#[test]
-fn empty_grouped_sql_includes_constant_projection_column() {
-    let select_items = vec![
-        GroupedSelectItem::GroupKey {
-            group_key_slot: 0,
-            select_index: 0,
-        },
-        GroupedSelectItem::Constant {
-            select_index: 1,
-            projection: "CAST(NULL AS BOOLEAN)".to_string(),
-        },
-        GroupedSelectItem::Aggregate {
-            plan_slot: 0,
-            select_index: 2,
-        },
-    ];
-    let group_key_types = vec![ExasolType::decimal(20, 0)];
-    let aggregate_types = vec![ExasolType::decimal(18, 0)];
-    let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
-    let sql = resp["sql"].as_str().unwrap();
-    let select_clause = sql
-        .strip_prefix("SELECT ")
-        .and_then(|s| s.split(" FROM").next())
-        .unwrap();
-    let columns: Vec<&str> = select_clause.split(", ").collect();
-    assert_eq!(
-        columns,
-        vec![
-            "CAST(NULL AS DECIMAL(20,0))",
-            "CAST(NULL AS BOOLEAN)",
-            "CAST(NULL AS DECIMAL(18,0))",
-        ],
-        "constant column is reused verbatim in select-list order: {sql}"
+        resp["sql"],
+        "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS BOOLEAN), CAST(NULL AS DECIMAL(18,0)) \
+         FROM DUAL WHERE 1=0"
     );
 }
 
@@ -145,7 +84,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         &grouped,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -173,7 +112,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
             &single,
             &projected_columns(&proj, &proj_types),
             false,
-            &column_types(col_types),
+            ScanTranslator::new(&column_types(col_types)),
             &relation(col_types),
         )
         .unwrap()["sql"]
@@ -183,7 +122,8 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         assert_eq!(
             sql,
             format!(
-                "SELECT SUM(\"{column}\") FROM (SELECT CAST(NULL AS {ty}) AS \"{column}\" \
+                "SELECT CAST(SUM(\"{column}\") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS {ty}) \
+                 AS \"{column}\" \
                  FROM DUAL WHERE 1=0) AS \"LHS_T0\""
             )
         );
@@ -203,7 +143,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         &request,
         &projected_columns(&[], &[]),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -212,7 +152,8 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         .to_string();
     assert_eq!(
         sql,
-        "SELECT 'X', COUNT(*) FROM (SELECT CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
+        "SELECT CAST('X' AS VARCHAR(2000000)), CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT \
+         CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
          WHERE 1=0) AS \"LHS_T0\" HAVING (COUNT(*) = 0)"
     );
 }
@@ -236,7 +177,7 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
         &grouped_non_numeric,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -271,7 +212,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
         &grouped_having,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -301,7 +242,10 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     ];
     assert!(
         matches!(
-            classify_request_shape(&pushdown_req, &column_types(&col_types)),
+            classify_request_shape(
+                &pushdown_req,
+                ScanTranslator::new(&column_types(&col_types))
+            ),
             RequestShape::RowScan
         ),
         "the fixture must classify as RowScan for this test to exercise its arm"
@@ -314,7 +258,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         true,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .expect("the widened empty row-scan result must build")["sql"]
@@ -331,7 +275,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .expect("the non-widened empty row-scan result must build")["sql"]
