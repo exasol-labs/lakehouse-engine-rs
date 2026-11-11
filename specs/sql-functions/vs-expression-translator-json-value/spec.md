@@ -23,15 +23,29 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 
 * *GIVEN* a `JSON_VALUE` call that runs in the scan
 * *WHEN* the scan evaluates it on a document
-* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON, at any nesting depth, SHALL take the `ON ERROR` behavior, except that a lone surrogate escape outside the selected item SHALL NOT
-* *AND* the path SHALL run in lax mode over item sequences: a member step selects every member of that name, also duplicates, in an object or in the objects of an array, and an index step treats a non-array as a one-item array
+* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON SHALL take the `ON ERROR` behavior
+* *AND* the path SHALL run in lax mode over item sequences: a member step selects the member of that name in an object or in each object of an array, and an index step treats a non-array as a one-item array
 * *AND* no item SHALL take the `ON EMPTY` behavior, and several items or an object or array item SHALL take the `ON ERROR` behavior
+
+### Scenario: JSON_VALUE in the scan differs from Exasol on number text, duplicate keys, and deep nesting
+
+* *GIVEN* a `JSON_VALUE` call that runs in the scan
+* *WHEN* the selected item is a number other than an integer in the 64-bit range, the path meets a duplicate key, or the document nests deeper than 128 levels
+* *THEN* a number SHALL yield the shortest text that reads back as the same DOUBLE, such as `1.5` for `1.50` and `100.0` for `1e2`, where native Exasol yields the number's source text
+* *AND* a duplicate key SHALL select the last member of that name, where native Exasol takes the `ON ERROR` behavior
+* *AND* a document nested deeper than 128 levels SHALL take the `ON ERROR` behavior, where native Exasol reads it
+
+### Scenario: Several JSON_VALUE calls on one document parse it once per row
+
+* *GIVEN* several `JSON_VALUE` calls that run in the scan over the same document
+* *WHEN* they appear together in the select list, the WHERE clause, or the GROUP BY keys and aggregate arguments
+* *THEN* the scan SHALL parse each row's document once for them
 
 ### Scenario: JSON_VALUE in the scan converts the item as Exasol does
 
 * *GIVEN* a `JSON_VALUE` call that runs in the scan and a path that selects one scalar item
 * *WHEN* the scan converts the item to the `RETURNING` type
-* *THEN* a JSON null SHALL yield NULL, and the item's text SHALL be a string's unescaped text, a number's source text, or `true` or `false`
+* *THEN* a JSON null SHALL yield NULL, and the item's text SHALL be a string's unescaped text, a number's text, or `true` or `false`
 * *AND* for `VARCHAR(n)`, an empty text SHALL yield NULL, and a text longer than `n` characters SHALL take the `ON ERROR` behavior
 * *AND* for `BOOLEAN`, the text SHALL convert as Exasol casts text to BOOLEAN: spaces trimmed, case ignored, `TRUE`, `T`, `YES`, `Y`, and the number 1 true, `FALSE`, `F`, `NO`, `N`, and the number 0 false, and any other text SHALL take the `ON ERROR` behavior
 

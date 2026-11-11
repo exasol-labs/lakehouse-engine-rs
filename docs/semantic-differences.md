@@ -117,10 +117,19 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 
 A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
 
-## JSON_VALUE on a document with a lone surrogate escape
+## JSON_VALUE on numbers, duplicate keys, and deep nesting
 
-Native Exasol rejects a document that contains a lone UTF-16 surrogate escape such as `"\ud800"`, and `JSON_VALUE` takes its `ON ERROR` behavior. The scan rejects such an escape only in the item the path selects, and returns the selected value otherwise.
+The scan parses each JSON document once into a tree, which keeps no number's source text and one member per key. Three results differ from native Exasol:
+
+- A number other than an integer in the 64-bit range comes back as the shortest text that reads back as the same DOUBLE. Native Exasol returns the number's source text.
+- A duplicate key selects its last member. Native Exasol takes the `ON ERROR` behavior when the path meets a duplicate key.
+- A document nested deeper than 128 levels takes the `ON ERROR` behavior. Native Exasol reads it.
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
-| `JSON_VALUE('{"a":"\ud800","b":1}', '$.b')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"n":1.50}', '$.n')` | `'1.5'` | `'1.50'` |
+| `JSON_VALUE('{"n":1e2}', '$.n')` | `'100.0'` | `'1e2'` |
+| `JSON_VALUE('{"n":12345678901234567890123}', '$.n')` | `'1.2345678901234568e+22'` | `'12345678901234567890123'` |
+| `JSON_VALUE('{"n":1,"n":2}', '$.n')` | `'2'` | `NULL` (`ON ERROR`) |
+
+Integers in the 64-bit range and decimals in their shortest form, such as `42` or `1.5`, come back as native Exasol returns them. A `RETURNING DECIMAL` or `DOUBLE` call runs in Exasol SQL and is not affected ([Capabilities](capabilities.md#scalar-functions)).
