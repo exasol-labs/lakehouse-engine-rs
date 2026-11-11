@@ -1,3 +1,4 @@
+use super::super::support::ColumnTypes;
 use super::super::test_support::*;
 use super::*;
 use crate::types::exasol_type::ExasolType;
@@ -21,7 +22,7 @@ fn grouped_numeric_aggregate_classifies_as_grouped() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::Grouped { having: None, .. }),
         "numeric grouped aggregate must decompose: {shape:?}"
@@ -38,7 +39,7 @@ fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "non-numeric grouped aggregate with no HAVING routes to the wrapper: {shape:?}"
@@ -56,7 +57,7 @@ fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "non-numeric grouped aggregate with a HAVING routes to the wrapper: {shape:?}"
@@ -78,7 +79,7 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "an unmatched HAVING aggregate must fall through to the wrapper, not Grouped or Err: {shape:?}"
@@ -103,7 +104,7 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "a partially-matching AND junction must fall through to the wrapper as a whole: {shape:?}"
@@ -128,7 +129,7 @@ fn grouped_having_fully_matched_stays_grouped() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     match shape {
         RequestShape::Grouped {
             having: Some(sql), ..
@@ -161,7 +162,7 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "a DISTINCT aggregate in the HAVING must fall through to the wrapper: {shape:?}"
@@ -181,13 +182,14 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
         .column(col("REGION"))
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, untyped_scan())
             .expect("a group-key-only select list still detects as grouped")
+            .aggregates
             .plans
             .is_empty(),
         "the group-key-only shape must reach the classifier with an EMPTY plan list"
     );
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "an aggregate sort key resolvable against no plan must route to the wrapper, not Err: {shape:?}"
@@ -207,14 +209,15 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
         .count_star()
         .build_pushdown();
     assert_eq!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, untyped_scan())
             .expect("grouped aggregate")
+            .aggregates
             .plans
             .len(),
         1,
         "this shape must reach the classifier with a NON-empty plan list"
     );
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "a sort key matching none of the non-empty plans must route to the wrapper: {shape:?}"
@@ -236,10 +239,10 @@ fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    match classify_request_shape(&req, &col_types()) {
+    match classify_request_shape(&req, ScanTranslator::new(&col_types())) {
         RequestShape::Grouped { order_by, .. } => assert_eq!(
             order_by.as_deref(),
-            Some("1 ASC NULLS LAST"),
+            Some(r#""GK_0" ASC NULLS LAST"#),
             "the classifier must carry the resolved merge ORDER BY"
         ),
         other => panic!("expected Grouped, got {other:?}"),
@@ -254,11 +257,12 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     match shape {
         RequestShape::SingleGroupAgg {
             items,
             having: None,
+            ..
         } => assert_eq!(items.len(), 1),
         other => panic!("expected SingleGroupAgg, got {other:?}"),
     }
@@ -272,7 +276,7 @@ fn single_group_count_distinct_classifies_as_single_group() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::SingleGroupAgg { .. }),
         "a single-group COUNT(DISTINCT) is a single-group shape: {shape:?}"
@@ -291,7 +295,7 @@ fn plain_projection_classifies_as_row_scan() {
     .column(col("REGION"))
     .column(col("AMOUNT"))
     .build_pushdown();
-    let shape = classify_request_shape(&req, &col_types());
+    let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
     assert!(
         matches!(shape, RequestShape::RowScan),
         "a plain projection is a row scan: {shape:?}"
@@ -324,7 +328,7 @@ fn single_group_having_over_a_split_aggregate_renders_over_the_merge() {
         serde_json::json!([count_star()]),
         Some(count_greater_than(100)),
     );
-    match classify_request_shape(&req, &col_types()) {
+    match classify_request_shape(&req, ScanTranslator::new(&col_types())) {
         RequestShape::SingleGroupAgg {
             having: Some(having),
             ..
@@ -356,7 +360,7 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
             Some(predicate_equal(num_lit(1), num_lit(1))),
         ),
     ] {
-        let shape = classify_request_shape(&req, &col_types());
+        let shape = classify_request_shape(&req, ScanTranslator::new(&col_types()));
         assert!(
             matches!(shape, RequestShape::SingleGroupWrapper),
             "{}: {shape:?}",

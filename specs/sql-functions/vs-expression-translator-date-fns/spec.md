@@ -4,7 +4,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-* The date functions are arms of the same recursive walker behind the six public entry points of `crates/vs-expression`: `render_expression`, `render_expression_safe` and `render_df_filter_safe` for DataFusion, and `render_expression_exasol`, `render_expression_exasol_safe` and `render_df_filter_exasol_safe` for Exasol.
+* The date functions are arms of the same recursive walker behind the public entry points of `crates/vs-expression`: `render_scan_expression` and `render_scan_filter` for DataFusion, and `render_expression_exasol`, `render_expression_exasol_safe` and `render_df_filter_exasol_safe` for Exasol.
 * The Exasol dialect renders wrapper SQL text that Exasol's own engine parses. It renders the original name, argument order and argument count of every date or time function, because Exasol's compiler emitted them. Each such name is declared `VerbatimCall` in the crate's declaration of translated names (see `sql-comprehension/vs-expression-translator`), and the declaration's own branch renders it ahead of every per-name arm. `EXTRACT` is the exception: it is the node type `function_scalar_extract` and branches on dialect inside its own arm. Only the DataFusion dialect uses the `date_part` and epoch-arithmetic translations. `DATE_PART` is not an Exasol function (`function or script DATE_PART not found`, SQL code 42000), so a `date_part` rendering in Exasol-dialect wrapper SQL fails to compile.
 * The now-family `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP` and `SYSTIMESTAMP` is translated in neither dialect, and `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE` and `FN_SYSTIMESTAMP` are not advertised: see `pushdown-capabilities/pushdown-planning-capability-extensions`. Exasol reads the instant in the session time zone (`CURRENT_TIMESTAMP`) or the database time zone (`SYSTIMESTAMP`), and `CURRENT_DATE` and `SYSDATE` are `TO_DATE` of each. The scan UDF receives neither zone and has no statement anchor, so it can only read its container clock in UTC, once per shard. Exasol's now-family is statement-constant. Exasol never delegates an unadvertised capability, so withdrawal hands the four names back to the engine that owns the clock.
 * Exasol sends EXTRACT as node type `function_scalar_extract` with the field in a `toExtract` property. The DataFusion dialect renders `date_part('<FIELD>', expr)`, because the DataFusion dependency's default feature set has no EXTRACT planner. The Exasol dialect renders `EXTRACT(<FIELD> FROM expr)`.
@@ -65,7 +65,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *GIVEN* a VS expression node of type `function_scalar` named `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, or `SYSTIMESTAMP`
 * *WHEN* `render_expression` or `render_expression_exasol` processes the node in raising mode
 * *THEN* the translator SHALL return an error naming the unsupported function, identically in both dialects
-* *AND* `render_expression_safe` and `render_expression_exasol_safe` SHALL each return `None` for the same node without panicking
+* *AND* `render_scan_expression` SHALL return an error and `render_expression_exasol_safe` SHALL return `None` for the same node, neither panicking
 * *AND* the four names MUST NOT appear in the crate's declaration of translated `function_scalar` names, so the gate declines them before any per-name arm is reached and no per-name arm for them remains reachable
 * *AND* `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, and `FN_SYSTIMESTAMP` MUST NOT be advertised, so Exasol never pushes a now-family node and evaluates its own clock instead (see `pushdown-capabilities/pushdown-planning-capability-extensions`)
 * *AND* the reason SHALL be the scan's missing clock context, not a rendering defect: the scan UDF receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE`, holds no statement anchor, and reads its container clock in UTC once per shard, so no rendering of these four names on the scan path can match Exasol
@@ -74,7 +74,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 * *GIVEN* a VS expression node of type `function_scalar` named `TO_DATE` or `TO_TIMESTAMP` with a string source argument and an optional format argument
 * *WHEN* `render_expression` processes the node
-* *THEN* with one argument `TO_DATE` SHALL render as `to_date(<source_sql>)` and `TO_TIMESTAMP` SHALL render as `to_timestamp(<source_sql>)`
+* *THEN* with one argument the DataFusion dialect SHALL decline the node, because Exasol parses the source by the session's `NLS_DATE_FORMAT` or `NLS_TIMESTAMP_FORMAT` (`pushdown-types/pushdown-planning-scan-text-conversion`)
 * *AND* with a format argument the DataFusion dialect SHALL translate the format or decline the node, as `sql-functions/vs-expression-translator-datetime-format` specifies, and MUST NOT forward an Exasol format model to a DataFusion parser
 * *AND* `render_expression_exasol` SHALL render `TO_DATE(<args>)` / `TO_TIMESTAMP(<args>)`, forwarding the format argument unchanged, so Exasol interprets the format model it sent
 

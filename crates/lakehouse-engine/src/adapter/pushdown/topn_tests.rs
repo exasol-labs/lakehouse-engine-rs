@@ -1,11 +1,12 @@
-use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
+use super::super::single_group_agg::single_group_merge_select;
+use super::super::support::ScanTranslator;
 use super::super::support::projection_items;
 use super::super::support::{
     AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
-    classify_where_filter, involved_columns, order_by_present, project_columns, shard_count,
+    involved_columns, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
-use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
+use super::super::{detect_aggregates, single_group_plans};
 use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
@@ -15,35 +16,37 @@ use crate::types::exasol_type::ExasolType;
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
     let pushdown = parsed_pushdown(request);
     let pushdown_req = pushdown.json();
-    let (mut projection, widened) =
-        project_columns(&pushdown, &first_table_column_types(request)).unwrap();
+    let (mut projection, widened) = project_columns(
+        &pushdown,
+        ScanTranslator::new(&first_table_column_types(request)),
+    )
+    .unwrap();
     let limit = extract_limit(pushdown_req);
     let has_order_by = order_by_present(pushdown_req);
     let col_types = involved_columns(request, |tables| tables.first())
         .unwrap()
         .types;
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
+    let (filter, declined_filter) = ScanTranslator::new(&column_types(&col_types))
+        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
     assert!(
         declined_filter.is_none(),
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
-    let items = detect_aggregates(&pushdown)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types)));
-    let merge_inputs = items.as_deref().map(|it| {
-        let plans = ordinary_plans(it);
-        let plan_types = single_group_plan_types(pushdown.select_types(), it);
-        let merge_select =
-            single_group_merge_select(it, &plans, &plan_types, &column_types(&col_types))
-                .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
-        AggregateMergeInputs::new(plan_types, merge_select, limit)
+    let scan_columns = column_types(&col_types);
+    let scan = ScanTranslator::new(&scan_columns);
+    let plans = detect_aggregates(&pushdown, scan).and_then(|items| {
+        let plans = single_group_plans(&items, pushdown.select_types(), scan)?;
+        Some((items, plans))
+    });
+    let merge_inputs = plans.as_ref().map(|(items, plans)| {
+        let merge_select = single_group_merge_select(items, plans, pushdown.select_types(), scan)
+            .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
+        AggregateMergeInputs::new(plans.emits.clone(), merge_select, limit)
             .expect("one merge item per select-list item is never empty")
     });
-    let aggregates = items.map(|it| ordinary_plans(&it));
+    let aggregates = plans.map(|(_, plans)| plans.plans);
     // An aggregate select list always widens (aggregates stay off the projection), and
     // production guards widening only on the `RowScan` arm.
     assert!(
@@ -103,7 +106,6 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         &shards,
         &projection,
         effective_limit,
-        &column_types(&col_types),
         merge_inputs.as_ref(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

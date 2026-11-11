@@ -1,5 +1,5 @@
-use super::grouped_agg::{is_literal_selectlist_item, partial_emits_items};
-use super::scalar_over_agg::{col_type_for, with_stat_grand_means};
+use super::grouped_agg::is_literal_selectlist_item;
+use super::scalar_over_agg::with_stat_grand_means;
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
@@ -8,12 +8,15 @@ use crate::scan::spec::{
     AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec,
     ScanStorage, StorageBackend, render_order_by_clause,
 };
-use crate::types::exasol_type::{ExasolType, exasol_type_from_json, exasol_type_to_json};
+use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
 use crate::types::mapping::timestamp_literal_digits;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{ColumnNode, render_df_filter_safe, render_expression_safe, walk_column_nodes};
+use vs_expression::{
+    ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
+    render_scan_expression, render_scan_filter, walk_column_nodes,
+};
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
 
@@ -35,7 +38,8 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 /// `request_limit` is the raw request limit, rendered as a trailing `LIMIT n` on the
 /// one-row merge (a no-op for `n >= 1`, correct for `n = 0`).
 pub struct AggregateMergeInputs {
-    plan_types: Vec<ExasolType>,
+    /// [`TypedPlans::emits`](super::TypedPlans).
+    partial_emits: Vec<String>,
     merge_select: Vec<String>,
     having: Option<String>,
     request_limit: Option<u64>,
@@ -45,7 +49,7 @@ impl AggregateMergeInputs {
     /// `None` for an empty `merge_select`: a narrower select list would fail Exasol's
     /// positional validation, so the caller must use its fallback.
     pub fn new(
-        plan_types: Vec<ExasolType>,
+        partial_emits: Vec<String>,
         merge_select: Vec<String>,
         request_limit: Option<u64>,
     ) -> Option<Self> {
@@ -53,7 +57,7 @@ impl AggregateMergeInputs {
             return None;
         }
         Some(Self {
-            plan_types,
+            partial_emits,
             merge_select,
             having: None,
             request_limit,
@@ -74,7 +78,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     shards: &[Vec<E>],
     projection: &[ProjectedColumn],
     limit: Option<u64>,
-    col_types: &ColumnTypes,
     merge_inputs: Option<&AggregateMergeInputs>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -91,7 +94,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             spec_template,
             shards,
             aggregates,
-            col_types,
             inputs,
             udf_name,
             distribute_udf_name,
@@ -172,13 +174,11 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     aggregates: &[AggregatePlan],
-    col_types: &ColumnTypes,
     inputs: &AggregateMergeInputs,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    let emits_items = partial_emits_items(aggregates, col_types, &inputs.plan_types);
-    let emits = emits_items.join(", ");
+    let emits = inputs.partial_emits.join(", ");
     let merge_select = inputs.merge_select.join(", ");
 
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
@@ -195,7 +195,8 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 }
 
 /// `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`. LIMIT goes only on the outer
-/// wrapper: inside the fan-out it would truncate a shard's distinct set.
+/// wrapper: inside the fan-out it would truncate a shard's distinct set. `None` when the
+/// column's type is unknown.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
@@ -205,7 +206,7 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Option<String> {
     let [SingleGroupItem::Distinct(dc)] = items else {
         unreachable!(
             "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
@@ -218,12 +219,12 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
         col_types,
         udf_name,
         distribute_udf_name,
-    );
+    )?;
     let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
-    sql
+    Some(sql)
 }
 
 /// `"V"` carries the column's raw values, declared with its exact Exasol type, so
@@ -235,7 +236,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Option<String> {
     let Some(col) = dc.column.as_deref() else {
         unreachable!(
             "build_distinct_fan_out is dispatched only for a lone bare-column \
@@ -243,7 +244,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
              single-table wrapper instead"
         )
     };
-    let value_type = col_type_for(Some(col), None, col_types, None);
+    let value_type = col_types.get(&ColumnRef::from(col))?.exa_type;
     let proj_item = ProjectionItem::from(col);
     let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
@@ -265,7 +266,13 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         files: base_spec.files.clone(),
     };
     let emits = format!(r#""V" {value_type}"#);
-    build_fan_out_inner(&spec, shards, &emits, udf_name, distribute_udf_name)
+    Some(build_fan_out_inner(
+        &spec,
+        shards,
+        &emits,
+        udf_name,
+        distribute_udf_name,
+    ))
 }
 
 /// A nested distributor does the `GROUP BY shard_key` fan-out, wrapped by an outer
@@ -364,63 +371,23 @@ pub(super) fn involved_columns<'r>(
     })
 }
 
-/// `false` means the caller must self-apply the predicate in its own SQL, never
-/// omit it: Exasol has no fallback for a delegated capability.
-pub(super) fn datafusion_renderable(expr: &Json) -> bool {
-    render_expression_safe(expr).is_some()
-}
-
-/// Curated deliberately; see [`rewrite_expr_tree`].
-const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
-
-/// Curated deliberately; see [`rewrite_expr_tree`].
-const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
-
-/// Post-order is load-bearing: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`,
-/// so only a check that sees rewritten children reaches nested occurrences, and an
-/// already-coerced inner argument is not re-wrapped.
-///
-/// `f` returning `None` declines the whole tree; the caller must self-apply it.
-///
-/// The child fields are curated rather than walking every map value, so a
-/// `dataType` sub-object or a `name` identifier is never handed to `f`.
-fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<Json> {
+/// Post-order over [`EXPR_ARRAY_FIELDS`] and [`EXPR_SINGLE_FIELDS`], so `f` sees rewritten
+/// children.
+fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Json) -> Json {
     let mut out = node.clone();
     for field in EXPR_ARRAY_FIELDS {
         if let Some(Json::Array(children)) = node.get(field) {
-            let rewritten: Option<Vec<Json>> =
-                children.iter().map(|c| rewrite_expr_tree(c, f)).collect();
-            out[field] = Json::Array(rewritten?);
+            out[field] = Json::Array(children.iter().map(|c| rewrite_expr_tree(c, f)).collect());
         }
     }
     for field in EXPR_SINGLE_FIELDS {
         if let Some(child) = node.get(field)
             && child.is_object()
         {
-            out[field] = rewrite_expr_tree(child, f)?;
+            out[field] = rewrite_expr_tree(child, f);
         }
     }
     f(&out)
-}
-
-/// DataFusion does not implicitly cast a non-string `LIKE` subject to VARCHAR as
-/// Exasol does, and column nodes carry no `dataType`, so this type-aware guard lives
-/// in the adapter, not in `vs-expression` (#207, decision-log [1]).
-///
-/// For a bare-column subject: string types pass, DATE is wrapped as
-/// `CAST(<col> AS VARCHAR)`, anything else or an unresolved name declines the whole
-/// filter (the caller must self-apply it).
-///
-/// The DATE cast matches Exasol only under the default `NLS_DATE_FORMAT`; an altered
-/// session format is a tracked exception (#216, decision-log [8]).
-fn like_subject_type_guard(filter: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    rewrite_expr_tree(
-        filter,
-        &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
-            Some("predicate_like") => guard_like_subject(out, col_types),
-            _ => Some(out.clone()),
-        },
-    )
 }
 
 /// The (relation alias, column) pair a `column` node names.
@@ -564,213 +531,18 @@ impl ColumnTypes {
     }
 }
 
-/// Deliberately does not test the node's `type`: callers treat a non-column node as a
-/// pass-through but an unresolved type as a decline.
+/// The Exasol type of the column `node` names; `None` when it names no column of `col_types`.
 fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
     col_types
         .resolve(node)
         .map(|(_, column_type)| column_type.exa_type)
 }
 
-fn guard_like_subject(like_node: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let Some(subject) = like_node
-        .get("expression")
-        .filter(|subject| ColumnNode::parse(subject).is_some())
-    else {
-        return Some(like_node.clone());
-    };
-
-    match column_exa_type(subject, col_types) {
-        Some(exa_type) if exa_type.is_character() => Some(like_node.clone()),
-        // DataFusion's Date32→Utf8 cast is `YYYY-MM-DD`.
-        Some(ExasolType::Date) => {
-            let mut out = like_node.clone();
-            out["expression"] = wrap_cast_to_varchar(subject);
-            Some(out)
-        }
-        // Other types' string forms diverge between engines, so decline rather than risk
-        // a wrong or hard-failing cast (decision-log [2]).
-        _ => None,
-    }
-}
-
-/// Exasol trims trailing DECIMAL scale zeros when stringifying (`2912.00`→`'2912'`);
-/// DataFusion renders the full declared scale, a silent wrong result (#211).
-///
-/// Rewrites only a bare DECIMAL column that is the direct argument of a string
-/// `CAST` (the whole cast is replaced), `CONCAT`, or `LENGTH`. Any other context,
-/// and a computed argument whose type is unresolvable, is left untouched (a tracked
-/// exception in the spec).
-///
-/// The closure never declines, so the `unwrap_or_else` fallback is unreachable.
-fn rewrite_decimal_stringifications(node: &Json, col_types: &ColumnTypes) -> Json {
-    rewrite_expr_tree(node, &|out: &Json| {
-        let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        Some(match node_type {
-            "function_scalar_cast" => {
-                // An invalid target stays in the tree for `render_cast` to refuse.
-                let target_is_string = out
-                    .get("dataType")
-                    .map(exasol_type_from_json)
-                    .is_some_and(|target| target.is_ok_and(|t| t.is_character()));
-                if target_is_string
-                    && let Some(Json::Array(args)) = out.get("arguments")
-                    && let [arg] = args.as_slice()
-                    && is_bare_decimal_column(arg, col_types)
-                {
-                    // Replace the whole cast; do not re-nest inside it.
-                    return Some(wrap_decimal_to_varchar(arg));
-                }
-                out.clone()
-            }
-            "function_scalar" => {
-                let fn_name = out
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-                let mut out = out.clone();
-                if (fn_name == "CONCAT" || fn_name == "LENGTH")
-                    && let Some(Json::Array(args)) = out.get("arguments")
-                {
-                    let rewritten: Vec<Json> = args
-                        .iter()
-                        .map(|a| {
-                            if is_bare_decimal_column(a, col_types) {
-                                wrap_decimal_to_varchar(a)
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-                    out["arguments"] = Json::Array(rewritten);
-                }
-                out
-            }
-            _ => out.clone(),
-        })
-    })
-    .unwrap_or_else(|| node.clone())
-}
-
-/// Integer columns arrive as `DECIMAL(p,0)`; the trim is a no-op on them.
-fn is_bare_decimal_column(node: &Json, col_types: &ColumnTypes) -> bool {
-    if node.get("type").and_then(|t| t.as_str()) != Some("column") {
-        return false;
-    }
-    column_exa_type(node, col_types).is_some_and(|exa_type| exa_type.is_decimal())
-}
-
-/// Never sent by Exasol; only this rewriter synthesizes it.
-fn wrap_decimal_to_varchar(column: &Json) -> Json {
-    serde_json::json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [column.clone()],
-    })
-}
-
-/// Shared so the LIKE and string-function DATE branches are identical.
-fn wrap_cast_to_varchar(node: &Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
-        "arguments": [node.clone()],
-    })
-}
-
-/// String-typed arguments that Exasol implicitly converts to VARCHAR (#210).
-#[derive(Debug, PartialEq, Eq)]
-enum StringPositionArgs {
-    /// Never declines: `CHR`/`UNICODECHR` take a genuine integer codepoint.
-    NotGoverned,
-    Coerce(Vec<usize>),
-    /// This function at this arity is not rendered faithfully.
-    Decline,
-}
-
-/// Every returned index is `< arg_count`.
-///
-/// `INSTR`/`LOCATE` beyond two arguments must decline: `vs-expression` silently drops
-/// the extra arguments, so coercing would plan a truncated, wrong rendering (#228).
-fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
-    let coerce_in_range = |indices: Vec<usize>| {
-        StringPositionArgs::Coerce(indices.into_iter().filter(|i| *i < arg_count).collect())
-    };
-    match fn_name.to_uppercase().as_str() {
-        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => {
-            coerce_in_range((0..arg_count).collect())
-        }
-        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
-        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => coerce_in_range(vec![0]),
-        "LPAD" | "RPAD" if arg_count > 2 => coerce_in_range(vec![0, 2]),
-        "LPAD" | "RPAD" => coerce_in_range(vec![0]),
-        "INSTR" | "LOCATE" if arg_count > 2 => StringPositionArgs::Decline,
-        "INSTR" | "LOCATE" => coerce_in_range(vec![0, 1]),
-        _ => StringPositionArgs::NotGoverned,
-    }
-}
-
-/// Exasol implicitly converts numeric or DATE string-function arguments to VARCHAR;
-/// DataFusion fails at plan time (#210). A decline propagates to the whole tree and
-/// must be self-applied by the caller. Must run before
-/// [`rewrite_decimal_stringifications`] so a coerced argument is not double-wrapped.
-fn string_function_arg_type_guard(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    rewrite_expr_tree(node, &|out: &Json| {
-        if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
-            return Some(out.clone());
-        }
-        let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let arg_count = out
-            .get("arguments")
-            .and_then(|a| a.as_array())
-            .map_or(0, |a| a.len());
-        match string_position_args(fn_name, arg_count) {
-            StringPositionArgs::NotGoverned => Some(out.clone()),
-            // `vs-expression` renders this arity incompletely (#228).
-            StringPositionArgs::Decline => None,
-            StringPositionArgs::Coerce(indices) => {
-                let mut out = out.clone();
-                for i in indices {
-                    let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
-                    out["arguments"][i] = coerced;
-                }
-                Some(out)
-            }
-        }
-    })
-}
-
-/// A non-`column` argument is returned unchanged: its type is unresolvable, a tracked
-/// exception (#223) that must not decline.
-fn coerce_string_position_arg(arg: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
-        return Some(arg.clone());
-    }
-    match column_exa_type(arg, col_types) {
-        Some(exa_type) if exa_type.is_character() => Some(arg.clone()),
-        Some(ExasolType::Date) => Some(wrap_cast_to_varchar(arg)),
-        Some(ExasolType::Decimal(_)) => Some(wrap_decimal_to_varchar(arg)),
-        // Other types' text forms diverge between engines; a cast would turn a crash into
-        // a wrong answer.
-        _ => None,
-    }
-}
-
-/// Order matters: the string-function guard must precede the decimal rewrite so a
-/// coerced argument is not double-wrapped. `None` means a guard declined.
-pub(super) fn apply_type_rewrites(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let expr = like_subject_type_guard(expr, col_types)?;
-    let expr = string_function_arg_type_guard(&expr, col_types)?;
-    let expr = rewrite_overprecise_timestamp_comparisons(&expr, col_types)?;
-    Some(rewrite_decimal_stringifications(&expr, col_types))
-}
-
 /// DataFusion truncates a timestamp literal to its column's unit, while Exasol compares at full
 /// precision (#461). Workaround for apache/datafusion#22142, fixed by apache/datafusion#22906.
-fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
+fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Json {
     rewrite_expr_tree(node, &|out: &Json| {
-        Some(rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone()))
+        rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone())
     })
 }
 
@@ -865,26 +637,52 @@ fn contains_aggregate_node(node: &Json) -> bool {
     }
 }
 
-/// The sole owner of "a tree the DataFusion scan may be handed". Renderability is
-/// checked on the rewritten tree, since that is what the scan carries; checking the
-/// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
-pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    apply_type_rewrites(expr, col_types)
-        .map(|tree| compare_binary_bytes(tree, col_types))
-        .filter(datafusion_renderable)
+impl ColumnTypeLookup for ColumnTypes {
+    fn column_type(&self, column: &Json) -> Option<ExasolType> {
+        column_exa_type(column, self)
+    }
 }
 
-/// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`).
-/// `declined` is the original, un-rewritten tree: the type rewrites target the
-/// DataFusion dialect only.
-pub(super) fn classify_where_filter<'a>(
-    filter_json_raw: Option<&'a Json>,
-    col_types: &ColumnTypes,
-) -> (Option<String>, Option<&'a Json>) {
-    let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types);
-    match (filter_json_raw, filter_json_raw.and_then(accepted)) {
-        (Some(raw), None) => (None, Some(raw)),
-        (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
+/// The adapter's own rewrites of a tree the scan computes: the timestamp-literal floor (#461) and
+/// the binary byte comparison. They need the column types, so they run here, once.
+fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
+    compare_binary_bytes(
+        rewrite_overprecise_timestamp_comparisons(expr, col_types),
+        col_types,
+    )
+}
+
+/// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
+/// same column types, so every path runs the same typed checks (#587).
+#[derive(Debug, Clone, Copy)]
+pub struct ScanTranslator<'a> {
+    columns: &'a ColumnTypes,
+}
+
+impl<'a> ScanTranslator<'a> {
+    pub fn new(columns: &'a ColumnTypes) -> Self {
+        Self { columns }
+    }
+
+    pub(super) fn columns(self) -> &'a ColumnTypes {
+        self.columns
+    }
+
+    /// `None` declines: the caller applies the expression in Exasol or declines the shape.
+    pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
+        render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
+    }
+
+    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `scan_filter` is
+    /// `None` for a trivially true filter; `declined` is the raw tree, which Exasol applies itself.
+    pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
+        let Some(raw) = filter else {
+            return (None, None);
+        };
+        match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
+            Ok(sql) => (sql, None),
+            Err(_) => (None, Some(raw)),
+        }
     }
 }
 
@@ -895,13 +693,14 @@ pub(super) fn classify_where_filter<'a>(
 /// can coincide. A missing or empty select list is not a widening.
 pub(super) fn project_columns(
     pushdown: &PushdownRequest,
-    all_cols: &ColumnTypes,
+    scan: ScanTranslator<'_>,
 ) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
-    let Some((first_col, first)) = all_cols.0.first() else {
+    let all_cols = scan.columns();
+    if all_cols.0.is_empty() {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
         ));
-    };
+    }
     let full_row = || all_cols.projection();
 
     // Repeating `first_col` for an unprojectable item would duplicate EMITS
@@ -920,36 +719,27 @@ pub(super) fn project_columns(
                     needs_full_fallback = true;
                     continue;
                 }
-                let Some(e) = apply_type_rewrites(e, all_cols) else {
-                    needs_full_fallback = true;
-                    continue;
-                };
-                let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        let (column, exa_type) = match (all_cols.resolve(e), column_node_ref(e)) {
-                            (Some((column, column_type)), _) => {
-                                (column.clone(), column_type.exa_type)
-                            }
-                            (None, Some(named)) => {
-                                (ColumnRef::from(named.name), ExasolType::WIDEST_VARCHAR)
-                            }
-                            (None, None) => (first_col.clone(), first.exa_type),
+                        // A column without a known type would declare a guessed EMITS type.
+                        let Some((column, column_type)) = all_cols.resolve(e) else {
+                            needs_full_fallback = true;
+                            continue;
                         };
                         projected.push(ProjectedColumn {
-                            item: ProjectionItem::Column(column),
-                            exa_type,
+                            item: ProjectionItem::Column(column.clone()),
+                            exa_type: column_type.exa_type,
                         });
                     }
                     // A literal is pushed positionally so the emitted arity equals the
                     // select-list arity (#190).
                     t if is_literal_selectlist_item(t) || is_pushable_expression_node(t) => {
                         // The EMITS column type must equal Exasol's declared type.
-                        match (render_expression_safe(e), pushdown.emittable_select_type(i)) {
-                            (Some(sql_frag), Some(exa_type)) => {
+                        match (scan.expression(e), pushdown.emittable_select_type(i)) {
+                            (Some(fragment), Some(exa_type)) => {
                                 projected.push(ProjectedColumn {
-                                    item: ProjectionItem::Expr { expr: sql_frag },
+                                    item: ProjectionItem::Expr { expr: fragment.sql },
                                     exa_type,
                                 });
                             }
@@ -1093,15 +883,13 @@ impl PushdownRequest {
     }
 }
 
-/// Every non-literal node type `render_expression_safe` renders, except `predicate_greater[equal]`:
+/// Every non-literal node type the scan renders, except `predicate_greater[equal]`:
 /// Exasol normalises `a > b` to `b < a`.
 fn is_pushable_expression_node(node_type: &str) -> bool {
     matches!(
         node_type,
         "function_scalar"
             | "function_scalar_cast"
-            // Synthesized from a DECIMAL-to-string cast by the type rewrites (#211).
-            | "decimal_to_varchar_exasol"
             | "function_scalar_extract"
             | "function_scalar_case"
             | "predicate_equal"
@@ -1119,10 +907,20 @@ fn is_pushable_expression_node(node_type: &str) -> bool {
     )
 }
 
-/// Exasol type-checks each pushdown output column against its declared type, so a value
-/// computed in Exasol SQL whose type can differ is cast to the declared type.
-pub(super) fn cast_to_declared_type(expr: &str, declared: ExasolType) -> String {
-    format!("CAST({expr} AS {declared})")
+/// The one builder of a pushdown output select list: each item is cast to its declared type
+/// unless it already has it. `None` when the item count differs from the declared types.
+pub(super) fn output_select_list(
+    items: impl IntoIterator<Item = SqlFragment>,
+    select_types: &[ExasolType],
+) -> Option<Vec<String>> {
+    let items: Vec<SqlFragment> = items.into_iter().collect();
+    (items.len() == select_types.len()).then(|| {
+        items
+            .iter()
+            .zip(select_types)
+            .map(|(item, &declared)| item.as_type(declared))
+            .collect()
+    })
 }
 
 /// The scan-spec storage block: a CONNECTION reference only when the scan UDF can

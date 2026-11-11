@@ -156,7 +156,13 @@ impl UnityCatalogSession {
             .map_err(|e| UdfError::User(format!("{what} failed: {}", redact(&error_chain(&e)))))?;
         Ok(self
             .http
-            .send_json(request, RepeatSafety::Safe, &what, redact)
+            .send_json(
+                request,
+                RepeatSafety::Safe,
+                self.auth.renewable(),
+                &what,
+                redact,
+            )
             .await?)
     }
 }

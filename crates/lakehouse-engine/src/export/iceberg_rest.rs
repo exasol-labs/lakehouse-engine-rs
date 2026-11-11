@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
-use lakehouse_catalog::{CatalogSession, resolve_aws_identity};
+use lakehouse_catalog::{CatalogSession, ResolvedIdentity, resolve_aws_identity};
 use lakehouse_catalog_write::{CommitTag, TableWriteSession, WriteStorage};
 
 /// The Iceberg REST target of `table`, a `TABLE_NAME` value.
@@ -34,8 +34,10 @@ impl IcebergRestTarget {
             creds,
             allow_http,
         } = &self.connection;
-        let creds = resolve_aws_identity(creds.clone(), address, *allow_http).await?;
-        let storage = WriteStorage::of(&creds, *allow_http);
+        // A writer can outlive the assumed role's session, so its storage renews through `role`.
+        let ResolvedIdentity { creds, role } =
+            resolve_aws_identity(creds.clone(), address, *allow_http).await?;
+        let storage = WriteStorage::of(&creds, *allow_http, role);
         let session = CatalogSession::resolve(address, &creds.warehouse, None, &creds)
             .await
             .map_err(|error| {

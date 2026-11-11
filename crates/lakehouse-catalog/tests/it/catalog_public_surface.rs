@@ -13,11 +13,11 @@ use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogProps,
     CatalogSession, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
     ConnectionCreds, GlueCatalogSession, HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient,
-    PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
-    StorageProps, TableAdmission, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
-    catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
-    read_iceberg_metadata_file, redact_credentials, redact_secret_values, resolve_aws_identity,
-    resolve_uc_vended_storage, resolve_vended_storage,
+    PartitionFormat, ResolvedIdentity, SkipReason, SkippedTable, StaticStoreAddress,
+    StorageBackend, StorageCreds, StorageProps, TableAdmission, TableFormat,
+    TemporaryTableCredentials, UnityCatalogSession, catalog_identifier_string, load_table_any_auth,
+    parse_glue_table_ident, parse_table_ident, read_iceberg_metadata_file, redact_credentials,
+    redact_secret_values, resolve_aws_identity, resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
@@ -332,10 +332,12 @@ async fn aws_identity_resolver_is_public() {
         ..connection_creds()
     };
 
-    let resolved: Result<ConnectionCreds, UdfError> =
+    let resolved: Result<ResolvedIdentity, UdfError> =
         resolve_aws_identity(stated, "http://catalog", false).await;
 
-    let resolved = resolved.expect("a set naming no role resolves without any STS request");
+    let resolved = resolved
+        .expect("a set naming no role resolves without any STS request")
+        .creds;
     assert_eq!(resolved.access_key, "minioadmin");
     assert_eq!(
         resolved.aws_sts_endpoint.as_deref(),

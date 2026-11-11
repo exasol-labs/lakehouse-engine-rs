@@ -21,10 +21,91 @@ use tokio::net::TcpListener;
 // Named, not globbed: a local helper of the same name would silently shadow a glob import.
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
-    cast_json, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
-    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
-    str_lit, string_equal, table_col, table_column, timestamp_lit,
+    cast_json, cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list,
+    is_not_null, is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
+    scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
+
+/// Renders through the typed scan gate with no column type known.
+pub(crate) fn untyped_scan_filter(filter: &Json) -> Option<String> {
+    scan_filter_sql(filter, &ColumnTypes::default())
+}
+
+pub(crate) fn untyped_scan_expression(expr: &Json) -> Option<String> {
+    untyped_scan().expression(expr).map(|fragment| fragment.sql)
+}
+
+/// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
+pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
+    ScanTranslator::new(col_types).split_where(Some(filter)).0
+}
+
+/// The deduplicated partial plans of a single-group select list, whatever their types.
+pub(crate) fn ordinary_plans(
+    items: &[single_group_agg::SingleGroupItem],
+    scan: ScanTranslator<'_>,
+) -> Vec<crate::scan::spec::AggregatePlan> {
+    single_group_agg::fold_single_group_plans(items, &[], scan).0
+}
+
+/// The plans' exact types, `None` when any slot has none.
+pub(crate) fn single_group_plan_types(
+    select_types: &[ExasolType],
+    items: &[single_group_agg::SingleGroupItem],
+    scan: ScanTranslator<'_>,
+) -> Option<Vec<ExasolType>> {
+    single_group_plans(items, select_types, scan).map(|plans| plans.types)
+}
+
+/// `COUNT(*)`'s partial plan.
+pub(crate) fn count_plan() -> AggregatePlan {
+    AggregatePlan {
+        kind: AggKind::Count,
+        column: None,
+        arg_expr: None,
+    }
+}
+
+/// The partial plan of `kind` over a bare `column`.
+pub(crate) fn column_plan(kind: AggKind, column: &str) -> AggregatePlan {
+    AggregatePlan {
+        kind,
+        column: Some(column.to_string()),
+        arg_expr: None,
+    }
+}
+
+/// A translator that knows no column type.
+pub(crate) fn untyped_scan() -> ScanTranslator<'static> {
+    static NO_COLUMNS: std::sync::LazyLock<ColumnTypes> =
+        std::sync::LazyLock::new(ColumnTypes::default);
+    ScanTranslator::new(&NO_COLUMNS)
+}
+
+/// The numeric columns the aggregate fixtures sum, average, or deviate over.
+pub(crate) const AGGREGATED_COLUMNS: [&str; 12] = [
+    "X",
+    "V",
+    "W",
+    "F",
+    "ID",
+    "AMOUNT",
+    "SCORE",
+    "L_QUANTITY",
+    "L_EXTENDEDPRICE",
+    "L_DISCOUNT",
+    "C_ACCTBAL",
+    "C_DECIMAL_A",
+];
+
+/// A translator that types [`AGGREGATED_COLUMNS`] as DOUBLE PRECISION and knows no other column,
+/// so the scan computes the fixtures' numeric aggregates.
+pub(crate) fn aggregate_scan() -> ScanTranslator<'static> {
+    static AGGREGATED: std::sync::LazyLock<ColumnTypes> = std::sync::LazyLock::new(|| {
+        column_types(&AGGREGATED_COLUMNS.map(|name| (name, ExasolType::DoublePrecision)))
+    });
+    ScanTranslator::new(&AGGREGATED)
+}
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
 pub(crate) const SALES: &str = "SALES";
@@ -414,11 +495,6 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
     })
 }
 
-/// Exasol's `CAST(arg AS target)` node.
-pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
-    cast_json(exasol_type_to_json(&target), arg)
-}
-
 pub(crate) fn customer_orders_join() -> Json {
     inner_join(
         table_ref("CUSTOMER"),
@@ -486,7 +562,7 @@ pub(crate) fn project_split(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    let (projection, widened) = support::project_columns(pushdown, all_cols)?;
+    let (projection, widened) = support::project_columns(pushdown, ScanTranslator::new(all_cols))?;
     let (items, types) = split_projection(&projection);
     Ok((items, types, widened))
 }
@@ -1301,11 +1377,6 @@ pub(crate) fn build_sql_for_fixture_n(
     limit: Option<u64>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = proj_cols
-        .iter()
-        .cloned()
-        .zip(proj_types.iter().cloned())
-        .collect();
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
@@ -1328,7 +1399,6 @@ pub(crate) fn build_sql_for_fixture_n(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         limit,
-        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1503,8 +1573,7 @@ impl PushdownRequestBuilder {
         self.field("limit", serde_json::json!({"numElements": num_elements}))
     }
 
-    /// `selectListDataTypes` as `raw` spells it, or absent for `None`, in place of the list the
-    /// item types derive: for a test that pins an absent, invalid, or miscounted list.
+    /// The raw `selectListDataTypes` value, `None` to omit the key.
     pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
         self.raw_select_list_data_types = Some(raw);
         self
@@ -1594,11 +1663,6 @@ pub(crate) fn build_row_sql_with_root(
     proj_types: Vec<ExasolType>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = proj_cols
-        .iter()
-        .cloned()
-        .zip(proj_types.iter().cloned())
-        .collect();
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
@@ -1620,7 +1684,6 @@ pub(crate) fn build_row_sql_with_root(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         None,
-        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

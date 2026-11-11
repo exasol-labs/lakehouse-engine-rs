@@ -7,9 +7,10 @@ use crate::common::e2e_harness::{
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
-    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE,
-    build_seed_catalog, seed_all_types, seed_complex_types_probe, seed_distinct_probe, seed_events,
-    seed_high_card_probe, seed_ident_part_bytes, seed_typed_distinct_probe,
+    E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
+    E2E_TABLE, E2E_TYPED_TABLE, build_seed_catalog, seed_all_types, seed_complex_types_probe,
+    seed_distinct_probe, seed_events, seed_high_card_probe, seed_ident_part_bytes,
+    seed_typed_distinct_probe,
 };
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
@@ -96,8 +97,16 @@ pub fn events_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_TABLE)
 }
 
+/// Every column of `TYPED_DISTINCT_PROBE` after `ID`, in declared order.
+pub const TYPED_COLUMNS: &str =
+    "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
+
 pub fn typed_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_TYPED_TABLE)
+}
+
+pub fn vs_char_pad_table() -> String {
+    vs_table(LAKEHOUSE_VS, E2E_CHAR_PAD_TABLE)
 }
 
 pub fn vs_dim_table() -> String {

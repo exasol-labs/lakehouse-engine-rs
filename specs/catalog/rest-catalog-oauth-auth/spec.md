@@ -63,5 +63,5 @@ The Virtual Schema authenticates to an Iceberg REST Catalog in one of three mode
 * *WHEN* the session sends a request after the token reached its renewal point, which is `expires_in` minus the renewal skew of 60 seconds or half of `expires_in`, whichever is shorter, and a second request follows
 * *THEN* the session SHALL run one new client-credentials grant before the first of them, and send both requests with the new token
 * *AND* concurrent requests at the renewal point SHALL share that one grant
-* *AND* a grant answer with no `expires_in`, or an `expires_in` of 0, SHALL keep its token for the life of the session, as today
+* *AND* a grant answer with no `expires_in`, or an `expires_in` of 0, SHALL keep its token for the life of the session
 * *AND* no bearer token a request carried MUST appear in any returned SQL string or error message
