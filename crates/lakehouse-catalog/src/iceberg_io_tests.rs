@@ -48,7 +48,7 @@ fn signed_request_does_not_leak_keys_in_headers() {
 async fn authorization(auth: &CatalogAuth) -> Option<String> {
     let client = reqwest::Client::new();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
-    let (request, _) = build_signed_request(client.get(url), auth, &creds_no_auth())
+    let request = build_signed_request(client.get(url), auth, &creds_no_auth())
         .await
         .expect("an unsigned request builds");
     assert!(request.headers().get("x-amz-date").is_none());

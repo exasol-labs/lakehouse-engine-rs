@@ -12,7 +12,7 @@ use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use scalar_functions::{ExasolForm, scalar_function};
-use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
+use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{
     ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
 };
@@ -530,19 +530,20 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
-        // Synthesized by the typed scan pass, DataFusion dialect only: integer and boolean text
-        // is the same in every session, so the scan may produce it.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE if dialect == Dialect::DataFusion => {
+        // Synthesized by the typed scan pass, DataFusion dialect only.
+        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE
+            if dialect == Dialect::DataFusion =>
+        {
             let arg = value("arguments")
                 .and_then(|a| a.as_array())
                 .and_then(|a| a.first())
                 .ok_or_else(|| UdfError::User(format!("{kind} missing its argument")))?;
             let inner = render_expression_inner(arg, dialect)?
                 .ok_or_else(|| UdfError::User(format!("{kind} argument is null")))?;
-            Ok(Some(if kind == INTEGER_TEXT_NODE {
-                format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)")
-            } else {
-                render_bool_to_string_case(&inner)
+            Ok(Some(match kind {
+                INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
+                BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                _ => format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)"),
             }))
         }
         "function_scalar" => {
