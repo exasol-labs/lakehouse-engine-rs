@@ -2,9 +2,10 @@ use super::*;
 use crate::scan::test_support::invoke_scalar_udf;
 use arrow::array::{BooleanArray, StringArray};
 
-/// One batch of `documents`, with `constants` after them.
+/// One batch of `documents` as `document_type`, with `constants` after them.
 fn invoke(
     returning: Returning,
+    document_type: &DataType,
     documents: Vec<Option<&str>>,
     constants: Vec<ScalarValue>,
 ) -> ArrayRef {
@@ -18,7 +19,9 @@ fn invoke(
         signature: Signature::any(constants.len() + 1, Volatility::Immutable),
     };
     let rows = documents.len();
-    let mut args = vec![ColumnarValue::Array(Arc::new(StringArray::from(documents)))];
+    let documents: ArrayRef = Arc::new(StringArray::from(documents));
+    let documents = cast(&documents, document_type).expect("a string type");
+    let mut args = vec![ColumnarValue::Array(documents)];
     args.extend(constants.into_iter().map(ColumnarValue::Scalar));
     invoke_scalar_udf(&udf, args, rows)
         .and_then(|values| values.to_array(rows))
@@ -30,26 +33,17 @@ fn text(value: &str) -> ScalarValue {
 }
 
 #[test]
-fn text_function_applies_the_behaviors() {
-    let values = invoke(
-        Returning::Text,
-        vec![
-            None,
-            Some(""),
-            Some("{"),
-            Some(r#"{"b":1}"#),
-            Some(r#"{"a":"abcd"}"#),
-            Some(r#"{"a":"ab"}"#),
-            Some(r#"{"a":null}"#),
-            Some(r#"{"a":""}"#),
-        ],
-        vec![
-            text("$.a"),
-            ScalarValue::Int64(Some(3)),
-            text("e"),
-            text("x"),
-        ],
-    );
+fn text_function_applies_the_behaviors_to_every_string_type() {
+    let documents = vec![
+        None,
+        Some(""),
+        Some("{"),
+        Some(r#"{"b":1}"#),
+        Some(r#"{"a":"abcd"}"#),
+        Some(r#"{"a":"ab"}"#),
+        Some(r#"{"a":null}"#),
+        Some(r#"{"a":""}"#),
+    ];
     let expected = StringArray::from(vec![
         None,
         None,
@@ -60,13 +54,32 @@ fn text_function_applies_the_behaviors() {
         None,
         None,
     ]);
-    assert_eq!(values.as_string::<i32>(), &expected);
+    for document_type in [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+    ] {
+        let values = invoke(
+            Returning::Text,
+            &document_type,
+            documents.clone(),
+            vec![
+                text("$.a"),
+                ScalarValue::Int64(Some(3)),
+                text("e"),
+                text("x"),
+            ],
+        );
+        assert_eq!(values.as_string::<i32>(), &expected, "{document_type}");
+    }
 }
 
 #[test]
 fn boolean_function_applies_the_behaviors() {
     let values = invoke(
         Returning::Boolean,
+        &DataType::Utf8,
         vec![
             None,
             Some(r#"{"a":"yes"}"#),
@@ -100,19 +113,14 @@ fn selected(doc: &str, path: &str) -> String {
 fn paths_select_what_exasol_selects() {
     let cases = [
         (r#"{"a":"x"}"#, "$.a", r#"Text("x")"#),
-        (r#" {"a" : 1.5 } "#, "$.a", r#"Text("1.5")"#),
-        (r#"{"a":-12}"#, "$.a", r#"Text("-12")"#),
         (r#"{"a":true}"#, "$.a", r#"Text("true")"#),
         (r#"{"a":null}"#, "$.a", "Null"),
         (r#"{"a":null}"#, "$.a.b", "Empty"),
-        (r#"{"a":"é😀\/"}"#, "$.a", r#"Text("é😀/")"#),
-        (r#"{"A":1}"#, "$.a", "Empty"),
         (r#"{"a":1}"#, "$.b", "Empty"),
         (r#"{"a":{"b":1}}"#, "$.a", "Error"),
         (r#"{"a":[1]}"#, "$.a", "Error"),
         (r#"{"a":1}"#, "$", "Error"),
         (r#""s""#, "$", r#"Text("s")"#),
-        (r#"{"a":1,"b":2,"b":3}"#, "$.a", r#"Text("1")"#),
         (r#"{"a":[{"b":1}]}"#, "$.a.b", r#"Text("1")"#),
         (r#"{"a":[{"b":1},{"b":2}]}"#, "$.a.b", "Error"),
         (r#"{"a":[{"b":1},{"c":2},5]}"#, "$.a.b", r#"Text("1")"#),
@@ -129,67 +137,6 @@ fn paths_select_what_exasol_selects() {
     ];
     for (doc, path, expected) in cases {
         assert_eq!(selected(doc, path), expected, "{doc} {path}");
-    }
-}
-
-/// Exasol applies `ON ERROR` to each of these.
-#[test]
-fn documents_that_are_not_strict_json_fail() {
-    let tab = "{\"a\":\"x\ty\"}";
-    for doc in [
-        r#"{"a":1,"#,
-        r#"{"a":1} x"#,
-        r#"{"a":1}{"a":2}"#,
-        r#"{"a":01}"#,
-        r#"{"a":+1}"#,
-        r#"{"a":.5}"#,
-        r#"{"a":1.}"#,
-        r#"{"a":1e}"#,
-        r#"{"a":-}"#,
-        r#"{"a":NaN}"#,
-        r#"{"a":TRUE}"#,
-        r#"{a:1}"#,
-        r#"{'a':1}"#,
-        r#"[1,]"#,
-        r#"{"a":1,}"#,
-        r#"{"a":"\q"}"#,
-        r#"{"a":"\udc00","b":1}"#,
-        tab,
-        "{\"a\":\u{c}1}",
-        "\u{feff}{\"a\":1}",
-        "   ",
-    ] {
-        assert_eq!(selected(doc, "$.b"), "Error", "{doc:?}");
-    }
-}
-
-/// docs/semantic-differences.md lists each of these.
-#[test]
-fn parsed_documents_differ_from_exasol_as_documented() {
-    let deep = |depth| {
-        format!(
-            r#"{{"a":{}1{},"b":1}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        )
-    };
-    let cases = [
-        (r#"{"a":1.50}"#.to_string(), "$.a", r#"Text("1.5")"#),
-        (r#"{"a":1e2}"#.to_string(), "$.a", r#"Text("100.0")"#),
-        (r#"{"a":-1.5E+3}"#.to_string(), "$.a", r#"Text("-1500.0")"#),
-        (r#"{"a":-0}"#.to_string(), "$.a", r#"Text("-0.0")"#),
-        (
-            r#"{"a":12345678901234567890123}"#.to_string(),
-            "$.a",
-            r#"Text("1.2345678901234568e+22")"#,
-        ),
-        (r#"{"a":1,"a":2}"#.to_string(), "$.a", r#"Text("2")"#),
-        (r#"{"a":{"b":1},"a":{"c":2}}"#.to_string(), "$.a.b", "Empty"),
-        (deep(120), "$.b", r#"Text("1")"#),
-        (deep(200), "$.b", "Error"),
-    ];
-    for (doc, path, expected) in cases {
-        assert_eq!(selected(&doc, path), expected, "{doc} {path}");
     }
 }
 

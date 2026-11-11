@@ -87,7 +87,7 @@ pub fn lakehouse_vs() {
         seed("high_card_probe", seed_high_card_probe(&url, WAREHOUSE));
         seed("ident_part_bytes", seed_ident_part_bytes(&url, WAREHOUSE));
         seed(
-            "json_docs",
+            "json_value_docs",
             seed_json_docs(&url, WAREHOUSE, E2E_JSON_TABLE, &JSON_DOCS),
         );
         seed(

@@ -2129,7 +2129,7 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
 }
 
 /// `JSON_VALUE` parity fixture: one document per `id`, starting at 1.
-pub const E2E_JSON_TABLE: &str = "json_docs";
+pub const E2E_JSON_TABLE: &str = "json_value_docs";
 
 pub const JSON_DOCS: [Option<&str>; 10] = [
     Some(
@@ -2181,7 +2181,7 @@ pub async fn seed_json_docs(
     if !catalog
         .namespace_exists(&ns)
         .await
-        .context("check namespace for json_docs")?
+        .with_context(|| format!("check namespace for {table}"))?
     {
         let _ = catalog.create_namespace(&ns, HashMap::new()).await;
     }
@@ -2192,7 +2192,7 @@ pub async fn seed_json_docs(
             NestedField::optional(2, "doc", Type::Primitive(PrimitiveType::String)).into(),
         ])
         .build()
-        .context("build json_docs Iceberg schema")?;
+        .with_context(|| format!("build {table} Iceberg schema"))?;
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("doc", DataType::Utf8, true),
@@ -2204,7 +2204,7 @@ pub async fn seed_json_docs(
             Arc::new(StringArray::from_iter(docs.iter().map(|d| d.as_ref()))),
         ],
     )
-    .context("build json_docs batch")?;
+    .with_context(|| format!("build {table} batch"))?;
     create_and_append(&catalog, E2E_NAMESPACE, table, iceberg_schema, [batch])
         .await
         .with_context(|| format!("seed {table} table"))?;
