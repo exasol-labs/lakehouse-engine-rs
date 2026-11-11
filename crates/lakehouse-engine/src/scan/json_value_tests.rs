@@ -174,7 +174,10 @@ fn documents_that_are_not_strict_json_fail() {
         "\u{feff}{\"a\":1}",
         "   ",
     ] {
-        assert_eq!(select(doc, &[]), Item::Error, "{doc:?}");
+        for path in ["$", "$.a"] {
+            let path = parse_json_path(path).expect("path in the subset");
+            assert_eq!(select(doc, &path), Item::Error, "{doc:?}");
+        }
     }
 }
 

@@ -65,15 +65,33 @@ fn kind(value: &RawValue) -> u8 {
     value.get().as_bytes()[0]
 }
 
+/// The first step's members of an object document, found in the same pass that validates the
+/// document. `None` when the path starts otherwise or that pass fails, and `select` then validates
+/// and walks in two passes, which gives the same result: this pass only ever accepts less.
+fn first_members<'a>(doc: &'a str, path: &[JsonPathStep]) -> Option<Vec<&'a RawValue>> {
+    let Some(JsonPathStep::Member(name)) = path.first() else {
+        return None;
+    };
+    let mut document = serde_json::Deserializer::from_str(doc);
+    let found = document.deserialize_map(Members(name)).ok()?;
+    document.end().ok()?;
+    Some(found)
+}
+
 /// Lax mode: a member step looks into the objects of an array, an index step treats a non-array
 /// as a one-item array, and a structural mismatch selects nothing. Raw values keep each number's
 /// source text, and serde_json skips them without recursion, so no nesting depth overflows.
 fn select<'a>(doc: &'a str, path: &[JsonPathStep]) -> Item<'a> {
-    let Ok(root) = serde_json::from_str::<&RawValue>(doc) else {
-        return Item::Error;
+    let (mut items, rest) = match first_members(doc, path) {
+        Some(found) => (found, &path[1..]),
+        None => {
+            let Ok(root) = serde_json::from_str::<&RawValue>(doc) else {
+                return Item::Error;
+            };
+            (vec![root], path)
+        }
     };
-    let mut items = vec![root];
-    for step in path {
+    for step in rest {
         items = items
             .into_iter()
             .flat_map(|item| match (step, kind(item)) {
