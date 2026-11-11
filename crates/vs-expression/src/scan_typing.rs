@@ -71,6 +71,9 @@ impl TypeClass {
 pub(crate) const INTEGER_TEXT_NODE: &str = "scan_integer_text";
 /// Synthetic node: a boolean operand converted to Exasol's `TRUE`/`FALSE`.
 pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
+/// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
+/// (apache/datafusion#16797).
+pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
 /// a `name` identifier to its visitor.
@@ -330,6 +333,7 @@ fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
                 operands.extend(args.iter().zip(children.of("arguments")));
             }
             compare_without_session_parse(node, out, &operands)?;
+            compare_booleans_as_numbers(node, out, children)?;
             TypeClass::Boolean
         }
         "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
@@ -385,6 +389,7 @@ fn case_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
                 operands.extend(whens.iter().zip(children.of("arguments")));
             }
             compare_without_session_parse(node, out, &operands)?;
+            compare_booleans_as_numbers(node, out, children)?;
         }
         _ => refuse_implicit_text(node, &children.of("arguments"))?,
     }
@@ -515,6 +520,47 @@ fn compare_without_session_parse(
     Ok(())
 }
 
+/// Exasol compares a BOOLEAN with a number as 1 or 0, except a multi-value IN over a BOOLEAN,
+/// which converts its numbers to BOOLEAN and fails on any but 0 and 1.
+fn compare_booleans_as_numbers(
+    node: &Json,
+    out: &mut Json,
+    children: &ChildClasses,
+) -> Result<(), UdfError> {
+    const OPERANDS: [&str; 4] = ["expression", "left", "right", "basis"];
+    let arguments = children.of("arguments");
+    let classes: Vec<TypeClass> = OPERANDS
+        .iter()
+        .filter_map(|field| children.one(field))
+        .chain(arguments.iter().copied())
+        .collect();
+    let has_number = classes
+        .iter()
+        .any(|c| matches!(c, TypeClass::Integer { .. } | TypeClass::Number));
+    if !has_number || !classes.contains(&TypeClass::Boolean) {
+        return Ok(());
+    }
+    if kind(node) == "predicate_in_constlist"
+        && children.one("expression") == Some(TypeClass::Boolean)
+    {
+        return Err(decline(format!(
+            "an IN list converts its numbers to the BOOLEAN it tests: {}",
+            short(node)
+        )));
+    }
+    for field in OPERANDS {
+        if children.one(field) == Some(TypeClass::Boolean) {
+            out[field] = wrap(BOOLEAN_NUMBER_NODE, out[field].take());
+        }
+    }
+    for (i, class) in arguments.into_iter().enumerate() {
+        if class == TypeClass::Boolean {
+            out["arguments"][i] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][i].take());
+        }
+    }
+    Ok(())
+}
+
 fn integer_literal(digits: &str) -> Json {
     let (sign, digits) = match digits.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -597,6 +643,15 @@ fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError>
         }
         ExasolType::Varchar { size, .. } => {
             *source = cast_to_text(source.take(), source_class, target, size, false)?;
+        }
+        ExasolType::Decimal(d) if source_class == TypeClass::Boolean => {
+            if d.precision() == d.scale() {
+                return Err(decline(format!(
+                    "CAST of {} to {target} cannot hold 1",
+                    short(source)
+                )));
+            }
+            *source = wrap(BOOLEAN_NUMBER_NODE, source.take());
         }
         _ => cast_from_text(source, source_class, target)?,
     }

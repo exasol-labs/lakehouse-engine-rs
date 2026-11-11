@@ -90,7 +90,7 @@ Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and re
 - text that meets one of these types in a comparison, `IN`, `LIKE`, `||`, a string function, `CASE`, `COALESCE`, `GREATEST`, or arithmetic;
 - `SUM`, `AVG`, `STDDEV`, or `VARIANCE` over text or a BOOLEAN, which Exasol converts to a number. The aggregate runs in Exasol SQL instead of splitting into scan partials.
 
-Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
+Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A BOOLEAN cast to DECIMAL or compared with a number runs in the scan as 1 or 0, except an `IN` list of numbers over a BOOLEAN, which runs in Exasol SQL. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
 Such a condition runs in Exasol SQL. On a single table it takes the whole WHERE with it, so the scan filters no rows, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
 

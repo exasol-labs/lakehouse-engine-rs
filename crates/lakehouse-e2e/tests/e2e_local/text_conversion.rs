@@ -1,5 +1,5 @@
-//! Text conversions under non-default session settings: each query over the virtual table must
-//! match the same query over a native copy, and take the path the case names.
+//! Text and BOOLEAN conversions under the case's session settings: each query over the virtual
+//! table must match the same query over a native copy, and take the path the case names.
 
 use crate::common::e2e_harness::PathCheck::{Has, Lacks, NScan, Split, Wrapper};
 use crate::common::e2e_harness::*;
@@ -9,6 +9,7 @@ use crate::fixtures::{LAKEHOUSE_VS, TYPED_COLUMNS, lakehouse_vs, typed_table, vs
 const YDM: &str = "NLS_DATE_FORMAT = 'YYYY-DD-MM'";
 const TS_DMY: &str = "NLS_TIMESTAMP_FORMAT = 'DD.MM.YYYY HH24:MI:SS.FF6'";
 const COMMA: &str = "NLS_NUMERIC_CHARACTERS = ',.'";
+const BROADCAST_JOIN: &str = r#""join":{"#;
 
 /// `query` over `{T}`, run in a session with `setting` applied, must match native Exasol and take
 /// `path`. Native Exasol returns rows for [`CASES`] and raises an error for [`ERROR_CASES`].
@@ -349,6 +350,51 @@ const CASES: &[Case] = &[
         query: "SELECT SUM(CAST(NULL AS DECIMAL(10,0))) FROM {T}",
         path: Wrapper,
     },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID, CAST(C_BOOL AS DECIMAL(18,0)), CAST(C_BOOL AS DECIMAL(5,2)) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT CAST(C_BOOL AS INTEGER) K, COUNT(*) FROM {T} GROUP BY CAST(C_BOOL AS INTEGER) ORDER BY 1 DESC LIMIT 2",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT C_QTY, SUM(CAST(C_BOOL AS INTEGER)) FROM {T} GROUP BY C_QTY",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT COUNT(*) FROM {T} WHERE C_BOOL = 1",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE C_BOOL = 2 OR C_BOOL < 0.5",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE C_BOOL BETWEEN 1 AND C_QTY OR C_BOOL >= C_PRICE",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CASE C_BOOL WHEN 0 THEN 'no' WHEN 1 THEN 'yes' END FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE C_BOOL IN (0, 1)",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT a.ID, b.ID FROM {T} a JOIN {T} b ON a.ID = b.ID WHERE a.C_BOOL = 1 AND CAST(b.C_BOOL AS DECIMAL(1,0)) = 1",
+        path: Has(BROADCAST_JOIN),
+    },
 ];
 
 const ERROR_CASES: &[Case] = &[
@@ -387,6 +433,16 @@ const ERROR_CASES: &[Case] = &[
         query: "SELECT AVG(C_VARCHAR) FROM {T}",
         path: Wrapper,
     },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE C_BOOL IN (1, 2)",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(C_BOOL AS DECIMAL(2,2)) FROM {T}",
+        path: Lacks(SCAN_ITEM),
+    },
 ];
 
 fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
@@ -405,6 +461,7 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
 /// Scenario: A numeric aggregate over text or BOOLEAN runs in Exasol
 /// Scenario: A numeric aggregate over a bare NULL runs in Exasol
+/// Scenario: A BOOLEAN converts to 1 or 0 where Exasol converts it to a number
 #[test]
 fn text_conversions_match_native_under_session_settings() {
     lakehouse_vs();

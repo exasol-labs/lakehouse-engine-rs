@@ -70,6 +70,14 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *THEN* the aggregate SHALL NOT split into scan partials, and the qualified wrapper SHALL compute it in Exasol
 * *AND* the result SHALL equal native Exasol
 
+### Scenario: A BOOLEAN converts to 1 or 0 where Exasol converts it to a number
+
+* *GIVEN* a CAST of a BOOLEAN to `DECIMAL(p,s)`, or a comparison, `BETWEEN`, or simple `CASE` of a BOOLEAN with a number, such as `CAST(flag AS INTEGER)` or `flag = 2`, which DataFusion rejects
+* *WHEN* the adapter plans the request
+* *THEN* the scan SHALL compute it with `TRUE` as 1 and `FALSE` as 0, and the result SHALL equal native Exasol
+* *AND* a CAST to a `DECIMAL(p,s)` whose p equals s, which cannot hold 1, SHALL run in Exasol
+* *AND* an `IN` list of numbers over a BOOLEAN SHALL run in Exasol, because Exasol converts the numbers to BOOLEAN and fails on any but 0 and 1
+
 ### Scenario: A column of unknown type declines
 
 * *GIVEN* an expression that converts a column to text or compares it with text, or a numeric aggregate over the column, where the column has no type in the request's column metadata
