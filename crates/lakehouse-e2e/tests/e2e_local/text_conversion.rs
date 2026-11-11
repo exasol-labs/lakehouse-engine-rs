@@ -9,7 +9,6 @@ use crate::fixtures::{LAKEHOUSE_VS, TYPED_COLUMNS, lakehouse_vs, typed_table, vs
 const YDM: &str = "NLS_DATE_FORMAT = 'YYYY-DD-MM'";
 const TS_DMY: &str = "NLS_TIMESTAMP_FORMAT = 'DD.MM.YYYY HH24:MI:SS.FF6'";
 const COMMA: &str = "NLS_NUMERIC_CHARACTERS = ',.'";
-const BROADCAST_JOIN: &str = r#""join":{"#;
 
 /// `query` over `{T}`, run in a session with `setting` applied, must match native Exasol and take
 /// `path`. Native Exasol returns rows for [`CASES`] and raises an error for [`ERROR_CASES`].
