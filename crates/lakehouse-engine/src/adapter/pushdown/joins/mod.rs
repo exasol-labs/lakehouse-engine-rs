@@ -12,8 +12,8 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, PushdownRequest, SCAN_UDF_NAME, project_columns,
-    quote_ident,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
+    project_columns, quote_ident,
 };
 
 mod attribution;
@@ -43,6 +43,15 @@ pub(super) use sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
 };
 
+/// [`attribution::JoinLegs::ensure_columns_declared`] for a single-table request.
+pub(super) fn ensure_single_scan_columns_declared(
+    request: &Json,
+    pushdown: &Json,
+    involved: &InvolvedColumns<'_>,
+) -> Result<(), UdfError> {
+    attribution::JoinLegs::for_single_scan(request).ensure_columns_declared(pushdown, &[involved])
+}
+
 /// The generated SQL runs outside the adapter script's schema, so an unqualified name would
 /// not resolve.
 pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
@@ -68,8 +77,8 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
 }
 
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
-/// the other side's same-named column. A `column` with no `tableName` is charged to every
-/// side. With no explicit select list, each side's whole declared row is charged.
+/// the other side's same-named column. With no explicit select list, each side's whole
+/// declared row is charged.
 ///
 /// Lives here rather than in `planning`, which must not depend on `rendering`.
 fn ensure_no_side_refuses_a_referenced_column(
@@ -104,8 +113,8 @@ fn ensure_no_side_refuses_a_referenced_column(
 /// serve, and whose leg-qualified render succeeds. The legs may share column names or be one
 /// table joined to itself. Everything else takes the sole fallback,
 /// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
-/// A column no single leg owns fails the request through `unattributable_decline`, the
-/// fallback's own error, on both paths.
+/// A column that binds no single leg, or that its leg does not declare, fails the request
+/// before any catalog call ([`attribution::JoinLegs::ensure_columns_declared`]).
 ///
 /// No plan-time check compares the sides' storage backends: each side reads through its own
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
@@ -138,18 +147,19 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| leaf.table_identifier.as_str())
         .collect();
-    let resolver =
-        TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
     // Legs are indexed positionally, not by tableName, which a self-join's occurrences share.
     let legs = join.legs();
-    let side_filters: Vec<Option<Json>> = (0..join.tables.len())
-        .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
-        .collect();
     let involved = join
         .tables
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
         .collect::<Result<Vec<_>, _>>()?;
+    legs.ensure_columns_declared(pushdown_req, &involved.iter().collect::<Vec<_>>())?;
+    let resolver =
+        TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
+    let side_filters: Vec<Option<Json>> = (0..join.tables.len())
+        .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
+        .collect();
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> =
         try_join_all(join.tables.iter().zip(&side_filters).zip(&involved).map(
@@ -169,7 +179,7 @@ pub(super) async fn plan_join(
 
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let scan = ScanTranslator::new(&combined);
+        let scan = ScanTranslator::over(&combined, &[pushdown_req])?;
         let (projection, widened) = project_columns(pushdown, scan)?;
         let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
         return empty_result_sql(

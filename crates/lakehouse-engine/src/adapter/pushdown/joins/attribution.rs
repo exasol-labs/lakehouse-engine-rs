@@ -3,14 +3,16 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use super::planning::{DetectedJoin, JoinLeaf};
+use crate::adapter::pushdown::support::{InvolvedColumns, undeclared_column_error};
 use crate::scan::spec::relation_alias;
+use exasol_udf_sdk::error::UdfError;
 use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ColumnLeg {
     Leg(usize),
-    /// No `tableName`, or one no leg declares. Left unqualified, which the N = 1 wrapper's
-    /// name collapse relies on.
+    /// No `tableName`, or one no leg declares. A single scan leaves it unqualified, which the
+    /// N = 1 wrapper's name collapse relies on; a join fails the request ([`JoinLegs::bind`]).
     NoLeg,
     /// `tableName` names several legs and `tableAlias` matches none; picking one arbitrarily
     /// would return wrong rows.
@@ -28,7 +30,7 @@ struct LegReferences {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct UnattributableColumn {
+struct UnattributableColumn {
     table_name: String,
     table_alias: Option<String>,
     column_name: String,
@@ -195,30 +197,66 @@ impl JoinLegs {
         referenced.legs.into_iter().next()
     }
 
-    /// [`Self::qualify`] for a path that has no unqualified rendering to fall back on: a
-    /// [`ColumnLeg::NoLeg`] column fails like an [`ColumnLeg::Unattributable`] one, since
-    /// binding it to either leg could return the other leg's values. Like [`Self::qualify`], it
-    /// takes a raw request tree, never its own output.
-    pub(super) fn qualify_every_column(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
-        self.qualify_tree(expr, true)
-    }
-
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
-    /// name is ambiguous once a table occurs on several legs. [`ColumnLeg::NoLeg`] columns are
+    /// name is ambiguous once a table occurs on several legs. A single scan's untagged column is
     /// left untouched. Apply it once, to a raw request tree: an `LHS_T{leg}` alias matches no
-    /// leaf alias, so re-qualifying a self-join's output fails as unattributable, or binds the
-    /// other leg when the query names its occurrences `LHS_T*`.
-    pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
-        self.qualify_tree(expr, false)
+    /// leaf alias, so re-qualifying a self-join's output fails, or binds the other leg when the
+    /// query names its occurrences `LHS_T*`. `Err` as [`Self::bind`].
+    pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UdfError> {
+        rewrite_table_aliases(expr, &mut |column| {
+            Ok(self.bind(column)?.map(|leg| self.leg_alias(leg)))
+        })
     }
 
-    /// `strict` turns a [`ColumnLeg::NoLeg`] column into an error instead of leaving it as is.
-    fn qualify_tree(&self, expr: &Json, strict: bool) -> Result<Json, UnattributableColumn> {
-        rewrite_table_aliases(expr, &mut |column| match self.resolve_column(column) {
-            ColumnLeg::Leg(leg) => Ok(Some(self.leg_alias(leg))),
-            ColumnLeg::NoLeg if !strict => Ok(None),
-            ColumnLeg::NoLeg | ColumnLeg::Unattributable => Err(UnattributableColumn::of(column)),
-        })
+    /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`
+    /// declares it (#615). It runs before any render, so no later lookup or [`Self::qualify`] of
+    /// a request column can miss.
+    pub(crate) fn ensure_columns_declared(
+        &self,
+        pushdown: &Json,
+        declared: &[&InvolvedColumns<'_>],
+    ) -> Result<(), UdfError> {
+        let mut failure = None;
+        walk_column_nodes(pushdown, &mut |column| {
+            if failure.is_some() {
+                return;
+            }
+            let name = column.upper_name();
+            match self.bind(column) {
+                Err(error) => failure = Some(error),
+                Ok(leg)
+                    if !declared
+                        .get(leg.unwrap_or(0))
+                        .is_some_and(|involved| involved.declares(&name)) =>
+                {
+                    failure = Some(undeclared_column_error(&name));
+                }
+                Ok(_) => {}
+            }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// The one rule for which leg a column binds. `Ok(None)` is a single scan's column that
+    /// [`Self::resolve_column`] places on no leg: the scan has one table, so it binds that one,
+    /// left unqualified. In a join such a column, or an unattributable one, fails the request,
+    /// since binding it to either leg could return the other leg's values.
+    pub(super) fn bind(&self, column: ColumnNode<'_>) -> Result<Option<usize>, UdfError> {
+        match self.resolve_column(column) {
+            ColumnLeg::Leg(leg) => Ok(Some(leg)),
+            ColumnLeg::NoLeg if self.leg_count == 1 => Ok(None),
+            ColumnLeg::NoLeg if column.table_name.is_none_or(str::is_empty) => {
+                Err(UdfError::User(format!(
+                    "the pushdown request names column {} with no table, so it binds no table \
+                     of the join",
+                    column.upper_name()
+                )))
+            }
+            ColumnLeg::NoLeg | ColumnLeg::Unattributable => Err(UdfError::User(format!(
+                "the pushdown request names {}, which binds no single table of the query",
+                UnattributableColumn::of(column)
+            ))),
+        }
     }
 }
 

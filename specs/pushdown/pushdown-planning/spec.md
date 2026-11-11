@@ -97,6 +97,15 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, which Exasol 8.x omits, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, which Exasol sends only for ASCII, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
 * *AND* a request whose `selectList` holds one or more items SHALL fail the query when `selectListDataTypes` holds a different number of entries
 
+### Scenario: A column the request does not declare fails the request
+
+* *GIVEN* a `pushdown` request with a `column` node, in any clause, that binds no column its `involvedTables` entry declares, or that binds no single table of a join: it has no `tableName` in a join, its `tableName` names no table of the query, or its `tableName` names a table that occurs several times and its `tableAlias` matches no occurrence
+* *WHEN* the adapter plans the pushdown
+* *THEN* the adapter SHALL fail the query before any catalog request, with an error that names the column
+* *AND* the adapter MUST NOT guess a type for the column, decline the expression in its place, or bind it to one of several tables
+* *AND* a single-table request's `column` node without a `tableName` SHALL bind that one table
+* *AND* this state SHALL be unreachable for a request Exasol sends, because Exasol declares every column a query reads in `involvedTables` and stamps its table on every `column` node of a join
+
 ### Scenario: Every request of a supported Exasol version passes the strict type check
 
 * *GIVEN* Exasol 8.29.x or later

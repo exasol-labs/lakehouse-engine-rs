@@ -48,21 +48,22 @@ fn self_join_legs() -> JoinLegs {
 
 #[test]
 fn join_condition_renders_via_translator() {
+    let request = join_request(Json::Null, equi_condition());
+    let detected = detected_join(&request);
+    let sides = request_sides(&request, &detected);
+    let both_legs = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
     assert_eq!(
-        untyped_scan_expression(&equi_condition()).as_deref(),
+        ScanTranslator::new(&both_legs)
+            .expression(&equi_condition())
+            .map(|fragment| fragment.sql)
+            .as_deref(),
         Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
 
-    let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = render_broadcast_join(&parsed_pushdown(&request), &detected, &sides)
+        .expect("renderable join")
+        .expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
         "each operand is qualified by its own leg's alias"
@@ -368,9 +369,11 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit(7)),
     ]);
     let legs = self_join_legs();
+    let fact_orders = column_types(&[("O_ORDERKEY", ExasolType::decimal(20, 0))]);
 
-    let occurrence_a = untyped_scan_filter(
+    let occurrence_a = scan_filter_sql(
         &leg_local_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
+        &fact_orders,
     )
     .expect("renders");
     assert!(
@@ -378,8 +381,9 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         "occurrence A's leg-local filter must carry only its own conjunct: {occurrence_a}"
     );
 
-    let occurrence_b = untyped_scan_filter(
+    let occurrence_b = scan_filter_sql(
         &leg_local_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
+        &fact_orders,
     )
     .expect("renders");
     assert!(
@@ -410,7 +414,8 @@ fn screen_leg_filter_renders_the_accepted_set_bare() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -432,7 +437,8 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -454,7 +460,8 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
 
     let pruning = leg_local_filter(&filter, &customer_orders_legs(), 1)
         .expect("both conjuncts are ORDERS-leg-local");
-    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()));
+    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, Some(date_like.clone()));
     assert_eq!(
@@ -471,7 +478,8 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(leg, None);
     assert_eq!(declined, Some(filter));
@@ -491,6 +499,7 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
             &filter,
             &column_types(&involved_table(&request, table).unwrap().types),
         )
+        .expect("every column of the leg filter binds the leg")
     };
 
     assert_eq!(
@@ -900,7 +909,8 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types);
+    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types)
+        .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }

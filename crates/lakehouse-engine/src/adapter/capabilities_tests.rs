@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{col, pushdown_request, untyped_scan};
+use crate::adapter::pushdown::test_support::{col, pushdown_request};
 use crate::types::exasol_type::ExasolType;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
@@ -37,7 +37,7 @@ fn reports_group_by_capabilities() {
         "AGGREGATE_GROUP_BY_TUPLE must be advertised: {cap_strs:?}"
     );
 
-    let multi_key_group_by = pushdown_request(
+    let (multi_key_group_by, scan) = pushdown_request(
         "T",
         &[
             ("REGION", ExasolType::WIDEST_VARCHAR),
@@ -48,10 +48,9 @@ fn reports_group_by_capabilities() {
     .column(col("REGION"))
     .count_star()
     .column(col("YEAR"))
-    .build_pushdown();
-    let detection =
-        crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by, untyped_scan())
-            .expect("multi-key GROUP BY must be detected by the backing pushdown path");
+    .build_scanned();
+    let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by, scan)
+        .expect("multi-key GROUP BY must be detected by the backing pushdown path");
     assert_eq!(
         detection.group_keys.len(),
         2,

@@ -215,7 +215,7 @@ pub(super) fn extend_projection_with_sort_keys(
     projection: &mut Vec<ProjectedColumn>,
     keys: &[ParsedSortKey],
     col_types: &ColumnTypes,
-) {
+) -> Result<(), UdfError> {
     for column in keys.iter().flat_map(ParsedSortKey::referenced_columns) {
         let already_emitted = projection.iter().any(|projected| {
             matches!(&projected.item, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column)
@@ -223,14 +223,13 @@ pub(super) fn extend_projection_with_sort_keys(
         if already_emitted {
             continue;
         }
-        let Some(column_type) = col_types.get(&ColumnRef::from(column)) else {
-            continue;
-        };
+        let column_type = col_types.declared(&ColumnRef::from(column))?;
         projection.push(ProjectedColumn {
             item: ProjectionItem::from(column),
             exa_type: column_type.exa_type,
         });
     }
+    Ok(())
 }
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the adapter must reproduce the

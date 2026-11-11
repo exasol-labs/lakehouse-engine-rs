@@ -157,21 +157,18 @@ fn only_string_positions_convert_to_text() {
     }
 }
 
-/// Scenario: A column of unknown type declines
 #[test]
-fn a_column_of_unknown_type_declines_where_it_meets_text() {
+fn a_column_the_lookup_does_not_declare_declines_any_expression() {
     for expr in [
         like(col("UNKNOWN"), "1%"),
         scalar_fn("UPPER", [col("UNKNOWN")]),
         predicate_equal(col("UNKNOWN"), str_lit("1")),
         cast_to(ExasolType::WIDEST_VARCHAR, col("UNKNOWN")),
+        predicate_equal(col("UNKNOWN"), num_lit(1)),
+        col("UNKNOWN"),
     ] {
         assert!(render(&expr).is_err(), "{expr} must decline");
     }
-    assert!(
-        render(&predicate_equal(col("UNKNOWN"), num_lit(1))).is_ok(),
-        "no text conversion, so the column's type does not matter"
-    );
 }
 
 #[test]

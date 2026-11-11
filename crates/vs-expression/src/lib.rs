@@ -14,7 +14,7 @@ pub use fragment::SqlFragment;
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{
-    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
+    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type, stated_type,
 };
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
@@ -1003,6 +1003,7 @@ pub fn render_scan_expression(
     columns: &dyn ColumnTypeLookup,
 ) -> Result<SqlFragment, UdfError> {
     let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
+    let typed = columns.read_typed(typed);
     let ty = exact_expression_type(expr, columns).map(|ty| {
         if ty.is_character() {
             ExasolType::WIDEST_VARCHAR

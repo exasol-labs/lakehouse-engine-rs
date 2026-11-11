@@ -283,7 +283,7 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             partition_columns: Vec::new(),
             refused_columns: Vec::new(),
         },
-        ColumnTypes::default(),
+        column_types(NO_COLUMNS),
     )
 }
 
@@ -448,19 +448,6 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
     delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
         .expect("a select list naming only the mappable side's column must plan");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
-    let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_variant_col().await;
-    let request = delta_join_request(Some(vec![col("VARIANT_COL")]));
-
-    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
-        .await
-        .expect_err("a column reference naming no side must be charged to every side");
-
-    assert_refuses_variant_col(error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

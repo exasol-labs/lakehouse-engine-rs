@@ -78,12 +78,6 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *AND* a CAST to a `DECIMAL(p,s)` whose p equals s, which cannot hold 1, SHALL run in Exasol
 * *AND* an `IN` list of numbers over a BOOLEAN SHALL run in Exasol, because Exasol converts the numbers to BOOLEAN and fails on any but 0 and 1
 
-### Scenario: A column of unknown type declines
-
-* *GIVEN* an expression that converts a column to text or compares it with text, or a numeric aggregate over the column, where the column has no type in the request's column metadata
-* *WHEN* the adapter plans the request
-* *THEN* the scan SHALL NOT compute the expression
-
 ### Scenario: A broadcast join keeps its plan for an integer LIKE
 
 * *GIVEN* a broadcast-eligible inner equi-join whose WHERE filter holds `LIKE` over an integer column of one leg

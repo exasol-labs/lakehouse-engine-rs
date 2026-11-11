@@ -81,7 +81,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         // Mirrors the dispatcher's guard (#198); a declining fixture belongs on `build_dispatch_sql`.
         ensure_every_sort_key_renders(&keys)
             .expect("plan_scan_sql mirrors only fixtures whose pushed ORDER BY renders in full");
-        extend_projection_with_sort_keys(&mut projection, &keys, &column_types(&col_types));
+        extend_projection_with_sort_keys(&mut projection, &keys, &column_types(&col_types))
+            .expect("every fixture sort key names a declared column");
         keys
     } else {
         Vec::new()

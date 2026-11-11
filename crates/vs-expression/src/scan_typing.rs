@@ -9,6 +9,12 @@ use crate::scalar_functions::{ResultRule, ScalarFunction, TextArgs, UNLISTED, sc
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
     fn column_type(&self, column: &Json) -> Option<ExasolType>;
+
+    /// Rewrites how the scan reads the columns of an already typed tree, keeping each value's
+    /// Exasol type, so the rewritten nodes need no lookup. Identity unless the storage differs.
+    fn read_typed(&self, typed: Json) -> Json {
+        typed
+    }
 }
 
 /// The part of a node's Exasol type that decides whether the scan may convert it to text.
@@ -228,10 +234,12 @@ pub(crate) fn type_scan_tree(
         return Ok((node.clone(), TypeClass::Other));
     }
     if kind(node) == "column" {
-        let class = columns
+        // The adapter fails a request that names an undeclared column before any render
+        // (#615), so a miss here is an adapter bug: decline rather than guess a type.
+        let ty = columns
             .column_type(node)
-            .map_or(TypeClass::Other, TypeClass::of);
-        return Ok((node.clone(), class));
+            .ok_or_else(|| decline(format!("no declared column binds {}", short(node))))?;
+        return Ok((node.clone(), TypeClass::of(ty)));
     }
     let (mut out, children) = type_children(node, columns)?;
     let class = node_class(node, &mut out, &children)?;
@@ -426,14 +434,20 @@ fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfErro
 /// The type the request states for `node`: a CAST's `dataType` or a column's type. `None`
 /// otherwise, because Exasol's expression typing depends on values, session, and version (#476).
 pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
-    if let Some(data_type) = node.get("dataType") {
-        return exasol_type_from_json(data_type).ok();
+    if node.get("dataType").is_some() {
+        return stated_type(node);
     }
     if kind(node) == "column" {
         columns.column_type(node)
     } else {
         None
     }
+}
+
+/// A CAST's `dataType`: the only exact type of a tree over a relation the request does not
+/// declare, such as the merge output of a split aggregate.
+pub fn stated_type(node: &Json) -> Option<ExasolType> {
+    exasol_type_from_json(node.get("dataType")?).ok()
 }
 
 /// The digit count of `text` when it is digits with an optional leading minus sign.

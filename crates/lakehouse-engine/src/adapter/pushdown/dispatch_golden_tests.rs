@@ -3,8 +3,8 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types, count_star,
-    float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
+    NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
+    count_star, float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
     request_typed, round_of, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
@@ -735,7 +735,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 10,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     }
 }
 
@@ -759,7 +759,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     }
 }
 

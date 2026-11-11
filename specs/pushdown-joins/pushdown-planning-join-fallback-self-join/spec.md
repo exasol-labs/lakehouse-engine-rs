@@ -60,8 +60,8 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 
 * *GIVEN* a `pushdown` request over an inner join in which some `tableName` names MORE THAN ONE leg
 * *AND* a `column` node of that `tableName` whose (`tableName`, `tableAlias`) pair matches no leaf's (`name`, `alias`) pair
-* *WHEN* the adapter renders the unified unaccelerated fallback SQL
-* *THEN* the adapter SHALL return the wrapper's HARD client-facing error rather than render that reference against an arbitrarily chosen leg, because an arbitrary choice returns wrong rows with no error
+* *WHEN* the adapter plans the request
+* *THEN* the adapter SHALL fail the request with a client-facing error before any catalog request, rather than render that reference against an arbitrarily chosen leg, because an arbitrary choice returns wrong rows with no error
 * *AND* the error message SHALL name the unattributable column and its table, so the failure is diagnosable from the client
 * *AND* the adapter MUST NOT fall back to bare, unqualified rendering for such a column, which Exasol would reject as ambiguous across the wrapper's subqueries
 * *AND* this state SHALL be UNREACHABLE for a well-formed request, because a table joined to itself is only legal SQL with distinct occurrences, and Exasol stamps each occurrence's alias on every `column` node of an aliased FROM clause, including columns written unqualified

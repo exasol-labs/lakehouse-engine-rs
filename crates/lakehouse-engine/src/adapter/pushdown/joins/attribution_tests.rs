@@ -1,7 +1,12 @@
+use super::super::planning::involved_table;
 use super::*;
+use crate::adapter::pushdown::support::involved_columns;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, not, num_lit, predicate_equal, scalar_fn, table_col,
+    PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, not, num_lit,
+    order_by_element, pd, predicate_equal, pushdown_request, scalar_fn, str_lit, table_col,
+    user_message,
 };
+use crate::types::exasol_type::ExasolType;
 
 impl super::JoinLegs {
     fn resolve(&self, node: &Json) -> ColumnLeg {
@@ -77,17 +82,22 @@ fn alias_matching_is_verbatim_not_case_folded() {
 }
 
 #[test]
-fn column_of_a_table_no_leg_declares_is_left_unqualified() {
+fn a_column_no_leg_declares_fails_a_join_and_stays_bare_in_a_single_scan() {
     let legs = self_join_legs();
+    let single = JoinLegs::for_single_scan(&serde_json::json!({
+        "involvedTables": [{ "name": "FACT_ORDERS" }],
+    }));
     let foreign = aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY");
 
-    let untagged = legs.resolve(&col("X"));
-
     assert_eq!(legs.resolve(&foreign), ColumnLeg::NoLeg);
-    assert_eq!(untagged, ColumnLeg::NoLeg);
+    assert_eq!(legs.resolve(&col("X")), ColumnLeg::NoLeg);
+    legs.qualify(&foreign)
+        .expect_err("binding it to either leg could return the other leg's values");
     assert_eq!(
-        legs.qualify(&foreign).expect("no leg is not a failure"),
-        foreign
+        single
+            .qualify(&col("X"))
+            .expect("a single scan binds its one table"),
+        col("X")
     );
 }
 
@@ -321,4 +331,171 @@ fn leg_alias_is_the_wrapper_subquery_alias_of_that_leg() {
     assert_eq!(legs.leg_alias(0), "LHS_T0");
     assert_eq!(legs.leg_alias(1), "LHS_T1");
     assert_eq!(legs.leg_alias(2), "LHS_T2");
+}
+
+/// [`JoinLegs::ensure_columns_declared`] as `handle_pushdown` runs it over `request`'s one table.
+fn single_scan_gate(request: &Json) -> Result<(), UdfError> {
+    let declared = involved_columns(request, |tables| tables.first()).unwrap();
+    JoinLegs::for_single_scan(request).ensure_columns_declared(&pd(request), &[&declared])
+}
+
+/// [`JoinLegs::ensure_columns_declared`] as `plan_join` runs it, each leg declaring its table's
+/// columns.
+fn join_gate(request: &Json, leaves: &[JoinLeaf]) -> Result<(), UdfError> {
+    let declared: Vec<InvolvedColumns<'_>> = leaves
+        .iter()
+        .map(|leaf| involved_table(request, &leaf.table_name).unwrap())
+        .collect();
+    JoinLegs::from_leaves(leaves)
+        .ensure_columns_declared(&pd(request), &declared.iter().collect::<Vec<_>>())
+}
+
+fn id_name_table() -> PushdownRequestBuilder {
+    pushdown_request(
+        "T",
+        &[
+            ("ID", ExasolType::decimal(18, 0)),
+            ("NAME", ExasolType::varchar(100)),
+        ],
+    )
+}
+
+fn customer_orders() -> (PushdownRequestBuilder, [JoinLeaf; 2]) {
+    let request = pushdown_request(
+        "CUSTOMER",
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+        ],
+    )
+    .table(
+        "ORDERS",
+        &[
+            ("O_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+        ],
+    )
+    .field("from", customer_orders_join());
+    (request, [leaf("CUSTOMER", None), leaf("ORDERS", None)])
+}
+
+#[test]
+fn a_single_scan_whose_every_column_is_declared_passes() {
+    let request = id_name_table()
+        .column(table_col("T", "ID"))
+        .filter(predicate_equal(table_col("T", "NAME"), str_lit("x")))
+        .group_by(vec![table_col("T", "ID")])
+        .order_by(serde_json::json!([order_by_element(
+            table_col("T", "ID"),
+            true,
+            true
+        )]))
+        .build()
+        .0;
+
+    single_scan_gate(&request).expect("every column is declared");
+}
+
+/// Scenario: A column the request does not declare fails the request
+#[test]
+fn a_single_scan_column_its_table_does_not_declare_fails_the_request() {
+    let missing = || table_col("T", "MISSING");
+    let selecting_id = || id_name_table().column(table_col("T", "ID"));
+    let cases = [
+        (
+            "selectList",
+            id_name_table().item(missing(), ExasolType::decimal(18, 0)),
+        ),
+        (
+            "filter",
+            selecting_id().filter(predicate_equal(missing(), num_lit(1))),
+        ),
+        ("groupBy", selecting_id().group_by(vec![missing()])),
+        (
+            "orderBy",
+            selecting_id().order_by(serde_json::json!([order_by_element(missing(), true, true)])),
+        ),
+    ];
+    for (clause, request) in cases {
+        let error = single_scan_gate(&request.build().0)
+            .expect_err(&format!("an undeclared column in {clause} fails"));
+        assert_mentions(&user_message(error), &["MISSING"]);
+    }
+}
+
+#[test]
+fn a_single_scan_column_without_a_table_name_binds_the_one_table() {
+    let declared = id_name_table().column(col("ID")).build().0;
+    let undeclared = id_name_table()
+        .item(col("MISSING"), ExasolType::decimal(18, 0))
+        .build()
+        .0;
+
+    single_scan_gate(&declared).expect("the one table declares ID");
+    assert_mentions(
+        &user_message(single_scan_gate(&undeclared).expect_err("the one table lacks MISSING")),
+        &["MISSING"],
+    );
+}
+
+#[test]
+fn a_join_column_declared_on_its_own_leg_passes() {
+    let (request, leaves) = customer_orders();
+    let request = request
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .column(table_col("ORDERS", "O_ORDERKEY"))
+        .build()
+        .0;
+
+    join_gate(&request, &leaves).expect("each column is declared on the leg it names");
+}
+
+/// Scenario: A column the request does not declare fails the request
+#[test]
+fn a_join_column_that_binds_no_declaring_leg_fails_the_request() {
+    let (request, leaves) = customer_orders();
+    let cases = [
+        (
+            "a leg that does not declare it",
+            request.clone().item(
+                table_col("CUSTOMER", "O_CUSTKEY"),
+                ExasolType::decimal(20, 0),
+            ),
+            "O_CUSTKEY",
+        ),
+        (
+            "a table the query does not read",
+            request
+                .clone()
+                .item(table_col("NOPE", "C_NAME"), ExasolType::varchar(100)),
+            "C_NAME",
+        ),
+        (
+            "no tableName",
+            request.column(col("C_CUSTKEY")),
+            "C_CUSTKEY",
+        ),
+    ];
+    for (binding, request, column) in cases {
+        let error = join_gate(&request.build().0, &leaves)
+            .expect_err(&format!("a column naming {binding} fails"));
+        assert_mentions(&user_message(error), &[column]);
+    }
+}
+
+/// Scenario: A column the request does not declare fails the request
+/// Scenario: A column reference no leg key matches fails loudly
+#[test]
+fn a_self_join_column_whose_alias_matches_no_occurrence_fails_the_request() {
+    let request = pushdown_request("FACT_ORDERS", &[("O_ORDERKEY", ExasolType::decimal(20, 0))])
+        .column(aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"))
+        .build()
+        .0;
+    let leaves = [
+        leaf("FACT_ORDERS", Some("A")),
+        leaf("FACT_ORDERS", Some("B")),
+    ];
+
+    let error = join_gate(&request, &leaves).expect_err("alias C names neither occurrence");
+    assert_mentions(&user_message(error), &["O_ORDERKEY", "FACT_ORDERS"]);
 }

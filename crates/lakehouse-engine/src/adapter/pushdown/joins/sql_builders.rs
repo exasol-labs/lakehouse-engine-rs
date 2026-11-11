@@ -14,7 +14,7 @@ use super::super::support::{
     projection_items, quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
-use super::attribution::{JoinLegs, UnattributableColumn};
+use super::attribution::JoinLegs;
 use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
@@ -56,9 +56,7 @@ pub(crate) fn render_broadcast_join(
     sides: &[ResolvedJoinSide],
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let legs = join.legs();
-    let condition_tree = legs
-        .qualify_every_column(&join.conditions[0])
-        .map_err(unattributable_decline)?;
+    let condition_tree = legs.qualify(&join.conditions[0])?;
     let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs)?);
     let col_types = ColumnTypes::per_relation(
         sides
@@ -66,7 +64,15 @@ pub(crate) fn render_broadcast_join(
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let scan = ScanTranslator::new(&col_types);
+    let rendered_clauses = ["selectList", "filter", "orderBy"]
+        .into_iter()
+        .filter_map(|clause| qualified.json().get(clause));
+    let scan = ScanTranslator::over(
+        &col_types,
+        &std::iter::once(&condition_tree)
+            .chain(rendered_clauses)
+            .collect::<Vec<_>>(),
+    )?;
     // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
     // loses broadcast eligibility and takes the N-scan fallback (#587).
     let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
@@ -97,15 +103,12 @@ pub(crate) fn render_broadcast_join(
     }))
 }
 
-/// Only the clauses the broadcast plan renders; a column no single leg owns has no correct
-/// qualified reference, so it fails with the fallback's own error.
+/// Only the clauses the broadcast plan renders.
 fn qualify_broadcast_clauses(pushdown_req: &Json, legs: &JoinLegs) -> Result<Json, UdfError> {
     let mut qualified = pushdown_req.clone();
     for clause in ["selectList", "filter", "orderBy"] {
         if let Some(value) = pushdown_req.get(clause) {
-            qualified[clause] = legs
-                .qualify_every_column(value)
-                .map_err(unattributable_decline)?;
+            qualified[clause] = legs.qualify(value)?;
         }
     }
     Ok(qualified)
@@ -197,14 +200,6 @@ fn join_render_decline(clause: &str) -> UdfError {
     ))
 }
 
-/// Picking a leg arbitrarily instead would return silently wrong rows.
-fn unattributable_decline(column: UnattributableColumn) -> UdfError {
-    join_render_decline(&format!(
-        "{column} could not be attributed to a join leg, so no correct qualified \
-         reference exists"
-    ))
-}
-
 /// `Ok(None)` when trivially true; `Err` when neither dialect renders it (see
 /// `_decision/045`) or a reference cannot be placed on a leg.
 fn render_self_applied_where(
@@ -212,13 +207,10 @@ fn render_self_applied_where(
     legs: &JoinLegs,
     subject: &str,
 ) -> Result<Option<String>, UdfError> {
-    if let Some(sql) = render_df_filter_qualified(tree, legs).map_err(unattributable_decline)? {
+    if let Some(sql) = render_df_filter_qualified(tree, legs)? {
         return Ok(Some(sql));
     }
-    if render_expression_qualified(tree, legs)
-        .map_err(unattributable_decline)?
-        .is_some()
-    {
+    if render_expression_qualified(tree, legs)?.is_some() {
         return Ok(None);
     }
     let tree_json = serde_json::to_string(tree).unwrap_or_default();
@@ -351,13 +343,11 @@ pub(in super::super) fn build_n_scan_join_sql(
     // A condition has no lower fallback: if it cannot render qualified, no correct SQL exists.
     let mut conditions = Vec::with_capacity(join.conditions.len());
     for cond in &join.conditions {
-        let rendered = render_expression_qualified(cond, &legs)
-            .map_err(unattributable_decline)?
-            .ok_or_else(|| {
-                join_render_decline(
-                    "a join condition could not be rendered against the qualified N-scan schema",
-                )
-            })?;
+        let rendered = render_expression_qualified(cond, &legs)?.ok_or_else(|| {
+            join_render_decline(
+                "a join condition could not be rendered against the qualified N-scan schema",
+            )
+        })?;
         conditions.push(rendered);
     }
 
@@ -374,7 +364,7 @@ pub(in super::super) fn build_n_scan_join_sql(
             referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
         let (side_filter, side_declined) =
             match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
-                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i]),
+                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i])?,
                 None => (None, None),
             };
         // Disjoint by attribution, so no conjunct is double-applied.
@@ -690,7 +680,7 @@ fn qualified_join_having(pushdown_req: &Json, legs: &JoinLegs) -> Result<Option<
 
 /// The error names the render's reason, such as an invalid CAST `dataType`.
 fn render_required_clause(expr: &Json, legs: &JoinLegs, clause: &str) -> Result<String, UdfError> {
-    let qualified = legs.qualify(expr).map_err(unattributable_decline)?;
+    let qualified = legs.qualify(expr)?;
     render_expression_exasol(&qualified).map_err(|err| {
         join_render_decline(&format!(
             "{clause} could not be rendered for the qualified N-scan join ({err})"
@@ -719,9 +709,7 @@ fn qualified_join_order_by(
     for element in elements {
         let (ascending, nulls_last) = parse_sort_flags(element).ok_or_else(decline)?;
         let expr = element.get("expression").ok_or_else(decline)?;
-        let rendered = render_expression_qualified(expr, legs)
-            .map_err(unattributable_decline)?
-            .ok_or_else(decline)?;
+        let rendered = render_expression_qualified(expr, legs)?.ok_or_else(decline)?;
         parts.push(render_ordered(&rendered, ascending, nulls_last));
     }
     Ok(Some(parts.join(", ")))

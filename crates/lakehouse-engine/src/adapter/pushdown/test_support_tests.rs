@@ -26,15 +26,6 @@ pub(crate) use vs_expression::test_support::{
     scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
 
-/// Renders through the typed scan gate with no column type known.
-pub(crate) fn untyped_scan_filter(filter: &Json) -> Option<String> {
-    scan_filter_sql(filter, &ColumnTypes::default())
-}
-
-pub(crate) fn untyped_scan_expression(expr: &Json) -> Option<String> {
-    untyped_scan().expression(expr).map(|fragment| fragment.sql)
-}
-
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
     ScanTranslator::new(col_types).split_where(Some(filter)).0
@@ -75,36 +66,37 @@ pub(crate) fn column_plan(kind: AggKind, column: &str) -> AggregatePlan {
     }
 }
 
-/// A translator that knows no column type.
-pub(crate) fn untyped_scan() -> ScanTranslator<'static> {
-    static NO_COLUMNS: std::sync::LazyLock<ColumnTypes> =
-        std::sync::LazyLock::new(ColumnTypes::default);
-    ScanTranslator::new(&NO_COLUMNS)
-}
-
-/// The numeric columns the aggregate fixtures sum, average, or deviate over.
-pub(crate) const AGGREGATED_COLUMNS: [&str; 12] = [
-    "X",
-    "V",
-    "W",
-    "F",
-    "ID",
-    "AMOUNT",
-    "SCORE",
-    "L_QUANTITY",
-    "L_EXTENDEDPRICE",
-    "L_DISCOUNT",
-    "C_ACCTBAL",
-    "C_DECIMAL_A",
+/// The numeric columns the aggregate fixtures sum, average, or deviate over, typed DOUBLE
+/// PRECISION so the scan computes their aggregates.
+pub(crate) const AGGREGATED: [(&str, ExasolType); 12] = [
+    ("X", ExasolType::DoublePrecision),
+    ("V", ExasolType::DoublePrecision),
+    ("W", ExasolType::DoublePrecision),
+    ("F", ExasolType::DoublePrecision),
+    ("ID", ExasolType::DoublePrecision),
+    ("AMOUNT", ExasolType::DoublePrecision),
+    ("SCORE", ExasolType::DoublePrecision),
+    ("L_QUANTITY", ExasolType::DoublePrecision),
+    ("L_EXTENDEDPRICE", ExasolType::DoublePrecision),
+    ("L_DISCOUNT", ExasolType::DoublePrecision),
+    ("C_ACCTBAL", ExasolType::DoublePrecision),
+    ("C_DECIMAL_A", ExasolType::DoublePrecision),
 ];
 
-/// A translator that types [`AGGREGATED_COLUMNS`] as DOUBLE PRECISION and knows no other column,
-/// so the scan computes the fixtures' numeric aggregates.
-pub(crate) fn aggregate_scan() -> ScanTranslator<'static> {
-    static AGGREGATED: std::sync::LazyLock<ColumnTypes> = std::sync::LazyLock::new(|| {
-        column_types(&AGGREGATED_COLUMNS.map(|name| (name, ExasolType::DoublePrecision)))
-    });
-    ScanTranslator::new(&AGGREGATED)
+/// The translator `handle_pushdown` derives from `request`'s first involved table. Its column map
+/// is leaked, so a test passes the translator inline as production passes its own. Panics on a
+/// request that names a column it does not declare, which `handle_pushdown` fails before any render.
+pub(crate) fn scan_of(request: &Json) -> ScanTranslator<'static> {
+    let involved = support::involved_columns(request, |tables| tables.first()).unwrap();
+    joins::ensure_single_scan_columns_declared(request, &pd(request), &involved)
+        .unwrap_or_else(|error| panic!("{}", user_message(error)));
+    ScanTranslator::new(Box::leak(Box::new(first_table_column_types(request))))
+}
+
+/// A translator over `columns`, for a unit that takes a node and never a request. Its column map is
+/// leaked, as in [`scan_of`].
+pub(crate) fn typed_scan<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> ScanTranslator<'static> {
+    ScanTranslator::new(Box::leak(Box::new(column_types(columns))))
 }
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
@@ -479,7 +471,15 @@ pub(crate) fn request_sides(
             partition_columns: Vec::new(),
             total_bytes: 0,
             refused_columns: Vec::new(),
-            column_types: ColumnTypes::default(),
+            column_types: column_types(
+                &support::involved_columns(request, |tables| {
+                    tables
+                        .iter()
+                        .find(|table| table["name"].as_str() == Some(leaf.table_name.as_str()))
+                })
+                .unwrap()
+                .types,
+            ),
         })
         .collect();
     request_typed(request, &sides)
@@ -1512,6 +1512,20 @@ pub(crate) fn pushdown_request<N: AsRef<str>>(
 }
 
 impl PushdownRequestBuilder {
+    /// More columns of the last involved table.
+    pub(crate) fn declare<N: AsRef<str>>(mut self, columns: &[(N, ExasolType)]) -> Self {
+        let (_, declared) = self
+            .tables
+            .last_mut()
+            .expect("a request has an involved table");
+        declared.extend(
+            columns
+                .iter()
+                .map(|(column, exa_type)| (column.as_ref().to_string(), *exa_type)),
+        );
+        self
+    }
+
     /// Another involved table, as a join involves.
     pub(crate) fn table<N: AsRef<str>>(mut self, name: &str, columns: &[(N, ExasolType)]) -> Self {
         let columns = columns
@@ -1628,6 +1642,13 @@ impl PushdownRequestBuilder {
     /// [`build`](Self::build)'s `pushdownRequest`, parsed as `handle_pushdown` parses it.
     pub(crate) fn build_pushdown(self) -> PushdownRequest {
         parsed_pushdown(&self.build().0)
+    }
+
+    /// [`build_pushdown`](Self::build_pushdown) and the translator `handle_pushdown` derives from
+    /// the request's first involved table.
+    pub(crate) fn build_scanned(self) -> (PushdownRequest, ScanTranslator<'static>) {
+        let request = self.build().0;
+        (parsed_pushdown(&request), scan_of(&request))
     }
 
     fn item_typed(mut self, node: Json, exa_type: ExasolType) -> Self {

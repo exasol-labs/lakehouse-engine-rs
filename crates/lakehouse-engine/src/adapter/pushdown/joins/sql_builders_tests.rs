@@ -708,11 +708,7 @@ fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
         UdfError::User(msg) => {
             assert!(msg.contains("O_ORDERKEY"), "{msg}");
             assert!(msg.contains("FACT_ORDERS"), "{msg}");
-            assert!(
-                msg.contains("could not be attributed to a join leg"),
-                "{msg}"
-            );
-            assert!(msg.contains("hard error, not a native re-plan"), "{msg}");
+            assert!(msg.contains("binds no single table of the query"), "{msg}");
         }
         other => panic!("expected a User decline, got {other:?}"),
     }
@@ -1412,29 +1408,6 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
         classify_join_window(&pd(&having)),
         JoinWindowPlan::ExasolPostProcessed
     ));
-}
-
-#[test]
-fn aggregate_over_join_classifies_before_the_render_that_would_error() {
-    let mut request = join_request(Json::Null, equi_condition());
-    for table in request["involvedTables"].as_array_mut().unwrap() {
-        table["columns"] = serde_json::json!([]);
-    }
-    request = selecting(request, &[(count_star(), ExasolType::decimal(18, 0))]);
-    let pushdown_req = pd(&request);
-
-    assert!(matches!(
-        classify_join_window(&pushdown_req),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-    assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&request),
-            &detected_join(&request),
-            &request_sides(&request, &detected_join(&request))
-        )
-        .is_err()
-    );
 }
 
 #[test]
@@ -2277,7 +2250,7 @@ fn referenced_columns_falls_back_to_first_column() {
 fn n_scan_join_untranslatable_select_item_is_hard_error() {
     let unknown = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
     assert!(
-        untyped_scan_expression(&unknown).is_none()
+        typed_scan(NO_COLUMNS).expression(&unknown).is_none()
             && render_expression_exasol_safe(&unknown).is_none(),
         "the fixture node must be untranslatable under BOTH dialects"
     );
@@ -2419,7 +2392,9 @@ fn declined_filter_wrapper_sql(
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
     let declined = declined_second_predicate(table_col("T", "C_TS"));
     assert!(
-        untyped_scan_expression(&declined).is_none()
+        ScanTranslator::new(&first_table_column_types(&declined_filter_request()))
+            .expression(&declined)
+            .is_none()
             && render_expression_exasol_safe(&declined).is_some(),
         "fixture precondition: SECOND(C_TS, 3) must decline for DataFusion and \
          render for Exasol"
@@ -2957,7 +2932,7 @@ fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
     ] {
         let message = attribution_error(&request);
         assert!(
-            message.contains("could not be attributed to a join leg"),
+            message.contains("C_NAME") && message.contains("binds no"),
             "a NoLeg column ({label}) must fail like an unattributable one: {message}"
         );
     }

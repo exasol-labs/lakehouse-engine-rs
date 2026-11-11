@@ -1862,7 +1862,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -1875,7 +1875,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: vec!["REGION".to_string()],
         total_bytes: 10,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     };
     let sides = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(

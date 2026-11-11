@@ -381,8 +381,9 @@ fn projection_carried_in_common_literal_and_emits() {
 
 #[test]
 fn pushdown_translates_or_omits_predicate() {
+    let ages = column_types(&[("AGE", ExasolType::decimal(20, 0))]);
     let translatable = compare("predicate_greater", col("age"), num_lit(18));
-    let filter_rendered = untyped_scan_filter(&translatable);
+    let filter_rendered = scan_filter_sql(&translatable, &ages);
     assert!(
         filter_rendered.is_some(),
         "translatable predicate must produce a filter string"
@@ -400,7 +401,7 @@ fn pushdown_translates_or_omits_predicate() {
     // Kept out of the scan spec only; the adapter still self-applies it (see
     // `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`).
     let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
-    let omitted = untyped_scan_filter(&untranslatable);
+    let omitted = scan_filter_sql(&untranslatable, &ages);
     assert!(
         omitted.is_none(),
         "untranslatable predicate must be omitted (None), not mistranslated"
@@ -532,7 +533,7 @@ fn aggregate_query_builds_partial_agg_spec() {
         cast_merge_items(
             &agg_plans,
             &[ExasolType::DoublePrecision, ExasolType::decimal(18, 0)],
-            &ColumnTypes::default(),
+            &column_types(NO_COLUMNS),
         ),
         None,
     )
@@ -707,7 +708,7 @@ fn build_agg_sql(
     let merge_select = cast_merge_items(
         &agg_plans,
         &vec![ExasolType::DoublePrecision; agg_plans.len()],
-        &ColumnTypes::default(),
+        &column_types(NO_COLUMNS),
     );
     let spec_template = CommonScanSpec {
         aggregates: Some(agg_plans),
@@ -738,7 +739,7 @@ fn aggregate_merge_renders_having_then_request_limit() {
     let merge_select = cast_merge_items(
         &plans,
         &[ExasolType::decimal(18, 0)],
-        &ColumnTypes::default(),
+        &column_types(NO_COLUMNS),
     );
     let spec_template = CommonScanSpec {
         aggregates: Some(plans),
@@ -1058,7 +1059,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         .build();
     let pushdown = parsed_pushdown(&request);
 
-    let items = super::super::detect_aggregates(&pushdown, untyped_scan())
+    let items = super::super::detect_aggregates(&pushdown, scan_of(&request))
         .expect("two COUNT(DISTINCT) items are detected as distinct fan-out descriptors");
     assert!(
         has_distinct(&items),
@@ -1717,7 +1718,10 @@ fn filter_in_common_arg() {
 
     let filter_json = predicate_equal(col("id"), num_lit(42));
 
-    let df_filter = untyped_scan_filter(&filter_json);
+    let df_filter = scan_filter_sql(
+        &filter_json,
+        &column_types(&[("ID", ExasolType::decimal(10, 0))]),
+    );
     assert!(
         df_filter.is_some(),
         "translatable filter must produce a DataFusion SQL string"
@@ -2836,8 +2840,8 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
-        untyped_scan_expression(&literal).is_some(),
-        "literal_timestamp_utc must render via untyped_scan_expression"
+        typed_scan(NO_COLUMNS).expression(&literal).is_some(),
+        "literal_timestamp_utc must render through the scan translator"
     );
     let (proj_cols, proj_types, widened) = projected(id_name_request().item(
         literal,
@@ -2866,7 +2870,7 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
 fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
     let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
-        untyped_scan_expression(&literal).is_none(),
+        typed_scan(NO_COLUMNS).expression(&literal).is_none(),
         "the DataFusion dialect must keep declining the real wire name (#242): \
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"
@@ -2891,4 +2895,29 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
         proj_types,
         vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
     );
+}
+
+#[test]
+fn a_translator_over_a_tree_whose_columns_all_bind_builds() {
+    let universe = shared_name_universe();
+    let tree = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "X", "tableAlias": "LHS_T0"},
+        "right": {"type": "column", "name": "X", "tableAlias": "LHS_T1"},
+    });
+
+    ScanTranslator::over(&universe, &[&tree]).expect("each column binds its own relation");
+}
+
+#[test]
+fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
+    let universe = shared_name_universe();
+    let undeclared = serde_json::json!({"type": "column", "name": "Y", "tableAlias": "LHS_T0"});
+    let wrong_relation = serde_json::json!({"type": "column", "name": "X", "tableAlias": "LHS_T2"});
+
+    for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
+        let error = ScanTranslator::over(&universe, &[&tree])
+            .expect_err("a column no entry binds is an adapter bug, never a decline");
+        assert_mentions(&user_message(error), &[column]);
+    }
 }
