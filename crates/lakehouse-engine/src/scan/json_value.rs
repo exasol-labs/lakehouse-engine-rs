@@ -1,7 +1,8 @@
 //! `JSON_VALUE` in the scan with Exasol's semantics (#574): the whole document must be JSON, paths
 //! run in lax mode over item sequences, and the result converts to the `RETURNING` type.
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, StringArray};
+use arrow::array::{ArrayRef, AsArray, BooleanArray, StringArray};
+use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
@@ -24,8 +25,7 @@ enum Item<'a> {
     /// Not JSON, several items, or a non-scalar item: `ON ERROR` applies.
     Error,
     Null,
-    Boolean(bool),
-    /// A string's text or a number's source text.
+    /// A string's text, or the source text of a number, `true`, or `false`.
     Text(Cow<'a, str>),
 }
 
@@ -97,8 +97,6 @@ fn select<'a>(doc: &'a str, path: &[JsonPathStep]) -> Item<'a> {
         [] => Item::Empty,
         [item] => match kind(item) {
             b'n' => Item::Null,
-            b't' => Item::Boolean(true),
-            b'f' => Item::Boolean(false),
             b'"' => serde_json::from_str::<String>(item.get())
                 .map_or(Item::Error, |text| Item::Text(text.into())),
             b'{' | b'[' => Item::Error,
@@ -125,31 +123,27 @@ fn boolean_from_text(text: &str) -> Option<bool> {
     }
 }
 
-/// `None` is the result NULL; `Err(())` means `ON ERROR` applies.
-fn text_value<'i>(
-    item: &'i Item<'_>,
-    max_chars: usize,
-) -> Option<std::result::Result<&'i str, ()>> {
-    let text = match item {
-        Item::Null => return None,
-        Item::Boolean(true) => "true",
-        Item::Boolean(false) => "false",
-        Item::Text(text) => text,
-        Item::Empty | Item::Error => return Some(Err(())),
-    };
+/// `Err` means `ON ERROR` applies. Exasol reads the empty string as NULL.
+fn text_value(text: &str, max_chars: usize) -> std::result::Result<Option<&str>, ()> {
     match text {
-        "" => None,
-        text if text.chars().count() > max_chars => Some(Err(())),
-        text => Some(Ok(text)),
+        "" => Ok(None),
+        text if text.chars().count() > max_chars => Err(()),
+        text => Ok(Some(text)),
     }
 }
 
-fn boolean_value(item: &Item<'_>) -> Option<std::result::Result<bool, ()>> {
-    match item {
+/// A NULL document or item gives NULL, and a failed conversion gives `on_error`.
+fn resolve<'i, T: Copy>(
+    item: Option<&'i Item<'_>>,
+    convert: impl Fn(&'i str) -> std::result::Result<Option<T>, ()>,
+    on_empty: Option<T>,
+    on_error: Option<T>,
+) -> Option<T> {
+    match item? {
         Item::Null => None,
-        Item::Boolean(value) => Some(Ok(*value)),
-        Item::Text(text) => Some(boolean_from_text(text).ok_or(())),
-        Item::Empty | Item::Error => Some(Err(())),
+        Item::Empty => on_empty,
+        Item::Error => on_error,
+        Item::Text(text) => convert(text).unwrap_or(on_error),
     }
 }
 
@@ -157,20 +151,6 @@ fn boolean_value(item: &Item<'_>) -> Option<std::result::Result<bool, ()>> {
 struct JsonUdf {
     name: &'static str,
     signature: Signature,
-}
-
-fn texts(array: &ArrayRef) -> Result<Vec<Option<&str>>> {
-    Ok(match array.data_type() {
-        DataType::Utf8 => array.as_string::<i32>().iter().collect(),
-        DataType::LargeUtf8 => array.as_string::<i64>().iter().collect(),
-        DataType::Utf8View => array.as_string_view().iter().collect(),
-        DataType::Null => vec![None; array.len()],
-        other => {
-            return Err(DataFusionError::Execution(format!(
-                "JSON_VALUE reads a text document, not {other}"
-            )));
-        }
-    })
 }
 
 fn scalar_argument(args: &ScalarFunctionArgs, index: usize) -> Result<&ScalarValue> {
@@ -184,15 +164,16 @@ fn scalar_argument(args: &ScalarFunctionArgs, index: usize) -> Result<&ScalarVal
 
 impl JsonUdf {
     fn values(&self, args: &ScalarFunctionArgs) -> Result<ArrayRef> {
-        let documents = args.args[0].to_array(args.number_rows)?;
+        let documents = cast(&args.args[0].to_array(args.number_rows)?, &DataType::Utf8)?;
         let path = scalar_argument(args, 1)?
             .try_as_str()
             .flatten()
             .and_then(parse_json_path)
             .ok_or_else(|| DataFusionError::Execution(format!("{} path", self.name)))?;
         // Exasol reads the empty string as NULL.
-        let items: Vec<Option<Item>> = texts(&documents)?
-            .into_iter()
+        let items: Vec<Option<Item>> = documents
+            .as_string::<i32>()
+            .iter()
             .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, &path)))
             .collect();
         if self.name == JSON_VALUE_BOOLEAN_FN {
@@ -202,39 +183,29 @@ impl JsonUdf {
                 other => Err(DataFusionError::Execution(format!("fallback {other}"))),
             };
             let (on_empty, on_error) = (fallback(2)?, fallback(3)?);
+            let boolean = |text| boolean_from_text(text).map(Some).ok_or(());
             let values: BooleanArray = items
                 .iter()
-                .map(|item| match boolean_value(item.as_ref()?)? {
-                    Ok(value) => Some(value),
-                    Err(()) if item == &Some(Item::Empty) => on_empty,
-                    Err(()) => on_error,
-                })
+                .map(|item| resolve(item.as_ref(), boolean, on_empty, on_error))
                 .collect();
             return Ok(Arc::new(values));
         }
-        let max_chars = scalar_argument(args, 2)?
-            .cast_to(&DataType::UInt64)
-            .ok()
-            .and_then(|value| match value {
-                ScalarValue::UInt64(Some(max)) => Some(max as usize),
-                _ => None,
-            })
-            .ok_or_else(|| DataFusionError::Execution(format!("{} size", self.name)))?;
+        let ScalarValue::UInt64(Some(max_chars)) =
+            scalar_argument(args, 2)?.cast_to(&DataType::UInt64)?
+        else {
+            return Err(DataFusionError::Execution(format!("{} size", self.name)));
+        };
         let fallback = |index| match scalar_argument(args, index)? {
             ScalarValue::Null => Ok(None),
             other => other
                 .try_as_str()
-                .map(|text| text.map(str::to_string))
                 .ok_or_else(|| DataFusionError::Execution(format!("fallback {other}"))),
         };
         let (on_empty, on_error) = (fallback(3)?, fallback(4)?);
+        let text = |text| text_value(text, max_chars as usize);
         let values: StringArray = items
             .iter()
-            .map(|item| match text_value(item.as_ref()?, max_chars)? {
-                Ok(value) => Some(value),
-                Err(()) if item == &Some(Item::Empty) => on_empty.as_deref(),
-                Err(()) => on_error.as_deref(),
-            })
+            .map(|item| resolve(item.as_ref(), text, on_empty, on_error))
             .collect();
         Ok(Arc::new(values))
     }

@@ -19,7 +19,7 @@ fn paths_select_what_exasol_selects() {
             "$.a",
             r#"Text("12345678901234567890123")"#,
         ),
-        (r#"{"a":true}"#, "$.a", "Boolean(true)"),
+        (r#"{"a":true}"#, "$.a", r#"Text("true")"#),
         (r#"{"a":null}"#, "$.a", "Null"),
         (r#"{"a":null}"#, "$.a.b", "Empty"),
         (r#"{"a":"é😀\/"}"#, "$.a", r#"Text("é😀/")"#),
@@ -126,15 +126,14 @@ fn text_to_boolean_follows_exasol_cast() {
 
 #[test]
 fn text_results_count_characters_and_read_empty_as_null() {
-    for (item, max_chars, expected) in [
-        (Item::Text("éé€".into()), 3, Some(Ok("éé€"))),
-        (Item::Text("😀x".into()), 1, Some(Err(()))),
-        (Item::Text("12345".into()), 3, Some(Err(()))),
-        (Item::Boolean(false), 3, Some(Err(()))),
-        (Item::Boolean(false), 5, Some(Ok("false"))),
-        (Item::Text("".into()), 3, None),
-        (Item::Null, 3, None),
+    for (text, max_chars, expected) in [
+        ("éé€", 3, Ok(Some("éé€"))),
+        ("😀x", 1, Err(())),
+        ("12345", 3, Err(())),
+        ("false", 3, Err(())),
+        ("false", 5, Ok(Some("false"))),
+        ("", 3, Ok(None)),
     ] {
-        assert_eq!(text_value(&item, max_chars), expected, "{item:?}");
+        assert_eq!(text_value(text, max_chars), expected, "{text:?}");
     }
 }

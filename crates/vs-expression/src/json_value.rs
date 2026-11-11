@@ -138,23 +138,21 @@ fn fallback(behavior: Option<&Json>, returning: Returning) -> Result<Fallback, U
     };
     let expression = behavior.get("expression").unwrap_or(&Json::Null);
     let value = expression.get("value");
-    let fallback = match (behavior.get("type").and_then(Json::as_str), returning) {
-        (Some("NULL"), _) => Some(Fallback::Null),
-        (Some("DEFAULT"), _) if expression.get("type") == Some(&"literal_null".into()) => {
-            Some(Fallback::Null)
-        }
-        (Some("DEFAULT"), Returning::Text { max_chars }) => value
+    fn kind(node: &Json) -> Option<&str> {
+        node.get("type").and_then(Json::as_str)
+    }
+    let fallback = match (kind(behavior), kind(expression), returning) {
+        (Some("NULL"), _, _) | (Some("DEFAULT"), Some("literal_null"), _) => Some(Fallback::Null),
+        (Some("DEFAULT"), Some("literal_string"), Returning::Text { max_chars }) => value
             .and_then(Json::as_str)
-            .filter(|_| expression.get("type") == Some(&"literal_string".into()))
             .filter(|text| text.chars().count() <= max_chars as usize)
             .map(|text| match text {
                 "" => Fallback::Null,
                 text => Fallback::Text(text.to_string()),
             }),
-        (Some("DEFAULT"), Returning::Boolean) => value
-            .and_then(Json::as_bool)
-            .filter(|_| expression.get("type") == Some(&"literal_bool".into()))
-            .map(Fallback::Boolean),
+        (Some("DEFAULT"), Some("literal_bool"), Returning::Boolean) => {
+            value.and_then(Json::as_bool).map(Fallback::Boolean)
+        }
         _ => None,
     };
     fallback.ok_or_else(|| decline(format!("JSON_VALUE behavior {behavior} runs in Exasol")))
