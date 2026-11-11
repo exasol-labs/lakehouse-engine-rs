@@ -195,7 +195,7 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
     .await
     .expect("sigv4 resolution must not fail");
     assert!(
-        matches!(&auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
+        matches!(&auth, CatalogAuth::Sigv4 { region, .. } if region == "us-east-1"),
         "use_sigv4 must resolve to CatalogAuth::Sigv4 carrying the stated region"
     );
 

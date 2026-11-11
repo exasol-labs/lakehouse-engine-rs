@@ -1,8 +1,35 @@
 //! Builders for Exasol pushdown-request JSON nodes: columns, literals, predicates, scalar
-//! functions, CAST, EXTRACT, CASE, and aggregates. Dependent crates enable `test-support`.
+//! functions, CAST, EXTRACT, CASE, and aggregates, plus the column types the typed renderers
+//! look up. Dependent crates enable `test-support`.
 
-use crate::ColumnNode;
+use crate::exasol_type::{ExasolType, exasol_type_to_json};
+use crate::{ColumnNode, ColumnTypeLookup};
 use serde_json::{Map, Value as Json, json};
+
+/// Column types by name, matched case-insensitively. The default knows no column.
+#[derive(Debug, Default)]
+pub struct TypedColumns(Vec<(String, ExasolType)>);
+
+pub fn typed_columns<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> TypedColumns {
+    TypedColumns(
+        columns
+            .iter()
+            .map(|(name, exa_type)| (name.as_ref().to_uppercase(), *exa_type))
+            .collect(),
+    )
+}
+
+/// `VARCHAR(size) ASCII`.
+pub fn ascii_varchar(size: u32) -> ExasolType {
+    ExasolType::Varchar { size, ascii: true }
+}
+
+impl ColumnTypeLookup for TypedColumns {
+    fn column_type(&self, column: &Json) -> Option<ExasolType> {
+        let name = column.get("name")?.as_str()?.to_uppercase();
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
+    }
+}
 
 pub fn col(name: &str) -> Json {
     ColumnNode::to_json(name, None, None)
@@ -144,6 +171,11 @@ pub fn cast_json(data_type: Json, argument: Json) -> Json {
             ("dataType", data_type),
         ],
     )
+}
+
+/// `CAST(argument AS target)`.
+pub fn cast_to(target: ExasolType, argument: Json) -> Json {
+    cast_json(exasol_type_to_json(&target), argument)
 }
 
 /// `EXTRACT(field FROM argument)`.

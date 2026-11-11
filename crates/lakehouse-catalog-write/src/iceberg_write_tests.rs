@@ -2,12 +2,12 @@ use super::*;
 use crate::retry::backoff_wait;
 use crate::test_support::{
     COMMIT_CONFLICT, CREATE_CONFLICT, LOAD_TABLE_NO_SNAPSHOTS, LOAD_TABLE_TAGGED, PREFIX_CONFIG,
-    RECORDED_PLACEHOLDERS, STAGE_TABLE, STAGED_LOCATION, TAGGED_EXPORT_ID, TAGGED_WRITER_ID,
-    assert_free_of, catalog, data_file, ident, memory_table, requests_starting, session,
+    RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
+    catalog, data_file, ident, memory_table, requests_starting, session,
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
-use lakehouse_catalog::StorageProps;
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
+use lakehouse_catalog::{StorageProps, system_clock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,6 +20,7 @@ const EXISTS_T: &str = "HEAD /v1/p/namespaces/ns/tables/t ";
 const COMMIT_STAGED: &str = "POST /v1/p/namespaces/ns/tables/staged ";
 const LOAD_STAGED: &str = "GET /v1/p/namespaces/ns/tables/staged?snapshots=all ";
 const EXISTS_STAGED: &str = "HEAD /v1/p/namespaces/ns/tables/staged ";
+const DROP_STAGED: &str = "DELETE /v1/p/namespaces/ns/tables/staged";
 
 fn static_storage() -> WriteStorage {
     WriteStorage::Static(StorageBackend::S3(StorageProps {
@@ -68,14 +69,14 @@ fn memory_write_table(retries: u32) -> WriteTable {
     );
     WriteTable {
         table: memory_table(&answer, &ident("ns", "t")),
-        credentials: TableCredentials::Static(Vec::new()),
+        credentials: StorageCredentials::keys("", "", None, system_clock()),
     }
 }
 
 fn memory_staged_table() -> StagedTable {
     StagedTable(WriteTable {
         table: memory_table(STAGE_TABLE, &ident("ns", "staged")),
-        credentials: TableCredentials::Static(Vec::new()),
+        credentials: StorageCredentials::keys("", "", None, system_clock()),
     })
 }
 
@@ -107,32 +108,15 @@ fn json_body(request: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn ensure_namespace_creates_each_level_top_down_and_counts_an_existing_one_as_created() {
-    let answer = in_turn(vec![(409, CREATE_CONFLICT.into()), (200, "{}".into())]);
-    let (uri, requests) = catalog(PREFIX_CONFIG, move |_| answer()).await;
-    let writes = static_writes(&uri).await;
-
-    writes
-        .ensure_namespace(&NamespaceIdent::from_strs(["a", "b"]).unwrap())
-        .await
-        .unwrap();
-
-    let bodies: Vec<_> = requests_starting(&requests, "POST /v1/p/namespaces ")
-        .iter()
-        .map(|request| json_body(request))
-        .collect();
-    assert_eq!(
-        bodies,
-        [
-            serde_json::json!({"namespace": ["a"]}),
-            serde_json::json!({"namespace": ["a", "b"]})
-        ]
-    );
-}
-
-#[tokio::test]
 async fn a_namespace_level_the_catalog_refuses_fails_at_once_naming_the_namespace() {
-    let (uri, requests) = catalog(PREFIX_CONFIG, |_| (403, "{\"error\":\"denied\"}".into())).await;
+    let (uri, requests) = catalog(PREFIX_CONFIG, |line| {
+        if line.starts_with("GET ") {
+            (404, "{}".into())
+        } else {
+            (403, "{\"error\":\"denied\"}".into())
+        }
+    })
+    .await;
     let writes = static_writes(&uri).await;
 
     let refused = writes
@@ -153,7 +137,14 @@ async fn a_namespace_level_the_catalog_refuses_fails_at_once_naming_the_namespac
 #[tokio::test]
 async fn a_namespace_level_without_an_answer_is_sent_again() {
     let answer = in_turn(vec![(504, "{}".into()), (200, "{}".into())]);
-    let (uri, requests) = catalog(PREFIX_CONFIG, move |_| answer()).await;
+    let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
+        if line.starts_with("GET ") {
+            (404, "{}".into())
+        } else {
+            answer()
+        }
+    })
+    .await;
     let writes = static_writes(&uri).await;
 
     writes
@@ -162,41 +153,6 @@ async fn a_namespace_level_without_an_answer_is_sent_again() {
         .unwrap();
 
     assert_eq!(requests_starting(&requests, "POST ").len(), 2);
-}
-
-#[tokio::test]
-async fn create_table_sends_a_format_2_table_tagged_with_the_export_id() {
-    let (uri, requests) = catalog(
-        PREFIX_CONFIG,
-        routes(vec![(TABLES, (200, LOAD_TABLE_NO_SNAPSHOTS.into()))]),
-    )
-    .await;
-    let writes = static_writes(&uri).await;
-
-    let created = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
-        .await
-        .unwrap();
-
-    let sent = json_body(&requests_starting(&requests, TABLES)[0]);
-    assert_eq!(sent["name"], "t");
-    assert_eq!(
-        sent["properties"],
-        serde_json::json!({
-            "format-version": "2",
-            "commit.retry.num-retries": "20",
-            "lakehouse.export-id": "e1"
-        })
-    );
-    assert_eq!(sent["schema"]["fields"][0]["name"], "ID");
-    assert!(sent.get("stage-create").is_none(), "{sent}");
-    assert_eq!(
-        created.table().metadata().location(),
-        "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2"
-    );
-    let mut secrets = created.secret_values();
-    secrets.sort();
-    assert_eq!(secrets, STATIC_SECRETS);
 }
 
 #[tokio::test]
@@ -227,25 +183,6 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
         foreign.err().unwrap().to_string(),
         "table ns.t already exists; the export only creates new tables"
     );
-}
-
-#[tokio::test]
-async fn an_existing_table_is_refused_naming_it_and_an_absent_one_passes() {
-    let (uri, _) = catalog(
-        PREFIX_CONFIG,
-        routes(vec![(EXISTS_T, (204, String::new()))]),
-    )
-    .await;
-    let writes = static_writes(&uri).await;
-
-    let existing = writes.refuse_existing_table(&ident("ns", "t")).await;
-    let absent = writes.refuse_existing_table(&ident("ns", "absent")).await;
-
-    assert_eq!(
-        existing.unwrap_err().to_string(),
-        "table ns.t already exists; the export only creates new tables"
-    );
-    assert!(absent.is_ok(), "{absent:?}");
 }
 
 #[tokio::test]
@@ -300,7 +237,7 @@ async fn a_create_the_catalog_refuses_fails_at_once_naming_the_table() {
 
 #[tokio::test]
 async fn a_create_the_catalog_stays_busy_for_fails_after_its_retries() {
-    let (uri, requests) = catalog(PREFIX_CONFIG, |_| (503, "{}".into())).await;
+    let (uri, requests) = catalog(PREFIX_CONFIG, |_| (429, "{}".into())).await;
     let writes = static_writes(&uri).await;
 
     let failed = writes
@@ -313,7 +250,7 @@ async fn a_create_the_catalog_stays_busy_for_fails_after_its_retries() {
     assert_eq!(
         failed,
         format!(
-            "creating table ns.t failed after 5 attempts: the catalog {uri} answered HTTP 503: {{}}"
+            "creating table ns.t failed after 5 attempts: the catalog {uri} answered HTTP 429: {{}}"
         )
     );
     assert_eq!(requests_starting(&requests, TABLES).len(), 5);
@@ -417,31 +354,6 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
 }
 
 #[tokio::test]
-async fn stage_table_asks_for_staged_creation_and_opens_the_invisible_table() {
-    let (uri, requests) = catalog(
-        PREFIX_CONFIG,
-        routes(vec![(TABLES, (200, STAGE_TABLE.into()))]),
-    )
-    .await;
-    let writes = vended_writes(&uri, true).await;
-
-    let staged = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
-        .await
-        .unwrap();
-
-    let sent = json_body(&requests_starting(&requests, TABLES)[0]);
-    assert_eq!(sent["stage-create"], true);
-    assert_eq!(sent["properties"]["lakehouse.export-id"], "e1");
-    assert_eq!(staged.table().metadata().location(), STAGED_LOCATION);
-    assert_eq!(staged.table().metadata_location(), None);
-    assert_eq!(
-        requests_starting(&requests, "HEAD /v1/p/namespaces/ns/tables/staged ").len(),
-        1
-    );
-}
-
-#[tokio::test]
 async fn an_abfss_stage_answer_is_refused_naming_the_table_and_the_scheme() {
     let abfss = STAGE_TABLE.replace(
         "s3://warehouse/lakehouse_vended/",
@@ -520,19 +432,21 @@ async fn an_unreadable_stage_answer_fails_stating_that_single_commit_needs_stage
 }
 
 #[tokio::test]
-async fn a_stage_answer_followed_by_a_visible_table_is_refused_naming_the_catalog() {
-    let (uri, _) = catalog(
+async fn a_stage_answer_followed_by_a_table_this_export_created_drops_it() {
+    let (uri, requests) = catalog(
         PREFIX_CONFIG,
         routes(vec![
             (TABLES, (200, STAGE_TABLE.into())),
             (EXISTS_STAGED, (204, String::new())),
+            (LOAD_STAGED, (200, STAGE_TABLE.into())),
+            (DROP_STAGED, (204, String::new())),
         ]),
     )
     .await;
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -542,24 +456,207 @@ async fn a_stage_answer_followed_by_a_visible_table_is_refused_naming_the_catalo
         refused,
         format!(
             "the catalog {uri} ignored staged creation (stage-create): table ns.staged became \
-             visible before its commit, so SINGLE_COMMIT cannot make it appear only with its data"
+             visible before its commit, so SINGLE_COMMIT cannot make it appear only with its \
+             data; the table was dropped again"
         )
+    );
+    assert_eq!(requests_starting(&requests, DROP_STAGED).len(), 1);
+}
+
+#[tokio::test]
+async fn a_stage_answer_followed_by_a_table_it_cannot_drop_says_the_table_must_be_dropped() {
+    let (uri, _) = catalog(
+        PREFIX_CONFIG,
+        routes(vec![
+            (TABLES, (200, STAGE_TABLE.into())),
+            (EXISTS_STAGED, (204, String::new())),
+            (LOAD_STAGED, (200, STAGE_TABLE.into())),
+            (DROP_STAGED, (403, "{}".into())),
+        ]),
+    )
+    .await;
+    let writes = vended_writes(&uri, true).await;
+
+    let refused = writes
+        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        refused.ends_with("; the table now exists and must be dropped"),
+        "{refused}"
     );
 }
 
 #[tokio::test]
-async fn load_table_opens_the_table_with_every_snapshot() {
+async fn a_stage_answer_followed_by_another_exports_table_leaves_it_and_says_so() {
     let (uri, requests) = catalog(
         PREFIX_CONFIG,
-        routes(vec![(LOAD_T, (200, LOAD_TABLE_TAGGED.into()))]),
+        routes(vec![
+            (TABLES, (200, STAGE_TABLE.into())),
+            (EXISTS_STAGED, (204, String::new())),
+            (LOAD_STAGED, (200, STAGE_TABLE.into())),
+        ]),
+    )
+    .await;
+    let writes = vended_writes(&uri, true).await;
+
+    let refused = writes
+        .stage_table(&ident("ns", "staged"), schema(), "another-export")
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        refused.ends_with("; the table now exists and must be dropped"),
+        "{refused}"
+    );
+    assert!(requests_starting(&requests, DROP_STAGED).is_empty());
+}
+
+/// A namespace the catalog holds is not created, so a user who may not create namespaces can still
+/// export into it.
+#[tokio::test]
+async fn an_existing_namespace_is_not_created_even_where_creating_is_refused() {
+    let (uri, _) = catalog(
+        PREFIX_CONFIG,
+        routes(vec![
+            ("GET /v1/p/namespaces/a ", (200, "{}".into())),
+            ("GET /v1/p/namespaces/a%1Fb ", (200, "{}".into())),
+            (
+                "POST /v1/p/namespaces ",
+                (403, "{\"error\":\"denied\"}".into()),
+            ),
+        ]),
     )
     .await;
     let writes = static_writes(&uri).await;
 
-    let loaded = writes.load_table(&ident("ns", "t")).await.unwrap();
+    let ensured = writes
+        .ensure_namespace(&NamespaceIdent::from_strs(["a", "b"]).unwrap())
+        .await;
 
-    assert_eq!(loaded.table().metadata().snapshots().len(), 1);
-    assert_eq!(requests_starting(&requests, LOAD_T).len(), 1);
+    assert!(ensured.is_ok(), "{ensured:?}");
+}
+
+#[tokio::test]
+async fn a_missing_namespace_level_is_created_and_one_created_meanwhile_counts_as_created() {
+    let (uri, requests) = catalog(
+        PREFIX_CONFIG,
+        routes(vec![(
+            "POST /v1/p/namespaces ",
+            (409, CREATE_CONFLICT.into()),
+        )]),
+    )
+    .await;
+    let writes = static_writes(&uri).await;
+
+    writes
+        .ensure_namespace(&NamespaceIdent::new("a".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(requests_starting(&requests, "POST ").len(), 1);
+}
+
+#[test]
+fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
+    let request = creation_request(&ident("ns", "t"), schema(), "e1");
+
+    let sent = serde_json::to_value(&request).unwrap();
+
+    assert_eq!(sent["name"], "t");
+    assert_eq!(
+        sent["properties"],
+        serde_json::json!({
+            "format-version": "2",
+            "commit.retry.num-retries": "20",
+            "lakehouse.export-id": "e1"
+        })
+    );
+    assert_eq!(sent["schema"]["fields"][0]["name"], "ID");
+    assert!(sent.get("stage-create").is_none(), "{sent}");
+}
+
+#[test]
+fn a_stage_request_asks_for_staged_creation() {
+    let mut request = creation_request(&ident("ns", "t"), schema(), "e1");
+    request.stage_create = Some(true);
+
+    let sent = serde_json::to_value(&request).unwrap();
+
+    assert_eq!(sent["stage-create"], true);
+}
+
+#[test]
+fn a_status_maps_to_what_it_says_about_the_request() {
+    let cases = [
+        (200, Outcome::Applied),
+        (204, Outcome::Applied),
+        (409, Outcome::Conflict),
+        (429, Outcome::Busy),
+        (500, Outcome::MayHaveApplied),
+        (502, Outcome::MayHaveApplied),
+        (503, Outcome::MayHaveApplied),
+        (504, Outcome::MayHaveApplied),
+        (400, Outcome::Refused),
+        (401, Outcome::Refused),
+        (403, Outcome::Refused),
+        (404, Outcome::Refused),
+        (501, Outcome::Refused),
+    ];
+
+    for (status, expected) in cases {
+        assert_eq!(classify(status), expected, "HTTP {status}");
+    }
+}
+
+#[test]
+fn a_commit_request_names_the_table_and_carries_its_requirements_and_updates() {
+    let body = commit_request(
+        &ident("ns", "t"),
+        vec![TableRequirement::NotExist],
+        Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(body["identifier"]["name"], "t");
+    assert_eq!(
+        body["requirements"],
+        serde_json::json!([{"type": "assert-create"}])
+    );
+    assert_eq!(body["updates"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_staged_commit_requires_the_table_not_to_exist_and_ends_with_the_snapshot() {
+    let staged = memory_staged_table();
+    let files = vec![data_file(staged.table(), "w0")];
+
+    let sent = staged_commit(staged.table(), files, &tag()).await.unwrap();
+
+    assert_eq!(
+        sent["requirements"],
+        serde_json::json!([{"type": "assert-create"}])
+    );
+    assert_eq!(sent["updates"][0]["action"], "assign-uuid");
+    assert_eq!(
+        sent["updates"][0]["uuid"],
+        staged.table().metadata().uuid().to_string()
+    );
+    let actions: Vec<&str> = sent["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|update| update["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actions[actions.len() - 2..],
+        ["add-snapshot", "set-snapshot-ref"]
+    );
 }
 
 #[test]
@@ -571,9 +668,9 @@ fn a_connection_that_vends_gets_vended_storage_and_one_with_keys_its_own() {
         ..Default::default()
     };
 
-    let own = WriteStorage::of(&creds, false);
+    let own = WriteStorage::of(&creds, false, None);
     creds.use_vended_credentials = true;
-    let vended = WriteStorage::of(&creds, false);
+    let vended = WriteStorage::of(&creds, false, None);
 
     let WriteStorage::Static(backend) = own else {
         panic!("a CONNECTION with keys writes with them");
@@ -588,7 +685,7 @@ fn a_connection_that_vends_gets_vended_storage_and_one_with_keys_its_own() {
 /// Scenario: A commit retried after an unknown outcome adds its rows once
 #[tokio::test]
 async fn unknown_outcome_with_tagged_reload_commits_once() {
-    for status in [500, 502, 504] {
+    for status in [500, 502, 503, 504] {
         let (uri, requests) = catalog(
             PREFIX_CONFIG,
             routes(vec![
@@ -634,28 +731,7 @@ async fn staged_unknown_outcome_with_created_table_commits_once() {
 
     writes.commit_staged(&staged, files, &tag()).await.unwrap();
 
-    let commits = requests_starting(&requests, COMMIT_STAGED);
-    assert_eq!(commits.len(), 1);
-    let sent = json_body(&commits[0]);
-    assert_eq!(
-        sent["requirements"],
-        serde_json::json!([{"type": "assert-create"}])
-    );
-    assert_eq!(sent["updates"][0]["action"], "assign-uuid");
-    assert_eq!(
-        sent["updates"][0]["uuid"],
-        staged.table().metadata().uuid().to_string()
-    );
-    let actions: Vec<&str> = sent["updates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|update| update["action"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        actions[actions.len() - 2..],
-        ["add-snapshot", "set-snapshot-ref"]
-    );
+    assert_eq!(requests_starting(&requests, COMMIT_STAGED).len(), 1);
 }
 
 /// Scenario: A commit retried after an unknown outcome adds its rows once
@@ -786,7 +862,13 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
 
 #[tokio::test]
 async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the_last_outcome() {
-    for (status, unknown) in [(409, false), (500, true), (504, true)] {
+    for (status, unknown) in [
+        (409, false),
+        (429, false),
+        (500, true),
+        (503, true),
+        (504, true),
+    ] {
         let (uri, requests) = catalog(
             PREFIX_CONFIG,
             routes(vec![

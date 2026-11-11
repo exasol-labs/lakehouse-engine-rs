@@ -1,6 +1,11 @@
 use super::*;
+use crate::scalar_functions::{SCALAR_FUNCTIONS, ScalarFunction};
 use crate::test_support::*;
 use serde_json::json;
+
+fn scan_filter(filter: &Json) -> Result<Option<String>, UdfError> {
+    render_scan_filter(filter, &typed_columns::<&str>(&[]))
+}
 
 /// Exasol's `CAST("X" AS data_type)` node.
 fn cast(data_type: Json) -> Json {
@@ -260,7 +265,7 @@ fn renders_arithmetic_mul() {
 fn legacy_mul_name_is_not_recognized() {
     let expr = scalar_fn("MUL", [col("a"), col("b")]);
     assert!(
-        render_expression_safe(&expr).is_none(),
+        render_expression(&expr).is_err(),
         "the obsolete \"MUL\" node name must not translate; Exasol emits \"MULT\""
     );
 }
@@ -479,27 +484,6 @@ fn renders_cast_char_as_exasol_char() {
 }
 
 #[test]
-fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
-    let expr = cast_json(
-        json!({"type": "VARCHAR", "size": 10}),
-        compare("predicate_greater", col("c_acctbal"), num_lit(0)),
-    );
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
-    );
-}
-
-#[test]
-fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
-    let expr = cast_json(json!({"type": "VARCHAR", "size": 10}), is_null(col("x")));
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"(CASE ("X" IS NULL) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
-    );
-}
-
-#[test]
 fn renders_cast_bool_to_varchar_as_plain_cast_in_exasol_dialect() {
     let expr = cast_json(
         json!({"type": "VARCHAR", "size": 10}),
@@ -551,11 +535,6 @@ fn renders_cast_timestamp_precision_per_dialect() {
             format!(r#"CAST("X" AS TIMESTAMP({p}))"#),
             "DataFusion dialect must render TIMESTAMP({p}) verbatim"
         );
-        assert_eq!(
-            render_expression_safe(&expr),
-            Some(format!(r#"CAST("X" AS TIMESTAMP({p}))"#)),
-            "DataFusion dialect safe variant must render TIMESTAMP({p}) verbatim"
-        );
     }
 
     for p in [1u64, 2, 4, 5, 7, 8, 10, 99] {
@@ -563,11 +542,6 @@ fn renders_cast_timestamp_precision_per_dialect() {
         assert!(
             render_expression(&expr).is_err(),
             "DataFusion dialect must decline TIMESTAMP({p})"
-        );
-        assert_eq!(
-            render_expression_safe(&expr),
-            None,
-            "DataFusion dialect safe variant must decline TIMESTAMP({p})"
         );
     }
 
@@ -625,7 +599,7 @@ fn cast_to_unsupported_target_declines() {
             "CAST to {data_type} must raise in the DataFusion dialect's raising mode"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "CAST to {data_type} must be None in the DataFusion dialect's safe mode"
         );
         assert_eq!(
@@ -657,50 +631,6 @@ fn renders_cast_nested_function_scalar_defensive() {
 }
 
 #[test]
-fn renders_decimal_to_varchar_exasol() {
-    let expr = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [col("c_decimal_a")]
-    });
-    let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
-    assert_eq!(render_expression(&expr).unwrap(), expected);
-    assert_eq!(render_expression_safe(&expr).unwrap(), expected);
-}
-
-#[test]
-fn decimal_to_varchar_exasol_wrong_arity_errors() {
-    let no_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": []
-    });
-    let two_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [
-            col("c_decimal_a"),
-            col("c_decimal_b")
-        ]
-    });
-    for expr in [&no_args, &two_args] {
-        assert!(
-            render_expression(expr).is_err(),
-            "decimal_to_varchar_exasol with non-unary arguments must raise: {expr}"
-        );
-        assert!(
-            render_expression_safe(expr).is_none(),
-            "decimal_to_varchar_exasol with non-unary arguments must be None in safe mode: {expr}"
-        );
-    }
-}
-
-#[test]
-fn format_decimal_exasol_style_renders_exact_regex_sql() {
-    assert_eq!(
-        format_decimal_exasol_style("some_col"),
-        r#"regexp_replace(regexp_replace(CAST(some_col AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', '')"#
-    );
-}
-
-#[test]
 fn unsupported_node_returns_error() {
     let expr = json!({"type": "fn_sum", "operands": []});
     let err = render_expression(&expr).unwrap_err();
@@ -711,21 +641,37 @@ fn unsupported_node_returns_error() {
 }
 
 #[test]
-fn unsupported_node_returns_none_in_safe_mode() {
-    let expr = json!({"type": "fn_sum", "operands": []});
-    assert!(render_expression_safe(&expr).is_none());
+fn only_a_true_scan_filter_renders_as_no_filter() {
+    for (filter, expected) in [
+        (bool_lit(true), None),
+        (bool_lit(false), Some("FALSE")),
+        (null_lit(), Some("FALSE")),
+    ] {
+        assert_eq!(scan_filter(&filter).unwrap().as_deref(), expected);
+        assert_eq!(render_df_filter_exasol_safe(&filter).as_deref(), expected);
+    }
 }
 
 #[test]
-fn true_filter_returns_none_in_safe_mode() {
-    let expr = bool_lit(true);
-    assert!(render_df_filter_safe(&expr).is_none());
-}
-
-#[test]
-fn null_filter_returns_none_in_safe_mode() {
-    let expr = null_lit();
-    assert!(render_df_filter_safe(&expr).is_none());
+fn conjoined_scan_filters_render_as_their_predicate_and() {
+    let conjuncts = [
+        predicate_equal(num_lit(1), num_lit(1)),
+        predicate_equal(num_lit(2), num_lit(2)),
+    ];
+    let one_by_one = conjuncts
+        .iter()
+        .map(|c| scan_filter(c).unwrap().unwrap())
+        .collect();
+    assert_eq!(
+        conjoin_scan_filters(one_by_one),
+        scan_filter(&and(conjuncts)).unwrap()
+    );
+    assert_eq!(conjoin_scan_filters(vec!["TRUE".into()]), None);
+    assert_eq!(
+        conjoin_scan_filters(vec!["NULL".into()]).as_deref(),
+        Some("FALSE")
+    );
+    assert_eq!(conjoin_scan_filters(Vec::new()), None);
 }
 
 #[test]
@@ -797,7 +743,7 @@ fn literal_timestamputc_wire_name_renders_exasol_only() {
          AS TIMESTAMP WITH LOCAL TIME ZONE)"
     );
 
-    assert!(render_expression_safe(&real_wire_name).is_none());
+    assert!(render_expression(&real_wire_name).is_err());
 }
 
 #[test]
@@ -889,7 +835,7 @@ fn renders_math_scalar_functions() {
     assert_eq!(render_expression(&expr).unwrap(), r#"trunc("V")"#);
 
     let expr = scalar_fn("ABS", [col("x"), col("y")]);
-    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
 }
 
 #[test]
@@ -976,18 +922,6 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
 }
 
 #[test]
-fn renders_concat_bool_operand_as_exasol_case() {
-    let expr = scalar_fn(
-        "CONCAT",
-        [predicate_equal(col("active"), bool_lit(true)), str_lit("")],
-    );
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END), ''), '')"#
-    );
-}
-
-#[test]
 fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
     let expr = scalar_fn("CONCAT", [col("s"), str_lit("")]);
     assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S" || '')"#);
@@ -1043,7 +977,7 @@ fn concat_empty_argument_list_errors_in_both_dialects() {
         render_expression_exasol(&expr).unwrap_err().to_string(),
         expected
     );
-    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
     assert!(render_expression_exasol_safe(&expr).is_none());
 }
 
@@ -1059,7 +993,7 @@ fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
         render_expression_exasol(&expr).unwrap_err().to_string(),
         expected
     );
-    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
     assert!(render_expression_exasol_safe(&expr).is_none());
 
     let expr = scalar_fn("CONCAT", [col("a"), Json::Null]);
@@ -1069,7 +1003,7 @@ fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
         render_expression_exasol(&expr).unwrap_err().to_string(),
         expected
     );
-    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
     assert!(render_expression_exasol_safe(&expr).is_none());
 }
 
@@ -1099,7 +1033,7 @@ fn renders_case_when() {
     );
 
     let expr3 = scalar_fn("CASE", []);
-    assert!(render_expression_safe(&expr3).is_none());
+    assert!(render_expression(&expr3).is_err());
 }
 
 #[test]
@@ -1171,7 +1105,7 @@ fn renders_greatest_least_empty_argument_list_errors() {
             "{name} empty args must raise"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} empty args must be None in safe mode"
         );
     }
@@ -1191,7 +1125,7 @@ fn greatest_least_without_arguments_key_errors() {
             "{name} error should mention missing 'arguments', got: {err}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} without arguments key must be None in safe mode"
         );
     }
@@ -1326,7 +1260,7 @@ fn now_family_falls_through() {
             );
         }
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} must be None in the DataFusion safe variant"
         );
         assert!(
@@ -1339,7 +1273,10 @@ fn now_family_falls_through() {
 #[test]
 fn renders_to_date_to_timestamp() {
     let expr = scalar_fn("TO_DATE", [col("s")]);
-    assert_eq!(render_expression(&expr).unwrap(), r#"to_date("S")"#);
+    assert!(
+        render_expression(&expr).is_err(),
+        "without a format Exasol parses by the session"
+    );
 
     let expr2 = scalar_fn("TO_DATE", [col("s"), str_lit("YYYY-MM-DD")]);
     assert_eq!(
@@ -1348,7 +1285,7 @@ fn renders_to_date_to_timestamp() {
     );
 
     let expr3 = scalar_fn("TO_TIMESTAMP", [col("s")]);
-    assert_eq!(render_expression(&expr3).unwrap(), r#"to_timestamp("S")"#);
+    assert!(render_expression(&expr3).is_err());
 
     let expr4 = scalar_fn("TO_TIMESTAMP", [col("s"), str_lit("YYYY-MM-DD HH24:MI:SS")]);
     assert_eq!(
@@ -1385,7 +1322,7 @@ fn renders_week_at_year_boundary_dates() {
 fn week_with_wrong_arity_falls_back() {
     let expr = scalar_fn("WEEK", [col("d"), col("e")]);
     assert!(render_expression(&expr).is_err());
-    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
 }
 
 #[test]
@@ -1432,7 +1369,7 @@ fn between_fns_reject_wrong_arity() {
             "{name} 1-arg must raise"
         );
         assert!(
-            render_expression_safe(&one_arg).is_none(),
+            render_expression(&one_arg).is_err(),
             "{name} 1-arg must be None in safe mode"
         );
 
@@ -1442,7 +1379,7 @@ fn between_fns_reject_wrong_arity() {
             "{name} 3-arg must raise"
         );
         assert!(
-            render_expression_safe(&three_args).is_none(),
+            render_expression(&three_args).is_err(),
             "{name} 3-arg must be None in safe mode"
         );
     }
@@ -1453,7 +1390,7 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     let expr = scalar_fn("SECOND", [col("ts"), num_lit(3)]);
 
     assert!(
-        render_expression_safe(&expr).is_none(),
+        render_expression(&expr).is_err(),
         "SECOND(ts, 3) must decline under the DataFusion dialect"
     );
     assert!(
@@ -1473,7 +1410,7 @@ fn div_falls_through_as_unsupported() {
         "error must name DIV as unsupported: {err}"
     );
     assert!(
-        render_expression_safe(&expr).is_none(),
+        render_expression(&expr).is_err(),
         "DIV must be None in safe mode without panicking"
     );
 }
@@ -1491,7 +1428,7 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
             "error must name the unsupported function '{name}': {err}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} must be None in safe mode without panicking"
         );
     }
@@ -1523,7 +1460,7 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
             "the Exasol dialect must decline {name}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} must be None in the DataFusion safe variant"
         );
         assert!(
@@ -1546,8 +1483,8 @@ fn regexp_like_predicate_declines_in_both_dialects() {
         render_expression_exasol(&expr).unwrap_err().to_string(),
         expected
     );
-    assert!(render_expression_safe(&expr).is_none());
-    assert!(render_df_filter_safe(&expr).is_none());
+    assert!(render_expression(&expr).is_err());
+    assert!(scan_filter(&expr).is_err());
     assert!(render_expression_exasol_safe(&expr).is_none());
     assert!(render_df_filter_exasol_safe(&expr).is_none());
 }
@@ -1582,7 +1519,7 @@ fn bitwise_operator_functions_fall_through() {
             "error must name the unsupported function '{name}': {err}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} must be None in safe mode without panicking"
         );
     }
@@ -1618,7 +1555,7 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
             "Exasol dialect must decline the undeclared node {expr}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "DataFusion safe variant must be None for {expr}"
         );
         assert!(
@@ -1661,7 +1598,7 @@ fn unsupported_date_functions_decline_in_both_dialects() {
             "the Exasol dialect must decline {name}"
         );
         assert!(
-            render_expression_safe(&expr).is_none(),
+            render_expression(&expr).is_err(),
             "{name} must be None in the DataFusion safe variant"
         );
         assert!(
@@ -1724,7 +1661,7 @@ fn render_expression_renders_scalar_wrapping_aggregates() {
         ],
     );
 
-    let sql = render_expression_safe(&round).expect("scalar-over-aggregate must render");
+    let sql = render_expression(&round).expect("scalar-over-aggregate must render");
     assert!(
         sql.contains(r#"SUM(CASE WHEN ("L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
         "nested SUM(CASE ...) must be spliced verbatim: {sql}"
@@ -1743,7 +1680,7 @@ fn aggregate_with_unrenderable_argument_declines() {
         "an unrenderable argument must raise in raising mode"
     );
     assert!(
-        render_expression_safe(&bad).is_none(),
+        render_expression(&bad).is_err(),
         "an unrenderable argument must be None in safe mode"
     );
 }
@@ -1923,22 +1860,20 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
 }
 
 #[test]
-fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
-    // The DataFusion dialect's strpos drops a third (start) argument, a known limitation of
-    // that rendering.
+fn instr_locate_with_start_arg_render_in_exasol_and_decline_in_datafusion() {
     let instr = scalar_fn("INSTR", [str_lit("hello"), str_lit("l"), num_lit(3)]);
     assert_eq!(
         render_expression_exasol(&instr).unwrap(),
         "INSTR('hello', 'l', 3)"
     );
-    assert_eq!(render_expression(&instr).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&instr).is_err());
 
     let locate = scalar_fn("LOCATE", [str_lit("l"), str_lit("hello"), num_lit(3)]);
     assert_eq!(
         render_expression_exasol(&locate).unwrap(),
         "LOCATE('l', 'hello', 3)"
     );
-    assert_eq!(render_expression(&locate).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&locate).is_err());
 }
 
 #[test]
@@ -2051,10 +1986,9 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
             format!(r#"{exasol_name}("S")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
-        assert_eq!(
-            render_expression(&bare).unwrap(),
-            format!(r#"{df_name}("S")"#),
-            "the DataFusion dialect must stay unchanged for {exasol_name}"
+        assert!(
+            render_expression(&bare).is_err(),
+            "without a format the DataFusion dialect must decline {exasol_name}"
         );
 
         let formatted = scalar_fn(exasol_name, [col("s"), str_lit("YYYY-MM-DD")]);
@@ -2101,7 +2035,7 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
     for (name, arguments, exasol_sql) in cases {
         let expr = scalar_fn(name, arguments);
         assert!(render_expression(&expr).is_err(), "{exasol_sql} must err");
-        assert_eq!(render_expression_safe(&expr), None, "{exasol_sql}");
+        assert_eq!(render_expression(&expr).ok(), None, "{exasol_sql}");
         assert_eq!(
             render_expression_exasol(&expr).as_deref().ok(),
             Some(exasol_sql)
@@ -2290,20 +2224,20 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
         ),
     ]);
 
-    let missing: Vec<&str> = TRANSLATED_SCALAR_FNS
+    let missing: Vec<&str> = SCALAR_FUNCTIONS
         .iter()
-        .map(|(name, _)| *name)
+        .map(|f| f.name)
         .filter(|name| !fixtures.iter().any(|f| f.name == *name))
         .collect();
     assert!(
         missing.is_empty(),
-        "every name declared in TRANSLATED_SCALAR_FNS needs a sweep fixture; missing: \
+        "every name declared in SCALAR_FUNCTIONS needs a sweep fixture; missing: \
          {missing:?}"
     );
     let undeclared: Vec<&str> = fixtures
         .iter()
         .map(|f| f.name)
-        .filter(|name| declared_scalar_fn(name).is_none())
+        .filter(|name| scalar_function(name).is_none())
         .collect();
     assert!(
         undeclared.is_empty(),
@@ -2311,14 +2245,19 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     );
     assert_eq!(
         fixtures.len(),
-        TRANSLATED_SCALAR_FNS.len(),
+        SCALAR_FUNCTIONS.len(),
         "the fixture map and the declaration must line up one to one; a duplicated row on \
          either side is the only way both subset checks above can pass at different sizes"
     );
 
     let mut swept: Vec<String> = Vec::new();
 
-    for (declared_name, form) in TRANSLATED_SCALAR_FNS {
+    for ScalarFunction {
+        name: declared_name,
+        exasol: form,
+        ..
+    } in SCALAR_FUNCTIONS
+    {
         let fixture = fixtures
             .iter()
             .find(|f| f.name == *declared_name)
@@ -2327,7 +2266,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
         // ahead of them.
         if let Err(err) = render_expression(&fixture.node) {
             panic!(
-                "{declared_name} is declared in TRANSLATED_SCALAR_FNS, which gates BOTH \
+                "{declared_name} is declared in SCALAR_FUNCTIONS, which gates BOTH \
                  dialects from one lookup, so it MUST render in the DataFusion dialect too; \
                  it declined with {err:?}. A declared name that has lost its per-name arm \
                  still renders in the Exasol dialect through the verbatim gate, so this is \
@@ -2535,15 +2474,6 @@ fn literal_double_renders_as_a_double_cast_only_in_the_datafusion_dialect() {
         assert_eq!(render_expression(&node).unwrap(), datafusion);
         assert_eq!(render_expression_exasol(&node).unwrap(), exasol);
     }
-}
-
-#[test]
-fn exasol_df_filter_suppresses_trivially_true() {
-    let true_filter = bool_lit(true);
-    assert!(render_df_filter_exasol_safe(&true_filter).is_none());
-
-    let null_filter = null_lit();
-    assert!(render_df_filter_exasol_safe(&null_filter).is_none());
 }
 
 #[test]

@@ -20,10 +20,10 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *AND* the DataFusion dialect SHALL decline a target of `INTERVAL YEAR TO MONTH`, `INTERVAL DAY TO SECOND`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE`
 * *AND* the Exasol dialect SHALL render `DECIMAL(p,s)`, `DOUBLE PRECISION`, `BOOLEAN`, `DATE`, `CHAR(n)`, `VARCHAR(n)`, `INTERVAL YEAR(p) TO MONTH`, `INTERVAL DAY(p) TO SECOND(f)`, `GEOMETRY(srid)`, `HASHTYPE(n BYTE)`, and the TIMESTAMP targets per the fractional-seconds-precision and local-time-zone scenarios, each with the parameters the `dataType` carries
 * *AND* a `HASHTYPE(8 BIT)` target, which Exasol sends as `bytesize` 1, SHALL render as `HASHTYPE(1 BYTE)`
-* *AND* the DataFusion dialect SHALL render a CAST of a boolean-producing expression to a `CHAR` or `VARCHAR` target as `(CASE <expr> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)`, to match Exasol
+* *AND* the DataFusion dialect SHALL render a CAST of a BOOLEAN value, a column included, to a `CHAR` or `VARCHAR` target as `(CASE <expr> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)`, to match Exasol
 * *AND* a query whose WHERE predicate carries a CAST to `INTERVAL`, `GEOMETRY`, or `HASHTYPE`, for example `WHERE CAST(c AS GEOMETRY) IS NULL` or `WHERE CAST(ts - ts AS INTERVAL DAY(2) TO SECOND(3)) IS NOT NULL`, SHALL return the same rows, or fail with the same error, as native Exasol, because the adapter applies that CAST in its Exasol-dialect wrapper over the sharded scan; a select-list item of these types routes per `pushdown-capabilities/pushdown-planning-capability-extensions`
 * *AND* a CAST whose `dataType` is incomplete, outside Exasol's limits, or names an unknown type SHALL fail the query in both dialects (`pushdown/pushdown-planning`)
-* *AND* a CAST to a text target that the scan computes MAY return a value that differs from Exasol's CAST, a known deviation that (#587) removes: a `CHAR(n)`, a `VARCHAR(n)` shorter than 2,000,000, or an ASCII target gets no length check, no blank padding, and no ASCII check, and a DATE, TIMESTAMP, BOOLEAN, DOUBLE, or DECIMAL value with a scale above 0 converts to DataFusion's text form
+* *AND* a CAST to or from text SHALL reach the DataFusion dialect only when `pushdown-types/pushdown-planning-scan-text-conversion` lets the scan compute it
 
 ### Scenario: CAST to TIMESTAMP renders the declared fractional-seconds precision per SQL dialect
 

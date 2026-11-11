@@ -80,6 +80,28 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 
+`INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
+
+### Text and session settings
+
+Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and reads text as one of these types, by the session's NLS settings. The pushdown request does not carry them, so these conversions run in Exasol SQL:
+
+- a CAST between text and one of these types, and `TO_DATE` or `TO_TIMESTAMP` without a format;
+- text that meets one of these types in a comparison, `IN`, `LIKE`, `||`, a string function, `CASE`, `COALESCE`, `GREATEST`, or arithmetic;
+- `SUM`, `AVG`, `STDDEV`, or `VARIANCE` over text or a BOOLEAN, which Exasol converts to a number. The aggregate runs in Exasol SQL instead of splitting into scan partials.
+
+Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
+
+Such a condition runs in Exasol SQL. On a single table it takes the whole WHERE with it, so the scan filters no rows, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
+
+| Runs in Exasol SQL | Runs in the scan |
+|---|---|
+| `d = '2024-01-02'` | `d = DATE '2024-01-02'` |
+| `ts > '2024-01-01 00:00:00'` | `ts > TIMESTAMP '2024-01-01 00:00:00'` |
+| `d LIKE '2024%'` | `d >= DATE '2024-01-01' AND d < DATE '2025-01-01'` |
+| `TO_DATE(s)` | `TO_DATE(s, 'YYYY-MM-DD')` |
+| `MAX(CAST(d AS VARCHAR(10)))` | `CAST(MAX(d) AS VARCHAR(10))` |
+
 ## Aggregation
 
 When DataFusion can render the aggregates and group keys, each shard computes a partial aggregate and Exasol SQL merges them. Otherwise the scan only filters and projects, and Exasol SQL aggregates the scanned rows. `HAVING` always runs in Exasol SQL, over the merged aggregates.
@@ -95,6 +117,8 @@ When DataFusion can render the aggregates and group keys, each shard computes a 
 An aggregate argument can be a column or a scalar expression. Examples are `SUM(LENGTH(c))` and a
 two-column binary arithmetic expression such as `SUM(price * discount)`. Statistical aggregates take
 the partial path only for a bare-column argument.
+
+A partial aggregate needs every partial column and group key in a type the request states: a column, a CAST, or the same aggregate selected on its own. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A computed group key that is not selected, such as `GROUP BY qty * 2`, needs a CAST.
 
 Each aggregate emits partial values instead of a final value:
 

@@ -1,6 +1,7 @@
 //! Iceberg REST and Unity Catalog access for the lakehouse engine, including AWS STS role assumption.
 
 mod auth;
+mod aws_credential;
 mod aws_error;
 mod catalog_http;
 mod client;
@@ -26,6 +27,7 @@ pub mod exported_test_support;
 #[path = "test_support_tests.rs"]
 mod test_support;
 
+pub use aws_credential::aws_lease;
 pub use catalog_http::RepeatSafety;
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
@@ -49,7 +51,7 @@ pub use session::{
     table_ident_path,
 };
 pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
-pub use sts::resolve_aws_identity;
+pub use sts::{AssumedRole, ResolvedIdentity, resolve_aws_identity};
 
 pub use vended::{VendedS3Credentials, resolve_vended_storage, vended_s3_credentials};
 

@@ -1,5 +1,5 @@
 //! The one holder of a credential that expires, such as an OAuth2 token or vended storage
-//! credentials: it renews the value before it expires and remembers every value it held.
+//! credentials: it renews the value before it expires.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -48,10 +48,11 @@ pub enum AtRenewalPoint {
 /// never carries a value that expires in flight. The skew is at most half the lease's lifetime, so
 /// a lease shorter than the skew is still shared for its first half. Callers wait on one lock for
 /// the renewal, so a value that reaches its renewal point is renewed once however many callers
-/// arrive. It keeps every value it held, so a writer can strip each one from error text.
+/// arrive. It shows only the value it holds now, so a writer strips just that one from error text.
 pub struct ExpiringCredential<T> {
     current: tokio::sync::Mutex<Holding<T>>,
-    held: Mutex<Vec<T>>,
+    /// The held value, readable without waiting for a renewal in flight.
+    latest: Mutex<Option<T>>,
     skew_ms: u64,
     clock: EpochClock,
 }
@@ -80,7 +81,7 @@ impl<T: Clone> ExpiringCredential<T> {
             .as_ref()
             .and_then(|lease| renew_at(lease, skew_ms, clock()));
         Self {
-            held: Mutex::new(lease.iter().map(|lease| lease.value.clone()).collect()),
+            latest: Mutex::new(lease.as_ref().map(|lease| lease.value.clone())),
             current: tokio::sync::Mutex::new(Holding {
                 lease,
                 renew_at_ms,
@@ -130,8 +131,8 @@ impl<T: Clone> ExpiringCredential<T> {
             }
         }
         let renewed = renew(now_ms).await?;
-        self.remember(&renewed.value);
         let value = renewed.value.clone();
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(value.clone());
         *current = Holding {
             renew_at_ms: renew_at(&renewed, self.skew_ms, now_ms),
             lease: Some(renewed),
@@ -140,19 +141,12 @@ impl<T: Clone> ExpiringCredential<T> {
         Ok(value)
     }
 
-    /// Every value this holder has held, the current one included, oldest first.
-    pub fn held_values(&self) -> Vec<T> {
-        self.held
+    /// The value this holder holds now, `None` before the first one.
+    pub fn current(&self) -> Option<T> {
+        self.latest
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    fn remember(&self, value: &T) {
-        self.held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(value.clone());
     }
 }
 

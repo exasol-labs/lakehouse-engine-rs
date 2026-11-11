@@ -12,7 +12,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * LIMIT and OFFSET are never pushed into a per-shard grouped scan, because a per-shard bound would drop groups before the merge re-groups them. The merge SELECT renders the request's full final window through the shared limit-and-offset seam.
 * Exasol accepts an OFFSET only alongside an ORDER BY. A grouped request with an offset always has a merge `ORDER BY` beside it, because an `ORDER BY` that cannot resolve over the merge routes the request to the qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). Exasol rejects an OFFSET in an ungrouped aggregated select (`sqlCode 42000`), so only the grouped merge and the wrapper carry one.
 * Exasol validates the outer wrapper SELECT's column types positionally against `selectListDataTypes`, so the wrapper lists its items in the user's `selectList` order.
-* The outer merge wrapper has only the stringified `GK_*` staging columns and the `PARTIAL_*` columns. A group-key sort key renders as a positional output ordinal that points at the type-cast expression, so it sorts on the native value and not on the `GK_*` VARCHAR. An aggregate sort key renders as that aggregate's merged expression over the `PARTIAL_*` columns, matched by `AggregatePlan` equality like the merged HAVING (`render_having_over_merge`). The merge wrapper is a GROUP BY query, so its `ORDER BY` can reference an aggregate expression directly without adding a hidden output column.
+* The outer merge wrapper has only the typed `GK_*` group-key columns (`pushdown-aggregates/pushdown-planning-split-aggregate-types`) and the `PARTIAL_*` columns. A sort key renders as a HAVING operand does: a group key as its `GK_*` column, whether or not the key is projected, an aggregate as its merged expression over the `PARTIAL_*` columns matched by `AggregatePlan` equality (`render_having_over_merge`), and a scalar over both with each part rewritten so. The merge wrapper is a GROUP BY query, so its `ORDER BY` can reference an aggregate expression directly without adding a hidden output column.
 * Related features: `pushdown-grouped-agg/pushdown-planning-grouped-agg-scalar-over-aggregate` (scalar functions wrapping aggregates), `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback` (requests that cannot use the partial/merge shape), and `storage-access/pushdown-planning-grouped-agg-credential-reference` (credential exposure in the generated SQL).
 
 
@@ -30,9 +30,9 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 ### Scenario: Outer wrapper SELECT preserves user select-list order for interleaved keys and aggregates
 
 * *GIVEN* a grouped aggregate pushdown whose `selectList` places one or more aggregates before, after, or between the group-key projections (e.g. `SELECT SUM(score), MOD(id,4)`, or `SELECT k1, SUM(score), k2`, or `SELECT COUNT(*), MOD(id,4)`)
-* *WHEN* the adapter builds the outer wrapper SELECT, its cast list, and its GROUP BY list
-* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key cast expressions and merged-aggregate expressions as required
-* *AND* the Exasol-declared type applied to each group-key cast SHALL be resolved from the `selectListDataTypes` entry at that key's own select-list index, matched by index rather than by comparing rendered SQL strings
+* *WHEN* the adapter builds the outer wrapper SELECT and its GROUP BY list
+* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key columns and merged-aggregate expressions as required
+* *AND* the Exasol-declared type of each group key SHALL be resolved from the `selectListDataTypes` entry at that key's own select-list index, matched by index rather than by comparing rendered SQL strings
 * *AND* the resulting pushdown query SHALL pass Exasol's positional pushdown-column-type check (no "Data type mismatch in column number N" error) for every arrangement of keys and aggregates
 * *AND* the merged per-group result SHALL equal the result of the same query with the group keys listed first (which is already correct)
 
@@ -43,7 +43,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *THEN* the scan spec SHALL carry a `group_keys` field containing the rendered DataFusion SQL fragment for each group-key expression in order
 * *AND* each group-key expression MUST be renderable by the VS expression translator in raising mode
 * *AND* the scan UDF MUST use the same rendered expressions in its per-shard DataFusion GROUP BY clause
-* *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type and CAST rather than silently defaulting to `VARCHAR(2000000)`
+* *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type
 
 ### Scenario: Grouped scan-driving SQL fans out via a nested shard_key distributor over G work units
 
@@ -74,7 +74,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the inner distributor's `shard_key` grouping SHALL parallelize the scan across nodes while the scalar scan UDF performs the user GROUP BY inside each shard invocation, emitting one partial-aggregate row per distinct user group per shard
 * *AND* the outer wrapper SQL SHALL GROUP BY the user group-key columns over the scalar scan select and merge the per-shard partials using the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path, with no `SELECT * FROM (...)` wrapper between the merge and the scalar scan
-* *AND* the outer wrapper SELECT list SHALL place each group-key cast expression and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectListDataTypes`, so the wrapper's result column order and per-column type match Exasol's positional pushdown validation for ANY interleaving of keys and aggregates, while the inner scalar scan's per-shard EMITS clause MAY remain keys-first (GK_* then PARTIAL_*) because it is matched only against the scan UDF's own output
+* *AND* the outer wrapper SELECT list SHALL place each group-key column and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectListDataTypes`, so the wrapper's result column order and per-column type match Exasol's positional pushdown validation for ANY interleaving of keys and aggregates, while the inner scalar scan's per-shard EMITS clause MAY remain keys-first (GK_* then PARTIAL_*) because it is matched only against the scan UDF's own output
 * *AND* the merged result per group SHALL equal the result of the same grouped aggregate evaluated over all rows on a single node
 
 ### Scenario: Grouped aggregate scan spec leaves the projection field empty
@@ -90,10 +90,10 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 
 * *GIVEN* a grouped `pushdown` request that decomposes into the partial/merge grouped shape, whose `orderBy` sorts on an aggregate expression matching one of the detected select-list aggregate plans (`SELECT c_bool, SUM(c_price) FROM t GROUP BY c_bool ORDER BY SUM(c_price) DESC`)
 * *WHEN* the adapter builds the outer merge SQL
-* *THEN* the merge `ORDER BY` element SHALL be that aggregate's merged expression over the `PARTIAL_*` columns (for example `SUM("PARTIAL_sum_1")`), produced by the SAME merge rewriter and the SAME `AggregatePlan` equality match (kind plus source column) the merged HAVING uses
+* *THEN* the merge `ORDER BY` element SHALL be that aggregate's merged expression over the `PARTIAL_*` columns cast to the aggregate's native type (for example `CAST(SUM("PARTIAL_sum_1") AS DOUBLE PRECISION)`), produced by the SAME merge rewriter and the SAME `AggregatePlan` equality match (kind plus source column) the merged HAVING uses
 * *AND* the element SHALL render its direction and NULL placement through the one shared direction/NULL seam every `ORDER BY` the adapter emits routes through, so the grouped merge cannot drift from the other ordered paths
-* *AND* the outer wrapper's visible SELECT list, its cast list, and its GROUP BY list SHALL be UNCHANGED, the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
-* *AND* a group-key sort key SHALL still render as its positional output ordinal, unchanged by this delta, including in an `orderBy` that mixes a group-key key with an aggregate key
+* *AND* the outer wrapper's visible SELECT list and its GROUP BY list SHALL be UNCHANGED, the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
+* *AND* a group-key sort key SHALL render as its `GK_*` column, including in an `orderBy` that mixes a group-key key with an aggregate key
 * *AND* the per-shard partial scan SHALL still carry no `LIMIT` and no sort keys, so the anti-wrong-truncation invariant holds unchanged
 * *AND* the merged result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 

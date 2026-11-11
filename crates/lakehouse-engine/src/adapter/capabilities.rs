@@ -104,8 +104,7 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_YEAR",
     "FN_WEEK",
     // ADD_HOURS/ADD_MINUTES are not advertised: Exasol infers TIMESTAMP(0) for
-    // ADD_HOURS(DATE, n) but the type-blind rendering yields TIMESTAMP(3), which
-    // Exasol rejects.
+    // ADD_HOURS(DATE, n) but the rendering yields TIMESTAMP(3), which Exasol rejects.
     "FN_DAYS_BETWEEN",
     "FN_HOURS_BETWEEN",
     "FN_MINUTES_BETWEEN",

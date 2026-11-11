@@ -111,6 +111,21 @@ pub fn exa_conn() -> ExaConn {
     ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
 }
 
+/// The [`exa_session`] setting that keeps the session defaults.
+pub const DEFAULT_SESSION: &str = "";
+/// A date format under which no ISO date text parses.
+pub const DMY: &str = "NLS_DATE_FORMAT = 'DD.MM.YYYY'";
+
+/// An [`exa_conn`] whose session applies `setting`, such as [`DMY`]; [`DEFAULT_SESSION`] keeps
+/// the defaults.
+pub fn exa_session(setting: &str) -> ExaConn {
+    let mut conn = exa_conn();
+    if !setting.is_empty() {
+        conn.execute(&format!("ALTER SESSION SET {setting}"));
+    }
+    conn
+}
+
 /// For credential-bearing DDL: an Exasol error may echo the statement, so failures omit the SQL.
 pub fn exa_conn_redacting() -> ExaConn {
     ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
@@ -840,6 +855,125 @@ pub fn note_of<'a>(
         .1
 }
 
+/// The column data types of a result and its rows as strings, sorted unless `sql` orders them so
+/// two plans of one query compare equal; or, for a failing `sql`, its error class: the text before
+/// the rejected value and the relation name an error quotes, which depend on row order and plan
+/// shape.
+type Outcome = Result<(Vec<serde_json::Value>, Vec<Vec<String>>), String>;
+
+fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
+    let resp = conn.try_execute(sql);
+    if resp["status"] == "error" {
+        let text = error_text(&resp, sql);
+        // A CAST Exasol evaluates over the scanned rows fails in a UDF VM, which prefixes the
+        // same error message.
+        let text = text.strip_prefix("VM error: ").unwrap_or(&text);
+        return Err(text
+            .split([';', '('])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string());
+    }
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let types = result_set["columns"]
+        .as_array()
+        .map(|columns| columns.iter().map(|c| c["dataType"].clone()).collect())
+        .unwrap_or_default();
+    let columns = conn.fetch_result_columns(result_set);
+    let row_count = columns.first().map_or(0, Vec::len);
+    let mut rows: Vec<Vec<String>> = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|col| value_to_string(&col[row]))
+                .collect()
+        })
+        .collect();
+    if !sql.contains("ORDER BY") {
+        rows.sort();
+    }
+    Ok((types, rows))
+}
+
+/// The scan spec's filter key: the scan applies at least one WHERE conjunct.
+pub const SCAN_FILTER: &str = r#""filter":""#;
+/// The alias of a select expression the scan computes; absent when the projection widens to the
+/// base row and Exasol computes the expression.
+pub const SCAN_ITEM: &str = "_LH_PROJ_";
+/// The scan's partial-aggregate columns, which Exasol merges.
+pub const PARTIAL: &str = "PARTIAL_";
+
+/// The path a query must take, read from its one pushdown statement.
+#[derive(Clone, Copy, Debug)]
+pub enum PathCheck<'a> {
+    /// Exasol picks the path, so only the outcome is compared.
+    Unchecked,
+    /// The statement names the marker.
+    Has(&'a str),
+    /// The statement never names the marker.
+    Lacks(&'a str),
+    /// The scan emits partial aggregates that Exasol merges, applying any HAVING there.
+    Split,
+    /// Exasol computes the query in the single-table wrapper over a raw row scan.
+    Wrapper,
+    /// The join takes the N-scan fallback over `n` scans instead of the broadcast plan.
+    NScan(usize),
+}
+
+impl PathCheck<'_> {
+    /// Whether `plan`, the pushdown statement of `query`, takes this path.
+    pub fn holds(self, query: &str, plan: &str) -> bool {
+        match self {
+            PathCheck::Unchecked => true,
+            PathCheck::Has(marker) => plan.contains(marker),
+            PathCheck::Lacks(marker) => !plan.contains(marker),
+            PathCheck::Split => {
+                plan.contains(PARTIAL) && (!query.contains(" HAVING ") || plan.contains(" HAVING "))
+            }
+            PathCheck::Wrapper => has_n_scan_wrapper(plan, 1) && !plan.contains(PARTIAL),
+            PathCheck::NScan(n) => has_n_scan_wrapper(plan, n) && !has_broadcast_join_block(plan),
+        }
+    }
+}
+
+/// What the native query returns. A case states it, so a query that fails on both sides for a
+/// reason the case did not intend, such as a misspelled column, does not pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    Rows,
+    Error,
+}
+
+/// `query` names its table `{T}`. Over `vs_table` it must have the outcome it has over
+/// `native_table`, which must be `expect`: the same rows or the same error class. Its pushdown
+/// must take `path`. Returns what differs.
+pub fn native_copy_mismatch(
+    conn: &mut ExaConn,
+    vs_table: &str,
+    native_table: &str,
+    query: &str,
+    path: PathCheck<'_>,
+    expect: Expect,
+) -> Option<String> {
+    let vs_query = query.replace("{T}", vs_table);
+    let actual = comparable_outcome(conn, &vs_query);
+    let expected = comparable_outcome(conn, &query.replace("{T}", native_table));
+    if expected.is_err() != (expect == Expect::Error) {
+        return Some(format!(
+            "`{query}`: native must return {expect:?}, got {expected:?}"
+        ));
+    }
+    if actual != expected {
+        return Some(format!("`{query}`: got {actual:?}, native {expected:?}"));
+    }
+    if matches!(path, PathCheck::Unchecked) {
+        return None;
+    }
+    let plan = isolated_pushdown_statement(conn, &vs_query);
+    (!path.holds(query, &plan)).then(|| format!("`{query}` must take {path:?}: {plan}"))
+}
+
 pub fn value_to_string(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)
@@ -1070,9 +1204,18 @@ pub const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
 /// Copies `table` natively, so a query over the copy is the oracle for the same query over the
 /// virtual table.
 pub fn create_native_copy(conn: &mut ExaConn, table: &str, columns: &str) {
+    copy_natively(conn, &format!("SELECT ID, {columns} FROM {table}"));
+}
+
+/// [`create_native_copy`] of every column, for a table without an `ID` column.
+pub fn create_full_native_copy(conn: &mut ExaConn, table: &str) {
+    copy_natively(conn, &format!("SELECT * FROM {table}"));
+}
+
+fn copy_natively(conn: &mut ExaConn, select: &str) {
     conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
     conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
+        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS {select}"
     ));
 }
 
@@ -1107,9 +1250,8 @@ pub fn assert_filters_match_native_copy(
     }
 }
 
-/// Each query names its table as `{}`. It must return the same columns, in the same order, over
-/// the virtual `table` as over a native copy of `columns`, so a query that needs a row order
-/// carries its own `ORDER BY`.
+/// Each query names its table as `{T}`. It must return over the virtual `table` what it returns
+/// over a native copy of `columns` ([`native_copy_mismatch`]), whatever path it takes.
 pub fn assert_queries_match_native_copy(
     conn: &mut ExaConn,
     table: &str,
@@ -1117,13 +1259,29 @@ pub fn assert_queries_match_native_copy(
     queries: &[&str],
 ) {
     create_native_copy(conn, table, columns);
-    for query in queries {
-        assert_eq!(
-            conn.query_columns(&query.replace("{}", table)),
-            conn.query_columns(&query.replace("{}", NATIVE_COPY)),
-            "{query} on {table} must return what native Exasol returns"
-        );
-    }
+    assert_no_native_mismatch(conn, table, queries);
+}
+
+fn assert_no_native_mismatch(conn: &mut ExaConn, table: &str, queries: &[&str]) {
+    let failures: Vec<String> = queries
+        .iter()
+        .filter_map(|query| {
+            native_copy_mismatch(
+                conn,
+                table,
+                NATIVE_COPY,
+                query,
+                PathCheck::Unchecked,
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "over {table}, {} queries differ from native Exasol:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// The engine's alias for a binary column's raw bytes, which a pushed hex-literal comparison names.
@@ -1182,18 +1340,17 @@ pub fn assert_binary_columns_match_native_copy(
     let filters: Vec<&str> = filters.iter().map(String::as_str).collect();
     assert_filters_match_native_copy(conn, table, &columns.join(", "), &filters);
 
-    for column in columns {
-        for query in [
-            format!("SELECT MIN({column}), MAX({column}) FROM {{}}"),
-            format!("SELECT TO_CHAR(ID) FROM {{}} ORDER BY {column} NULLS FIRST, ID"),
-        ] {
-            assert_eq!(
-                conn.query_columns(&query.replace("{}", table)),
-                conn.query_columns(&query.replace("{}", NATIVE_COPY)),
-                "{query} on {table} must return what native Exasol returns"
-            );
-        }
-    }
+    let queries: Vec<String> = columns
+        .iter()
+        .flat_map(|column| {
+            [
+                format!("SELECT MIN({column}), MAX({column}) FROM {{T}}"),
+                format!("SELECT TO_CHAR(ID) FROM {{T}} ORDER BY {column} NULLS FIRST, ID"),
+            ]
+        })
+        .collect();
+    let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
+    assert_no_native_mismatch(conn, table, &queries);
 }
 
 /// A lowercase hex `literal` of the column's width compares `column`'s raw bytes, which Parquet
@@ -1237,19 +1394,29 @@ pub fn assert_binary_values_refused(
 /// Ground truth independent of join pushdown: both tables read un-joined through the VS
 /// and joined in-process.
 pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    expected_join_rows_with_fact_where(
+    join_in_process(
         conn,
         vs_name,
         &format!("O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"),
+        |_, _| true,
     )
 }
 
-/// Applies `fact_where` through the single-table WHERE path, independent of the join
-/// pushdown under test.
-pub fn expected_join_rows_with_fact_where(
+/// Keeps the fact rows for which `keep(custkey, orderdate)` holds, in the test process, so no
+/// engine render computes the expected rows.
+pub fn expected_join_rows_kept(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    keep: impl Fn(&str, &str) -> bool,
+) -> Vec<(String, String)> {
+    join_in_process(conn, vs_name, "TRUE", keep)
+}
+
+fn join_in_process(
     conn: &mut ExaConn,
     vs_name: &str,
     fact_where: &str,
+    keep: impl Fn(&str, &str) -> bool,
 ) -> Vec<(String, String)> {
     let dim_cols = conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
@@ -1271,13 +1438,14 @@ pub fn expected_join_rows_with_fact_where(
     let mut rows: Vec<(String, String)> = fact_cols[0]
         .iter()
         .zip(fact_cols[1].iter())
-        .map(|(custkey, date)| {
-            let key = value_to_string(custkey);
+        .map(|(custkey, date)| (value_to_string(custkey), value_to_string(date)))
+        .filter(|(key, date)| keep(key, date))
+        .map(|(key, date)| {
             let name = custkey_to_name
                 .get(&key)
                 .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
                 .clone();
-            (name, value_to_string(date))
+            (name, date)
         })
         .collect();
     rows.sort();

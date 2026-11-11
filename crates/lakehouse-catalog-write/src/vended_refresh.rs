@@ -1,14 +1,15 @@
-//! The vended storage credentials of an export table, renewed through the catalog's
-//! `loadCredentials` endpoint before they expire. The source sits inside the table's FileIO, so
-//! every storage request of a writer, its commit's manifests included, signs with fresh keys.
+//! The storage credentials of an export table, as the one `ProvideCredential` source of its FileIO,
+//! so every storage request of a writer, its commit's manifests included, signs with a current
+//! credential. Each kind of credential is renewed its own way: CONNECTION keys never, an assumed
+//! role by assuming it again, vended credentials through the catalog's `loadCredentials` endpoint.
 
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use lakehouse_catalog::{
-    AtRenewalPoint, AwsCredential, CatalogSession, CustomAwsCredentialLoader, EpochClock,
-    ExpiringCredential, Lease, RenewalPoint, VendedS3Credentials, redact_error_text, scheme_of,
+    AssumedRole, AtRenewalPoint, AwsCredential, CatalogSession, CustomAwsCredentialLoader,
+    EpochClock, ExpiringCredential, Lease, RenewalPoint, VendedS3Credentials, aws_lease,
+    redact_error_text, scheme_of,
 };
-use reqsign_core::time::Timestamp;
 use reqsign_core::{Context, ProvideCredential};
 use std::fmt;
 use std::sync::Arc;
@@ -20,36 +21,13 @@ const RENEWAL_SKEW: Duration = Duration::from_secs(5 * 60);
 /// credential it replaces; this pause bounds the requests that would then follow.
 const MIN_RENEWAL_INTERVAL_MS: u64 = 30_000;
 
-const CREDENTIALS_ROUTE: &str =
-    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials";
-
-/// What a credential source does with its credentials when a storage request needs them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshDecision {
-    Keep,
-    Renew,
-    Expired,
-}
-
-/// What to do at the holder's renewal point, within five minutes of the expiry: renew when the
-/// catalog offers the credentials endpoint. Only still-valid credentials wait 30 s after the
-/// previous renewal; expired ones always renew. Without the endpoint, keep the credentials until
-/// they expire.
-pub(crate) fn refresh_decision(point: RenewalPoint, endpoint_offered: bool) -> RefreshDecision {
-    if !endpoint_offered {
-        return if point.now_ms >= point.expires_at_ms {
-            RefreshDecision::Expired
-        } else {
-            RefreshDecision::Keep
-        };
-    }
+/// What to do at the holder's renewal point, within five minutes of the expiry: still-valid
+/// credentials wait 30 s after the previous renewal, expired ones always renew.
+pub(crate) fn keep_at_renewal_point(point: RenewalPoint) -> bool {
     let renewed_recently = point
         .renewed_at_ms
         .is_some_and(|last| point.now_ms.saturating_sub(last) < MIN_RENEWAL_INTERVAL_MS);
-    if renewed_recently && point.now_ms < point.expires_at_ms {
-        return RefreshDecision::Keep;
-    }
-    RefreshDecision::Renew
+    renewed_recently && point.now_ms < point.expires_at_ms
 }
 
 /// The table whose vended credentials a source renews, and how: through the writer's own catalog
@@ -61,40 +39,68 @@ pub(crate) struct VendedTable {
     pub(crate) allow_http: bool,
 }
 
-/// The vended storage credentials of one table, as a `ProvideCredential` source for its FileIO.
-/// It renews them through `loadCredentials` on the CONNECTION's catalog address, so the catalog
+/// The storage credentials of one table, as a `ProvideCredential` source for its FileIO. Vended
+/// credentials renew through `loadCredentials` on the CONNECTION's catalog address, so the catalog
 /// token never goes to an address the catalog chose. No error and no `Debug` output shows a
-/// credential value.
+/// credential value, and only the value held now is redacted.
 #[derive(Clone)]
-pub(crate) struct VendedCredentials {
+pub(crate) struct StorageCredentials {
     inner: Arc<Source>,
 }
 
-struct Source {
-    holder: ExpiringCredential<AwsCredential>,
-    vended: VendedTable,
-    endpoint_offered: bool,
+enum Source {
+    /// The CONNECTION's own keys: a lease with no expiry, never renewed.
+    Keys(ExpiringCredential<AwsCredential>),
+    /// An assumed role, shared with the catalog signing that reads the same holder.
+    Role(AssumedRole),
+    Vended {
+        holder: ExpiringCredential<AwsCredential>,
+        vended: VendedTable,
+    },
 }
 
-impl VendedCredentials {
+impl StorageCredentials {
+    /// The CONNECTION's keys, which do not expire.
+    pub(crate) fn keys(
+        access_key: &str,
+        secret_key: &str,
+        session_token: Option<&str>,
+        clock: EpochClock,
+    ) -> Self {
+        let lease = aws_lease(
+            access_key.to_string(),
+            secret_key.to_string(),
+            session_token.map(str::to_string),
+            None,
+        );
+        Self {
+            inner: Arc::new(Source::Keys(ExpiringCredential::seeded(
+                lease,
+                RENEWAL_SKEW,
+                clock,
+            ))),
+        }
+    }
+
+    /// The credentials of an assumed role, renewed by assuming it again.
+    pub(crate) fn role(role: AssumedRole) -> Self {
+        Self {
+            inner: Arc::new(Source::Role(role)),
+        }
+    }
+
     /// Seeded from the credentials of a create, stage-create, or load answer; `clock` reads epoch
     /// milliseconds.
-    pub(crate) fn seeded(
+    pub(crate) fn vended(
         vended: VendedTable,
         seed: VendedS3Credentials,
         clock: EpochClock,
     ) -> Result<Self, UdfError> {
         let lease = vended_lease(seed, &vended).map_err(UdfError::User)?;
-        // A session that never read `/v1/config` cannot say, so try the endpoint and fail loudly.
-        let endpoint_offered = vended
-            .session
-            .offers_endpoint(CREDENTIALS_ROUTE)
-            .unwrap_or(true);
         Ok(Self {
-            inner: Arc::new(Source {
+            inner: Arc::new(Source::Vended {
                 holder: ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock),
                 vended,
-                endpoint_offered,
             }),
         })
     }
@@ -104,59 +110,63 @@ impl VendedCredentials {
         CustomAwsCredentialLoader::new(self.clone())
     }
 
-    /// Every credential value the source has held, for value-based error redaction.
+    /// The credential values held now, for value-based error redaction.
     pub(crate) fn secret_values(&self) -> Vec<String> {
-        self.inner
-            .holder
-            .held_values()
-            .into_iter()
-            .flat_map(|credential| {
-                [
-                    Some(credential.access_key_id),
-                    Some(credential.secret_access_key),
-                    credential.session_token,
-                ]
-            })
-            .flatten()
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    async fn credential(&self) -> Result<AwsCredential, String> {
-        let source = &self.inner;
-        source
-            .holder
-            .get_or_keep(|point| self.decide(point), |_| self.renew())
-            .await
-    }
-
-    fn decide(&self, point: RenewalPoint) -> Result<AtRenewalPoint, String> {
-        let source = &self.inner;
-        match refresh_decision(point, source.endpoint_offered) {
-            RefreshDecision::Keep => Ok(AtRenewalPoint::Keep),
-            RefreshDecision::Renew => Ok(AtRenewalPoint::Renew),
-            RefreshDecision::Expired => Err(format!(
-                "the vended storage credentials of table {} expired at {}, and the catalog {} \
-                 offers no credentials endpoint to refresh them",
-                source.vended.table,
-                epoch_time(point.expires_at_ms),
-                source.vended.session.catalog_uri()
-            )),
+        match &*self.inner {
+            Source::Role(role) => role.secret_values(),
+            Source::Keys(holder) | Source::Vended { holder, .. } => holder
+                .current()
+                .into_iter()
+                .flat_map(|credential| {
+                    [
+                        Some(credential.access_key_id),
+                        Some(credential.secret_access_key),
+                        credential.session_token,
+                    ]
+                })
+                .flatten()
+                .filter(|value| !value.is_empty())
+                .collect(),
         }
     }
 
-    async fn renew(&self) -> Result<Lease<AwsCredential>, String> {
-        let vended = &self.inner.vended;
+    async fn credential(&self) -> Result<AwsCredential, String> {
+        match &*self.inner {
+            Source::Role(role) => role.credential().await.map_err(|error| error.to_string()),
+            Source::Keys(holder) => {
+                holder
+                    .get(|_| async {
+                        Err("the CONNECTION's storage keys cannot be renewed".into())
+                    })
+                    .await
+            }
+            Source::Vended { holder, vended } => {
+                holder
+                    .get_or_keep(
+                        |point| {
+                            Ok(if keep_at_renewal_point(point) {
+                                AtRenewalPoint::Keep
+                            } else {
+                                AtRenewalPoint::Renew
+                            })
+                        },
+                        |_| self.renew_vended(vended),
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn renew_vended(&self, vended: &VendedTable) -> Result<Lease<AwsCredential>, String> {
         let credentials = vended
             .session
             .load_credentials(&vended.table, &vended.location)
             .await
-            .map_err(|error| self.refresh_failure(&error.to_string()))?;
-        vended_lease(credentials, vended).map_err(|cause| self.refresh_failure(&cause))
+            .map_err(|error| self.refresh_failure(vended, &error.to_string()))?;
+        vended_lease(credentials, vended).map_err(|cause| self.refresh_failure(vended, &cause))
     }
 
-    fn refresh_failure(&self, cause: &str) -> String {
-        let vended = &self.inner.vended;
+    fn refresh_failure(&self, vended: &VendedTable, cause: &str) -> String {
         let held = self.secret_values();
         let held: Vec<&str> = held.iter().map(String::as_str).collect();
         format!(
@@ -169,7 +179,7 @@ impl VendedCredentials {
     }
 }
 
-impl ProvideCredential for VendedCredentials {
+impl ProvideCredential for StorageCredentials {
     type Credential = AwsCredential;
 
     async fn provide_credential(&self, _: &Context) -> reqsign_core::Result<Option<AwsCredential>> {
@@ -180,13 +190,18 @@ impl ProvideCredential for VendedCredentials {
     }
 }
 
-impl fmt::Debug for VendedCredentials {
+impl fmt::Debug for StorageCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let vended = &self.inner.vended;
-        f.debug_struct("VendedCredentials")
-            .field("table", &vended.table.to_string())
-            .field("location", &vended.location)
-            .finish_non_exhaustive()
+        match &*self.inner {
+            Source::Vended { vended, .. } => f
+                .debug_struct("StorageCredentials")
+                .field("table", &vended.table.to_string())
+                .field("location", &vended.location)
+                .finish_non_exhaustive(),
+            Source::Keys(_) | Source::Role(_) => {
+                f.debug_struct("StorageCredentials").finish_non_exhaustive()
+            }
+        }
     }
 }
 
@@ -208,26 +223,12 @@ fn vended_lease(
     vended: &VendedTable,
 ) -> Result<Lease<AwsCredential>, String> {
     refuse_plaintext_endpoint(credentials.endpoint.as_deref(), vended)?;
-    Ok(Lease {
-        value: AwsCredential {
-            access_key_id: credentials.access_key_id,
-            secret_access_key: credentials.secret_access_key,
-            session_token: credentials.session_token,
-            expires_in: credentials.expires_at_ms.and_then(timestamp),
-        },
-        expires_at_ms: credentials.expires_at_ms,
-    })
-}
-
-fn timestamp(epoch_ms: u64) -> Option<Timestamp> {
-    Timestamp::from_millisecond(i64::try_from(epoch_ms).ok()?).ok()
-}
-
-fn epoch_time(epoch_ms: u64) -> String {
-    timestamp(epoch_ms).map_or_else(
-        || format!("{epoch_ms} ms after the Unix epoch"),
-        Timestamp::format_rfc3339_zulu,
-    )
+    Ok(aws_lease(
+        credentials.access_key_id,
+        credentials.secret_access_key,
+        credentials.session_token,
+        credentials.expires_at_ms,
+    ))
 }
 
 #[cfg(test)]

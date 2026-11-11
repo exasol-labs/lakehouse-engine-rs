@@ -7,7 +7,7 @@
 * Five sites encode the contract: `partial_select_items`, `emit_null_partial_row`, and `partial_row_from_batch` in `scan/partial_agg.rs`, `partial_emits_items` in `adapter/pushdown/grouped_agg.rs`, and `merge_select_items` in `adapter/pushdown/scalar_over_agg.rs`. A count disagreement is silent. `partial_row_from_batch` advances its own index and `emit_null_partial_row` builds a `Vec<Value>` by length alone, so a wrong count shifts every later aggregate's value into the wrong `EMITS` slot.
 * Count, CountCol, Sum, Min, and Max contribute 1 column. Avg contributes 2 (sum, then count). The STDDEV/VARIANCE family contributes 3 (cnt, mean, m2).
 * `AggKind` lives in `scan/spec.rs`, which both the scan and the adapter already import. `scan/spec.rs` imports only `serde` and must not depend on `exasol_udf_sdk`, so the descriptor expresses an empty shard's value as a boolean counter property and the emit site maps it to `Value::Int64(0)` or `Value::Null`.
-* `empty_agg_literal` and `validate_agg_col_types` match on `AggKind` for other questions and are not part of the contract.
+* `empty_agg_literal` matches on `AggKind` for another question and is not part of the contract.
 
 ## Scenarios
 

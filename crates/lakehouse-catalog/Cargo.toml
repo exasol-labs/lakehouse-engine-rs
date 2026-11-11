@@ -41,6 +41,6 @@ http       = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }
+reqsign-core = { workspace = true }
 
 [dev-dependencies]
-reqsign-core = { workspace = true }

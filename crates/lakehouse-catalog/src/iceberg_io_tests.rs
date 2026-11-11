@@ -75,6 +75,7 @@ async fn sigv4_request_is_signed_for_the_carried_region() {
     creds.region = String::new();
     let auth = CatalogAuth::Sigv4 {
         region: "eu-west-1".into(),
+        role: None,
     };
     let url = format!("{catalog_uri}/v1/catalogs/123456789012/namespaces/db/tables/t");
 

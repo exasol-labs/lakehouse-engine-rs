@@ -32,7 +32,7 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through the table's identifier note back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
 * *AND* an unquoted projection of the column SHALL return the seeded values in full, so the uppercased column name still maps back to the Iceberg field's own casing at scan time
 * *AND* a `LIKE` predicate over that column SHALL return the correct subset of rows
-* *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold
+* *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the scan translator resolved the column's Exasol type from a `col_types` entry whose name came through this fold
 
 ### Scenario: createVirtualSchema reads the database version once and threads the resolved precision
 
