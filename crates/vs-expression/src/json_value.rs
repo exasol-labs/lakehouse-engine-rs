@@ -4,7 +4,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE, exasol_type_from_json};
-use crate::scan_typing::decline;
+use crate::scan_typing::{decline, kind};
 
 /// `(document, path, max_chars, on_empty, on_error)`, returning text.
 pub const JSON_VALUE_TEXT_FN: &str = "lakehouse_json_value_text";
@@ -138,19 +138,16 @@ fn fallback(behavior: Option<&Json>, returning: Returning) -> Result<Fallback, U
     };
     let expression = behavior.get("expression").unwrap_or(&Json::Null);
     let value = expression.get("value");
-    fn kind(node: &Json) -> Option<&str> {
-        node.get("type").and_then(Json::as_str)
-    }
     let fallback = match (kind(behavior), kind(expression), returning) {
-        (Some("NULL"), _, _) | (Some("DEFAULT"), Some("literal_null"), _) => Some(Fallback::Null),
-        (Some("DEFAULT"), Some("literal_string"), Returning::Text { max_chars }) => value
+        ("NULL", _, _) | ("DEFAULT", "literal_null", _) => Some(Fallback::Null),
+        ("DEFAULT", "literal_string", Returning::Text { max_chars }) => value
             .and_then(Json::as_str)
             .filter(|text| text.chars().count() <= max_chars as usize)
             .map(|text| match text {
                 "" => Fallback::Null,
                 text => Fallback::Text(text.to_string()),
             }),
-        (Some("DEFAULT"), Some("literal_bool"), Returning::Boolean) => {
+        ("DEFAULT", "literal_bool", Returning::Boolean) => {
             value.and_then(Json::as_bool).map(Fallback::Boolean)
         }
         _ => None,

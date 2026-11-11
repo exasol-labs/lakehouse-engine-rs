@@ -86,7 +86,7 @@ pub(crate) fn decline(reason: String) -> UdfError {
     UdfError::User(format!("the scan cannot compute this expression: {reason}"))
 }
 
-fn kind(node: &Json) -> &str {
+pub(crate) fn kind(node: &Json) -> &str {
     node.get("type").and_then(Json::as_str).unwrap_or("")
 }
 

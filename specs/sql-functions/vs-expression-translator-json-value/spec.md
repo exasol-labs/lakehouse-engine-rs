@@ -7,7 +7,6 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 * Exasol sends `JSON_VALUE` as a `function_scalar_json_value` node with the document and a path literal as `arguments`, a `returningDataType` (`VARCHAR(2000000)` without a `RETURNING` clause), and an `emptyBehavior` and `errorBehavior` of `NULL`, `ERROR`, or `DEFAULT` with an `expression`.
 * Exasol converts the extracted text to `DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP` by the session's NLS settings, which the pushdown request does not carry.
 * Exasol casts a `DEFAULT` to the `RETURNING` type when it compiles the statement, and fails the statement when the value does not convert or fit.
-* Native behavior was captured on Exasol 2025.1.
 
 ## Scenarios
 

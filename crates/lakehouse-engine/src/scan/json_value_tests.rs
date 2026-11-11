@@ -1,8 +1,7 @@
 use super::*;
-use arrow::datatypes::Field;
-use datafusion::common::config::ConfigOptions;
+use crate::scan::test_support::invoke_scalar_udf;
 
-/// Drives `invoke_with_args` as DataFusion does per batch, with `constants` after the documents.
+/// One batch of `documents`, with `constants` after them.
 fn invoke(
     returning: Returning,
     documents: Vec<Option<&str>>,
@@ -20,19 +19,7 @@ fn invoke(
     let rows = documents.len();
     let mut args = vec![ColumnarValue::Array(Arc::new(StringArray::from(documents)))];
     args.extend(constants.into_iter().map(ColumnarValue::Scalar));
-    let arg_fields = args
-        .iter()
-        .map(|arg| Arc::new(Field::new("arg", arg.data_type(), true)))
-        .collect();
-    let return_type = udf.return_type(&[]).expect("fixed return type");
-    let args = ScalarFunctionArgs {
-        arg_fields,
-        args,
-        number_rows: rows,
-        return_field: Arc::new(Field::new(name, return_type, true)),
-        config_options: Arc::new(ConfigOptions::default()),
-    };
-    udf.invoke_with_args(args)
+    invoke_scalar_udf(&udf, args, rows)
         .and_then(|values| values.to_array(rows))
         .expect("constant arguments")
 }
