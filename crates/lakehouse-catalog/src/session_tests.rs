@@ -793,12 +793,11 @@ async fn a_request_carries_the_session_auth_and_the_delegation_header_when_the_c
             ..session_over(CatalogHttp::new(), "https://catalog.example.com")
         };
 
-        let (request, bearer) = session
+        let request = session
             .build_request(Method::GET, "namespaces", None)
             .await
             .expect("the request builds");
 
-        assert_eq!(bearer.as_deref(), Some(BEARER_TOK));
         assert_eq!(
             request.headers()["authorization"],
             format!("Bearer {BEARER_TOK}")

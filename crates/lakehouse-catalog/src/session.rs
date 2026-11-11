@@ -258,7 +258,7 @@ impl CatalogSession {
         body: Option<&serde_json::Value>,
         safety: RepeatSafety,
     ) -> Result<CatalogResponse, CatalogSendError> {
-        let (request, _) = self
+        let request = self
             .build_request(method, path, body)
             .await
             .map_err(|error| CatalogSendError::Unsent(error.to_string()))?;
@@ -389,13 +389,12 @@ impl CatalogSession {
         })
     }
 
-    /// The request and the bearer token it carries, which an error of the request redacts.
     async fn build_request(
         &self,
         method: Method,
         path: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<(Request, Option<String>), UdfError> {
+    ) -> Result<Request, UdfError> {
         let url = catalog_url(&self.catalog_uri, &self.prefix, path);
         let mut builder = self
             .http

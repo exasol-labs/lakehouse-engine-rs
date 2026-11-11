@@ -22,12 +22,13 @@ pub(crate) fn redact_catalog_text(
 }
 
 /// Renews an OAuth2 token that reached its renewal point before the request carries it. Returns
-/// the request with the bearer it carries, which is what an error of that request redacts.
+/// the request. An error of a sent request must redact the bearer the last attempt carried
+/// (`CatalogAnswer.bearer`, `CatalogHttpError::bearer()`), which differs after a renewal.
 pub(crate) async fn build_signed_request(
     builder: reqwest::RequestBuilder,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
-) -> Result<(reqwest::Request, Option<String>), UdfError> {
+) -> Result<reqwest::Request, UdfError> {
     let (builder, bearer) = auth
         .apply(builder)
         .await
@@ -77,7 +78,7 @@ pub(crate) async fn build_signed_request(
         }
         CatalogAuth::Bearer(_) | CatalogAuth::OAuth2(_) | CatalogAuth::None => request,
     };
-    Ok((signed, bearer))
+    Ok(signed)
 }
 
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
@@ -91,7 +92,7 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     if send_access_delegation {
         builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
     }
-    let (request, _) = build_signed_request(builder, auth, creds)
+    let request = build_signed_request(builder, auth, creds)
         .await
         .map_err(|e| CatalogRequestError::without_status(e.to_string()))?;
     http.send_json(
@@ -131,7 +132,7 @@ pub(crate) async fn authed_post_json(
         .header("accept", "application/json")
         .header("content-type", "application/json")
         .body(body);
-    let (request, _) = build_signed_request(builder, auth, creds).await?;
+    let request = build_signed_request(builder, auth, creds).await?;
     let answer = http
         .send_capped(
             request,
