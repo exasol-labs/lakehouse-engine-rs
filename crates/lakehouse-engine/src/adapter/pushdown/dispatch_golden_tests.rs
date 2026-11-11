@@ -198,9 +198,11 @@ fn dispatch_sql(
 /// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
-    let (projection, widened) =
-        super::support::project_columns(&pushdown, &column_types(&base_col_types()))
-            .expect("the fixture must project");
+    let (projection, widened) = super::support::project_columns(
+        &pushdown,
+        ScanTranslator::new(&column_types(&base_col_types())),
+    )
+    .expect("the fixture must project");
     assert!(
         widened,
         "this fixture must exercise the widening guard, not a per-item projection"
@@ -210,7 +212,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         &pushdown,
         projection,
         widened,
-        &column_types(&base_col_types()),
+        ScanTranslator::new(&column_types(&base_col_types())),
         None,
         None,
         None,
@@ -255,7 +257,7 @@ fn dispatch_sql_with_pushdown_req(
             .expect("the fixture declares a valid selectListDataTypes"),
         projected_columns(&proj_cols, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         filter,
         None,
         limit,
@@ -288,7 +290,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &parsed_pushdown(request),
         &projected_columns(proj_cols, proj_types),
         false,
-        &column_types(&base_col_types()),
+        ScanTranslator::new(&column_types(&base_col_types())),
         &EmptyRelation::single_scan(request, &column_types(&base_col_types())),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
@@ -446,8 +448,10 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     let expected = include_str!("testdata/dispatch_golden/empty_unmergeable_having.sql");
     assert_eq!(actual, expected);
 
-    let shape =
-        classify_request_shape(&parsed_pushdown(&request), &column_types(&base_col_types()));
+    let shape = classify_request_shape(
+        &parsed_pushdown(&request),
+        ScanTranslator::new(&column_types(&base_col_types())),
+    );
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "an unmergeable HAVING must route to GroupByWrapper, not stay classified as \

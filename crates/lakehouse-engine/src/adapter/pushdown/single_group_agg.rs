@@ -2,11 +2,10 @@ use crate::scan::spec::AggregatePlan;
 use serde_json::Value as Json;
 
 use super::scalar_over_agg::{
-    NESTED_AGGREGATE_PLAN_TYPE, arg_column_or_expr, cast_merge_items,
-    classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items, parse_agg_item,
-    render_scalar_over_merge,
+    TypedPlans, arg_column_or_expr, classify_scalar_over_aggregate, fold_aggregate_plan,
+    fold_nested_plans, parse_agg_item, render_scalar_over_merge,
 };
-use super::support::{ColumnTypes, PushdownRequest, cast_to_declared_type};
+use super::support::{PushdownRequest, ScanTranslator, output_select_list};
 use crate::types::exasol_type::ExasolType;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
@@ -19,7 +18,7 @@ pub enum SingleGroupItem {
     /// each nested aggregate's merged expression.
     ScalarOverAggregate {
         node: Json,
-        declared_type: ExasolType,
+        nested: Vec<(AggregatePlan, Json)>,
     },
 }
 
@@ -32,7 +31,10 @@ pub struct DistinctCount {
 
 /// `None` (row-scan fallback) when any item declines; one declining item declines
 /// the whole detection.
-pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupItem>> {
+pub fn detect_aggregates(
+    pushdown: &PushdownRequest,
+    scan: ScanTranslator<'_>,
+) -> Option<Vec<SingleGroupItem>> {
     let pushdown_req = pushdown.json();
     if pushdown_req
         .get("groupBy")
@@ -52,16 +54,14 @@ pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupIt
     for (select_index, item) in list.iter().enumerate() {
         let resolved = if item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate") {
             pushdown.emittable_select_type(select_index)?;
-            match parse_count_distinct(item) {
+            match parse_count_distinct(item, scan) {
                 Some(distinct) => SingleGroupItem::Distinct(distinct),
-                None => SingleGroupItem::Aggregate(parse_agg_item(item)?),
+                None => SingleGroupItem::Aggregate(parse_agg_item(item, scan)?),
             }
         } else {
-            // Classified for the decline only; `ordinary_plans` re-derives the nested plans.
-            classify_scalar_over_aggregate(item)?;
             SingleGroupItem::ScalarOverAggregate {
                 node: item.clone(),
-                declared_type: pushdown.select_type(select_index)?,
+                nested: classify_scalar_over_aggregate(item, scan)?,
             }
         };
         items.push(resolved);
@@ -70,55 +70,38 @@ pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupIt
     Some(items)
 }
 
-/// Dedup is a correctness requirement: the merge rewrite binds each nested
-/// aggregate to the first structurally-equal slot, so duplicates would misalign
-/// with the `EMITS` columns (decision-log [6]).
-///
-/// `pub` so callers outside `pushdown` (integration tests) get nameable plans
-/// without naming `SingleGroupItem`.
-pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
-    let mut plans = Vec::new();
-    // The fold's accumulated types are discarded; see `single_group_plan_types`.
-    let mut plan_types = Vec::new();
-    for item in items {
-        match item {
-            SingleGroupItem::Aggregate(plan) => {
-                fold_aggregate_plan(&mut plans, &mut plan_types, plan.clone(), None);
-            }
-            SingleGroupItem::Distinct(_) => {}
-            SingleGroupItem::ScalarOverAggregate { node, .. } => {
-                for plan in classify_scalar_over_aggregate(node).into_iter().flatten() {
-                    fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
-                }
-            }
-        }
-    }
-    plans
+/// The partial plans of a single-group select list, typed and merged once per request.
+pub fn single_group_plans(
+    items: &[SingleGroupItem],
+    select_types: &[ExasolType],
+    scan: ScanTranslator<'_>,
+) -> Option<TypedPlans> {
+    let (plans, types) = fold_single_group_plans(items, select_types, scan);
+    TypedPlans::new(plans, types, scan.columns())
 }
 
-/// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's
-/// `EMITS`, so a slot reached only through a nested aggregate takes
-/// [`NESTED_AGGREGATE_PLAN_TYPE`] rather than the `VARCHAR(2000000)` default.
-pub fn single_group_plan_types(
-    select_types: &[ExasolType],
+/// Dedup is a correctness requirement: the merge rewrite binds each nested aggregate to the
+/// first structurally-equal slot, so duplicates would misalign with the `EMITS` columns.
+pub(super) fn fold_single_group_plans(
     items: &[SingleGroupItem],
-) -> Vec<ExasolType> {
-    let plans = ordinary_plans(items);
-    let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE; plans.len()];
-
+    select_types: &[ExasolType],
+    scan: ScanTranslator<'_>,
+) -> (Vec<AggregatePlan>, Vec<Option<ExasolType>>) {
+    let mut plans = Vec::new();
+    let mut plan_types = Vec::new();
     for (select_index, item) in items.iter().enumerate() {
-        if let SingleGroupItem::Aggregate(plan) = item {
-            let slot = plans
-                .iter()
-                .position(|p| p == plan)
-                .expect("ordinary_plans folds every top-level Aggregate item's plan in");
-            if let Some(&declared) = select_types.get(select_index) {
-                plan_types[slot] = declared;
+        match item {
+            SingleGroupItem::Aggregate(plan) => {
+                let declared = select_types.get(select_index).copied();
+                fold_aggregate_plan(&mut plans, &mut plan_types, plan.clone(), declared);
+            }
+            SingleGroupItem::Distinct(_) => {}
+            SingleGroupItem::ScalarOverAggregate { nested, .. } => {
+                fold_nested_plans(&mut plans, &mut plan_types, nested, scan);
             }
         }
     }
-
-    plan_types
+    (plans, plan_types)
 }
 
 /// `None` when any item has no merge expression (a `COUNT(DISTINCT)` or an
@@ -126,28 +109,21 @@ pub fn single_group_plan_types(
 /// narrower select list fails Exasol's positional validation.
 pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
-    plans: &[AggregatePlan],
-    plan_types: &[ExasolType],
-    col_types: &ColumnTypes,
+    plans: &TypedPlans,
+    select_types: &[ExasolType],
+    scan: ScanTranslator<'_>,
 ) -> Option<Vec<String>> {
-    let merged = merge_select_items(plans);
-    let cast_merged = cast_merge_items(plans, plan_types, col_types);
-    items
+    let fragments = items
         .iter()
         .map(|item| match item {
-            SingleGroupItem::Aggregate(plan) => {
-                let slot = plans.iter().position(|p| p == plan)?;
-                cast_merged.get(slot).cloned()
-            }
+            SingleGroupItem::Aggregate(plan) => plans.fragment(plans.slot_of(plan)?),
             SingleGroupItem::Distinct(_) => None,
-            SingleGroupItem::ScalarOverAggregate {
-                node,
-                declared_type,
-                ..
-            } => render_scalar_over_merge(node, plans, &merged)
-                .map(|expr| cast_to_declared_type(&expr, *declared_type)),
+            SingleGroupItem::ScalarOverAggregate { node, .. } => {
+                render_scalar_over_merge(node, &plans.plans, &plans.merged, scan)
+            }
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    output_select_list(fragments, select_types)
 }
 
 pub(super) fn has_distinct(items: &[SingleGroupItem]) -> bool {
@@ -167,7 +143,7 @@ pub(super) fn is_lone_count_distinct(items: &[SingleGroupItem]) -> bool {
 
 /// `None` when the item is not a distinct `COUNT` or its argument cannot be resolved;
 /// the caller then defers to [`parse_agg_item`], which declines it.
-fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
+fn parse_count_distinct(item: &Json, scan: ScanTranslator<'_>) -> Option<DistinctCount> {
     if item.get("distinct").and_then(|d| d.as_bool()) != Some(true) {
         return None;
     }
@@ -180,7 +156,7 @@ fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
         return None;
     }
     let args = item.get("arguments").and_then(|a| a.as_array());
-    let (column, arg_expr) = arg_column_or_expr(args)?;
+    let (column, arg_expr) = arg_column_or_expr(args, scan)?;
     Some(DistinctCount { column, arg_expr })
 }
 

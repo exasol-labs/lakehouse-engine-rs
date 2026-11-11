@@ -113,19 +113,6 @@ fn prefix_from_config_empty_when_absent() {
     );
 }
 
-/// The prefix a `/v1/config` lookup yields.
-async fn resolve_load_table_prefix(
-    http: &CatalogHttp,
-    catalog_uri: &str,
-    warehouse: &str,
-    auth: &CatalogAuth,
-    creds: &ConnectionCreds,
-) -> Result<String, UdfError> {
-    resolve_served_config(http, catalog_uri, warehouse, auth, creds)
-        .await
-        .map(|config| config.prefix)
-}
-
 #[tokio::test]
 async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     use std::net::SocketAddr;
@@ -159,6 +146,7 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     creds.use_sigv4 = true;
     let auth = CatalogAuth::Sigv4 {
         region: "us-east-1".into(),
+        role: None,
     };
 
     let http = CatalogHttp::new();
@@ -326,7 +314,8 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
 
         let session_creds = crate::resolve_aws_identity(stated, &load_table_uri, true)
             .await
-            .expect("the stub answers a well-formed AssumeRoleResponse");
+            .expect("the stub answers a well-formed AssumeRoleResponse")
+            .creds;
         let session = CatalogSession::resolve(&load_table_uri, WAREHOUSE, None, &session_creds)
             .await
             .expect("a SigV4 session resolves without any network access");
@@ -405,7 +394,7 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
         .expect("sigv4 session resolution must not fail without any network access");
 
     assert!(
-        matches!(&session.auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
+        matches!(&session.auth, CatalogAuth::Sigv4 { region, .. } if region == "us-east-1"),
         "sigv4 creds must resolve to CatalogAuth::Sigv4 carrying the endpoint's region"
     );
     assert_eq!(
@@ -474,7 +463,6 @@ fn session_over(http: CatalogHttp, catalog_uri: &str) -> CatalogSession {
         catalog_uri: catalog_uri.to_string(),
         auth: CatalogAuth::None,
         prefix: String::new(),
-        endpoints: ServedEndpoints::NotAsked,
         creds: creds_no_auth(),
     }
 }
@@ -709,39 +697,6 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
     load_table_any_auth(&pushdown_session, &catalog)
         .await
         .expect("a 503 on the pushdown load is retried to success");
-}
-
-const CREDENTIALS_ROUTE: &str =
-    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials";
-
-#[test]
-fn offered_endpoints_are_the_routes_the_config_lists_and_none_when_never_asked() {
-    let listing = serde_json::json!({"endpoints": [
-        "get /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "not-a-route",
-    ]});
-    for (config, offered) in [
-        (listing, Some(true)),
-        (
-            serde_json::json!({"endpoints": ["GET /v1/{prefix}/namespaces"]}),
-            Some(false),
-        ),
-        (serde_json::json!({"defaults": {}}), Some(false)),
-    ] {
-        let session = CatalogSession {
-            endpoints: endpoints_from_config(&config)
-                .map_or(ServedEndpoints::Unlisted, ServedEndpoints::Listed),
-            ..session_over(CatalogHttp::new(), "https://catalog.example.com")
-        };
-
-        assert_eq!(
-            session.offers_endpoint(CREDENTIALS_ROUTE),
-            offered,
-            "{config}"
-        );
-    }
-    let never_asked = session_over(CatalogHttp::new(), "https://catalog.example.com");
-    assert_eq!(never_asked.offers_endpoint(CREDENTIALS_ROUTE), None);
 }
 
 #[test]

@@ -6,8 +6,8 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 
 * Exasol sends expression trees as serde_json `Value` objects: column references, literals, comparison predicates, logical operators, scalar functions, arithmetic operators, CAST, and aggregate function nodes (`function_aggregate`). The crate uses only serde_json as its IR.
 * An aggregate node is not a translated function. Its name is spliced verbatim and its arguments are rendered by recursion, so a scalar expression that wraps aggregates renders in full.
-* The crate exposes six entry points in two dialect trios. The DataFusion trio is `render_expression` (returns `Err` for unsupported nodes), `render_expression_safe` (returns `None` for unsupported nodes), and `render_df_filter_safe` (as safe, and also suppresses trivially-true results). Its fragments are parsed by DataFusion inside the scan UDF. The Exasol trio (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) has the same three contracts, and its fragments are spliced into outer wrapper SQL that Exasol parses.
-* `render_expression_safe` does not suppress a trivially-true result, so it returns `None` for exactly the declined case.
+* The crate's DataFusion entry points are `render_scan_expression`, which returns `Err` for an unsupported node and for one the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`), and `render_scan_filter`, which also returns `Ok(None)` for a trivially-true result. Their fragments are parsed by DataFusion inside the scan UDF. The Exasol trio (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) has the same three contracts, and its fragments are spliced into outer wrapper SQL that Exasol parses.
+* `render_scan_expression` does not suppress a trivially-true result, so its `Err` marks exactly the declined case.
 * The dialect is threaded through every node, and a node branches on it where the two parsers disagree. The Exasol dialect renders what Exasol sent (verbatim name, argument order, and argument count). A construct that is not an Exasol call form has its own per-name arm: an operator wire name, `MOD`, `CONCAT`, a CAST target, and `CASE`.
 * An Exasol-dialect fragment reaches Exasol's parser as a select item, a GROUP BY key, a HAVING operand, an ORDER BY element, an N-scan cross-side residual, or a declined single-table WHERE predicate (rendered through `render_df_filter_qualified`). An acceptance test for Exasol-dialect rendering uses one of those positions.
 * Every translated `function_scalar` name is declared once in the crate, as `VerbatimCall` (`<NAME>(<rendered args>)`) or `Shaped` (rendered by its own per-name arm). The declaration gates dispatch, so an undeclared name is declined in both dialects with `unsupported scalar function: <name>` before any per-name arm is reached.
@@ -20,7 +20,7 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *WHEN* the adapter renders that predicate for the qualified single-table wrapper's outer `WHERE`
 * *THEN* the Exasol trio SHALL be the renderer used, reached through `render_df_filter_qualified`, so the fragment is parsed by Exasol's core engine and carries length-qualified CAST targets
 * *AND* the recorded set of wrapper positions an Exasol-dialect node can reach SHALL include this one, so an acceptance test for Exasol-dialect rendering MAY use a declined single-table WHERE predicate
-* *AND* no translator entry point SHALL be added, because `render_expression_safe` already returns `None` for exactly the declined case and the trivially-true rule stays owned by this crate
+* *AND* no translator entry point SHALL be added, because `render_scan_expression` already returns `Err` for exactly the declined case and the trivially-true rule stays owned by this crate
 
 ### Scenario: Bare column reference translates to quoted identifier
 
@@ -36,7 +36,7 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is absent from the crate's one declaration of translated `function_scalar` names (for example `SUBSTRING`), whether or not a per-name rendering arm exists for that name
 * *WHEN* `render_expression` or `render_expression_exasol` processes the node in raising mode
 * *THEN* the translator SHALL return an error reading `unsupported scalar function: <NAME>` in both dialects, the same error an unrecognised name raises
-* *AND* `render_expression_safe` and `render_expression_exasol_safe` SHALL return `None` for the same node without panicking
+* *AND* `render_scan_expression` SHALL return an error and `render_expression_exasol_safe` SHALL return `None` for the same node, neither panicking
 * *AND* the declaration lookup MUST happen before any per-name rendering arm is reached, so an arm added without a declaration entry is unreachable and cannot emit DataFusion SQL on the Exasol path
 * *AND* the adapter SHALL omit the expression and let Exasol evaluate it, exactly as it does for any other untranslated name
 

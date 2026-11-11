@@ -8,6 +8,7 @@ use crate::error_chain::error_chain;
 use crate::expiring::{EpochClock, ExpiringCredential, Lease};
 use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
+use crate::sts::AssumedRole;
 use exasol_udf_sdk::error::UdfError;
 use std::time::Duration;
 
@@ -40,13 +41,25 @@ pub(crate) fn redact_catalog_auth_error(
 /// Resolved once per session; authenticates every self-issued catalog request
 /// identically. Orthogonal to credential vending.
 pub(crate) enum CatalogAuth {
-    Sigv4 { region: String },
+    /// Signs with `role`'s credentials, assumed again as they expire, else with the CONNECTION's keys.
+    Sigv4 {
+        region: String,
+        role: Option<AssumedRole>,
+    },
     Bearer(String),
     OAuth2(Box<OAuth2Token>),
     None,
 }
 
 impl CatalogAuth {
+    /// The OAuth2 token a retry takes its bearer from again, if this auth has one.
+    pub(crate) fn renewable(&self) -> Option<&OAuth2Token> {
+        match self {
+            Self::OAuth2(token) => Some(token),
+            Self::Sigv4 { .. } | Self::Bearer(_) | Self::None => None,
+        }
+    }
+
     /// Puts the bearer on `builder`, after an OAuth2 token that reached its renewal point was
     /// granted anew, and returns the token the request carries, so the caller redacts exactly it.
     /// A request that carries no bearer returns `None`.
@@ -155,7 +168,7 @@ impl ClientCredentialsGrant {
 
         let body: serde_json::Value = self
             .http
-            .send_json(request, RepeatSafety::Safe, label, redact_secret)
+            .send_json(request, RepeatSafety::Safe, None, label, redact_secret)
             .await?;
 
         lease_from_grant_answer(&body, now_ms, self.require_expiry).map_err(|error| {
@@ -221,6 +234,7 @@ pub(crate) async fn resolve_catalog_auth(
     if creds.use_sigv4 {
         return Ok(CatalogAuth::Sigv4 {
             region: required_signing_region(creds, catalog_uri)?,
+            role: None,
         });
     }
     match creds.supplied_catalog_auth() {

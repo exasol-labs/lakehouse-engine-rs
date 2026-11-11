@@ -8,11 +8,11 @@
 
 ### Context
 
-A commit whose answer was lost returns HTTP 409 on a repeat, and a blind re-apply adds the writer's rows twice. The Iceberg REST spec answers 500, 502, or 504 when "the commit state is unknown".
+A commit whose answer was lost returns HTTP 409 on a repeat, and a blind re-apply adds the writer's rows twice. The Iceberg REST spec answers 500, 502, or 504 when "the commit state is unknown", and Iceberg Java's `CommitErrorHandler` reads 503 the same way.
 
 ### Decision
 
-The catalog write crate sends each writer's commit and, after a conflict or an uncertain outcome, reloads the table and commits again only when no snapshot carries the writer's tag. A writer whose last outcome is unknown fails and keeps its data files.
+The catalog write crate sends each writer's commit and, after a conflict or an uncertain outcome (HTTP 500, 502, 503, 504, or no complete answer), reloads the table and commits again only when no snapshot carries the writer's tag. A writer whose last outcome is unknown fails and keeps its data files.
 
 ### Options Considered
 

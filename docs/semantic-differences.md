@@ -104,24 +104,15 @@ For a few input strings the scan and native Exasol parse differently:
 
 The scan also accepts some strings Exasol rejects, such as a sign before the year, seconds 60, or a tab inside the value. Those queries return a result where Exasol raises an error.
 
-## CAST to text
+## CAST of text to a shorter VARCHAR
 
-A cast to text that the scan computes differs from native Exasol in two ways:
+The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or to an `ASCII` target, without Exasol's checks. Native Exasol fails on a value that does not fit, except that it cuts trailing spaces beyond `n` (`'ab   '` cast to `VARCHAR(3)` is `'ab '`). The scan keeps the whole value.
 
-- It skips the target type's length check, blank padding, and ASCII check.
-- It formats DATE, TIMESTAMP, BOOLEAN, DOUBLE, and DECIMAL values with a scale above 0 in a fixed
-  form that ignores the session's NLS settings.
+| Expression, over the values `'ab'`, `'ab   '`, `'cd'` | Virtual schema | Native Exasol |
+|---|---|---|
+| `WHERE CAST(val AS VARCHAR(3)) = 'ab '` | no rows | 1 row |
+| `SELECT CAST(val AS VARCHAR(3))` | right-truncation error | `'ab '` |
+| `WHERE CAST(val \|\| 'abcdefghij' AS VARCHAR(5)) IS NOT NULL` | returns rows | right-truncation error |
+| `WHERE CAST(val \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | returns rows | error |
 
-| Expression | Session setting | Virtual schema | Native Exasol |
-|---|---|---|---|
-| `WHERE CAST(name \|\| 'abcdefghijkl' AS VARCHAR(5)) IS NOT NULL` | default | returns rows | right-truncation error |
-| `WHERE CAST(name \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | default | returns rows | error |
-| `CAST(ts AS VARCHAR(40))` | default | `2024-01-01T00:00:00.100` | `2024-01-01 00:00:00.100000` |
-| `WHERE CAST(flag AS VARCHAR(2000000)) = 'TRUE'` | default | returns no rows | returns rows |
-| `CAST(d AS VARCHAR(10))` | `NLS_DATE_FORMAT='DD.MM.YYYY'` | `2024-01-01` | `01.01.2024` |
-
-**Workaround:** filter a date with a date range instead of a text comparison:
-
-```sql
-WHERE d >= DATE '2024-01-01' AND d < DATE '2025-01-01'
-```
+A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).

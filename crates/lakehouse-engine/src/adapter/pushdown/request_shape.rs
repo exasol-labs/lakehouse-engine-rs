@@ -6,13 +6,13 @@
 //! to [`RequestShape::GroupByWrapper`], which renders both natively, rather than
 //! dropping them (#195) or erroring (#198).
 
-use super::grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, render_having_over_merge};
-use super::single_group_agg::{SingleGroupItem, has_distinct};
-use super::support::{ColumnTypes, PushdownRequest};
-use super::{
-    GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
-    validate_agg_col_types,
+use super::grouped_agg::{
+    GroupedOrderBy, MergeScope, build_grouped_order_by_clause, render_having_over_merge,
 };
+use super::scalar_over_agg::TypedPlans;
+use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plans};
+use super::support::{PushdownRequest, ScanTranslator};
+use super::{GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates};
 
 #[derive(Debug)]
 pub(super) enum RequestShape {
@@ -27,9 +27,9 @@ pub(super) enum RequestShape {
     /// columns are the `selectList` items, never a bare row scan (Exasol's positional
     /// column-count check fails with `04000`).
     GroupByWrapper,
-    /// Ordinary aggregate column types passed [`validate_agg_col_types`].
     SingleGroupAgg {
         items: Vec<SingleGroupItem>,
+        aggregates: TypedPlans,
         having: Option<String>,
     },
     SingleGroupWrapper,
@@ -38,48 +38,44 @@ pub(super) enum RequestShape {
 
 pub(super) fn classify_request_shape(
     pushdown: &PushdownRequest,
-    col_types: &ColumnTypes,
+    scan: ScanTranslator<'_>,
 ) -> RequestShape {
     let pushdown_req = pushdown.json();
-    if let Some(detection) = detect_group_by_aggregates(pushdown) {
-        // A SUM over a non-numeric column would produce an opaque UDF error; demote.
-        if validate_agg_col_types(&detection.plans, col_types) {
-            // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
-            // from the select list cannot be sorted on there (#198).
-            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection) {
-                Some(GroupedOrderBy::Clause(clause)) => Some(clause),
-                Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
-                None => None,
-            };
-            match pushdown_req.get("having").filter(|h| !h.is_null()) {
-                None => {
-                    return RequestShape::Grouped {
-                        detection,
-                        having: None,
-                        order_by,
-                    };
-                }
-                Some(node) => {
-                    if let Some(sql) = render_having_over_merge(node, &detection.plans) {
-                        return RequestShape::Grouped {
-                            detection,
-                            having: Some(sql),
-                            order_by,
-                        };
-                    }
-                }
-            }
-        }
+    if let Some(detection) = detect_group_by_aggregates(pushdown, scan) {
+        let scope = MergeScope {
+            aggregates: &detection.aggregates,
+            group_keys: &detection.group_keys,
+        };
+        // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
+        // from the select list cannot be sorted on there (#198).
+        let order_by = match build_grouped_order_by_clause(pushdown_req, &scope, scan) {
+            Some(GroupedOrderBy::Clause(clause)) => Some(clause),
+            Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
+            None => None,
+        };
+        let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
+            None => None,
+            Some(node) => match render_having_over_merge(node, &scope, scan) {
+                Some(sql) => Some(sql),
+                None => return RequestShape::GroupByWrapper,
+            },
+        };
+        return RequestShape::Grouped {
+            detection,
+            having,
+            order_by,
+        };
     }
 
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by") {
         return RequestShape::GroupByWrapper;
     }
 
-    // Validated against ordinary plans only: a distinct item is a row-scan fan-out.
-    let Some(items) = detect_aggregates(pushdown)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
-    else {
+    // A nested aggregate without an exact type declines to the wrapper (#476).
+    let Some((items, aggregates)) = detect_aggregates(pushdown, scan).and_then(|items| {
+        let aggregates = single_group_plans(&items, pushdown.select_types(), scan)?;
+        Some((items, aggregates))
+    }) else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
             == Some("single_group")
         {
@@ -88,19 +84,24 @@ pub(super) fn classify_request_shape(
             RequestShape::RowScan
         };
     };
-    match pushdown_req.get("having").filter(|h| !h.is_null()) {
-        None => RequestShape::SingleGroupAgg {
-            items,
-            having: None,
-        },
-        Some(_) if has_distinct(&items) => RequestShape::SingleGroupWrapper,
-        Some(node) => match render_having_over_merge(node, &ordinary_plans(&items)) {
-            Some(sql) => RequestShape::SingleGroupAgg {
-                items,
-                having: Some(sql),
-            },
-            None => RequestShape::SingleGroupWrapper,
-        },
+    let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
+        None => None,
+        Some(_) if has_distinct(&items) => return RequestShape::SingleGroupWrapper,
+        Some(node) => {
+            let scope = MergeScope {
+                aggregates: &aggregates,
+                group_keys: &[],
+            };
+            match render_having_over_merge(node, &scope, scan) {
+                Some(sql) => Some(sql),
+                None => return RequestShape::SingleGroupWrapper,
+            }
+        }
+    };
+    RequestShape::SingleGroupAgg {
+        items,
+        aggregates,
+        having,
     }
 }
 

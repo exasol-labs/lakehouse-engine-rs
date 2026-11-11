@@ -19,6 +19,14 @@ pub(crate) enum UnityAuth {
 }
 
 impl UnityAuth {
+    /// The OAuth2 token a retry takes its bearer from again, if this auth has one.
+    pub(crate) fn renewable(&self) -> Option<&OAuth2Token> {
+        match self {
+            UnityAuth::OAuth(token) => Some(token),
+            UnityAuth::None | UnityAuth::Pat(_) => None,
+        }
+    }
+
     /// Also returns the bearer so callers can redact a minted token that is not
     /// in the CONNECTION credentials.
     pub(crate) async fn apply(
