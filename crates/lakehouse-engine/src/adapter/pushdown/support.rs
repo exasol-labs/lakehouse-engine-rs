@@ -892,6 +892,7 @@ fn is_pushable_expression_node(node_type: &str) -> bool {
             | "function_scalar_cast"
             | "function_scalar_extract"
             | "function_scalar_case"
+            | "function_scalar_json_value"
             | "predicate_equal"
             | "predicate_less"
             | "predicate_lessequal"

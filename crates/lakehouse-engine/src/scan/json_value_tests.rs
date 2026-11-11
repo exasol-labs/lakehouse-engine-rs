@@ -1,0 +1,164 @@
+use super::*;
+use crate::scan::scan_session_context;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::SessionConfig;
+
+fn selected(doc: &str, path: &str) -> String {
+    let tape = parse(doc).unwrap_or_default();
+    format!(
+        "{:?}",
+        select(&tape, &parse_json_path(path).expect("path in the subset"))
+    )
+}
+
+/// Each expected outcome is what Exasol 2025.1 returns for the same document and path.
+#[test]
+fn paths_select_what_exasol_selects() {
+    let cases = [
+        (r#"{"a":"x"}"#, "$.a", r#"Text("x")"#),
+        (r#" {"a" : 1.50 } "#, "$.a", r#"Text("1.50")"#),
+        (r#"{"a":-1.5E+3}"#, "$.a", r#"Text("-1.5E+3")"#),
+        (
+            r#"{"a":12345678901234567890123}"#,
+            "$.a",
+            r#"Text("12345678901234567890123")"#,
+        ),
+        (r#"{"a":true}"#, "$.a", "Boolean(true)"),
+        (r#"{"a":null}"#, "$.a", "Null"),
+        (r#"{"a":null}"#, "$.a.b", "Empty"),
+        (r#"{"a":"é😀\/"}"#, "$.a", r#"Text("é😀/")"#),
+        (r#"{"a":1}"#, "$.a", r#"Text("1")"#),
+        (r#"{"A":1}"#, "$.a", "Empty"),
+        (r#"{"a":1}"#, "$.b", "Empty"),
+        (r#"{"a":{"b":1}}"#, "$.a", "Error"),
+        (r#"{"a":[1]}"#, "$.a", "Error"),
+        (r#"{"a":1}"#, "$", "Error"),
+        (r#""s""#, "$", r#"Text("s")"#),
+        (r#"{"a":1,"a":2}"#, "$.a", "Error"),
+        (r#"{"a":{"b":1},"a":{"c":2}}"#, "$.a.b", r#"Text("1")"#),
+        (r#"{"a":1,"b":2,"b":3}"#, "$.a", r#"Text("1")"#),
+        (r#"{"a":[{"b":1}]}"#, "$.a.b", r#"Text("1")"#),
+        (r#"{"a":[{"b":1},{"b":2}]}"#, "$.a.b", "Error"),
+        (r#"{"a":[{"b":1},{"c":2},5]}"#, "$.a.b", r#"Text("1")"#),
+        (r#"{"a":[[{"b":1}]]}"#, "$.a.b", "Empty"),
+        (r#"{"a":[10,20]}"#, "$.a[1]", r#"Text("20")"#),
+        (r#"{"a":[10,20]}"#, "$.a[5]", "Empty"),
+        (r#"{"a":7}"#, "$.a[0]", r#"Text("7")"#),
+        (r#"{"a":7}"#, "$.a[1]", "Empty"),
+        (r#"{"a":{"b":1}}"#, "$.a[0].b", r#"Text("1")"#),
+        (r#"{"a":[{"b":[5,6]}]}"#, "$.a.b[1]", r#"Text("6")"#),
+        (r#"{"a b":1,"":2}"#, r#"$."""#, r#"Text("2")"#),
+        ("{}", "$.a", "Empty"),
+        ("[]", "$[0]", "Empty"),
+    ];
+    for (doc, path, expected) in cases {
+        assert_eq!(selected(doc, path), expected, "{doc} {path}");
+    }
+}
+
+/// Exasol applies `ON ERROR` to each of these.
+#[test]
+fn documents_that_are_not_strict_json_fail() {
+    let tab = "{\"a\":\"x\ty\"}";
+    for doc in [
+        r#"{"a":1,"#,
+        r#"{"a":1} x"#,
+        r#"{"a":1}{"a":2}"#,
+        r#"{"a":01}"#,
+        r#"{"a":+1}"#,
+        r#"{"a":.5}"#,
+        r#"{"a":1.}"#,
+        r#"{"a":1e}"#,
+        r#"{"a":-}"#,
+        r#"{"a":NaN}"#,
+        r#"{"a":TRUE}"#,
+        r#"{a:1}"#,
+        r#"{'a':1}"#,
+        r#"[1,]"#,
+        r#"{"a":1,}"#,
+        r#"{"a":"\q"}"#,
+        r#"{"a":"\ud800"}"#,
+        r#"{"a":"\udc00"}"#,
+        tab,
+        "{\"a\":\u{c}1}",
+        "\u{feff}{\"a\":1}",
+        "   ",
+    ] {
+        assert_eq!(parse(doc), None, "{doc:?}");
+    }
+}
+
+#[test]
+fn nesting_depth_is_unbounded() {
+    let depth = 1_000_000;
+    let doc = format!(r#"{{"a":{}1{}}}"#, "[".repeat(depth), "]".repeat(depth));
+    assert_eq!(selected(&doc, "$.b"), "Empty");
+}
+
+#[test]
+fn text_to_boolean_follows_exasol_cast() {
+    for (text, expected) in [
+        ("true", Some(true)),
+        ("TRUE", Some(true)),
+        ("  yes ", Some(true)),
+        ("t", Some(true)),
+        ("Y", Some(true)),
+        ("1", Some(true)),
+        ("001", Some(true)),
+        ("false", Some(false)),
+        ("No", Some(false)),
+        ("0", Some(false)),
+        ("000", Some(false)),
+        ("10", None),
+        ("2", None),
+        ("-0", None),
+        ("1.0", None),
+        ("1e0", None),
+        ("on", None),
+        ("\ttrue", None),
+        ("true\n", None),
+        ("", None),
+    ] {
+        assert_eq!(boolean_from_text(text), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn text_results_count_characters_and_read_empty_as_null() {
+    for (item, max_chars, expected) in [
+        (Item::Text("éé€"), 3, Some(Ok("éé€"))),
+        (Item::Text("😀x"), 1, Some(Err(()))),
+        (Item::Text("12345"), 3, Some(Err(()))),
+        (Item::Boolean(false), 3, Some(Err(()))),
+        (Item::Boolean(false), 5, Some(Ok("false"))),
+        (Item::Text(""), 3, None),
+        (Item::Null, 3, None),
+    ] {
+        assert_eq!(text_value(&item, max_chars), expected, "{item:?}");
+    }
+}
+
+/// Scenario: Several JSON_VALUE calls on one document parse it once
+#[tokio::test]
+async fn calls_on_one_document_parse_it_once() {
+    let ctx = scan_session_context(SessionConfig::new(), Arc::default());
+    let docs: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":"x","b":true}"#]));
+    let batch = arrow::record_batch::RecordBatch::try_from_iter([("doc", docs)]).unwrap();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+    let sql = format!(
+        "SELECT {JSON_VALUE_TEXT_FN}({JSON_PARSE_FN}(doc), '$.a', 10, NULL, NULL), \
+         {JSON_VALUE_BOOLEAN_FN}({JSON_PARSE_FN}(doc), '$.b', NULL, NULL) FROM t"
+    );
+    let df = ctx.sql(&sql).await.unwrap();
+    let plan = df.clone().create_physical_plan().await.unwrap();
+    let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    let evaluated = format!("{JSON_PARSE_FN}(doc@");
+    assert_eq!(rendered.matches(&evaluated).count(), 1, "{rendered}");
+
+    let rows = df.collect().await.unwrap();
+    assert_eq!(rows[0].column(0).as_string::<i32>().value(0), "x");
+    assert!(rows[0].column(1).as_boolean().value(0));
+}

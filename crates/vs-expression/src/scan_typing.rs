@@ -4,6 +4,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use crate::exasol_type::{ExasolType, exasol_type_from_json};
+use crate::json_value::{JsonValueCall, Returning};
 use crate::scalar_functions::{ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
@@ -81,7 +82,7 @@ pub const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"]
 /// See [`EXPR_ARRAY_FIELDS`].
 pub const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
-fn decline(reason: String) -> UdfError {
+pub(crate) fn decline(reason: String) -> UdfError {
     UdfError::User(format!("the scan cannot compute this expression: {reason}"))
 }
 
@@ -340,6 +341,7 @@ fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
                 .map_or(TypeClass::Other, |field| typed_function(field).class(&[]))
         }
         "function_scalar_case" => case_class(node, out, children)?,
+        "function_scalar_json_value" => json_value_class(node, &children.of("arguments"))?,
         "function_scalar_cast" => cast_class(out, &children.of("arguments"))?,
         "function_scalar" => scalar_function_class(node, out, &children.of("arguments"))?,
         "function_aggregate" => aggregate_class(node, &children.of("arguments"))?,
@@ -423,10 +425,27 @@ fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfErro
     }
 }
 
-/// The type the request states for `node`: a CAST's `dataType` or a column's type. `None`
-/// otherwise, because Exasol's expression typing depends on values, session, and version (#476).
+fn json_value_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+    if args.first() != Some(&TypeClass::Text) {
+        return Err(decline(format!(
+            "JSON_VALUE over a document that is not text: {}",
+            short(node)
+        )));
+    }
+    Ok(match JsonValueCall::parse(node)?.returning {
+        Returning::Text { .. } => TypeClass::Text,
+        Returning::Boolean => TypeClass::Boolean,
+    })
+}
+
+/// The type the request states for `node`: a CAST's `dataType`, a `JSON_VALUE`'s
+/// `returningDataType`, or a column's type. `None` otherwise, because Exasol's expression typing
+/// depends on values, session, and version (#476).
 pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
-    if let Some(data_type) = node.get("dataType") {
+    if let Some(data_type) = node
+        .get("dataType")
+        .or_else(|| node.get("returningDataType"))
+    {
         return exasol_type_from_json(data_type).ok();
     }
     if kind(node) == "column" {
