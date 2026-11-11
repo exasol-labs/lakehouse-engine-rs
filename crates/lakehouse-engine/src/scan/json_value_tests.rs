@@ -1,11 +1,6 @@
 use super::*;
-use crate::scan::scan_session_context;
-use crate::scan::test_support::current_thread_runtime;
 use crate::scan::test_support::invoke_scalar_udf;
 use arrow::array::{BooleanArray, StringArray};
-use arrow::util::pretty::pretty_format_batches;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::prelude::SessionConfig;
 
 /// One batch of `documents`, with `constants` after them.
 fn invoke(
@@ -237,64 +232,5 @@ fn text_results_count_characters_and_read_empty_as_null() {
         ("", 3, Ok(None)),
     ] {
         assert_eq!(text_value(text, max_chars), expected, "{text:?}");
-    }
-}
-
-/// The scalar functions the optimized plan of `sql` evaluates, and its rows.
-fn evaluated_functions_and_rows(sql: &str) -> (Vec<String>, String) {
-    let ctx = scan_session_context(SessionConfig::new(), Arc::default());
-    let (plan, rows) = current_thread_runtime()
-        .block_on(async {
-            let frame = ctx.sql(sql).await?;
-            let plan = frame.clone().into_optimized_plan()?;
-            let rows = pretty_format_batches(&frame.collect().await?)?.to_string();
-            Ok::<_, DataFusionError>((plan, rows))
-        })
-        .expect("query runs");
-    let mut functions = Vec::new();
-    plan.apply(|node| {
-        node.apply_expressions(|expr| {
-            expr.apply(|e| {
-                if let Expr::ScalarFunction(call) = e {
-                    functions.push(call.name().to_string());
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-        })
-    })
-    .expect("plan walk");
-    (functions, rows)
-}
-
-/// Scenario: Several JSON_VALUE calls on one document parse it once per row
-#[test]
-fn calls_on_one_document_share_one_parse() {
-    let docs = r#"(VALUES ('{"a":"x","b":1.5,"c":true}'), ('{"a":"y","c":false}'), (NULL)) t(doc)"#;
-    let text = |path: &str| format!("{JSON_VALUE_TEXT_FN}(doc, '{path}', 10, 'none', NULL)");
-    let boolean = |path: &str| format!("{JSON_VALUE_BOOLEAN_FN}(doc, '{path}', NULL, NULL)");
-    let (a, b, c) = (text("$.a"), text("$.b"), boolean("$.c"));
-    for (sql, expected) in [
-        (
-            format!("SELECT {a} AS a, {b} AS b, {c} AS c FROM {docs} ORDER BY a"),
-            "| x | 1.5  | true  |\n| y | none | false |\n|   |      |       |",
-        ),
-        (
-            format!("SELECT doc IS NULL AS n FROM {docs} WHERE {a} = 'x' OR {c} IS NULL"),
-            "| false |\n| true  |",
-        ),
-        (
-            format!("SELECT {a} AS a, COUNT({b}) AS b FROM {docs} GROUP BY {a} ORDER BY a"),
-            "| x | 1 |\n| y | 1 |\n|   | 0 |",
-        ),
-    ] {
-        let (functions, rows) = evaluated_functions_and_rows(&sql);
-        let count = |name: &str| functions.iter().filter(|f| *f == name).count();
-        assert_eq!(count(JSON_VALUES_FN), 1, "{sql}\n{functions:?}");
-        assert_eq!(
-            count(JSON_VALUE_TEXT_FN) + count(JSON_VALUE_BOOLEAN_FN),
-            0,
-            "{sql}"
-        );
-        assert!(rows.contains(expected), "{sql}\n{rows}");
     }
 }

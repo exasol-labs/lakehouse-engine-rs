@@ -90,7 +90,7 @@ The scan computes these functions when DataFusion can render the whole filter or
 - there is no `RETURNING` clause, or it names `VARCHAR(n)` in UTF8 or `BOOLEAN`;
 - `ON EMPTY` and `ON ERROR` are `NULL`, or `DEFAULT` with a literal of the returning type that fits it.
 
-Several such calls on one document parse it once per row. Numbers, duplicate keys, and deep nesting read differently from native Exasol ([Semantic differences](semantic-differences.md#json_value-on-numbers-duplicate-keys-and-deep-nesting)).
+Numbers, duplicate keys, and deep nesting read differently from native Exasol ([Semantic differences](semantic-differences.md#json_value-on-numbers-duplicate-keys-and-deep-nesting)).
 
 Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
 

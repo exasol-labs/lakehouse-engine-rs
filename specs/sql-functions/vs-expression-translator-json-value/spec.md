@@ -35,12 +35,6 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 * *AND* a duplicate key SHALL select the last member of that name, where native Exasol takes the `ON ERROR` behavior
 * *AND* a document nested deeper than 128 levels SHALL take the `ON ERROR` behavior, where native Exasol reads it
 
-### Scenario: Several JSON_VALUE calls on one document parse it once per row
-
-* *GIVEN* several `JSON_VALUE` calls that run in the scan over the same document
-* *WHEN* they appear together in the select list, the WHERE clause, or the GROUP BY keys and aggregate arguments
-* *THEN* the scan SHALL parse each row's document once for them
-
 ### Scenario: JSON_VALUE in the scan converts the item as Exasol does
 
 * *GIVEN* a `JSON_VALUE` call that runs in the scan and a path that selects one scalar item
