@@ -1,4 +1,100 @@
 use super::*;
+use arrow::datatypes::Field;
+use datafusion::common::config::ConfigOptions;
+
+/// Drives `invoke_with_args` as DataFusion does per batch, with `constants` after the documents.
+fn invoke(
+    returning: Returning,
+    documents: Vec<Option<&str>>,
+    constants: Vec<ScalarValue>,
+) -> ArrayRef {
+    let name = match returning {
+        Returning::Text => JSON_VALUE_TEXT_FN,
+        Returning::Boolean => JSON_VALUE_BOOLEAN_FN,
+    };
+    let udf = JsonUdf {
+        name,
+        returning,
+        signature: Signature::any(constants.len() + 1, Volatility::Immutable),
+    };
+    let rows = documents.len();
+    let mut args = vec![ColumnarValue::Array(Arc::new(StringArray::from(documents)))];
+    args.extend(constants.into_iter().map(ColumnarValue::Scalar));
+    let arg_fields = args
+        .iter()
+        .map(|arg| Arc::new(Field::new("arg", arg.data_type(), true)))
+        .collect();
+    let return_type = udf.return_type(&[]).expect("fixed return type");
+    let args = ScalarFunctionArgs {
+        arg_fields,
+        args,
+        number_rows: rows,
+        return_field: Arc::new(Field::new(name, return_type, true)),
+        config_options: Arc::new(ConfigOptions::default()),
+    };
+    udf.invoke_with_args(args)
+        .and_then(|values| values.to_array(rows))
+        .expect("constant arguments")
+}
+
+fn text(value: &str) -> ScalarValue {
+    ScalarValue::Utf8(Some(value.to_string()))
+}
+
+#[test]
+fn text_function_applies_the_behaviors() {
+    let values = invoke(
+        Returning::Text,
+        vec![
+            None,
+            Some(""),
+            Some("{"),
+            Some(r#"{"b":1}"#),
+            Some(r#"{"a":"abcd"}"#),
+            Some(r#"{"a":"ab"}"#),
+            Some(r#"{"a":null}"#),
+            Some(r#"{"a":""}"#),
+        ],
+        vec![
+            text("$.a"),
+            ScalarValue::Int64(Some(3)),
+            text("e"),
+            text("x"),
+        ],
+    );
+    let expected = StringArray::from(vec![
+        None,
+        None,
+        Some("x"),
+        Some("e"),
+        Some("x"),
+        Some("ab"),
+        None,
+        None,
+    ]);
+    assert_eq!(values.as_string::<i32>(), &expected);
+}
+
+#[test]
+fn boolean_function_applies_the_behaviors() {
+    let values = invoke(
+        Returning::Boolean,
+        vec![
+            None,
+            Some(r#"{"a":"yes"}"#),
+            Some(r#"{"a":0}"#),
+            Some(r#"{"b":1}"#),
+            Some(r#"{"a":"on"}"#),
+        ],
+        vec![
+            text("$.a"),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Null,
+        ],
+    );
+    let expected = BooleanArray::from(vec![None, Some(true), Some(false), Some(true), None]);
+    assert_eq!(values.as_boolean(), &expected);
+}
 
 fn selected(doc: &str, path: &str) -> String {
     format!(
