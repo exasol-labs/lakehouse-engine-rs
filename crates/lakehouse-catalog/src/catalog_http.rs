@@ -68,8 +68,8 @@ pub(crate) struct CatalogHttp {
     policy: RetryPolicy,
 }
 
-/// A complete answer of any HTTP status; the caller decides what the status means.
-#[derive(Debug)]
+/// A complete answer of any HTTP status; the caller decides what the status means. `Debug` is
+/// hand-written, because the bearer is a live token and the body can carry vended credentials.
 pub(crate) struct CatalogAnswer {
     pub(crate) status: StatusCode,
     headers: HeaderMap,
@@ -91,7 +91,7 @@ pub(crate) struct CatalogRequestError {
 }
 
 /// A catalog request that ended without a complete answer. [`Self::render`] gives its text.
-#[derive(Debug)]
+/// `Debug` is hand-written, because the bearer is a live token.
 pub(crate) struct CatalogHttpError {
     error: reqwest::Error,
     /// Set when the answer's headers arrived and the read of its body broke off.
@@ -219,7 +219,11 @@ impl CatalogHttp {
                 let Ok(bearer) = Box::pin(token.bearer()).await else {
                     return outcome;
                 };
-                set_bearer(&mut request, &bearer);
+                // A token the header cannot carry leaves the old one on the request, so the retries
+                // end rather than send a token that `carried` no longer names.
+                if !set_bearer(&mut request, &bearer) {
+                    return outcome;
+                }
                 carried = Some(bearer);
             }
         }
@@ -268,6 +272,26 @@ impl CatalogHttp {
             window_end.saturating_duration_since(Instant::now()),
             self.policy.read_timeout,
         )
+    }
+}
+
+impl std::fmt::Debug for CatalogAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogAnswer")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .field("cut", &self.cut)
+            .field("bearer", &self.bearer.as_ref().map(|_| "[redacted]"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CatalogHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogHttpError")
+            .field("status", &self.status)
+            .field("bearer", &self.bearer.as_ref().map(|_| "[redacted]"))
+            .finish_non_exhaustive()
     }
 }
 
@@ -378,11 +402,14 @@ fn carried_bearer(request: &Request) -> Option<String> {
     value.strip_prefix("Bearer ").map(str::to_owned)
 }
 
-fn set_bearer(request: &mut Request, bearer: &str) {
-    if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {bearer}")) {
-        value.set_sensitive(true);
-        request.headers_mut().insert(AUTHORIZATION, value);
-    }
+/// Whether `bearer` replaced the request's `Authorization`; false when it is not a valid header value.
+fn set_bearer(request: &mut Request, bearer: &str) -> bool {
+    let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {bearer}")) else {
+        return false;
+    };
+    value.set_sensitive(true);
+    request.headers_mut().insert(AUTHORIZATION, value);
+    true
 }
 
 /// `body` as an error may show it: passed through `redact`, then cut to
