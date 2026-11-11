@@ -302,7 +302,7 @@ async fn debug_shows_no_credential_and_secret_values_lists_only_the_credential_h
     assert_free_of(&shown, &SEED_SECRETS);
     let mut expected: Vec<String> = FIXTURE_PLACEHOLDERS
         .iter()
-        .map(|value| value.to_string())
+        .map(ToString::to_string)
         .collect();
     expected.sort();
     assert_eq!(held, expected);
