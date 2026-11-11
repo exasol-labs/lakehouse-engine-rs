@@ -24,16 +24,22 @@ fn session_config_applies_batch_size_and_clamps_floor() {
 #[test]
 fn datafusion_still_rejects_a_boolean_as_a_number() {
     let ctx = scan_session_context(SessionConfig::new(), Arc::default());
-    for sql in [
-        "SELECT CAST(b AS DECIMAL(18,0)) FROM (VALUES (true)) t(b)",
-        "SELECT b = 1 FROM (VALUES (true)) t(b)",
+    for (sql, reason) in [
+        (
+            "SELECT CAST(b AS DECIMAL(18,0)) FROM (VALUES (true)) t(b)",
+            "Unsupported CAST from Boolean to Decimal",
+        ),
+        ("SELECT b = 1 FROM (VALUES (true)) t(b)", "Boolean = Int64"),
     ] {
-        let result =
-            current_thread_runtime().block_on(async { ctx.sql(sql).await?.collect().await });
-        assert!(
-            result.is_err(),
-            "DataFusion now runs `{sql}`, so the scan typing's BOOLEAN_NUMBER_NODE rewrite can go (#613)"
-        );
+        match current_thread_runtime().block_on(async { ctx.sql(sql).await?.collect().await }) {
+            Ok(_) => panic!(
+                "DataFusion now runs `{sql}`, so the scan typing's BOOLEAN_NUMBER_NODE rewrite can go (#613)"
+            ),
+            Err(e) => assert!(
+                e.to_string().contains(reason),
+                "`{sql}` must fail for `{reason}`, not: {e}"
+            ),
+        }
     }
 }
 

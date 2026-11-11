@@ -387,6 +387,16 @@ const CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
+        query: "SELECT ID, CASE C_QTY WHEN C_BOOL THEN 'eq' WHEN 5 THEN 'five' END FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE C_QTY IN (TRUE, 5)",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE C_BOOL IN (0, 1)",
         path: Lacks(SCAN_FILTER),
     },

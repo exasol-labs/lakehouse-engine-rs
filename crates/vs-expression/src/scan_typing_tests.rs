@@ -311,8 +311,8 @@ fn a_boolean_compares_with_a_number_as_one_or_zero() {
         ),
         (
             "IN over a number",
-            in_list(col("I"), [col("B"), num_lit(5)]),
-            format!(r#"("I" IN ({B_AS_NUMBER}, 5))"#),
+            in_list(col("I"), [bool_lit(true), num_lit(5)]),
+            r#"("I" IN ((CASE TRUE WHEN TRUE THEN 1 WHEN FALSE THEN 0 END), 5))"#.to_string(),
         ),
         (
             "simple CASE",
