@@ -245,44 +245,48 @@ fn render_cast(
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
-fn render_json_value(expr: &Json, dialect: Dialect) -> Result<String, UdfError> {
-    let operand = |node: &Json| {
-        render_expression_inner(node, dialect)?
-            .ok_or_else(|| UdfError::User("JSON_VALUE operand is null".into()))
-    };
-    if dialect == Dialect::Exasol {
-        let args = expr
-            .get("arguments")
-            .and_then(Json::as_array)
-            .filter(|args| args.len() == 2)
-            .ok_or_else(|| UdfError::User("JSON_VALUE takes a document and a path".into()))?;
-        let mut sql = format!("JSON_VALUE({}, {}", operand(&args[0])?, operand(&args[1])?);
-        if let Some(data_type) = expr.get("returningDataType") {
-            sql.push_str(&format!(" RETURNING {}", exasol_type_from_json(data_type)?));
-        }
-        for (field, clause) in [("emptyBehavior", "EMPTY"), ("errorBehavior", "ERROR")] {
-            let Some(behavior) = expr.get(field) else {
-                continue;
-            };
-            let rendered = match behavior.get("type").and_then(Json::as_str) {
-                Some("DEFAULT") => format!(
-                    "DEFAULT {}",
-                    operand(behavior.get("expression").unwrap_or(&Json::Null))?
-                ),
-                Some(kind @ ("NULL" | "ERROR")) => kind.to_string(),
-                _ => return Err(UdfError::User(format!("JSON_VALUE behavior {behavior}"))),
-            };
-            sql.push_str(&format!(" {rendered} ON {clause}"));
-        }
-        return Ok(sql + ")");
+fn json_value_operand(node: &Json, dialect: Dialect) -> Result<String, UdfError> {
+    render_expression_inner(node, dialect)?
+        .ok_or_else(|| UdfError::User("JSON_VALUE operand is null".into()))
+}
+
+/// Every clause Exasol sent, so Exasol computes the forms the scan declines.
+fn render_json_value_exasol(expr: &Json) -> Result<String, UdfError> {
+    let operand = |node: &Json| json_value_operand(node, Dialect::Exasol);
+    let args = expr
+        .get("arguments")
+        .and_then(Json::as_array)
+        .filter(|args| args.len() == 2)
+        .ok_or_else(|| UdfError::User("JSON_VALUE takes a document and a path".into()))?;
+    let mut sql = format!("JSON_VALUE({}, {}", operand(&args[0])?, operand(&args[1])?);
+    if let Some(data_type) = expr.get("returningDataType") {
+        sql.push_str(&format!(" RETURNING {}", exasol_type_from_json(data_type)?));
     }
+    for (field, clause) in [("emptyBehavior", "EMPTY"), ("errorBehavior", "ERROR")] {
+        let Some(behavior) = expr.get(field) else {
+            continue;
+        };
+        let rendered = match behavior.get("type").and_then(Json::as_str) {
+            Some("DEFAULT") => format!(
+                "DEFAULT {}",
+                operand(behavior.get("expression").unwrap_or(&Json::Null))?
+            ),
+            Some(kind @ ("NULL" | "ERROR")) => kind.to_string(),
+            _ => return Err(UdfError::User(format!("JSON_VALUE behavior {behavior}"))),
+        };
+        sql.push_str(&format!(" {rendered} ON {clause}"));
+    }
+    Ok(sql + ")")
+}
+
+fn render_json_value_scan(expr: &Json) -> Result<String, UdfError> {
     let call = JsonValueCall::parse(expr)?;
     let fallback = |fallback: &Fallback| match fallback {
         Fallback::Null => "NULL".to_string(),
         Fallback::Text(text) => format!("'{}'", sql_escape(text)),
         Fallback::Boolean(value) => value.to_string().to_uppercase(),
     };
-    let doc = operand(call.document)?;
+    let doc = json_value_operand(call.document, Dialect::DataFusion)?;
     let path = format!("'{}'", sql_escape(call.path));
     let (on_empty, on_error) = (fallback(&call.on_empty), fallback(&call.on_error));
     Ok(match call.returning {
@@ -577,7 +581,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             sql.push_str(" END");
             Ok(Some(format!("({sql})")))
         }
-        "function_scalar_json_value" => render_json_value(expr, dialect).map(Some),
+        "function_scalar_json_value" => match dialect {
+            Dialect::Exasol => render_json_value_exasol(expr),
+            Dialect::DataFusion => render_json_value_scan(expr),
+        }
+        .map(Some),
         // The CAST wire shape Exasol sends; the nested `function_scalar` CAST arm
         // is a defensive alternate encoding.
         "function_scalar_cast" => {

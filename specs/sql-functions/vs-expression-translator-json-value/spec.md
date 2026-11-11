@@ -16,9 +16,9 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 * *GIVEN* a `JSON_VALUE` call whose document is text and whose path is `$` followed by `.name`, `."name"` without a backslash, and `[n]` steps with `n` at most 2147483647, with no whitespace
 * *AND* whose `RETURNING` type is `VARCHAR(n)` in UTF8 or `BOOLEAN`
 * *AND* whose `ON EMPTY` and `ON ERROR` behaviors are `NULL`, or `DEFAULT` with a NULL literal or a literal of the `RETURNING` type that fits it
-* *WHEN* the call appears in the select list, the WHERE clause, or a GROUP BY key
+* *WHEN* the call appears in the select list, the WHERE clause, a GROUP BY key, or an aggregate argument
 * *THEN* the scan SHALL evaluate it, and the scan SHALL NOT project the document column for it
-* *AND* a GROUP BY over it SHALL keep the split aggregate, typed by its `RETURNING` type
+* *AND* a GROUP BY over it, or an aggregate over it, SHALL keep the split aggregate, typed by its `RETURNING` type
 
 ### Scenario: JSON_VALUE in the scan reads the document and the path as Exasol does
 

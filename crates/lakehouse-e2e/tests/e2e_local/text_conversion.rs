@@ -562,6 +562,16 @@ const JSON_VALUE_CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
+        query: "SELECT MAX(JSON_VALUE(DOC, '$.locale')) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT LENGTH(MIN(JSON_VALUE(DOC, '$.note' RETURNING VARCHAR(5)))) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, JSON_VALUE(DOC, '$.order.id' RETURNING DECIMAL(18,0)) FROM {T}",
         path: Has(DOCUMENT_ONLY),
     },

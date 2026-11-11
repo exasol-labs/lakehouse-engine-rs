@@ -147,12 +147,6 @@ fn resolve<'i, T: Copy>(
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct JsonUdf {
-    name: &'static str,
-    signature: Signature,
-}
-
 fn scalar_argument(args: &ScalarFunctionArgs, index: usize) -> Result<&ScalarValue> {
     match args.args.get(index) {
         Some(ColumnarValue::Scalar(value)) => Ok(value),
@@ -162,53 +156,57 @@ fn scalar_argument(args: &ScalarFunctionArgs, index: usize) -> Result<&ScalarVal
     }
 }
 
-impl JsonUdf {
-    fn values(&self, args: &ScalarFunctionArgs) -> Result<ArrayRef> {
-        let documents = cast(&args.args[0].to_array(args.number_rows)?, &DataType::Utf8)?;
-        let path = scalar_argument(args, 1)?
+/// `(document, path, max_chars, on_empty, on_error)`.
+fn text_values(args: &ScalarFunctionArgs, items: &[Option<Item>]) -> Result<ArrayRef> {
+    let ScalarValue::UInt64(Some(max_chars)) =
+        scalar_argument(args, 2)?.cast_to(&DataType::UInt64)?
+    else {
+        return Err(DataFusionError::Execution(format!(
+            "{JSON_VALUE_TEXT_FN} size"
+        )));
+    };
+    let fallback = |index| match scalar_argument(args, index)? {
+        ScalarValue::Null => Ok(None),
+        other => other
             .try_as_str()
-            .flatten()
-            .and_then(parse_json_path)
-            .ok_or_else(|| DataFusionError::Execution(format!("{} path", self.name)))?;
-        // Exasol reads the empty string as NULL.
-        let items: Vec<Option<Item>> = documents
-            .as_string::<i32>()
-            .iter()
-            .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, &path)))
-            .collect();
-        if self.name == JSON_VALUE_BOOLEAN_FN {
-            let fallback = |index| match scalar_argument(args, index)? {
-                ScalarValue::Boolean(value) => Ok(*value),
-                ScalarValue::Null => Ok(None),
-                other => Err(DataFusionError::Execution(format!("fallback {other}"))),
-            };
-            let (on_empty, on_error) = (fallback(2)?, fallback(3)?);
-            let boolean = |text| boolean_from_text(text).map(Some).ok_or(());
-            let values: BooleanArray = items
-                .iter()
-                .map(|item| resolve(item.as_ref(), boolean, on_empty, on_error))
-                .collect();
-            return Ok(Arc::new(values));
-        }
-        let ScalarValue::UInt64(Some(max_chars)) =
-            scalar_argument(args, 2)?.cast_to(&DataType::UInt64)?
-        else {
-            return Err(DataFusionError::Execution(format!("{} size", self.name)));
-        };
-        let fallback = |index| match scalar_argument(args, index)? {
-            ScalarValue::Null => Ok(None),
-            other => other
-                .try_as_str()
-                .ok_or_else(|| DataFusionError::Execution(format!("fallback {other}"))),
-        };
-        let (on_empty, on_error) = (fallback(3)?, fallback(4)?);
-        let text = |text| text_value(text, max_chars as usize);
-        let values: StringArray = items
-            .iter()
-            .map(|item| resolve(item.as_ref(), text, on_empty, on_error))
-            .collect();
-        Ok(Arc::new(values))
-    }
+            .ok_or_else(|| DataFusionError::Execution(format!("fallback {other}"))),
+    };
+    let (on_empty, on_error) = (fallback(3)?, fallback(4)?);
+    let text = |text| text_value(text, max_chars as usize);
+    let values: StringArray = items
+        .iter()
+        .map(|item| resolve(item.as_ref(), text, on_empty, on_error))
+        .collect();
+    Ok(Arc::new(values))
+}
+
+/// `(document, path, on_empty, on_error)`.
+fn boolean_values(args: &ScalarFunctionArgs, items: &[Option<Item>]) -> Result<ArrayRef> {
+    let fallback = |index| match scalar_argument(args, index)? {
+        ScalarValue::Boolean(value) => Ok(*value),
+        ScalarValue::Null => Ok(None),
+        other => Err(DataFusionError::Execution(format!("fallback {other}"))),
+    };
+    let (on_empty, on_error) = (fallback(2)?, fallback(3)?);
+    let boolean = |text| boolean_from_text(text).map(Some).ok_or(());
+    let values: BooleanArray = items
+        .iter()
+        .map(|item| resolve(item.as_ref(), boolean, on_empty, on_error))
+        .collect();
+    Ok(Arc::new(values))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Returning {
+    Text,
+    Boolean,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonUdf {
+    name: &'static str,
+    returning: Returning,
+    signature: Signature,
 }
 
 impl ScalarUDFImpl for JsonUdf {
@@ -221,21 +219,41 @@ impl ScalarUDFImpl for JsonUdf {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(match self.name {
-            JSON_VALUE_BOOLEAN_FN => DataType::Boolean,
-            _ => DataType::Utf8,
+        Ok(match self.returning {
+            Returning::Text => DataType::Utf8,
+            Returning::Boolean => DataType::Boolean,
         })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        Ok(ColumnarValue::Array(self.values(&args)?))
+        let documents = cast(&args.args[0].to_array(args.number_rows)?, &DataType::Utf8)?;
+        let path = scalar_argument(&args, 1)?
+            .try_as_str()
+            .flatten()
+            .and_then(parse_json_path)
+            .ok_or_else(|| DataFusionError::Execution(format!("{} path", self.name)))?;
+        // Exasol reads the empty string as NULL.
+        let items: Vec<Option<Item>> = documents
+            .as_string::<i32>()
+            .iter()
+            .map(|doc| doc.filter(|d| !d.is_empty()).map(|d| select(d, &path)))
+            .collect();
+        let values = match self.returning {
+            Returning::Text => text_values(&args, &items)?,
+            Returning::Boolean => boolean_values(&args, &items)?,
+        };
+        Ok(ColumnarValue::Array(values))
     }
 }
 
 pub(super) fn register_json_value_udfs(ctx: &SessionContext) {
-    for (name, arity) in [(JSON_VALUE_TEXT_FN, 5), (JSON_VALUE_BOOLEAN_FN, 4)] {
+    for (name, returning, arity) in [
+        (JSON_VALUE_TEXT_FN, Returning::Text, 5),
+        (JSON_VALUE_BOOLEAN_FN, Returning::Boolean, 4),
+    ] {
         ctx.register_udf(ScalarUDF::from(JsonUdf {
             name,
+            returning,
             signature: Signature::any(arity, Volatility::Immutable),
         }));
     }
