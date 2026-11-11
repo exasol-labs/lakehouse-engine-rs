@@ -258,7 +258,7 @@ impl CatalogSession {
         body: Option<&serde_json::Value>,
         safety: RepeatSafety,
     ) -> Result<CatalogResponse, CatalogSendError> {
-        let (request, bearer) = self
+        let (request, _) = self
             .build_request(method, path, body)
             .await
             .map_err(|error| CatalogSendError::Unsent(error.to_string()))?;
@@ -270,7 +270,7 @@ impl CatalogSession {
             .map_err(|error| {
                 let message = format!(
                     "the catalog request {target} failed: {}",
-                    error.render(|msg| redact_catalog_text(msg, &self.creds, bearer.as_deref()))
+                    error.render(|msg| redact_catalog_text(msg, &self.creds, error.bearer()))
                 );
                 if error.is_unsent() {
                     CatalogSendError::Unsent(message)
@@ -281,7 +281,7 @@ impl CatalogSession {
         Ok(CatalogResponse {
             status: answer.status.as_u16(),
             body: answer.body,
-            bearer,
+            bearer: answer.bearer,
         })
     }
 

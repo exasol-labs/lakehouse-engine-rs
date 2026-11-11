@@ -168,7 +168,9 @@ impl ClientCredentialsGrant {
 
         let body: serde_json::Value = self
             .http
-            .send_json(request, RepeatSafety::Safe, None, label, redact_secret)
+            .send_json(request, RepeatSafety::Safe, None, label, |msg, _| {
+                redact_secret(msg)
+            })
             .await?;
 
         lease_from_grant_answer(&body, now_ms, self.require_expiry).map_err(|error| {

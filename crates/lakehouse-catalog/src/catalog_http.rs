@@ -76,6 +76,9 @@ pub(crate) struct CatalogAnswer {
     pub(crate) body: Vec<u8>,
     /// The body exceeded the caller's byte cap, and `body` holds only its first bytes.
     pub(crate) cut: bool,
+    /// The bearer the request that drew this answer carried, which a caller redacts. After a
+    /// renewal it is the latest token, never the one the caller built the request with.
+    pub(crate) bearer: Option<String>,
 }
 
 /// A failed catalog request, such as a [`CatalogHttp::send_json`], its message already redacted,
@@ -93,6 +96,8 @@ pub(crate) struct CatalogHttpError {
     error: reqwest::Error,
     /// Set when the answer's headers arrived and the read of its body broke off.
     status: Option<StatusCode>,
+    /// The bearer the failed request carried; see [`CatalogAnswer::bearer`].
+    bearer: Option<String>,
 }
 
 impl CatalogHttp {
@@ -139,14 +144,14 @@ impl CatalogHttp {
 
     /// [`Self::send`], then parses a 2xx answer's body as JSON. Every failure is an error whose
     /// message starts with `what`, shows each cause through `redact`, and quotes a non-2xx
-    /// answer's body as [`quote_body`] cuts it.
+    /// answer's body as [`quote_body`] cuts it. `redact` gets the bearer the last attempt carried.
     pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         request: Request,
         safety: RepeatSafety,
         renewable: Option<&OAuth2Token>,
         what: &str,
-        redact: impl Fn(&str) -> String,
+        redact: impl Fn(&str, Option<&str>) -> String,
     ) -> Result<T, CatalogRequestError> {
         let answer = self
             .send(request, safety, renewable)
@@ -154,7 +159,10 @@ impl CatalogHttp {
             .map_err(|error| {
                 CatalogRequestError::new(
                     error.status(),
-                    format!("{what} failed: {}", error.render(&redact)),
+                    format!(
+                        "{what} failed: {}",
+                        error.render(|msg| redact(msg, error.bearer()))
+                    ),
                 )
             })?;
         if !answer.status.is_success() {
@@ -163,14 +171,14 @@ impl CatalogHttp {
                 format!(
                     "{what} failed with HTTP {}: {}",
                     answer.status.as_u16(),
-                    quote_body(&answer.body, &redact)
+                    quote_body(&answer.body, |msg| redact(msg, answer.bearer.as_deref()))
                 ),
             ));
         }
         serde_json::from_slice(&answer.body).map_err(|error| {
             CatalogRequestError::without_status(format!(
                 "{what} returned an unparseable response: {}",
-                redact(&error.to_string())
+                redact(&error.to_string(), answer.bearer.as_deref())
             ))
         })
     }
@@ -189,13 +197,14 @@ impl CatalogHttp {
             RepeatSafety::Unsafe => 1,
         };
         let window_end = Instant::now() + self.policy.retry_window;
+        let mut carried = carried_bearer(&request);
         let mut attempts_made = 0;
         loop {
             attempts_made += 1;
             let resend = (attempts_made < attempts)
                 .then(|| request.try_clone())
                 .flatten();
-            let outcome = self.exchange(request, max_bytes).await;
+            let outcome = self.exchange(request, max_bytes, &carried).await;
             let Some(resend) = resend else {
                 return outcome;
             };
@@ -211,6 +220,7 @@ impl CatalogHttp {
                     return outcome;
                 };
                 set_bearer(&mut request, &bearer);
+                carried = Some(bearer);
             }
         }
     }
@@ -219,22 +229,24 @@ impl CatalogHttp {
         &self,
         request: Request,
         max_bytes: usize,
+        bearer: &Option<String>,
     ) -> Result<CatalogAnswer, CatalogHttpError> {
         let mut response = self
             .client
             .execute(request)
             .await
-            .map_err(|error| CatalogHttpError::transport(error, None))?;
+            .map_err(|error| CatalogHttpError::transport(error, None, bearer.clone()))?;
         let status = response.status();
         let headers = std::mem::take(response.headers_mut());
         let (body, cut) = read_body(&mut response, max_bytes)
             .await
-            .map_err(|error| CatalogHttpError::transport(error, Some(status)))?;
+            .map_err(|error| CatalogHttpError::transport(error, Some(status), bearer.clone()))?;
         Ok(CatalogAnswer {
             status,
             headers,
             body,
             cut,
+            bearer: bearer.clone(),
         })
     }
 
@@ -299,8 +311,21 @@ impl From<CatalogRequestError> for UdfError {
 }
 
 impl CatalogHttpError {
-    fn transport(error: reqwest::Error, status: Option<StatusCode>) -> Self {
-        Self { error, status }
+    fn transport(
+        error: reqwest::Error,
+        status: Option<StatusCode>,
+        bearer: Option<String>,
+    ) -> Self {
+        Self {
+            error,
+            status,
+            bearer,
+        }
+    }
+
+    /// The bearer the failed request carried, for the caller's redaction of its own text.
+    pub(crate) fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
     }
 
     /// The status of an answer whose body read broke off, so a caller can still report it.
@@ -345,6 +370,12 @@ async fn read_body(
         body.extend_from_slice(&chunk);
     }
     Ok((body, false))
+}
+
+/// The bearer a request already carries, so an error of a request that never renewed redacts it.
+fn carried_bearer(request: &Request) -> Option<String> {
+    let value = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ").map(str::to_owned)
 }
 
 fn set_bearer(request: &mut Request, bearer: &str) {
