@@ -1,7 +1,7 @@
 //! The virtual schema property catalog: every property name the adapter reads, and the value
 //! rule of each tuning property and of EXCLUDED_CAPABILITIES.
 
-use super::capabilities::{CAPABILITIES, split_excluded_capabilities};
+use super::capabilities::{CAPABILITIES, excluded_capability_entries};
 use super::nonempty_str;
 use super::table_filter::{TableFilter, parse_patterns};
 pub(super) use crate::exasol::parse_boolean;
@@ -154,20 +154,25 @@ fn unknown_names(props: &Json) -> BTreeSet<&str> {
 }
 
 fn unknown_entry(name: &str) -> String {
-    match nearest_name(name, &PROPERTY_NAMES) {
-        Some(known) => format!("unknown property '{name}' (did you mean '{known}'?)"),
-        None => format!("unknown property '{name}'"),
-    }
+    format!(
+        "unknown property '{name}'{}",
+        suggestion(name, &PROPERTY_NAMES)
+    )
 }
 
 fn unadvertised_capability_entry(entry: &str) -> String {
-    let expected = match nearest_name(entry, CAPABILITIES) {
-        Some(capability) => {
-            format!("an advertised capability name (did you mean '{capability}'?)")
-        }
-        None => "an advertised capability name".to_string(),
-    };
+    let expected = format!(
+        "an advertised capability name{}",
+        suggestion(entry, CAPABILITIES)
+    );
     invalid_entry(PROP_EXCLUDED_CAPABILITIES, entry, &expected)
+}
+
+/// ` (did you mean '<nearest>'?)` when [`nearest_name`] finds a candidate, else empty.
+fn suggestion(name: &str, candidates: &[&str]) -> String {
+    nearest_name(name, candidates)
+        .map(|nearest| format!(" (did you mean '{nearest}'?)"))
+        .unwrap_or_default()
 }
 
 /// The candidate at most [`SUGGESTION_MAX_EDITS`] edits from `unknown`, ignoring case; a tie
@@ -256,12 +261,17 @@ impl<'a> TuningChecker<'a> {
         let Some(raw) = resolve_excluded_capabilities(self.props) else {
             return;
         };
-        let entries: Vec<String> = split_excluded_capabilities(raw)
-            .unadvertised
-            .into_iter()
-            .map(unadvertised_capability_entry)
-            .collect();
-        if !entries.is_empty() {
+        let mut unadvertised: Vec<&str> = Vec::new();
+        for entry in excluded_capability_entries(raw).filter(|e| !CAPABILITIES.contains(e)) {
+            if !unadvertised.contains(&entry) {
+                unadvertised.push(entry);
+            }
+        }
+        if !unadvertised.is_empty() {
+            let entries: Vec<String> = unadvertised
+                .into_iter()
+                .map(unadvertised_capability_entry)
+                .collect();
             self.invalid
                 .insert(PROP_EXCLUDED_CAPABILITIES, entries.join("; "));
         }

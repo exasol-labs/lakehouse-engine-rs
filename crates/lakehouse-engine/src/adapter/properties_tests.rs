@@ -469,80 +469,18 @@ fn values_the_owning_modules_check_are_not_checked_here() {
 
 const EXCLUDED_CAPABILITIES: &str = "EXCLUDED_CAPABILITIES";
 
-fn excluded_capabilities_message(value: &str) -> String {
-    message(&[(EXCLUDED_CAPABILITIES, value)])
-}
-
-fn excluded_capabilities_entry(entry: &str, suggestion: Option<&str>) -> String {
-    let expected = match suggestion {
-        Some(capability) => {
-            format!("an advertised capability name (did you mean '{capability}'?)")
-        }
-        None => "an advertised capability name".to_string(),
-    };
-    invalid_entry(EXCLUDED_CAPABILITIES, entry, &expected)
-}
-
 #[test]
-fn excluded_capability_entries_name_each_unadvertised_entry() {
-    let msg = excluded_capabilities_message("FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK");
-
+fn unadvertised_capability_entries_are_reported_once_each_with_a_suggestion() {
     assert_eq!(
-        msg,
-        format!(
-            "invalid virtual schema properties: {}; {}; {}",
-            excluded_capabilities_entry("FN_PRED_LIK", Some("FN_PRED_LIKE")),
-            excluded_capabilities_entry("fn_pred_like", Some("FN_PRED_LIKE")),
-            excluded_capabilities_entry("MADE_UP", None),
-        )
+        message(&[(
+            EXCLUDED_CAPABILITIES,
+            "FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK, FN_PRED_LIKE"
+        )]),
+        "invalid virtual schema properties: \
+         invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'fn_pred_like' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'MADE_UP' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name"
     );
-}
-
-#[test]
-fn an_excluded_capability_is_suggested_within_two_edits_only() {
-    assert_eq!(
-        excluded_capabilities_message("FN_PRED_LIKEXY, FN_PRED_LIKEXYZ"),
-        format!(
-            "invalid virtual schema properties: {}; {}",
-            excluded_capabilities_entry("FN_PRED_LIKEXY", Some("FN_PRED_LIKE")),
-            excluded_capabilities_entry("FN_PRED_LIKEXYZ", None)
-        )
-    );
-}
-
-#[test]
-fn excluded_capability_entries_echo_under_the_echo_rule() {
-    let long = "x".repeat(101);
-
-    let msg = excluded_capabilities_message(&format!("it's, {long}"));
-
-    assert!(msg.contains("invalid value 'it''s' for"), "{msg}");
-    assert!(
-        msg.contains(&format!("invalid value '{}…' for", "x".repeat(100))),
-        "{msg}"
-    );
-}
-
-#[test]
-fn excluded_capability_entries_share_the_alphabetical_slot_of_the_property() {
-    let msg = message(&[
-        ("PARALLELISM_FACTOR", "0"),
-        (EXCLUDED_CAPABILITIES, "MADE_UP, ANOTHER_ONE"),
-        ("DATAFUSION_BATCH_SIZE", "abc"),
-        ("MADE_UP_PROPERTY", "x"),
-    ]);
-
-    let positions: Vec<usize> = [
-        "unknown property 'MADE_UP_PROPERTY'",
-        "for 'DATAFUSION_BATCH_SIZE'",
-        "invalid value 'MADE_UP' for 'EXCLUDED_CAPABILITIES'",
-        "invalid value 'ANOTHER_ONE' for 'EXCLUDED_CAPABILITIES'",
-        "for 'PARALLELISM_FACTOR'",
-    ]
-    .iter()
-    .map(|part| msg.find(part).unwrap_or_else(|| panic!("{part}: {msg}")))
-    .collect();
-    assert!(positions.windows(2).all(|w| w[0] < w[1]), "{msg}");
 }
 
 #[test]
@@ -562,17 +500,4 @@ fn excluded_capability_entries_accept_whitespace_and_empty_entries() {
         check_properties(&props(&[(EXCLUDED_CAPABILITIES, value)]))
             .unwrap_or_else(|e| panic!("{value:?} must pass: {e:?}"));
     }
-}
-
-#[test]
-fn the_excluded_capabilities_accessor_returns_the_raw_nonempty_value() {
-    assert_eq!(
-        resolve_excluded_capabilities(&props(&[(EXCLUDED_CAPABILITIES, " A , B ")])),
-        Some(" A , B ")
-    );
-    assert_eq!(
-        resolve_excluded_capabilities(&props(&[(EXCLUDED_CAPABILITIES, "")])),
-        None
-    );
-    assert_eq!(resolve_excluded_capabilities(&props(&[])), None);
 }

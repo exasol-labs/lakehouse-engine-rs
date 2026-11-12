@@ -136,9 +136,7 @@ The scan reads a document nested at most about 200 levels deep, with or without 
 
 ## ORDER BY with LIMIT under `EXCLUDED_CAPABILITIES`
 
-When `EXCLUDED_CAPABILITIES` lists `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised, `ORDER BY ... LIMIT n OFFSET m` returns the first n rows and ignores the offset. Exasol pushes the `ORDER BY` without the limit, removes its own `ORDER BY`, applies `LIMIT n` to the rows it receives, and drops the `OFFSET`. `ORDER BY id LIMIT 5 OFFSET 3` over the ids 1 to 20 returns 1 to 5 instead of 4 to 8 (observed on Exasol 2026.2.0-nano.3). Advertising all three capabilities, or none, returns 4 to 8.
-
-Exasol documents a related limit of virtual schemas: the outermost order of imported result rows is not guaranteed. See the ORDER BY clause limitations in the [virtual schema limitations](https://docs.exasol.com/db/latest/database_concepts/virtual_schema/user_guide.htm#Virtualschemalimitations), which give the workaround `SELECT * FROM (<virtual-schema-query> ORDER BY FALSE) ORDER BY <criteria>`.
+When `EXCLUDED_CAPABILITIES` lists `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised, `ORDER BY ... LIMIT n OFFSET m` returns the first n rows and ignores the offset. `ORDER BY id LIMIT 5 OFFSET 3` over the ids 1 to 20 returns 1 to 5 instead of 4 to 8 (observed on Exasol 2026.2.0-nano.3). Advertising all three capabilities, or none, returns 4 to 8. Exasol documents ORDER BY as a known limit of virtual schemas, see the [virtual schema limitations](https://docs.exasol.com/db/latest/database_concepts/virtual_schema/user_guide.htm#Virtualschemalimitations).
 
 **Workaround:** exclude `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION` together with `LIMIT` or `LIMIT_WITH_OFFSET`, so Exasol sorts and limits the rows itself:
 

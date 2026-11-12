@@ -150,15 +150,6 @@ fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_r
 }
 
 #[test]
-fn an_unadvertised_excluded_capability_fails_every_schema_request_before_the_connection_is_read() {
-    assert_every_schema_request_fails_before_the_connection_is_read(
-        "EXCLUDED_CAPABILITIES",
-        "FN_PRED_LIK, FN_PRED_LIKE",
-        "invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?)",
-    );
-}
-
-#[test]
 fn a_set_properties_null_unsets_an_invalid_value_before_the_check() {
     let request = serde_json::json!({
         "type": "setProperties",

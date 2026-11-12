@@ -36,8 +36,8 @@ The virtual schema property `EXCLUDED_CAPABILITIES` withholds named capabilities
 
 ### Scenario: Request shapes that an exclusion makes reachable return the same rows
 
-* *GIVEN* a virtual schema whose `EXCLUDED_CAPABILITIES` withholds one of these sets, each paired with queries that use the withheld construct: `SELECTLIST_PROJECTION, SELECTLIST_EXPRESSIONS` with a two-column projection, a grouped aggregate, and an inner equi-join; `AGGREGATE_SINGLE_GROUP` with an ungrouped `COUNT(*)` and `SUM`; `FN_AGG_COUNT` with a grouped `AVG` and `COUNT`; `FN_AGG_COUNT_DISTINCT` with an ungrouped and a grouped `COUNT(DISTINCT)`; `JOIN` with an inner equi-join
-* *WHEN* the user runs each query
+* *GIVEN* a virtual schema whose `EXCLUDED_CAPABILITIES` withholds a capability that the adapter's planning depends on, such as `SELECTLIST_PROJECTION`, `AGGREGATE_SINGLE_GROUP`, `FN_AGG_COUNT`, `FN_AGG_COUNT_DISTINCT`, or `JOIN`
+* *WHEN* the user runs a query that uses the withheld construct
 * *THEN* each query SHALL return the rows it returns over a virtual schema without the exclusion
 * *AND* the adapter MUST NOT return different rows for a request shape that only an exclusion makes reachable, because Exasol does not re-check a delegated capability
 

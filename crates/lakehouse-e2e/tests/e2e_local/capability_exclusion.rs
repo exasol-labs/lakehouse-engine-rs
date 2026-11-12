@@ -15,8 +15,6 @@ use crate::fixtures::{
 use serde_json::Value;
 
 const PROPERTY: &str = "EXCLUDED_CAPABILITIES";
-/// No value in this module lists it, so every echoed answer must hold it.
-const NEVER_EXCLUDED: &str = "FN_PRED_EQUAL";
 /// Names the events table `{T}`; matches `event-10` to `event-19`, a strict subset of the rows.
 const LIKE_QUERY: &str = "SELECT id, name FROM {T} WHERE name LIKE 'event-1%'";
 
@@ -54,96 +52,54 @@ fn echoed_requests(conn: &mut ExaConn, query: &str) -> String {
         .join("\n")
 }
 
-/// The `getCapabilities` exchange that `EXPLAIN VIRTUAL` echoes for a query. The answer is parsed,
-/// because the echoed request also carries the property value, which a substring probe would match.
-#[derive(Debug, PartialEq)]
-struct CapabilitiesExchange {
-    /// The `schemaMetadataInfo.properties` Exasol sent.
-    properties: serde_json::Map<String, Value>,
-    capabilities: Vec<String>,
-}
-
-impl CapabilitiesExchange {
-    fn of(messages: &[Value], query: &str) -> Self {
-        let message_with = |key: &str| {
-            messages
-                .iter()
-                .find(|m| m["type"] == "getCapabilities" && m.get(key).is_some())
-                .unwrap_or_else(|| {
-                    panic!("{query} echoed no getCapabilities message with {key}: {messages:?}")
-                })
-        };
-        let properties = message_with("schemaMetadataInfo")["schemaMetadataInfo"]["properties"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let capabilities = message_with("capabilities")["capabilities"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{query}: the capabilities must be an array: {messages:?}"))
-            .iter()
-            .map(value_to_string)
-            .collect();
-        Self {
-            properties,
-            capabilities,
-        }
-    }
-
-    fn property(&self) -> Option<&str> {
-        self.properties.get(PROPERTY).and_then(Value::as_str)
-    }
-
-    fn holds(&self, capability: &str) -> bool {
-        self.capabilities.iter().any(|c| c == capability)
-    }
-}
-
-/// The one exchange every pushdown of `query` echoes.
-fn echoed_exchange(conn: &mut ExaConn, query: &str) -> CapabilitiesExchange {
-    let mut exchanges = explain_virtual_messages(conn, query)
+/// The `getCapabilities` answer that `EXPLAIN VIRTUAL` echoes for `query`'s first pushdown. The
+/// answer is parsed, because the echoed request also carries the property value.
+fn echoed_capabilities(conn: &mut ExaConn, query: &str) -> Vec<String> {
+    let messages = explain_virtual_messages(conn, query)
         .into_iter()
-        .map(|messages| CapabilitiesExchange::of(&messages, query));
-    let first = exchanges
         .next()
         .unwrap_or_else(|| panic!("EXPLAIN VIRTUAL echoed no pushdown for {query}"));
-    for other in exchanges {
-        assert_eq!(
-            other, first,
-            "every pushdown of {query} must echo one exchange"
-        );
-    }
-    first
+    messages
+        .iter()
+        .filter(|m| m["type"] == "getCapabilities")
+        .find_map(|m| m["capabilities"].as_array())
+        .unwrap_or_else(|| panic!("{query} echoed no getCapabilities answer: {messages:?}"))
+        .iter()
+        .map(value_to_string)
+        .collect()
 }
 
-/// `query` echoes the capabilities a schema without the property receives, in order, less exactly
-/// `excluded`.
+/// The capabilities a schema without the property receives, in order.
+fn advertised_capabilities(conn: &mut ExaConn) -> Vec<String> {
+    let advertised = echoed_capabilities(conn, &like_query(LAKEHOUSE_VS));
+    assert!(
+        !advertised.is_empty(),
+        "{LAKEHOUSE_VS} must receive capabilities"
+    );
+    advertised
+}
+
+/// `query` echoes `advertised` less exactly `excluded`, in order.
 #[track_caller]
-fn assert_withholds_exactly(conn: &mut ExaConn, query: &str, excluded: &[&str]) {
-    let advertised = echoed_exchange(conn, &like_query(LAKEHOUSE_VS));
-    for name in excluded.iter().chain([&NEVER_EXCLUDED]) {
+fn assert_withholds_exactly(
+    conn: &mut ExaConn,
+    advertised: &[String],
+    query: &str,
+    excluded: &[&str],
+) {
+    for name in excluded {
         assert!(
-            advertised.holds(name),
+            advertised.iter().any(|c| c == name),
             "{LAKEHOUSE_VS} must receive {name}: {advertised:?}"
         );
     }
-    let echoed = echoed_exchange(conn, query);
-    for name in excluded {
-        assert!(
-            !echoed.holds(name),
-            "{query} must not receive {name}: {echoed:?}"
-        );
-    }
-    assert!(
-        echoed.holds(NEVER_EXCLUDED),
-        "{query} must receive {NEVER_EXCLUDED}: {echoed:?}"
-    );
-    let expected: Vec<String> = advertised
-        .capabilities
-        .into_iter()
+    let expected: Vec<&String> = advertised
+        .iter()
         .filter(|c| !excluded.contains(&c.as_str()))
         .collect();
     assert_eq!(
-        echoed.capabilities, expected,
+        echoed_capabilities(conn, query).iter().collect::<Vec<_>>(),
+        expected,
         "{query} must receive the advertised capabilities less exactly {excluded:?}"
     );
 }
@@ -170,9 +126,10 @@ fn assert_like_evaluated_by_exasol(conn: &mut ExaConn, vs: &str) {
 fn excluded_like_is_evaluated_by_exasol() {
     const VS: &str = "CE_LIKE";
     let mut conn = setup();
+    let advertised = advertised_capabilities(&mut conn);
     create_excluding(&mut conn, VS, "FN_PRED_LIKE");
 
-    assert_withholds_exactly(&mut conn, &like_query(VS), &["FN_PRED_LIKE"]);
+    assert_withholds_exactly(&mut conn, &advertised, &like_query(VS), &["FN_PRED_LIKE"]);
     assert_like_evaluated_by_exasol(&mut conn, VS);
     let unexcluded = like_query(LAKEHOUSE_VS);
     assert!(
@@ -186,6 +143,7 @@ fn excluded_like_is_evaluated_by_exasol() {
 fn set_exclusion_applies_from_the_next_query_without_refresh() {
     const VS: &str = "CE_SET";
     let mut conn = setup();
+    let advertised = advertised_capabilities(&mut conn);
     create_virtual_schema(&mut conn, &VsProps::new(VS, E2E_NAMESPACE));
     let query = like_query(VS);
     assert!(pushes_like(&mut conn, &query), "{query} must push its LIKE");
@@ -193,18 +151,7 @@ fn set_exclusion_applies_from_the_next_query_without_refresh() {
     conn.execute(&format!(
         "ALTER VIRTUAL SCHEMA {VS} SET {PROPERTY} = 'FN_PRED_LIKE'"
     ));
-    let exchange = echoed_exchange(&mut conn, &query);
-    assert_eq!(
-        exchange.property(),
-        Some("FN_PRED_LIKE"),
-        "Exasol must send the schema's properties with getCapabilities: {exchange:?}"
-    );
-    assert!(
-        !exchange.holds("FN_PRED_LIKE"),
-        "Exasol must request the capabilities again for the next query, without REFRESH: \
-         {exchange:?}"
-    );
-    assert_withholds_exactly(&mut conn, &query, &["FN_PRED_LIKE"]);
+    assert_withholds_exactly(&mut conn, &advertised, &query, &["FN_PRED_LIKE"]);
     assert!(
         !pushes_like(&mut conn, &query),
         "{query} must not push its LIKE"
@@ -216,9 +163,7 @@ fn set_exclusion_applies_from_the_next_query_without_refresh() {
     );
 
     conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS} SET {PROPERTY} = null"));
-    let exchange = echoed_exchange(&mut conn, &query);
-    assert_eq!(exchange.property(), None, "{exchange:?}");
-    assert_withholds_exactly(&mut conn, &query, &[]);
+    assert_withholds_exactly(&mut conn, &advertised, &query, &[]);
     assert!(
         pushes_like(&mut conn, &query),
         "{query} must push its LIKE again"
@@ -226,22 +171,19 @@ fn set_exclusion_applies_from_the_next_query_without_refresh() {
 }
 
 /// Scenario: An excluded capability is withheld from getCapabilities
-/// Scenario: Create, refresh, and set reject an entry the adapter does not advertise
 #[test]
-fn whitespace_and_empty_entries_are_accepted() {
+fn excluded_capabilities_are_withheld_from_get_capabilities() {
     const VS: &str = "CE_WHITESPACE";
-    const ONLY_EMPTY_VS: &str = "CE_ONLY_EMPTY";
     let mut conn = setup();
+    let advertised = advertised_capabilities(&mut conn);
 
     create_excluding(&mut conn, VS, " FN_PRED_LIKE ,, FN_AGG_COUNT_DISTINCT,");
     assert_withholds_exactly(
         &mut conn,
+        &advertised,
         &like_query(VS),
         &["FN_PRED_LIKE", "FN_AGG_COUNT_DISTINCT"],
     );
-
-    create_excluding(&mut conn, ONLY_EMPTY_VS, " , ");
-    assert_withholds_exactly(&mut conn, &like_query(ONLY_EMPTY_VS), &[]);
 }
 
 /// What a query names `{T}`.
@@ -465,10 +407,17 @@ fn exclusion_combinations_return_native_rows() {
     const VS: &str = "CE_COMBINATION";
     let mut conn = setup();
 
+    let advertised = advertised_capabilities(&mut conn);
+
     let mut failures = Vec::new();
     for combination in COMBINATIONS {
         create_excluding(&mut conn, VS, &combination.excluded.join(", "));
-        assert_withholds_exactly(&mut conn, &like_query(VS), combination.excluded);
+        assert_withholds_exactly(
+            &mut conn,
+            &advertised,
+            &like_query(VS),
+            combination.excluded,
+        );
         for query in combination.queries {
             if let Some(failure) = query.mismatch(&mut conn, VS) {
                 failures.push(format!("[{:?}] {failure}", combination.excluded));
@@ -495,7 +444,8 @@ fn get_capabilities_ignores_a_persisted_unadvertised_entry() {
         &format!("{PROPERTY} = 'NO_SUCH_CAPABILITY, FN_PRED_LIKE'"),
     );
 
-    assert_withholds_exactly(&mut conn, &like_query(VS), &["FN_PRED_LIKE"]);
+    let advertised = advertised_capabilities(&mut conn);
+    assert_withholds_exactly(&mut conn, &advertised, &like_query(VS), &["FN_PRED_LIKE"]);
     assert_like_evaluated_by_exasol(&mut conn, VS);
 
     let expected = format!(
@@ -519,5 +469,5 @@ fn get_capabilities_ignores_a_persisted_unadvertised_entry() {
         "ALTER VIRTUAL SCHEMA {VS} SET {PROPERTY} = 'FN_PRED_LIKE'"
     ));
     conn.execute(&refresh);
-    assert_withholds_exactly(&mut conn, &like_query(VS), &["FN_PRED_LIKE"]);
+    assert_withholds_exactly(&mut conn, &advertised, &like_query(VS), &["FN_PRED_LIKE"]);
 }

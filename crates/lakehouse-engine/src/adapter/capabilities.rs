@@ -139,39 +139,25 @@ pub const CAPABILITIES: &[&str] = &[
     "JOIN_CONDITION_EQUI",
 ];
 
-/// The entries of an `EXCLUDED_CAPABILITIES` value, divided by whether the adapter advertises them.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ExcludedEntries<'a> {
-    pub advertised: Vec<&'a str>,
-    /// Distinct, in the order the value lists them.
-    pub unadvertised: Vec<&'a str>,
+/// The entries of an `EXCLUDED_CAPABILITIES` value: split on `,`, trimmed, empty ones skipped.
+/// An entry matches a capability exactly and case-sensitively.
+pub fn excluded_capability_entries(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
 }
 
-/// Divides a raw `EXCLUDED_CAPABILITIES` value: entries split on `,`, trimmed, empty ones
-/// skipped, each matched exactly and case-sensitively against [`CAPABILITIES`]. This is the one
-/// owner of the entry syntax, shared by the value check and the capabilities response.
-pub fn split_excluded_capabilities(raw: &str) -> ExcludedEntries<'_> {
-    let mut entries = ExcludedEntries::default();
-    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        if CAPABILITIES.contains(&entry) {
-            entries.advertised.push(entry);
-        } else if !entries.unadvertised.contains(&entry) {
-            entries.unadvertised.push(entry);
-        }
-    }
-    entries
-}
-
-/// The advertised capabilities in order, less the advertised entries of `excluded`. A value
-/// entry the adapter does not advertise is ignored, so a persisted value never fails a request.
+/// The advertised capabilities in order, less those `excluded` lists. An entry the adapter does
+/// not advertise is ignored, so a persisted value never fails a request.
 pub fn get_capabilities_response(excluded: Option<&str>) -> Json {
-    let withheld = excluded
-        .map(split_excluded_capabilities)
-        .unwrap_or_default();
+    let withheld: Vec<&str> = excluded
+        .into_iter()
+        .flat_map(excluded_capability_entries)
+        .collect();
     let capabilities: Vec<&str> = CAPABILITIES
         .iter()
         .copied()
-        .filter(|capability| !withheld.advertised.contains(capability))
+        .filter(|capability| !withheld.contains(capability))
         .collect();
     json!({
         "type": "getCapabilities",
