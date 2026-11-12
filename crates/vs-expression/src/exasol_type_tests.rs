@@ -587,26 +587,16 @@ fn column_info_reads_each_measured_spelling() {
 }
 
 #[test]
-fn only_the_spelling_exasol_reports_for_a_type_is_its_reported_spelling() {
-    let mut cases: Vec<_> = measured_spellings()
-        .into_iter()
-        .map(|(type_name, exasol_type)| (type_name, exasol_type, true))
-        .collect();
-    cases.extend([
-        ("TIMESTAMP", ExasolType::BARE_TIMESTAMP, true),
-        (
-            "TIMESTAMP(3) WITH LOCAL TIME ZONE",
-            ExasolType::timestamp(3),
-            false,
-        ),
-    ]);
-    for (type_name, exasol_type, reported) in cases {
-        assert_eq!(
-            is_reported_spelling(exasol_type, type_name),
-            reported,
-            "{type_name} as {exasol_type:?}"
-        );
-    }
+fn column_info_reads_a_local_time_zone_timestamp_by_its_type_name() {
+    let column = ColumnInfo {
+        type_name: "TIMESTAMP(3) WITH LOCAL TIME ZONE".to_string(),
+        ..measured_column("TIMESTAMP(3)")
+    };
+
+    assert_eq!(
+        known(&column),
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 }
+    );
 }
 
 #[test]

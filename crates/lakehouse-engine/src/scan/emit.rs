@@ -207,7 +207,8 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
             DataType::Decimal128(decimal.precision(), decimal.scale() as i8)
         }
         ExasolType::Date => DataType::Date32,
-        ExasolType::Timestamp { precision } => DataType::Timestamp(
+        ExasolType::Timestamp { precision }
+        | ExasolType::TimestampWithLocalTimeZone { precision } => DataType::Timestamp(
             TimestampPrecision::from_declared_digits(precision.into()).arrow_unit(),
             None,
         ),

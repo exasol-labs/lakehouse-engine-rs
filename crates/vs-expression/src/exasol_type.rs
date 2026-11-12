@@ -373,7 +373,7 @@ pub enum UdfColumnType {
 
 /// Reads a UDF column's metadata by the bin Exasol reported (`typ`), and reads `type_name` only
 /// for what the bin lacks: an integer DECIMAL's absent precision, a bare `TIMESTAMP`'s
-/// precision 3, and the `ASCII` character set.
+/// precision 3, a local-time-zone timestamp, and the `ASCII` character set.
 pub fn exasol_type_from_column_info(column: &ColumnInfo) -> UdfColumnType {
     let type_name = column.type_name.as_str();
     let known = match &column.typ {
@@ -389,7 +389,14 @@ pub fn exasol_type_from_column_info(column: &ColumnInfo) -> UdfColumnType {
         ExaType::Timestamp { precision } => u8::try_from(*precision)
             .ok()
             .filter(|precision| *precision <= MAX_FRACTIONAL_DIGITS)
-            .map(ExasolType::timestamp),
+            .map(|precision| {
+                // Exasol reports a local-time-zone timestamp in the plain timestamp bin.
+                if type_name.contains("WITH LOCAL TIME ZONE") {
+                    ExasolType::TimestampWithLocalTimeZone { precision }
+                } else {
+                    ExasolType::timestamp(precision)
+                }
+            }),
         ExaType::String { size } => {
             (1..=MAX_VARCHAR_SIZE)
                 .contains(size)
@@ -411,32 +418,6 @@ pub fn exasol_type_from_column_info(column: &ColumnInfo) -> UdfColumnType {
         None => UdfColumnType::Unrecognized {
             type_name: column.type_name.clone(),
         },
-    }
-}
-
-/// Whether `type_name` is the spelling Exasol reports for `exasol_type` on a UDF column. The
-/// reader classifies a column by its bin alone, so a caller that must refuse a type sharing a bin,
-/// such as `TIMESTAMP(3) WITH LOCAL TIME ZONE`, checks the spelling too.
-pub fn is_reported_spelling(exasol_type: ExasolType, type_name: &str) -> bool {
-    let character = |kind: &str, size: u32, ascii: bool| {
-        let bare = format!("{kind}({size})");
-        let set = if ascii { "ASCII" } else { "UTF8" };
-        type_name == bare || type_name == format!("{bare} {set}")
-    };
-    match exasol_type {
-        ExasolType::Decimal(decimal) => {
-            type_name == format!("DECIMAL({},{})", decimal.precision(), decimal.scale())
-        }
-        ExasolType::DoublePrecision => type_name == "DOUBLE",
-        ExasolType::Boolean => type_name == "BOOLEAN",
-        ExasolType::Date => type_name == "DATE",
-        ExasolType::Timestamp { precision } => {
-            type_name == format!("TIMESTAMP({precision})")
-                || (exasol_type == ExasolType::BARE_TIMESTAMP && type_name == "TIMESTAMP")
-        }
-        ExasolType::Varchar { size, ascii } => character("VARCHAR", size, ascii),
-        ExasolType::Char { size, ascii } => character("CHAR", size, ascii),
-        _ => false,
     }
 }
 
