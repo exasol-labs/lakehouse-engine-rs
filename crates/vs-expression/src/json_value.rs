@@ -11,7 +11,7 @@ pub const JSON_VALUE_TEXT_FN: &str = "lakehouse_json_value_text";
 /// `(document, path, on_empty, on_error)`, returning BOOLEAN.
 pub const JSON_VALUE_BOOLEAN_FN: &str = "lakehouse_json_value_boolean";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JsonPathStep {
     Member(String),
     Index(u32),

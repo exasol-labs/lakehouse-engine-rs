@@ -4,7 +4,8 @@
 
 use crate::common::e2e_harness::PathCheck::{Has, Lacks, NScan, Split, Wrapper};
 use crate::common::e2e_harness::*;
-use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS};
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS, JSON_DOCS};
 use crate::fixtures::{
     LAKEHOUSE_VS, TYPED_COLUMNS, json_table, lakehouse_vs, typed_table, vs_char_pad_table,
 };
@@ -465,6 +466,48 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 
 /// Scenario: Text the session format converts runs in Exasol
 /// Scenario: Integer and boolean text runs in the scan
+/// Scenario: A JSON_VALUE without a DEFAULT ON ERROR stops reading once no path can select more
+#[test]
+fn json_value_fast_read_differs_from_native_as_documented() {
+    lakehouse_vs();
+    let table = json_table();
+    let mut conn = exa_conn();
+    let rows = |conn: &mut ExaConn, sql: &str| -> Vec<Vec<String>> {
+        conn.query_columns(sql)
+            .iter()
+            .map(|column| column.iter().map(value_to_string).collect())
+            .collect()
+    };
+    // Document 6 repeats `locale`, and document 7 ends without its closing brace.
+    let calls = "JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.order.id')";
+    let scan = rows(
+        &mut conn,
+        &format!("SELECT ID, {calls} FROM {table} WHERE ID IN (6, 7) ORDER BY ID"),
+    );
+    let ids = vec!["6".to_string(), "7".to_string()];
+    let big = "12345678901234567890123".to_string();
+    let de = "de_DE".to_string();
+    assert_eq!(
+        scan,
+        vec![ids, vec![de.clone(), de], vec![big.clone(), "44".into()]]
+    );
+    for (id, locale, order_id) in [(6, "null", big.as_str()), (7, "null", "null")] {
+        let doc = JSON_DOCS[id - 1].expect("a document").replace('\'', "''");
+        let native = rows(
+            &mut conn,
+            &format!(
+                "SELECT {} FROM DUAL",
+                calls.replace("DOC", &format!("'{doc}'"))
+            ),
+        );
+        assert_eq!(
+            native,
+            vec![vec![locale.to_string()], vec![order_id.to_string()]],
+            "{id}"
+        );
+    }
+}
+
 /// Scenario: A digits-only literal compares with an integer as a number
 /// Scenario: A group key travels with its exact type
 /// Scenario: A CAST of text to CHAR runs in Exasol
@@ -504,10 +547,12 @@ fn assert_cases_match_native(table: &str, columns: &str, cases: &[Case], error_c
 /// The scan's projection when a declined `JSON_VALUE` leaves Exasol only the document to read.
 const DOCUMENT_ONLY: &str = r#""projection":["ID","DOC"]"#;
 
+/// Without a `DEFAULT ... ON ERROR`, documents 6 and 7 read as
+/// `json_value_fast_read_differs_from_native_as_documented` checks, so `$.locale` cases skip them.
 const JSON_VALUE_CASES: &[Case] = &[
     Case {
         setting: DEFAULT_SESSION,
-        query: "SELECT ID, JSON_VALUE(DOC, '$.locale') FROM {T}",
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale') FROM {T} WHERE ID NOT IN (6, 7)",
         path: Has(r#""projection":["ID",{"expr""#),
     },
     Case {
@@ -537,8 +582,18 @@ const JSON_VALUE_CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
-        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.locale') = 'de_DE'",
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.locale') = 'de_DE' AND ID NOT IN (6, 7)",
         path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale' DEFAULT 'bad' ON ERROR), JSON_VALUE(DOC, '$.order.id') FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale' DEFAULT 'bad' ON ERROR) FROM {T} ORDER BY 2, 1",
+        path: Lacks(r#"},"DOC"]"#),
     },
     Case {
         setting: DEFAULT_SESSION,
@@ -557,7 +612,7 @@ const JSON_VALUE_CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
-        query: "SELECT JSON_VALUE(DOC, '$.locale'), COUNT(*) FROM {T} GROUP BY JSON_VALUE(DOC, '$.locale')",
+        query: "SELECT JSON_VALUE(DOC, '$.locale'), COUNT(*) FROM {T} WHERE ID NOT IN (6, 7) GROUP BY JSON_VALUE(DOC, '$.locale')",
         path: Split,
     },
     Case {

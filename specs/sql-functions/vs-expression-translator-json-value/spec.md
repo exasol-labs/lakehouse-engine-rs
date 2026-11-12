@@ -23,9 +23,23 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 
 * *GIVEN* a `JSON_VALUE` call that runs in the scan
 * *WHEN* the scan evaluates it on a document
-* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON, at any nesting depth, SHALL take the `ON ERROR` behavior, except that a lone surrogate escape outside the selected item SHALL NOT
+* *THEN* a NULL or empty document SHALL yield NULL, and a document that is not strict RFC 8259 JSON, or that nests deeper than about 200 levels, SHALL take the `ON ERROR` behavior, except as a fast read allows
 * *AND* the path SHALL run in lax mode over item sequences: a member step selects every member of that name, also duplicates, in an object or in the objects of an array, and an index step treats a non-array as a one-item array
 * *AND* no item SHALL take the `ON EMPTY` behavior, and several items or an object or array item SHALL take the `ON ERROR` behavior
+
+### Scenario: A JSON_VALUE without a DEFAULT ON ERROR stops reading once no path can select more
+
+* *GIVEN* the `JSON_VALUE` calls that run in the scan over one document, none with a `DEFAULT` `ON ERROR` behavior
+* *WHEN* the scan evaluates them on a document
+* *THEN* the scan SHALL stop reading the document once no call's path can select another item, and SHALL NOT check the rest of the document
+* *AND* in each object the scan SHALL take only the first member of a path step's name
+* *AND* a call with a `DEFAULT` `ON ERROR` behavior SHALL make the scan read and check the whole document for every call over it, because Exasol sends `NULL ON ERROR` also without the clause
+
+### Scenario: Several JSON_VALUE calls on one document parse it once per row
+
+* *GIVEN* several `JSON_VALUE` calls that run in the scan over one document, in one select list, filter, or aggregation
+* *WHEN* the scan evaluates them
+* *THEN* the scan SHALL read each document once per row for all of them
 
 ### Scenario: JSON_VALUE in the scan converts the item as Exasol does
 

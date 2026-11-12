@@ -92,6 +92,8 @@ The scan computes these functions when DataFusion can render the whole filter or
 
 Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
 
+The scan reads a document nested at most about 200 levels deep. A deeper document takes the `ON ERROR` behavior.
+
 ### Text and session settings
 
 Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and reads text as one of these types, by the session's NLS settings. The pushdown request does not carry them, so these conversions run in Exasol SQL:

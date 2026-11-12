@@ -117,10 +117,14 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 
 A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
 
-## JSON_VALUE on a document with a lone surrogate escape
+## JSON_VALUE without a DEFAULT ON ERROR
 
-Native Exasol rejects a document that contains a lone UTF-16 surrogate escape such as `"\ud800"`, and `JSON_VALUE` takes its `ON ERROR` behavior. The scan rejects such an escape only in the item the path selects, and returns the selected value otherwise.
+The scan reads a document only until no `JSON_VALUE` path over it can select another item, and it takes only the first member of each name in an object. Native Exasol reads and checks the whole document, and reads repeated members as several items. So a document that is broken after the selected value, or that repeats a member the path selects, can give a value where Exasol takes the `ON ERROR` behavior, or the reverse.
+
+A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document makes the scan read and check the whole document, and the results match native Exasol. Exasol sends `NULL ON ERROR` also when the clause is absent, so `NULL ON ERROR` cannot ask for this.
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
-| `JSON_VALUE('{"a":"\ud800","b":1}', '$.b')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"a":1} x', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"a":1,"a":2}', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"a":{"c":2},"a":{"b":1}}', '$.a.b')` | `NULL` (`ON EMPTY`) | `'1'` |
