@@ -238,13 +238,14 @@ fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
         .get("groupBy")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let is_group_by_aggregation =
-        pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by");
+    let has_aggregation_type = pushdown_req
+        .get("aggregationType")
+        .is_some_and(|v| !v.is_null());
     let has_having = pushdown_req
         .get("having")
         .filter(|h| !h.is_null())
         .is_some();
-    has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
+    has_aggregate_item || has_group_by || has_aggregation_type || has_having
 }
 
 /// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.

@@ -67,11 +67,12 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 
 ### Scenario: Aggregate over a join routes through the unified qualified wrapper
 
-* *GIVEN* an inner equi-join `pushdown` request whose select list, GROUP BY, or HAVING requires Exasol postprocessing, an aggregate select item, a non-empty `groupBy`, `aggregationType` = `group_by`, or a non-null `having`, or whose `ORDER BY`/`LIMIT` shape the broadcast path declines per `pushdown-joins/pushdown-planning-join`
+* *GIVEN* an inner equi-join `pushdown` request whose select list, GROUP BY, or HAVING requires Exasol postprocessing, an aggregate select item, a non-empty `groupBy`, a non-null `aggregationType`, or a non-null `having`, or whose `ORDER BY`/`LIMIT` shape the broadcast path declines per `pushdown-joins/pushdown-planning-join`
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL route the request to the unified qualified fallback path unconditionally, regardless of whether the join would otherwise be broadcast-eligible, because the broadcast in-UDF join renders only projection, filter, and join condition
 * *AND* a bare `LIMIT` alone, and a bare-projected-column `ORDER BY` alone, SHALL NOT be members of that set, which names exactly the four unconditional forcing conditions
 * *AND* the fallback wrapper SHALL render the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (side-0 fan-out) "LHS_T0", (side-1 fan-out) "LHS_T1", … WHERE <conditions> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), splicing Exasol's own aggregate function name verbatim while table-qualifying only its column argument(s)
+* *AND* a `single_group` request SHALL render `GROUP BY ()`, so it returns one row even when Exasol strips every aggregate the outer query does not reference, for example `SELECT COUNT(*) FROM (SELECT SUM(o.x) FROM o JOIN c ON …)`
 * *AND* a select-list item that is a SCALAR FUNCTION WRAPPING one or more aggregates (e.g. `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`) SHALL be rendered by recursing through the `crates/vs-expression` translator, which renders nested `function_aggregate` nodes by splicing the aggregate name verbatim and rendering the argument(s), NOT declined
 * *AND* the returned result SHALL equal the result of evaluating the same select list over the same inner join on a single node
 

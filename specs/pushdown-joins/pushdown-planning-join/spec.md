@@ -5,7 +5,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 ## Background
 
 * The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, no Exasol postprocessing, and a condition, filter, and projection that `crates/vs-expression` can render. Any deviation takes the fallback.
-* Exasol postprocessing means one of four conditions: an aggregate select item (`function_aggregate`), a non-empty `groupBy`, `aggregationType == "group_by"`, or a non-null `having`. A pushed `LIMIT` and a pushed `ORDER BY` are not forcing conditions.
+* Exasol postprocessing means one of four conditions: an aggregate select item (`function_aggregate`), a non-empty `groupBy`, a non-null `aggregationType` (`group_by` or `single_group`), or a non-null `having`. A pushed `LIMIT` and a pushed `ORDER BY` are not forcing conditions.
 * The dimension side rides in the shard-invariant common spec. Only the fact side's per-shard file subset flows through the `LAKEHOUSE_DISTRIBUTE_FILES` distributor.
 * A join leg is one occurrence of a table in the FROM tree. `pushdown-joins/pushdown-planning-join-fallback-self-join` owns the one binding that resolves a `column` node to its leg.
 * Exasol binds the pushdown result to the select list by position, so the column names the pushdown SQL emits stay inside it.
@@ -71,12 +71,12 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 * *GIVEN* a `pushdown` request over a broadcast-eligible inner equi-join carrying one of: a `limit` with a NON-ZERO `limit.offset` and an absent or empty `orderBy`; an `orderBy` element that is an expression, an aggregate, or any non-`column` node; an `orderBy` element missing `isAscending` or `nullsLast`; or an `orderBy` element naming a column that is not a bare-column item of the broadcast projection
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL decline the broadcast plan and route the request to the unified unaccelerated fallback, whose qualified wrapper renders the ordering and the window table-qualified over the materialized join
-* *AND* every arm EXCEPT projection membership SHALL be decided from the `pushdown` request ALONE, BEFORE either side is sized and before the broadcast render runs, so a request carrying an aggregate select item, a non-empty `groupBy`, `aggregationType == "group_by"`, or a non-null `having` MUST NOT reach the broadcast renderer at all, and pays neither its condition, filter, and projection render nor its no-column-metadata error arm
+* *AND* every arm EXCEPT projection membership SHALL be decided from the `pushdown` request ALONE, BEFORE either side is sized and before the broadcast render runs, so a request carrying an aggregate select item, a non-empty `groupBy`, a non-null `aggregationType` (`group_by` or `single_group`), or a non-null `having` MUST NOT reach the broadcast renderer at all, and pays neither its condition, filter, and projection render nor its no-column-metadata error arm
 * *AND* the projection-membership arm SHALL be decided LATER, at the broadcast construction site against the RENDERED broadcast projection, because that projection does not exist until the render has run, and a sort key naming a column that is not a bare-column item of it SHALL downgrade the request to the SAME unified unaccelerated fallback, by the same fall-through
 * *AND* that decline SHALL be a clean fall-through and MUST NOT be a hard client-facing `User` error, because, unlike the declined single-table row-scan path (`pushdown-capabilities/pushdown-planning-topn`), a renderer that CAN express the shape still exists
 * *AND* the adapter MUST NOT drop a sort key, a limit, or an offset it declined to serve on the broadcast path, so no reachable shape returns rows that are silently unordered, unwindowed, or wrongly truncated
 * *AND* the bare-`LIMIT`-with-non-zero-offset arm SHALL be a structural guard rather than a reachable branch, because a non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`)
-* *AND* an aggregate select item, a non-empty `groupBy`, `aggregationType == "group_by"`, and a non-null `having` SHALL each force the unified unaccelerated fallback unconditionally
+* *AND* an aggregate select item, a non-empty `groupBy`, a non-null `aggregationType` (`group_by` or `single_group`), and a non-null `having` SHALL each force the unified unaccelerated fallback unconditionally
 
 ### Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 

@@ -385,6 +385,9 @@ const SINGLE_GROUP_SELECTS: &[&str] = &[
     "LENGTH(MAX(P)), COUNT(*)",
 ];
 
+/// Wrapped in `SELECT COUNT(*) FROM (...)`, so Exasol strips their aggregates (#627).
+const NESTED_SELECTS: &[&str] = &["SUM(ID)", "COUNT(DISTINCT ID)"];
+
 const JOIN_SELECTS: &[&str] = &["COUNT(*), 'X'", "SUM(B.S)"];
 
 const HAVINGS: &[&str] = &[
@@ -470,6 +473,12 @@ pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: F
         for having in HAVINGS {
             for select in SINGLE_GROUP_SELECTS {
                 let query = format!("SELECT {select} FROM {{T}} WHERE {filter}{having}");
+                failures.extend(oracle_mismatch(conn, &query, format));
+            }
+            for select in NESTED_SELECTS {
+                let query = format!(
+                    "SELECT COUNT(*) FROM (SELECT {select} FROM {{T}} WHERE {filter}{having})"
+                );
                 failures.extend(oracle_mismatch(conn, &query, format));
             }
         }

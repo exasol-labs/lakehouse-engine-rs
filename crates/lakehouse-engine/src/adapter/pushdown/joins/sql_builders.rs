@@ -578,10 +578,16 @@ pub(in super::super) fn build_broadcast_join_sql(
 }
 
 fn qualified_join_group_by(pushdown_req: &Json, legs: &JoinLegs) -> Option<String> {
-    let keys = pushdown_req
+    let Some(keys) = pushdown_req
         .get("groupBy")
         .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())?;
+        .filter(|a| !a.is_empty())
+    else {
+        // Exasol may strip every aggregate from a single-group select list (#627).
+        return (pushdown_req.get("aggregationType").and_then(|v| v.as_str())
+            == Some("single_group"))
+        .then(|| "()".to_string());
+    };
     let parts: Vec<String> = keys
         .iter()
         .map(|key| render_expression_qualified(key, legs))
