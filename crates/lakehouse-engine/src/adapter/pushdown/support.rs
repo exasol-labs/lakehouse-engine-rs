@@ -195,8 +195,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 }
 
 /// `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`. LIMIT goes only on the outer
-/// wrapper: inside the fan-out it would truncate a shard's distinct set. `None` when the
-/// column's type is unknown.
+/// wrapper: inside the fan-out it would truncate a shard's distinct set.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
@@ -206,7 +205,7 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> Option<String> {
+) -> String {
     let [SingleGroupItem::Distinct(dc)] = items else {
         unreachable!(
             "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
@@ -219,12 +218,12 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
         col_types,
         udf_name,
         distribute_udf_name,
-    )?;
+    );
     let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
-    Some(sql)
+    sql
 }
 
 /// `"V"` carries the column's raw values, declared with its exact Exasol type, so
@@ -236,7 +235,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> Option<String> {
+) -> String {
     let Some(col) = dc.column.as_deref() else {
         unreachable!(
             "build_distinct_fan_out is dispatched only for a lone bare-column \
@@ -244,7 +243,10 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
              single-table wrapper instead"
         )
     };
-    let value_type = col_types.get(&ColumnRef::from(col))?.exa_type;
+    let value_type = col_types
+        .get(&ColumnRef::from(col))
+        .expect(BOUND_BY_TRANSLATOR)
+        .exa_type;
     let proj_item = ProjectionItem::from(col);
     let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
@@ -266,13 +268,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         files: base_spec.files.clone(),
     };
     let emits = format!(r#""V" {value_type}"#);
-    Some(build_fan_out_inner(
-        &spec,
-        shards,
-        &emits,
-        udf_name,
-        distribute_udf_name,
-    ))
+    build_fan_out_inner(&spec, shards, &emits, udf_name, distribute_udf_name)
 }
 
 /// A nested distributor does the `GROUP BY shard_key` fan-out, wrapped by an outer
@@ -328,6 +324,18 @@ pub(super) struct InvolvedColumns<'r> {
     /// The table's raw column notes, in the same order.
     pub(super) notes: TableNotes<'r>,
 }
+
+impl InvolvedColumns<'_> {
+    /// Whether the table declares the column of this uppercased name.
+    pub(super) fn declares(&self, upper_name: &str) -> bool {
+        self.types.iter().any(|(name, _)| name == upper_name)
+    }
+}
+
+/// The invariant every type lookup of a request column relies on once [`ScanTranslator::over`]
+/// has built the translator over that request.
+pub(super) const BOUND_BY_TRANSLATOR: &str =
+    "ScanTranslator::over binds every column of the request it renders";
 
 /// Reads each column's name, Exasol type, and note in one pass. A column missing `name` is
 /// skipped. A missing or invalid `dataType` fails the request: the adapter declared every column
@@ -420,7 +428,7 @@ pub(super) struct ColumnType {
 /// A broadcast join qualifies every entry with its leg's alias. A single-table scan and an
 /// N-scan leg each read one relation, so their entries stay unqualified and keep the bare-name
 /// lookup.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnTypes(Vec<(ColumnRef, ColumnType)>);
 
 impl ColumnTypes {
@@ -660,8 +668,29 @@ pub struct ScanTranslator<'a> {
 }
 
 impl<'a> ScanTranslator<'a> {
-    pub fn new(columns: &'a ColumnTypes) -> Self {
-        Self { columns }
+    /// The translator of `trees`, every tree it will render. Every declared column has a type, so
+    /// once each column of `trees` binds an entry, the typed pass declines only by a type rule.
+    /// The request check already failed every undeclared column, so a column that binds none is
+    /// an adapter bug, such as a wrong leg qualification, and fails the request loudly (#615).
+    pub(super) fn over(columns: &'a ColumnTypes, trees: &[&Json]) -> Result<Self, UdfError> {
+        for tree in trees {
+            let mut unbound = None;
+            walk_column_nodes(tree, &mut |column| {
+                let column = ColumnRef {
+                    relation: column.table_alias.map(str::to_string),
+                    name: column.upper_name(),
+                };
+                if unbound.is_none() && columns.get(&column).is_none() {
+                    unbound = Some(column.name);
+                }
+            });
+            if let Some(name) = unbound {
+                return Err(UdfError::User(format!(
+                    "internal adapter error: column {name} binds no column of the scanned tables"
+                )));
+            }
+        }
+        Ok(Self { columns })
     }
 
     pub(super) fn columns(self) -> &'a ColumnTypes {
@@ -673,14 +702,14 @@ impl<'a> ScanTranslator<'a> {
         render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
     }
 
-    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `scan_filter` is
-    /// `None` for a trivially true filter; `declined` is the raw tree, which Exasol applies itself.
+    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
+    /// raw tree, which Exasol applies itself.
     pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
         let Some(raw) = filter else {
             return (None, None);
         };
         match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
-            Ok(sql) => (sql, None),
+            Ok(sql) => (Some(sql), None),
             Err(_) => (None, Some(raw)),
         }
     }
@@ -722,11 +751,7 @@ pub(super) fn project_columns(
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        // A column without a known type would declare a guessed EMITS type.
-                        let Some((column, column_type)) = all_cols.resolve(e) else {
-                            needs_full_fallback = true;
-                            continue;
-                        };
+                        let (column, column_type) = all_cols.resolve(e).expect(BOUND_BY_TRANSLATOR);
                         projected.push(ProjectedColumn {
                             item: ProjectionItem::Column(column.clone()),
                             exa_type: column_type.exa_type,

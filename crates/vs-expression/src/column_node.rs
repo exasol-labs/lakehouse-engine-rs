@@ -87,32 +87,26 @@ pub fn strip_table_alias(tree: &Json) -> Json {
     }
 }
 
-/// Copies `tree`, setting each `column` node's `tableAlias` to `f`'s answer, if any.
-pub fn rewrite_table_aliases<E>(
-    tree: &Json,
-    f: &mut impl FnMut(ColumnNode<'_>) -> Result<Option<String>, E>,
-) -> Result<Json, E> {
+/// Copies `tree`, setting each `column` node's `tableAlias` to `f`'s answer.
+pub fn rewrite_table_aliases(tree: &Json, f: &mut impl FnMut(ColumnNode<'_>) -> String) -> Json {
     match tree {
         Json::Object(map) => {
-            let mut out = map
+            let mut out: Map<_, _> = map
                 .iter()
-                .map(|(key, value)| Ok((key.clone(), rewrite_table_aliases(value, f)?)))
-                .collect::<Result<Map<_, _>, E>>()?;
-            if let Some(alias) = ColumnNode::from_map(map)
-                .map(&mut *f)
-                .transpose()?
-                .flatten()
-            {
-                out.insert(TABLE_ALIAS.to_string(), Json::String(alias));
+                .map(|(key, value)| (key.clone(), rewrite_table_aliases(value, f)))
+                .collect();
+            if let Some(column) = ColumnNode::from_map(map) {
+                out.insert(TABLE_ALIAS.to_string(), Json::String(f(column)));
             }
-            Ok(Json::Object(out))
+            Json::Object(out)
         }
-        Json::Array(items) => items
-            .iter()
-            .map(|item| rewrite_table_aliases(item, f))
-            .collect::<Result<_, E>>()
-            .map(Json::Array),
-        other => Ok(other.clone()),
+        Json::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|item| rewrite_table_aliases(item, f))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

@@ -1,66 +1,14 @@
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
-use std::fmt;
 
 use super::planning::{DetectedJoin, JoinLeaf};
+use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::relation_alias;
+use exasol_udf_sdk::error::UdfError;
 use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ColumnLeg {
-    Leg(usize),
-    /// No `tableName`, or one no leg declares. Left unqualified, which the N = 1 wrapper's
-    /// name collapse relies on.
-    NoLeg,
-    /// `tableName` names several legs and `tableAlias` matches none; picking one arbitrarily
-    /// would return wrong rows.
-    Unattributable,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct LegReferences {
-    pub legs: BTreeSet<usize>,
-    /// Untagged, naming an undeclared table, or unattributable: all mean no single leg can
-    /// claim the tree.
-    pub has_unattributed: bool,
-    /// Distinguishes a column-free expression from one whose columns could not be attributed.
-    pub any_column: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct UnattributableColumn {
-    table_name: String,
-    table_alias: Option<String>,
-    column_name: String,
-}
-
-impl UnattributableColumn {
-    fn of(column: ColumnNode<'_>) -> Self {
-        Self {
-            table_name: column.table_name.unwrap_or_default().to_string(),
-            table_alias: column.table_alias.map(str::to_string),
-            column_name: column.name.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for UnattributableColumn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let column = &self.column_name;
-        match &self.table_alias {
-            Some(alias) => write!(
-                f,
-                "column {column} of table {} with alias {alias}",
-                self.table_name
-            ),
-            None => write!(
-                f,
-                "column {column} of table {} with no alias",
-                self.table_name
-            ),
-        }
-    }
-}
+/// The invariant every leg lookup after [`JoinLegs::ensure_columns_declared`] relies on.
+const BOUND: &str = "ensure_columns_declared binds every column of the request to one leg";
 
 #[derive(Debug, Clone)]
 struct LegKey {
@@ -81,7 +29,6 @@ struct LegKey {
 #[derive(Debug, Clone)]
 pub(super) struct JoinLegs {
     keys: Vec<LegKey>,
-    leg_count: usize,
 }
 
 impl JoinLegs {
@@ -97,129 +44,135 @@ impl JoinLegs {
                 leg,
             })
             .collect();
-        Self {
-            keys,
-            leg_count: leaves.len(),
-        }
+        Self { keys }
     }
 
-    /// Every `involvedTables[].name` maps to leg 0, so [`ColumnLeg::Unattributable`] cannot
-    /// arise. No `involvedTables` yields no keys, qualifying nothing.
+    /// The request's one table is leg 0: Exasol sends a request with no join for one table.
     pub(super) fn for_single_scan(request: &Json) -> Self {
         let keys = request
-            .get("involvedTables")
-            .and_then(|tables| tables.as_array())
-            .map(|tables| {
-                tables
-                    .iter()
-                    .filter_map(|table| table.get("name").and_then(|name| name.as_str()))
-                    .map(|name| LegKey {
-                        table_name: name.to_string(),
-                        table_alias: None,
-                        leg: 0,
-                    })
-                    .collect()
+            .pointer("/involvedTables/0/name")
+            .and_then(Json::as_str)
+            .map(|name| LegKey {
+                table_name: name.to_string(),
+                table_alias: None,
+                leg: 0,
             })
-            .unwrap_or_default();
-        Self { keys, leg_count: 1 }
-    }
-
-    pub(super) fn leg_count(&self) -> usize {
-        self.leg_count
+            .into_iter()
+            .collect();
+        Self { keys }
     }
 
     pub(super) fn leg_alias(&self, leg: usize) -> String {
         relation_alias(leg)
     }
 
-    /// The sole answer to leg identity; no other module reads `tableName` for it.
-    pub(super) fn resolve_column(&self, column: ColumnNode<'_>) -> ColumnLeg {
-        let Some(table_name) = column.table_name else {
-            return ColumnLeg::NoLeg;
-        };
+    /// The leg of a column of the request. Panics on a column that [`Self::ensure_columns_declared`]
+    /// would have rejected.
+    pub(super) fn leg(&self, column: ColumnNode<'_>) -> usize {
+        self.leg_of(column).expect(BOUND)
+    }
+
+    /// The sole answer to leg identity; no other module reads `tableName` for it. `None` only for
+    /// a request Exasol does not send: a column with no `tableName`, a `tableName` the query does
+    /// not read, or a self-join `tableAlias` that names no occurrence.
+    fn leg_of(&self, column: ColumnNode<'_>) -> Option<usize> {
+        let table_name = column.table_name?;
         let matching: Vec<&LegKey> = self
             .keys
             .iter()
             .filter(|key| key.table_name.eq_ignore_ascii_case(table_name))
             .collect();
-        let Some(first) = matching.first() else {
-            return ColumnLeg::NoLeg;
-        };
+        let first = matching.first()?;
         if matching.iter().all(|key| key.leg == first.leg) {
-            return ColumnLeg::Leg(first.leg);
+            return Some(first.leg);
         }
-        match matching
+        matching
             .iter()
             .find(|key| key.table_alias.as_deref() == column.table_alias)
-        {
-            Some(key) => ColumnLeg::Leg(key.leg),
-            None => ColumnLeg::Unattributable,
-        }
+            .map(|key| key.leg)
     }
 
-    fn legs_referenced(&self, expr: &Json) -> LegReferences {
-        let mut referenced = LegReferences::default();
+    fn legs_referenced(&self, expr: &Json) -> BTreeSet<usize> {
+        let mut legs = BTreeSet::new();
         walk_column_nodes(expr, &mut |column| {
-            referenced.any_column = true;
-            match self.resolve_column(column) {
-                ColumnLeg::Leg(leg) => {
-                    referenced.legs.insert(leg);
-                }
-                ColumnLeg::NoLeg | ColumnLeg::Unattributable => {
-                    referenced.has_unattributed = true;
-                }
-            }
+            legs.insert(self.leg(column));
         });
-        referenced
+        legs
     }
 
     /// The highest referenced leg index: the earliest join point of a left-to-right chain with
-    /// every referenced leg in scope. `None` when the tree has no column or an unattributed one,
-    /// so the caller must apply it where every leg is in scope.
-    pub(super) fn attachment_leg(&self, expr: &Json) -> Option<usize> {
-        let referenced = self.legs_referenced(expr);
-        if !referenced.any_column || referenced.has_unattributed {
-            return None;
+    /// every referenced leg in scope. Exasol pushes only a join whose condition references both
+    /// of its sides, so a condition always references a leg after the first.
+    pub(super) fn attachment_leg(&self, condition: &Json) -> usize {
+        match self.legs_referenced(condition).last() {
+            Some(&leg) if leg >= 1 => leg,
+            _ => panic!("Exasol pushes only a join condition that references both of its sides"),
         }
-        referenced.legs.into_iter().next_back()
     }
 
-    /// `None` when the conjunct has no column, an unattributed column, or spans several legs;
-    /// the caller then applies it where every leg is in scope. Pruning a single-leg conjunct
-    /// early is sound for an inner join: a row failing it can never survive the join.
+    /// `None` when the conjunct has no column or spans several legs; the caller then applies it
+    /// where every leg is in scope. Pruning a single-leg conjunct early is sound for an inner
+    /// join: a row failing it can never survive the join.
     pub(super) fn conjunct_leg(&self, conjunct: &Json) -> Option<usize> {
-        let referenced = self.legs_referenced(conjunct);
-        if referenced.has_unattributed || !referenced.any_column || referenced.legs.len() != 1 {
-            return None;
+        match *Vec::from_iter(self.legs_referenced(conjunct)) {
+            [leg] => Some(leg),
+            _ => None,
         }
-        referenced.legs.into_iter().next()
-    }
-
-    /// [`Self::qualify`] for a path that has no unqualified rendering to fall back on: a
-    /// [`ColumnLeg::NoLeg`] column fails like an [`ColumnLeg::Unattributable`] one, since
-    /// binding it to either leg could return the other leg's values. Like [`Self::qualify`], it
-    /// takes a raw request tree, never its own output.
-    pub(super) fn qualify_every_column(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
-        self.qualify_tree(expr, true)
     }
 
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
-    /// name is ambiguous once a table occurs on several legs. [`ColumnLeg::NoLeg`] columns are
-    /// left untouched. Apply it once, to a raw request tree: an `LHS_T{leg}` alias matches no
-    /// leaf alias, so re-qualifying a self-join's output fails as unattributable, or binds the
-    /// other leg when the query names its occurrences `LHS_T*`.
-    pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
-        self.qualify_tree(expr, false)
+    /// name is ambiguous once a table occurs on several legs. Apply it once, to a raw request
+    /// tree: an `LHS_T{leg}` alias matches no leaf alias, so a self-join's output does not
+    /// qualify again.
+    pub(super) fn qualify(&self, expr: &Json) -> Json {
+        rewrite_table_aliases(expr, &mut |column| self.leg_alias(self.leg(column)))
     }
 
-    /// `strict` turns a [`ColumnLeg::NoLeg`] column into an error instead of leaving it as is.
-    fn qualify_tree(&self, expr: &Json, strict: bool) -> Result<Json, UnattributableColumn> {
-        rewrite_table_aliases(expr, &mut |column| match self.resolve_column(column) {
-            ColumnLeg::Leg(leg) => Ok(Some(self.leg_alias(leg))),
-            ColumnLeg::NoLeg if !strict => Ok(None),
-            ColumnLeg::NoLeg | ColumnLeg::Unattributable => Err(UnattributableColumn::of(column)),
-        })
+    /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`
+    /// declares it (#615). It runs before any render, so every later leg and type lookup of a
+    /// request column binds.
+    pub(super) fn ensure_columns_declared(
+        &self,
+        pushdown: &Json,
+        declared: &[&InvolvedColumns<'_>],
+    ) -> Result<(), UdfError> {
+        let mut failure = None;
+        walk_column_nodes(pushdown, &mut |column| {
+            if failure.is_some() {
+                return;
+            }
+            let name = column.upper_name();
+            failure = match self.leg_of(column) {
+                None => Some(unbound_column_error(column)),
+                Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
+                    Some(undeclared_column_error(&name))
+                }
+                Some(_) => None,
+            };
+        });
+        failure.map_or(Ok(()), Err)
     }
+}
+
+/// Binding the column to some table anyway could return another table's values.
+fn unbound_column_error(column: ColumnNode<'_>) -> UdfError {
+    let table = column.table_name.unwrap_or_default();
+    let alias = column
+        .table_alias
+        .map_or_else(|| "no alias".to_string(), |alias| format!("alias {alias}"));
+    UdfError::User(format!(
+        "the pushdown request names column {} of table {table} with {alias}, which binds no \
+         single table of the query",
+        column.upper_name()
+    ))
+}
+
+/// Exasol declares every column a query reads in `involvedTables`, so this is an adapter bug or
+/// a request shape it does not know.
+fn undeclared_column_error(name: &str) -> UdfError {
+    UdfError::User(format!(
+        "the pushdown request names column {name}, which its involved table does not declare"
+    ))
 }
 
 /// Leg binding is derived here, in the module owning leg identity, so it has one owner.

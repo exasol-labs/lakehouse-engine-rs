@@ -22,7 +22,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *AND* a `HASHTYPE(8 BIT)` target, which Exasol sends as `bytesize` 1, SHALL render as `HASHTYPE(1 BYTE)`
 * *AND* the DataFusion dialect SHALL render a CAST of a BOOLEAN value, a column included, to a `CHAR` or `VARCHAR` target as `(CASE <expr> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)`, to match Exasol
 * *AND* a query whose WHERE predicate carries a CAST to `INTERVAL`, `GEOMETRY`, or `HASHTYPE`, for example `WHERE CAST(c AS GEOMETRY) IS NULL` or `WHERE CAST(ts - ts AS INTERVAL DAY(2) TO SECOND(3)) IS NOT NULL`, SHALL return the same rows, or fail with the same error, as native Exasol, because the adapter applies that CAST in its Exasol-dialect wrapper over the sharded scan; a select-list item of these types routes per `pushdown-capabilities/pushdown-planning-capability-extensions`
-* *AND* a CAST whose `dataType` is incomplete, outside Exasol's limits, or names an unknown type SHALL fail the query in both dialects (`pushdown/pushdown-planning`)
+* *AND* the DataFusion dialect SHALL refuse a CAST whose `dataType` is incomplete, outside Exasol's limits, or names an unknown type (`pushdown/pushdown-planning`)
 * *AND* a CAST to or from text SHALL reach the DataFusion dialect only when `pushdown-types/pushdown-planning-scan-text-conversion` lets the scan compute it
 
 ### Scenario: CAST to TIMESTAMP renders the declared fractional-seconds precision per SQL dialect

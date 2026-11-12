@@ -104,8 +104,8 @@ pub(super) fn fold_single_group_plans(
     (plans, plan_types)
 }
 
-/// `None` when any item has no merge expression (a `COUNT(DISTINCT)` or an
-/// unrenderable scalar); the caller must then use the qualified wrapper, since a
+/// `None` when any item has no merge expression (a `COUNT(DISTINCT)`, or a scalar over an
+/// aggregate the merge does not carry); the caller must then use the qualified wrapper, since a
 /// narrower select list fails Exasol's positional validation.
 pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
