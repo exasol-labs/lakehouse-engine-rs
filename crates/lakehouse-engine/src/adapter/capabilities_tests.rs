@@ -112,7 +112,6 @@ fn reports_audited_capability_set() {
     }
 
     for name in &[
-        "FN_DIV",
         "FN_TO_CHAR",
         "FN_TO_NUMBER",
         "FN_PRED_REGEXP_LIKE",
@@ -179,7 +178,7 @@ fn reports_audited_capability_set() {
         );
     }
 
-    for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
+    for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV", "FN_DIV"] {
         assert!(
             cap_strs.contains(name),
             "{name} must be advertised: {cap_strs:?}"
