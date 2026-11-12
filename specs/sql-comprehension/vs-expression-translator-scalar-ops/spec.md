@@ -4,23 +4,19 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-* The public DataFusion entry points are `render_scan_expression` and `render_scan_filter`, which take the column types and decline what the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`). Both return `Err` for an unsupported node and never panic, and `render_scan_filter` renders a `NULL` result as `FALSE`. The Exasol entry points never fail on a node Exasol sends (`sql-comprehension/vs-expression-translator`).
-* `+`, `-`, `*`, and unary `-` use the same syntax in both parsers. `/` (`FLOAT_DIV`) renders differently per dialect.
-* A conversion or operator node is translated only when its DataFusion result matches Exasol. `DIV`, `TO_CHAR`, `TO_NUMBER`, and the bitwise functions fail that test and fall back to Exasol.
+* Exasol sends `+`, `-`, `*`, `/`, and unary `-` as the `function_scalar` nodes `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, and `NEG`, and its integer division function as `DIV`.
+* The scan computes a pushed expression as DataFusion SQL, and a wrapper computes it as Exasol SQL.
+* An expression the scan does not compute takes the path's fallback, which computes it in Exasol (`pushdown-types/pushdown-planning-scan-text-conversion`).
 * The crate is a pure, stateless translator. It reads column types only through the lookup its caller passes.
 
 ## Scenarios
 
 ### Scenario: Arithmetic operators translate to binary SQL expressions
 
-* *GIVEN* a VS expression node of type `function_scalar` whose `name` is the Exasol scalar-function name for addition, subtraction, or multiplication, or for unary negation
-* *AND* the exact `name` strings Exasol emits for these operators have been verified against live `EXPLAIN VIRTUAL` output for an arithmetic pushdown (so the translator matches what Exasol actually sends, e.g. `MULT` for `*`, not an assumed `MUL`)
-* *WHEN* `render_expression` or `render_expression_exasol` processes the node
-* *THEN* the `ADD`, `SUB`, and `MULT` nodes SHALL return `(<left> <op> <right>)` where the operators are `+`, `-`, `*` respectively, for operands that are themselves any renderable expression (including two bare column references, e.g. `(L_EXTENDEDPRICE * L_DISCOUNT)`), byte-identically in BOTH dialects, the operator syntax is shared by both parsers, and these wire names are NOT Exasol function names (Exasol has no function called `ADD`), so the Exasol dialect's verbatim rule for named functions MUST NOT be applied to them
-* *AND* unary negation SHALL return `(-<operand>)` and SHALL compose inside an aggregate argument (e.g. `SUM(-<operand>)`) so it flows through the arithmetic-aggregate decomposition path
-* *AND* floating-point division (`FLOAT_DIV`) SHALL NOT be rendered by this shape, it is the one arithmetic operator whose rendering diverges by dialect, specified in `sql-comprehension/vs-expression-translator-float-div`; this scenario's "byte-identically in BOTH dialects" claim covers `ADD`, `SUB`, `MULT`, and `NEG` only
-* *AND* the set of arithmetic `name` strings the translator matches SHALL correspond exactly to the arithmetic operator capabilities the adapter advertises (`pushdown-capabilities/pushdown-planning-capability-extensions`), `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, and `FN_NEG`, so no advertised operator is left unrenderable and no rendered operator is left unadvertised
-* *AND* Exasol integer division (`DIV`) SHALL NOT be matched here and `FN_DIV` SHALL NOT be advertised
+* *GIVEN* a pushed `ADD`, `SUB`, `MULT`, or `NEG` node over operands the adapter renders, such as `L_EXTENDEDPRICE * L_DISCOUNT`
+* *WHEN* the adapter renders it for the scan or for an Exasol wrapper
+* *THEN* it SHALL render `(<left> + <right>)`, `(<left> - <right>)`, `(<left> * <right>)`, or `(-<operand>)`, with the same text for the scan and for the wrapper
+* *AND* unary negation SHALL compose inside an aggregate argument, such as `SUM(-<operand>)`
 
 ### Scenario: Unsupported node type returns an error
 
@@ -43,15 +39,6 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *THEN* it SHALL return `Ok("FALSE")`, because a WHERE condition that is NULL keeps no row. Exasol folds a condition such as `NULL LIKE '%b%'` or `'' LIKE '%b%'` (an empty string is NULL in Exasol) to a bare `literal_null` filter, and omitting it would return every row
 * *AND* `conjoin_scan_filters` SHALL apply the same rule, and an Exasol-dialect wrapper SHALL render a `NULL` filter as a `NULL` condition, which also keeps no row, so the single-table, grouped-aggregate, and join paths all return the zero rows native Exasol returns
 
-### Scenario: Integer division DIV is deliberately not translated
-
-* *GIVEN* a VS expression node of type `function_scalar` named `DIV`, Exasol integer-quotient division, which truncates toward zero (`DIV(-7,2) = -3`, verified live) and raises a division-by-zero error
-* *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL return an error naming `DIV` as unsupported
-* *AND* `render_scan_expression` SHALL return an error for the same node without panicking
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate `DIV`, because DataFusion has no `div` builtin and, unlike `FLOAT_DIV`, no single rendering reproduces it: `DIV` needs TRUNCATION, which DataFusion's `/` delivers for integer operands and not for any other kind. The renderer picks one rendering per function and does not consult the typed scan pass, so it does not render only the integer-operand case that pass identifies
-* *AND* this decline SHALL NOT be read as resting on the division-by-zero divergence that `FLOAT_DIV` accepts (see `sql-comprehension/vs-expression-translator-float-div`): for `x/0` the query fails either way, and for `0/0` the divergence belongs to the tracked NaN-at-emit gap rather than to the rendering. `DIV`'s disqualifying defect is that a wrong rendering would be wrong on EVERY row for non-integer operands, not only when a divisor is zero, that is the difference between the two operators, and a future `TRUNC(m/n)` emulation would have to answer the per-row problem, not the zero-divisor one
-
 ### Scenario: Conversion format functions TO_CHAR and TO_NUMBER are deliberately not translated
 
 * *GIVEN* a VS expression node of type `function_scalar` named `TO_CHAR` or `TO_NUMBER`
@@ -67,3 +54,27 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *THEN* the translator SHALL return an error naming the function as unsupported, and `render_scan_expression` SHALL return an error for the same node without panicking
 * *AND* for `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_LSHIFT`, and `BIT_RSHIFT`, which map to DataFusion's `&`, `|`, `#`, `<<`, and `>>` operators, the translator MUST NOT render them and the adapter SHALL let Exasol evaluate the function, because Exasol defines them over unsigned 64-bit integers (`0`–`18446744073709551615`, result `DECIMAL(20,0)`) while DataFusion's operators act on the operand's signed Arrow integer type (Iceberg carries only signed `int`/`long`, no unsigned primitive), a bit-63-set result reads as a large positive value in Exasol but negative under signed `Int64`, `BIT_RSHIFT`'s signed `>>` is arithmetic (sign-extending) versus Exasol's logical (zero-fill), and the translator cannot restrict rendering to the safe non-negative, bit-63-clear operand subset because operand values are unknown at plan time
 * *AND* for `BIT_NOT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, and `BIT_TO_NUM` the translator MUST NOT render them because DataFusion provides no matching operator or scalar function: its SQL planner (`parse_sql_unary_op`) supports only logical `NOT`, unary `+`, and unary `-`, rejecting unary `~` with `not_impl_err`, and `datafusion-functions` registers no bit-rotate, bit-test, bit-set, or bits-to-number scalar function (its only `bit`-named function is the string `bit_length`, out of scope here)
+
+### Scenario: Integer division over integer operands runs in the scan
+
+* *GIVEN* a pushed `DIV(<left>, <right>)` whose operands are each an integer (`DECIMAL(p,0)`) or NULL, such as `DIV(qty - 7, 2)` over an integer column `qty`
+* *WHEN* the adapter plans the request
+* *THEN* the scan SHALL compute the `DIV` in a select item, filter, or GROUP BY key, and its pushdown SQL SHALL call `vs_checked_int_div(<left>, <right>)`, unless another part of the enclosing expression sends it to the fallback
+* *AND* the quotient SHALL equal native Exasol's, which truncates toward zero: `DIV(-7, 2)` and `DIV(7, -2)` are `-3`, and `DIV(-7, -2)` is `3`
+* *AND* the result SHALL have native Exasol's type, `DECIMAL(p,0)` with the numerator's precision p
+* *AND* a NULL operand SHALL yield NULL, also over a zero divisor
+
+### Scenario: Integer division over a decimal or DOUBLE operand runs in Exasol
+
+* *GIVEN* a pushed `DIV(<left>, <right>)` with an operand that is not an integer, such as a DOUBLE or a DECIMAL with a scale above 0, for example `DIV(price, 2)` over a `DECIMAL(9,2)` column `price`
+* *WHEN* the adapter plans the request
+* *THEN* the scan SHALL NOT compute it, and the path's fallback SHALL compute it in Exasol SQL as `DIV(<left>, <right>)`
+* *AND* the result SHALL equal native Exasol's in value and type
+
+### Scenario: A pushed-down integer division by zero fails the query
+
+* *GIVEN* a `DIV` over integer operands that the scan computes, in the select list or in a WHERE filter
+* *AND* a scanned row whose divisor is zero and whose numerator is not NULL, zero included
+* *WHEN* the scan evaluates that row
+* *THEN* the query SHALL fail with a message that names a division by zero, as native Exasol fails with `data exception - division by zero`
+* *AND* the message SHALL NOT carry the storage-read framing `scan failed: assigned data could not be read`

@@ -36,6 +36,7 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_SUB",
     "FN_MULT",
     "FN_FLOAT_DIV",
+    "FN_DIV",
     "FN_NEG",
     // A CAST to INTERVAL/GEOMETRY/HASHTYPE/TIMESTAMP WITH LOCAL TIME ZONE declines in the
     // DataFusion dialect, so the Exasol-dialect wrapper applies it over the scan output.
