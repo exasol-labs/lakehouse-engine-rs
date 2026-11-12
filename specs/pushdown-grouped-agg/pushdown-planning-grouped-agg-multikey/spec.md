@@ -5,7 +5,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 ## Background
 
 * `pushdown-grouped-agg/pushdown-planning-grouped-agg` covers the detection, wrapper ordering, shard fan-out, LIMIT exclusion, and NULL grouping shared by every key count. The detection and scan-driving SQL builder accept a group-key list of any length and emit `GK_0..GK_{n-1}`.
-* `vs_expression::render_expression` (raising mode) renders each key. A tuple can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning for the whole request and never pushes a subset of the keys.
+* `vs_expression::render_expression` renders each key. A tuple can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning for the whole request and never pushes a subset of the keys.
 * Evidence that a multi-key GROUP BY was pushed down is the scan spec's `group_keys` field and the outer wrapper's `PARTIAL_*` merge columns. `GROUP BY shard_key` is absent when a filter prunes the file list to a single shard.
 * Exasol sends expression keys as pushed group keys: scalar functions such as `MOD`, `UPPER`, and `YEAR`, arithmetic such as `qty * 2`, and `CAST`.
 * Each `GK_{i}` column's declared type comes from the `selectListDataTypes` entry at that key's own `selectList` index, matched by index and not by comparing rendered SQL. A `DECIMAL` key and a `VARCHAR` key each declare their own `GK_{i}` type.
@@ -26,7 +26,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 
 * *GIVEN* a grouped aggregate `pushdown` request whose `groupBy` array contains two or more elements where each element is itself a scalar expression (e.g. `GROUP BY MOD(id,4), UPPER(name)`, or `GROUP BY YEAR(ts), LOWER(region)`), not merely a single expression key, the scalar functions being ones Exasol advertises and therefore actually sends as pushed group keys (arithmetic `/`/`*` and `CAST` are rendered by the translator but not advertised, so Exasol does not send them as group keys; that advertisement is future scope)
 * *WHEN* the adapter builds the grouped scan spec
-* *THEN* the adapter SHALL render EACH group-key expression element independently via the VS expression translator (raising mode) and carry the rendered fragments in `group_keys` in `groupBy` order
+* *THEN* the adapter SHALL render EACH group-key expression element independently via the VS expression translator and carry the rendered fragments in `group_keys` in `groupBy` order
 * *AND* the scan UDF SHALL use those same rendered expressions verbatim in its per-shard DataFusion GROUP BY clause, one per `GK_{i}` column
 * *AND* if ANY single element of the tuple is not translatable, the adapter SHALL fall back to row scanning for the whole request (never pushing down a partial subset of the group keys)
 

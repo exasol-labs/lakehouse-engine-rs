@@ -158,20 +158,6 @@ fn only_string_positions_convert_to_text() {
 }
 
 #[test]
-fn a_column_the_lookup_does_not_declare_declines_any_expression() {
-    for expr in [
-        like(col("UNKNOWN"), "1%"),
-        scalar_fn("UPPER", [col("UNKNOWN")]),
-        predicate_equal(col("UNKNOWN"), str_lit("1")),
-        cast_to(ExasolType::WIDEST_VARCHAR, col("UNKNOWN")),
-        predicate_equal(col("UNKNOWN"), num_lit(1)),
-        col("UNKNOWN"),
-    ] {
-        assert!(render(&expr).is_err(), "{expr} must decline");
-    }
-}
-
-#[test]
 fn integer_and_text_sources_keep_their_pushdown() {
     assert_eq!(
         render(&cast_to(ExasolType::WIDEST_VARCHAR, col("I"))).unwrap(),

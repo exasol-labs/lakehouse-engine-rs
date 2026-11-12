@@ -11,7 +11,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use vs_expression::exasol_type::ExasolType;
 use vs_expression::test_support::{
-    TypedColumns, cast_to, col, compare, num_lit, scalar_fn, str_lit, typed_columns,
+    TypedColumns, cast_to, col, compare, num_lit, scalar_fn, str_lit,
 };
 
 /// Field names are uppercase because `render_expression` uppercases and
@@ -31,14 +31,6 @@ fn context_with_acctbal() -> SessionContext {
     let ctx = SessionContext::new();
     ctx.register_table("scan_target", Arc::new(table)).unwrap();
     ctx
-}
-
-/// The scan table's columns as the request declares them.
-fn scan_target_columns() -> TypedColumns {
-    typed_columns(&[
-        ("C_CUSTKEY", ExasolType::WIDEST_VARCHAR),
-        ("C_ACCTBAL", ExasolType::DoublePrecision),
-    ])
 }
 
 fn acctbal_greater_than_zero() -> serde_json::Value {
@@ -68,7 +60,7 @@ async fn collect_strings(ctx: &SessionContext, sql: &str, col: &str) -> Vec<Opti
 async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
     let ctx = context_with_acctbal();
     let expr = cast_to(ExasolType::varchar(10), acctbal_greater_than_zero());
-    let fragment = vs_expression::render_scan_expression(&expr, &scan_target_columns())
+    let fragment = vs_expression::render_scan_expression(&expr, &TypedColumns::default())
         .expect("CAST must translate")
         .sql;
 
@@ -85,7 +77,7 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
 async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(&concat_expr, &scan_target_columns())
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
         .expect("CONCAT must translate")
         .sql;
 
@@ -102,7 +94,7 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
 async fn concat_group_by_key_uses_exasol_uppercase_labels() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(&concat_expr, &scan_target_columns())
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
         .expect("CONCAT must translate")
         .sql;
 

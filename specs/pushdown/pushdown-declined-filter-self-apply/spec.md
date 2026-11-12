@@ -7,9 +7,8 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
 * Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers two outcomes: no filter and a declined filter. Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
 * A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
-* `render_scan_filter` returns `Err` only for a declined filter.
 * Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
-* The adapter self-applies a declined predicate through the non-suppressing Exasol render, which renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so a declined predicate is never applied nowhere.
+* The adapter self-applies a declined predicate through the Exasol-dialect render. That render renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so every declined predicate is applied.
 * `handle_pushdown` computes the decline classification once per path and passes it down.
 * The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
 * On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row.

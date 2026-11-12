@@ -224,17 +224,14 @@ fn broadcast_absent_filter_stays_eligible() {
 #[test]
 fn a_lone_true_residual_renders_as_the_outer_where() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            {
-                "type": "predicate_less",
-                "left": num_lit(1),
-                "right": table_col("CUSTOMER", "C_CUSTKEY"),
-            },
-            bool_lit(true),
-        ],
-    });
+    request["pushdownRequest"]["filter"] = and([
+        compare(
+            "predicate_less",
+            num_lit(1),
+            table_col("CUSTOMER", "C_CUSTKEY"),
+        ),
+        bool_lit(true),
+    ]);
 
     let sql = n_scan_sql(&request).expect("a lone TRUE residual must render, not error");
 
@@ -734,7 +731,6 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
     );
 }
 
-/// Scenario: A join outside the broadcast contract is declined safely
 #[test]
 fn above_threshold_join_falls_back_inner_join_on() {
     let request = join_request(Json::Null, equi_condition());
@@ -2215,12 +2211,11 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 /// The wrapper's trailing clauses for `request`, whose every leg is an `EVENTS` occurrence.
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
     let events = column_types(&events_columns());
-    let leg_count = match detect_join(request, &pd(request)) {
-        Ok(JoinShape::Join(join)) => join.tables.len(),
-        _ => 1,
+    let (legs, leg_count) = match detect_join(request, &pd(request)).expect("a plannable request") {
+        JoinShape::Join(join) => (join.legs(), join.tables.len()),
+        JoinShape::NotAJoin => (JoinLegs::for_single_scan(request), 1),
     };
-    let (pushdown_req, legs) = planned(request);
-    outer_wrapper_clauses(&pushdown_req, &legs, &vec![&events; leg_count])
+    outer_wrapper_clauses(&parsed_pushdown(request), &legs, &vec![&events; leg_count])
         .map(|clauses| clauses.trailing)
 }
 
@@ -2239,16 +2234,11 @@ fn events() -> PushdownRequestBuilder {
 
 /// [`events`] joined to itself as occurrences `A` and `B` on `ID`.
 fn events_self_join() -> PushdownRequestBuilder {
-    let occurrence = |alias: &str| {
-        let mut leaf = table_ref("EVENTS");
-        leaf["alias"] = Json::String(alias.to_string());
-        leaf
-    };
     events().field(
         "from",
         inner_join(
-            occurrence("A"),
-            occurrence("B"),
+            table_ref_as("EVENTS", Some("A")),
+            table_ref_as("EVENTS", Some("B")),
             predicate_equal(
                 aliased_col("EVENTS", "A", "ID"),
                 aliased_col("EVENTS", "B", "ID"),

@@ -106,7 +106,7 @@ fn ensure_no_side_refuses_a_referenced_column(
 /// table joined to itself. Everything else takes the sole fallback,
 /// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
 /// A column that binds no single leg, or that its leg does not declare, fails the request
-/// before any catalog call ([`attribution::JoinLegs::ensure_columns_declared`]).
+/// before any catalog call ([`ensure_columns_declared`]).
 ///
 /// No plan-time check compares the sides' storage backends: each side reads through its own
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
@@ -146,7 +146,12 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
         .collect::<Result<Vec<_>, _>>()?;
-    legs.ensure_columns_declared(pushdown_req, &involved.iter().collect::<Vec<_>>())?;
+    ensure_columns_declared(
+        request,
+        pushdown_req,
+        Some(join),
+        &involved.iter().collect::<Vec<_>>(),
+    )?;
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())

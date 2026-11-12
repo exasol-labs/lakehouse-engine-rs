@@ -3,6 +3,28 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::ProjectionItem;
 
+/// The empty-result SQL a single-table `request` returns over zero files, for the derived
+/// projection `proj` typed `proj_types`.
+fn empty_sql(
+    request: &Json,
+    proj: &[ProjectionItem],
+    proj_types: &[ExasolType],
+    widened: bool,
+) -> String {
+    let scan = scan_of(request);
+    empty_result_sql(
+        &parsed_pushdown(request),
+        &projected_columns(proj, proj_types),
+        widened,
+        scan,
+        &EmptyRelation::single_scan(request, scan.columns()),
+    )
+    .expect("the empty result must build")["sql"]
+        .as_str()
+        .expect("the empty result carries sql")
+        .to_string()
+}
+
 #[test]
 fn empty_file_list_returns_empty_select() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -76,18 +98,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         .count_star()
         .build()
         .0;
-    let (grouped, scan) = (parsed_pushdown(&request), scan_of(&request));
-    let grouped_sql = empty_result_sql(
-        &grouped,
-        &projected_columns(&proj, &proj_types),
-        false,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let grouped_sql = empty_sql(&request, &proj, &proj_types, false);
     assert!(
         grouped_sql.contains("WHERE 1=0"),
         "grouped shape is zero rows: {grouped_sql}"
@@ -105,18 +116,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
             )
             .build()
             .0;
-        let (single, scan) = (parsed_pushdown(&request), scan_of(&request));
-        let sql = empty_result_sql(
-            &single,
-            &projected_columns(&proj, &proj_types),
-            false,
-            scan,
-            &EmptyRelation::single_scan(&request, scan.columns()),
-        )
-        .unwrap()["sql"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let sql = empty_sql(&request, &proj, &proj_types, false);
         assert_eq!(
             sql,
             format!(
@@ -137,18 +137,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         .count_star()
         .build()
         .0;
-    let (pushdown, scan) = (parsed_pushdown(&request), scan_of(&request));
-    let sql = empty_result_sql(
-        &pushdown,
-        &projected_columns(&[], &[]),
-        false,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let sql = empty_sql(&request, &[], &[], false);
     assert_eq!(
         sql,
         "SELECT CAST('X' AS VARCHAR(2000000)), CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT \
@@ -177,19 +166,7 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     )
     .build()
     .0;
-    let (grouped_non_numeric, scan) = (parsed_pushdown(&request), scan_of(&request));
-
-    let row_sql = empty_result_sql(
-        &grouped_non_numeric,
-        &projected_columns(&proj, &proj_types),
-        false,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let row_sql = empty_sql(&request, &proj, &proj_types, false);
     assert_eq!(
         row_sql,
         "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS DECIMAL(36,2)) FROM DUAL WHERE 1=0",
@@ -211,7 +188,14 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
         ],
     )
     .group_by(vec![col("K")])
-    .field("having", serde_json::json!({"type": "predicate_greater"}))
+    .field(
+        "having",
+        compare(
+            "predicate_greater",
+            agg_item("SUM", Some("name"), false),
+            num_lit(1),
+        ),
+    )
     .column(col("K"))
     .item(
         agg_item("SUM", Some("name"), false),
@@ -219,19 +203,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     )
     .build()
     .0;
-    let (grouped_having, scan) = (parsed_pushdown(&request), scan_of(&request));
-
-    let row_sql = empty_result_sql(
-        &grouped_having,
-        &projected_columns(&proj, &proj_types),
-        false,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let row_sql = empty_sql(&request, &proj, &proj_types, false);
     assert_eq!(
         row_sql,
         "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS DECIMAL(36,2)) FROM DUAL WHERE 1=0",
@@ -266,34 +238,14 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into(), "SCORE".into()];
     let proj_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
 
-    let widened = empty_result_sql(
-        &pushdown_req,
-        &projected_columns(&proj, &proj_types),
-        true,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .expect("the widened empty row-scan result must build")["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let widened = empty_sql(&request, &proj, &proj_types, true);
     assert_eq!(
         widened, "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
         "a widened row-scan projection over zero files must produce ONE \
          selectListDataTypes-typed column, not the 3-column base row: {widened}"
     );
 
-    let not_widened = empty_result_sql(
-        &pushdown_req,
-        &projected_columns(&proj, &proj_types),
-        false,
-        scan,
-        &EmptyRelation::single_scan(&request, scan.columns()),
-    )
-    .expect("the non-widened empty row-scan result must build")["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let not_widened = empty_sql(&request, &proj, &proj_types, false);
     assert_eq!(
         not_widened,
         empty_pushdown_sql(&projected_columns(&proj, &proj_types))["sql"]

@@ -40,10 +40,10 @@ fn from_table_node_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// Exasol pushes a join only when its condition holds an equality; a further non-equi conjunct
-/// rides along in the same condition, as `ON c = o AND c < o` arrives.
+/// `ON c = o AND c < o` arrives as one `predicate_and` condition. Kept whole, its type is not
+/// `predicate_equal`, so `plan_join` takes the fallback instead of broadcast.
 #[test]
-fn a_condition_with_a_non_equi_conjunct_is_served_by_unified_fallback() {
+fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
     let condition = and([
         equi_condition(),
         compare(
@@ -53,12 +53,13 @@ fn a_condition_with_a_non_equi_conjunct_is_served_by_unified_fallback() {
         ),
     ]);
     let request = join_request(Json::Null, condition.clone());
-    match detect_join(&request, &pd(&request)).expect("served, not declined") {
+    match detect_join(&request, &pd(&request)).expect("a join with a non-equi conjunct is detected")
+    {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
             assert_eq!(join.conditions, vec![condition]);
         }
-        other => panic!("expected Join (unified fallback), got {other:?}"),
+        other => panic!("expected Join, got {other:?}"),
     }
 }
 

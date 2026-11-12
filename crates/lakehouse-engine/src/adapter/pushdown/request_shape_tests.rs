@@ -48,7 +48,14 @@ fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
 fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
     let (req, scan) = pushdown_request("T", &T_COLUMNS)
         .group_by(vec![col("REGION")])
-        .field("having", serde_json::json!({"type": "predicate_greater"}))
+        .field(
+            "having",
+            compare(
+                "predicate_greater",
+                agg_item("SUM", Some("NAME"), false),
+                num_lit(1),
+            ),
+        )
         .column(col("REGION"))
         .item(
             agg_item("SUM", Some("NAME"), false),

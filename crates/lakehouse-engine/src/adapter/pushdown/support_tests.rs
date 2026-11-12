@@ -400,7 +400,7 @@ fn pushdown_translates_or_omits_predicate() {
 
     // Kept out of the scan spec only; the adapter still self-applies it (see
     // `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`).
-    let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
+    let untranslatable = like(col("age"), "1%");
     let omitted = scan_filter_sql(&untranslatable, &ages);
     assert!(
         omitted.is_none(),
@@ -500,10 +500,7 @@ fn project_columns_fallback_is_duplicate_free() {
                 ("name", ExasolType::WIDEST_VARCHAR),
             ],
         )
-        .item(
-            scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]),
-            ExasolType::decimal(20, 0),
-        )
+        .item(like(col("id"), "1%"), ExasolType::Boolean)
         .item(count_star(), ExasolType::decimal(20, 0)),
     );
 
@@ -2835,8 +2832,8 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
 #[test]
 fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
     let universe = shared_name_universe();
-    let undeclared = serde_json::json!({"type": "column", "name": "Y", "tableAlias": "LHS_T0"});
-    let wrong_relation = serde_json::json!({"type": "column", "name": "X", "tableAlias": "LHS_T2"});
+    let undeclared = alias_col("LHS_T0", "Y");
+    let wrong_relation = alias_col("LHS_T2", "X");
 
     for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
         let error = ScanTranslator::over(&universe, &[&tree])

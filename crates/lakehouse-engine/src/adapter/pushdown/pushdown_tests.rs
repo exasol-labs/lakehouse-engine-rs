@@ -642,15 +642,17 @@ fn guard_dispatch_sql(
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
 ) -> String {
-    let result = guard_dispatch_result(
+    let result = dispatch_with(
         request,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         projection_widened,
+        &column_types(&guard_col_types()),
+        (None, None),
         limit,
         logical_schema,
+        &sample_scan_storage(),
     )
-    .expect("build_dispatch_sql must succeed for this declined-ORDER-BY fixture");
+    .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
         .as_str()
         .expect("pushdown response must carry a sql field")
@@ -721,26 +723,6 @@ fn dispatch_planned(
     )
 }
 
-fn guard_dispatch_result(
-    request: &Json,
-    proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<ExasolType>,
-    projection_widened: bool,
-    limit: Option<u64>,
-    logical_schema: Vec<LogicalField>,
-) -> Result<Json, UdfError> {
-    dispatch_with(
-        request,
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        &column_types(&guard_col_types()),
-        (None, None),
-        limit,
-        logical_schema,
-        &sample_scan_storage(),
-    )
-}
-
 /// A filter the scan declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
     like(table_col("EVENTS", "AMOUNT"), "1%")
@@ -749,22 +731,18 @@ fn declined_like_on_decimal() -> Json {
 /// The empty logical schema declines the bounded top-N unconditionally, so the
 /// decline route must win on its own.
 fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
-    let result =
-        dispatch_for_body(request).expect("build_dispatch_sql must succeed for this fixture");
-    result["sql"]
-        .as_str()
-        .expect("pushdown response must carry a sql field")
-        .to_string()
-}
-
-fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
     let (request, _) = request.build();
-    dispatch_planned(
+    let result = dispatch_planned(
         &request,
         &first_table_column_types(&request),
         Vec::new(),
         &sample_scan_storage(),
     )
+    .expect("build_dispatch_sql must succeed for this fixture");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
 }
 
 #[test]

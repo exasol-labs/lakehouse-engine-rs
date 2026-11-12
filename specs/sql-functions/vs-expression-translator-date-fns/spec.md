@@ -65,7 +65,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *GIVEN* a VS expression node of type `function_scalar` named `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, or `SYSTIMESTAMP`
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return an error naming the unsupported function
-* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and Exasol never sends these names to the Exasol dialect, because the adapter does not advertise them
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking
 * *AND* the four names MUST NOT appear in the crate's declaration of translated `function_scalar` names, so the gate declines them before any per-name arm is reached and no per-name arm for them remains reachable
 * *AND* `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, and `FN_SYSTIMESTAMP` MUST NOT be advertised, so Exasol never pushes a now-family node and evaluates its own clock instead (see `pushdown-capabilities/pushdown-planning-capability-extensions`)
 * *AND* the reason SHALL be the scan's missing clock context, not a rendering defect: the scan UDF receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE`, holds no statement anchor, and reads its container clock in UTC once per shard, so no rendering of these four names on the scan path can match Exasol

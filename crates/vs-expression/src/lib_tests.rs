@@ -596,11 +596,7 @@ fn cast_to_unsupported_target_declines() {
         let expr = cast(data_type.clone());
         assert!(
             render_expression(&expr).is_err(),
-            "CAST to {data_type} must raise in the DataFusion dialect's raising mode"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "CAST to {data_type} must be None in the DataFusion dialect's safe mode"
+            "CAST to {data_type} must raise in the DataFusion dialect"
         );
         assert_eq!(
             render_expression_exasol(&expr),
@@ -954,6 +950,31 @@ fn renders_concat_single_argument() {
 }
 
 #[test]
+fn concat_without_a_renderable_argument_errors_in_the_datafusion_dialect() {
+    let cases = [
+        (
+            json!({"type": "function_scalar", "name": "CONCAT"}),
+            "function_scalar CONCAT missing 'arguments'",
+        ),
+        (
+            scalar_fn("CONCAT", []),
+            "function_scalar CONCAT requires at least 1 argument, got 0",
+        ),
+        (
+            scalar_fn("CONCAT", [col("a"), Json::Null]),
+            "CONCAT argument rendered to null",
+        ),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(
+            render_expression(&expr).unwrap_err().to_string(),
+            expected,
+            "{expr}"
+        );
+    }
+}
+
+#[test]
 fn renders_case_when() {
     let expr = scalar_fn(
         "CASE",
@@ -1050,10 +1071,6 @@ fn renders_greatest_least_empty_argument_list_errors() {
             render_expression(&expr).is_err(),
             "{name} empty args must raise"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} empty args must be None in safe mode"
-        );
     }
 }
 
@@ -1069,10 +1086,6 @@ fn greatest_least_without_arguments_key_errors() {
         assert!(
             err.to_string().contains("missing 'arguments'"),
             "{name} error should mention missing 'arguments', got: {err}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} without arguments key must be None in safe mode"
         );
     }
 }
@@ -1294,19 +1307,11 @@ fn between_fns_reject_wrong_arity() {
             render_expression(&one_arg).is_err(),
             "{name} 1-arg must raise"
         );
-        assert!(
-            render_expression(&one_arg).is_err(),
-            "{name} 1-arg must be None in safe mode"
-        );
 
         let three_args = scalar_fn(name, [col("a"), col("b"), col("c")]);
         assert!(
             render_expression(&three_args).is_err(),
             "{name} 3-arg must raise"
-        );
-        assert!(
-            render_expression(&three_args).is_err(),
-            "{name} 3-arg must be None in safe mode"
         );
     }
 }
@@ -1332,10 +1337,6 @@ fn div_falls_through_as_unsupported() {
         err.to_string().contains("DIV"),
         "error must name DIV as unsupported: {err}"
     );
-    assert!(
-        render_expression(&expr).is_err(),
-        "DIV must be None in safe mode without panicking"
-    );
 }
 
 #[test]
@@ -1349,10 +1350,6 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
         assert!(
             err.to_string().contains(name),
             "error must name the unsupported function '{name}': {err}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in safe mode without panicking"
         );
     }
 }
@@ -1420,10 +1417,6 @@ fn bitwise_operator_functions_fall_through() {
         assert!(
             err_string.contains(name),
             "error must name the unsupported function '{name}': {err}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in safe mode without panicking"
         );
     }
 }

@@ -60,7 +60,7 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 
 ### Scenario: Hidden sort-key columns are appended at most once
 
-* *GIVEN* a declined-`ORDER BY` row-scan `pushdown` request whose `orderBy` names a column already present as a bare-column item of the derived projection, or or names the same column in more than one sort key
+* *GIVEN* a declined-`ORDER BY` row-scan `pushdown` request whose `orderBy` names a column already present as a bare-column item of the derived projection, or names the same column in more than one sort key
 * *WHEN* the adapter appends hidden sort-key columns and builds the wrapper
 * *THEN* a sort-key column already present as a bare-column item of the derived projection SHALL NOT be appended, and a column named by two or more sort keys SHALL be appended at most once, because a repeated EMITS identifier is a duplicate-column error
 * *AND* a column referenced by an EXPRESSION sort key SHALL obey the same at-most-once rule across every sort key and every pre-existing bare-column projection item, so two sort expressions over the same base column append it once

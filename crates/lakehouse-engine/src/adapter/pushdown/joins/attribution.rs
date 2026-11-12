@@ -128,7 +128,7 @@ impl JoinLegs {
     /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`
     /// declares it (#615). It runs before any render, so every later leg and type lookup of a
     /// request column binds.
-    pub(crate) fn ensure_columns_declared(
+    pub(super) fn ensure_columns_declared(
         &self,
         pushdown: &Json,
         declared: &[&InvolvedColumns<'_>],

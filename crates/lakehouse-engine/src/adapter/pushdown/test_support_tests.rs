@@ -440,6 +440,18 @@ pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
     )
 }
 
+/// The columns `request` declares for its involved table `name`, as `plan_join` reads each leg's.
+fn table_columns<'r>(
+    request: &'r Json,
+    name: &str,
+) -> Result<support::InvolvedColumns<'r>, UdfError> {
+    support::involved_columns(request, |tables| {
+        tables
+            .iter()
+            .find(|table| table["name"].as_str() == Some(name))
+    })
+}
+
 /// `sides` with each side's map built, as the resolver builds it, from the columns `request`
 /// declares for the side's table and the side's declared schema.
 pub(crate) fn request_typed(
@@ -449,12 +461,7 @@ pub(crate) fn request_typed(
     sides
         .iter()
         .map(|side| {
-            let involved = support::involved_columns(request, |tables| {
-                tables
-                    .iter()
-                    .find(|table| table["name"].as_str() == Some(side.table_name.as_str()))
-            })
-            .unwrap();
+            let involved = table_columns(request, &side.table_name).unwrap();
             joins::ResolvedJoinSide {
                 column_types: ColumnTypes::of(&involved, &side.logical_schema, false),
                 ..side.clone()
@@ -483,15 +490,8 @@ pub(crate) fn request_sides(
             partition_columns: Vec::new(),
             total_bytes: 0,
             refused_columns: Vec::new(),
-            column_types: column_types(
-                &support::involved_columns(request, |tables| {
-                    tables
-                        .iter()
-                        .find(|table| table["name"].as_str() == Some(leaf.table_name.as_str()))
-                })
-                .unwrap()
-                .types,
-            ),
+            // Typed by `request_typed` below.
+            column_types: column_types(NO_COLUMNS),
         })
         .collect();
     request_typed(request, &sides)
@@ -499,6 +499,15 @@ pub(crate) fn request_sides(
 
 pub(crate) fn table_ref(name: &str) -> Json {
     serde_json::json!({"name": name, "type": "table"})
+}
+
+/// A join leaf of `name`; `None` omits its `alias`, as Exasol does for an unaliased occurrence.
+pub(crate) fn table_ref_as(name: &str, alias: Option<&str>) -> Json {
+    let mut leaf = table_ref(name);
+    if let Some(alias) = alias {
+        leaf["alias"] = Json::String(alias.to_string());
+    }
+    leaf
 }
 
 pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
@@ -1488,27 +1497,31 @@ pub(crate) fn pd(request: &Json) -> Json {
 /// Exasol does not send. Exasol sends a request with no join for exactly one table.
 pub(crate) fn assert_exasol_sends(request: &Json) {
     let pushdown = &request["pushdownRequest"];
-    let join = match detect_join(request, pushdown) {
-        Ok(JoinShape::Join(join)) => Some(join),
-        Ok(JoinShape::NotAJoin) => {
-            let tables = request["involvedTables"].as_array().map_or(0, Vec::len);
-            assert_eq!(
-                tables, 1,
-                "a request Exasol does not send: no join over {tables} tables"
-            );
-            None
-        }
-        Err(error) => not_sent(error),
-    };
+    if let Ok(JoinShape::NotAJoin) = detect_join(request, pushdown) {
+        let tables = request["involvedTables"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            tables, 1,
+            "a request Exasol does not send: no join over {tables} tables"
+        );
+    }
     // Exasol drops a WHERE that folds to TRUE, though it sends FALSE, NULL, and TRUE conjuncts.
     assert_ne!(
         pushdown["filter"],
         serde_json::json!({"type": "literal_bool", "value": true}),
         "a request Exasol does not send: a TRUE filter"
     );
-    fn not_sent<T>(error: UdfError) -> T {
-        panic!("a request Exasol does not send: {}", user_message(error))
-    }
+    request_check(request)
+        .unwrap_or_else(|error| panic!("a request Exasol does not send: {}", user_message(error)));
+}
+
+/// The planners' request check over `request`, as `handle_pushdown` and `plan_join` run it: over
+/// the join's legs, or over the request's one table.
+pub(crate) fn request_check(request: &Json) -> Result<(), UdfError> {
+    let pushdown = &request["pushdownRequest"];
+    let join = match detect_join(request, pushdown)? {
+        JoinShape::Join(join) => Some(join),
+        JoinShape::NotAJoin => None,
+    };
     let table_names: Vec<&str> = match &join {
         Some(join) => join
             .tables
@@ -1517,24 +1530,16 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
             .collect(),
         None => vec![request["involvedTables"][0]["name"].as_str().unwrap_or("")],
     };
-    let declared: Vec<_> = table_names
+    let declared = table_names
         .into_iter()
-        .map(|name| {
-            support::involved_columns(request, |tables| {
-                tables
-                    .iter()
-                    .find(|table| table["name"].as_str() == Some(name))
-            })
-            .unwrap_or_else(not_sent)
-        })
-        .collect();
+        .map(|name| table_columns(request, name))
+        .collect::<Result<Vec<_>, _>>()?;
     ensure_columns_declared(
         request,
         pushdown,
         join.as_ref(),
         &declared.iter().collect::<Vec<_>>(),
     )
-    .unwrap_or_else(not_sent);
 }
 
 /// A pushdown request as Exasol sends it, started by [`pushdown_request`]: each involved table with

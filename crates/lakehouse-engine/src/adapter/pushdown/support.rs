@@ -657,12 +657,15 @@ impl ColumnTypeLookup for ColumnTypes {
     fn column_type(&self, column: &Json) -> Option<ExasolType> {
         column_exa_type(column, self)
     }
+}
 
-    /// Runs after typing: the byte comparison reads a declared column through its raw-bytes
-    /// alias, which the request does not declare.
-    fn read_typed(&self, typed: Json) -> Json {
-        compare_binary_bytes(typed, self)
-    }
+/// The adapter's own rewrites of a tree the scan computes: the timestamp-literal floor (#461) and
+/// the binary byte comparison. They need the column types, so they run here, once.
+fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
+    compare_binary_bytes(
+        rewrite_overprecise_timestamp_comparisons(expr, col_types),
+        col_types,
+    )
 }
 
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
@@ -702,15 +705,9 @@ impl<'a> ScanTranslator<'a> {
         self.columns
     }
 
-    /// The timestamp-literal floor (#461) compares by the column's declared precision, so it
-    /// rewrites the request tree before typing.
-    fn before_typing(self, expr: &Json) -> Json {
-        rewrite_overprecise_timestamp_comparisons(expr, self.columns)
-    }
-
     /// `None` declines: the caller applies the expression in Exasol or declines the shape.
     pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
-        render_scan_expression(&self.before_typing(expr), self.columns).ok()
+        render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
     }
 
     /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
@@ -719,7 +716,7 @@ impl<'a> ScanTranslator<'a> {
         let Some(raw) = filter else {
             return (None, None);
         };
-        match render_scan_filter(&self.before_typing(raw), self.columns) {
+        match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
             Ok(sql) => (Some(sql), None),
             Err(_) => (None, Some(raw)),
         }

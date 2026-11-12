@@ -95,7 +95,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 ### Scenario: Regexp scalar functions are deliberately not translated
 
 * *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
-* *WHEN* `render_expression` processes the node in raising mode
+* *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
-* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and Exasol never sends these names to the Exasol dialect, because the adapter does not advertise them, and the Exasol dialect's verbatim rule covers only declared names, so it never widens the translated set
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking
 * *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

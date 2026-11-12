@@ -49,8 +49,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ### Scenario: Unsupported date functions fall through as unsupported nodes
 
 * *GIVEN* a VS expression node of type `function_scalar` named with a date-function name this feature does not translate: `ADD_HOURS`, `ADD_MINUTES`, `ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`, `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`, `POSIX_TIME`, or `LAST_DAY`
-* *WHEN* `render_expression` processes the node in raising mode
+* *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return an error naming the unsupported function
-* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and Exasol never sends these names to the Exasol dialect, because the adapter does not advertise them, and the Exasol dialect's verbatim rule covers only declared names, so it never widens the translated set
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking
 * *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because each named function either has an execution, parity, session-state, or input-type-dependent-return divergence from its DataFusion equivalent or (`LAST_DAY`) is not an Exasol function at all (see Background)
 * *AND* the capabilities `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_DAYS`, `FN_ADD_WEEKS`, `FN_ADD_YEARS`, `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, and `FN_CONVERT_TZ` MUST NOT be advertised, and no `FN_LAST_DAY` capability SHALL exist to advertise (Exasol has no `LAST_DAY` function and its `ScalarFunctionCapability` enum has no `LAST_DAY` member; `ADD_HOURS`/`ADD_MINUTES` are in this set because their end-to-end parity test found a DATE-argument `TIMESTAMP(0)` vs. `TIMESTAMP(3)` divergence, see Background)

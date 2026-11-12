@@ -3,9 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{
-    ColumnNode, SqlFragment, exact_expression_type, render_expression_exasol, stated_type,
-};
+use vs_expression::{ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -178,9 +176,7 @@ pub(super) fn render_scalar_over_merge(
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    // The tree reads the merge output, which carries no request column, so only a CAST types it.
-    let ty = stated_type(&sentinel_tree);
-    let mut sql = render_expression_exasol(&sentinel_tree);
+    let SqlFragment { mut sql, ty } = render_exasol_fragment(&sentinel_tree, scan.columns());
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;

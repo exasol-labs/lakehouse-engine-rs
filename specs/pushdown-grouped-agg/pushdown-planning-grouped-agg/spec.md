@@ -5,7 +5,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 ## Background
 
 * A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a non-empty `groupBy` array and a select list of supported aggregate functions. The `groupBy` array can hold any number of elements, emitted as `GK_0..GK_{n-1}`.
-* `vs_expression::render_expression` (raising mode) renders each group-key element independently, so keys can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning.
+* `vs_expression::render_expression` renders each group-key element independently, so keys can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning.
 * Cluster fan-out (`GROUP BY shard_key`) lives in the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery. The outer wrapper re-groups the scan's partial rows on the user group keys.
 * DataFusion emits one partial-aggregate row per distinct user group per shard. The outer wrapper merges them with the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path.
 * The grouped common spec's `projection` field is read only on the row-scan path. On the grouped path the scan UDF reads `group_keys` and `aggregates` and derives the DataFusion projection from the partial-aggregate query, so `projection` stays empty.
@@ -41,7 +41,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *GIVEN* a grouped aggregate pushdown request whose GROUP BY clause contains a mix of column references and scalar expressions (e.g., `YEAR(ts_col)`)
 * *WHEN* the adapter builds the scan spec
 * *THEN* the scan spec SHALL carry a `group_keys` field containing the rendered DataFusion SQL fragment for each group-key expression in order
-* *AND* each group-key expression MUST be renderable by the VS expression translator in raising mode
+* *AND* each group-key expression MUST be renderable by the VS expression translator
 * *AND* the scan UDF MUST use the same rendered expressions in its per-shard DataFusion GROUP BY clause
 * *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type
 

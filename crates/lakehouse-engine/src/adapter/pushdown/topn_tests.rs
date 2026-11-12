@@ -136,24 +136,6 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
 }
 
 #[test]
-fn sort_flags_reads_direction_and_nulls_without_column_gate() {
-    let expression_element =
-        order_by_element(scalar_fn("ABS", [col("L_EXTENDEDPRICE")]), false, true);
-    assert_eq!(
-        sort_flags(&expression_element),
-        (false, true),
-        "an expression element's flags must parse"
-    );
-    assert!(
-        parse_sort_key_element(&expression_element).is_none(),
-        "the bare-column gate must still reject the same element"
-    );
-
-    let column_element = order_by_element(table_col("LINEITEM", "L_ORDERKEY"), true, false);
-    assert_eq!(sort_flags(&column_element), (true, false));
-}
-
-#[test]
 fn ordered_topn_emits_per_shard_and_outer_order_by() {
     let request = nq4_request();
     let files = vec![

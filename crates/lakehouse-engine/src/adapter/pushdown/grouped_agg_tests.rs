@@ -190,6 +190,11 @@ fn upper_item(column: &str) -> serde_json::Value {
     scalar_fn("UPPER", [col(column)])
 }
 
+/// `SECOND(TS, 3)`: Exasol sends it, and the DataFusion dialect declines it on arity.
+fn declined_second_item() -> serde_json::Value {
+    scalar_fn("SECOND", [col("TS"), num_lit(3)])
+}
+
 #[test]
 fn detect_group_by_aggregates_column_key() {
     let (req, scan) = grouped_request(
@@ -518,8 +523,8 @@ fn detect_group_by_aggregates_expression_key() {
 #[test]
 fn detect_group_by_unsupported_expression_falls_back() {
     let (req, scan) = grouped_request(
-        &AGGREGATED,
-        vec![serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"})],
+        &[("TS", ExasolType::BARE_TIMESTAMP)],
+        vec![declined_second_item()],
     )
     .count_star()
     .build_scanned();
@@ -820,17 +825,14 @@ fn detect_group_by_all_expression_multi_key() {
     );
 
     let (bad_req, bad_req_scan) = grouped_request(
-        &AGGREGATED,
-        vec![
-            mod_item("ID", 4),
-            serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"}),
+        &[
+            ("ID", ExasolType::decimal(18, 0)),
+            ("TS", ExasolType::BARE_TIMESTAMP),
         ],
+        vec![mod_item("ID", 4), declined_second_item()],
     )
     .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-    .item(
-        serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"}),
-        ExasolType::WIDEST_VARCHAR,
-    )
+    .item(declined_second_item(), ExasolType::decimal(5, 3))
     .count_star()
     .build_scanned();
     assert!(

@@ -182,22 +182,15 @@ pub(super) fn nq3_join_request() -> Json {
 /// `None` omits both the leaf's `alias` and the columns' `tableAlias`, as Exasol does for an
 /// unaliased occurrence (mirrors the live `EXPLAIN VIRTUAL` capture for #361).
 pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
-    fn leaf(alias: Option<&str>) -> Json {
-        let mut leaf = table_ref("FACT_ORDERS");
-        if let Some(alias) = alias {
-            leaf["alias"] = Json::String(alias.to_string());
-        }
-        leaf
-    }
     fn order_key(alias: Option<&str>) -> Json {
         table_column("FACT_ORDERS", alias, "O_ORDERKEY")
     }
 
-    let mut from = leaf(leg_aliases[0]);
+    let mut from = table_ref_as("FACT_ORDERS", leg_aliases[0]);
     for (left_leg, right_leg) in leg_aliases.iter().zip(leg_aliases.iter().skip(1)) {
         from = inner_join(
             from,
-            leaf(*right_leg),
+            table_ref_as("FACT_ORDERS", *right_leg),
             predicate_equal(order_key(*left_leg), order_key(*right_leg)),
         );
     }

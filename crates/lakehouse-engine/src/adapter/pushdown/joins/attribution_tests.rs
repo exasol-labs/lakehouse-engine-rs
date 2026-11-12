@@ -1,9 +1,8 @@
-use super::super::planning::involved_table;
 use super::*;
-use crate::adapter::pushdown::support::involved_columns;
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, num_lit,
-    order_by_element, predicate_equal, pushdown_request, scalar_fn, table_col, user_message,
+    PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, inner_join,
+    num_lit, order_by_element, predicate_equal, pushdown_request, request_check, scalar_fn,
+    table_col, table_ref_as, user_message,
 };
 use crate::types::exasol_type::ExasolType;
 
@@ -208,26 +207,6 @@ fn leg_alias_is_the_wrapper_subquery_alias_of_that_leg() {
     assert_eq!(legs.leg_alias(2), "LHS_T2");
 }
 
-/// [`JoinLegs::ensure_columns_declared`] as `handle_pushdown` runs it over `request`'s one table.
-fn single_scan_gate(request: &Json) -> Result<(), UdfError> {
-    let declared = involved_columns(request, |tables| tables.first()).unwrap();
-    JoinLegs::for_single_scan(request)
-        .ensure_columns_declared(&request["pushdownRequest"], &[&declared])
-}
-
-/// [`JoinLegs::ensure_columns_declared`] as `plan_join` runs it, each leg declaring its table's
-/// columns.
-fn join_gate(request: &Json, leaves: &[JoinLeaf]) -> Result<(), UdfError> {
-    let declared: Vec<InvolvedColumns<'_>> = leaves
-        .iter()
-        .map(|leaf| involved_table(request, &leaf.table_name).unwrap())
-        .collect();
-    JoinLegs::from_leaves(leaves).ensure_columns_declared(
-        &request["pushdownRequest"],
-        &declared.iter().collect::<Vec<_>>(),
-    )
-}
-
 fn id_name_table() -> PushdownRequestBuilder {
     pushdown_request(
         "T",
@@ -238,8 +217,8 @@ fn id_name_table() -> PushdownRequestBuilder {
     )
 }
 
-fn customer_orders() -> (PushdownRequestBuilder, [JoinLeaf; 2]) {
-    let request = pushdown_request(
+fn customer_orders() -> PushdownRequestBuilder {
+    pushdown_request(
         "CUSTOMER",
         &[
             ("C_CUSTKEY", ExasolType::decimal(20, 0)),
@@ -253,13 +232,27 @@ fn customer_orders() -> (PushdownRequestBuilder, [JoinLeaf; 2]) {
             ("O_CUSTKEY", ExasolType::decimal(20, 0)),
         ],
     )
-    .field("from", customer_orders_join());
-    (request, [leaf("CUSTOMER", None), leaf("ORDERS", None)])
+    .field("from", customer_orders_join())
+}
+
+/// `FROM FACT_ORDERS a JOIN FACT_ORDERS b ON a.O_ORDERKEY = b.O_ORDERKEY`.
+fn fact_orders_self_join() -> PushdownRequestBuilder {
+    pushdown_request("FACT_ORDERS", &[("O_ORDERKEY", ExasolType::decimal(20, 0))]).field(
+        "from",
+        inner_join(
+            table_ref_as("FACT_ORDERS", Some("A")),
+            table_ref_as("FACT_ORDERS", Some("B")),
+            predicate_equal(
+                aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+                aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
+            ),
+        ),
+    )
 }
 
 /// Scenario: A column the request does not declare fails the request
 #[test]
-fn a_single_scan_column_its_table_does_not_declare_fails_the_request() {
+fn a_column_the_request_does_not_declare_fails_the_request() {
     let missing = || table_col("T", "MISSING");
     let selecting_id = || id_name_table().column(table_col("T", "ID"));
     let mut untagged = selecting_id().build_unchecked().0;
@@ -267,97 +260,72 @@ fn a_single_scan_column_its_table_does_not_declare_fails_the_request() {
         .as_object_mut()
         .expect("a column node")
         .remove("tableName");
-    let cases: [(&str, Json, &[&str]); 6] = [
+    let join = customer_orders();
+    let unchecked = |request: PushdownRequestBuilder| request.build_unchecked().0;
+    let cases: [(&str, Json, &[&str]); 10] = [
         (
             "an undeclared column in selectList",
-            id_name_table()
-                .item(missing(), ExasolType::decimal(18, 0))
-                .build_unchecked()
-                .0,
+            unchecked(id_name_table().item(missing(), ExasolType::decimal(18, 0))),
             &["MISSING"],
         ),
         (
             "an undeclared column in filter",
-            selecting_id()
-                .filter(predicate_equal(missing(), num_lit(1)))
-                .build_unchecked()
-                .0,
+            unchecked(selecting_id().filter(predicate_equal(missing(), num_lit(1)))),
             &["MISSING"],
         ),
         (
             "an undeclared column in groupBy",
-            selecting_id().group_by(vec![missing()]).build_unchecked().0,
+            unchecked(selecting_id().group_by(vec![missing()])),
             &["MISSING"],
         ),
         (
             "an undeclared column in orderBy",
-            selecting_id()
-                .order_by(serde_json::json!([order_by_element(missing(), true, true)]))
-                .build_unchecked()
-                .0,
+            unchecked(selecting_id().order_by(serde_json::json!([order_by_element(
+                missing(),
+                true,
+                true
+            )]))),
             &["MISSING"],
         ),
         (
             "a tableName naming another table",
-            id_name_table()
-                .item(table_col("OTHER", "ID"), ExasolType::decimal(18, 0))
-                .build_unchecked()
-                .0,
+            unchecked(id_name_table().item(table_col("OTHER", "ID"), ExasolType::decimal(18, 0))),
             &["ID", "OTHER"],
         ),
-        ("a column with no tableName", untagged, &["ID"]),
-    ];
-    for (case, request, mentioned) in cases {
-        let error = single_scan_gate(&request).expect_err(&format!("{case} fails"));
-        assert_mentions(&user_message(error), mentioned);
-    }
-}
-
-/// Scenario: A column the request does not declare fails the request
-#[test]
-fn a_join_column_that_binds_no_declaring_leg_fails_the_request() {
-    let (request, leaves) = customer_orders();
-    let cases = [
         (
-            "a leg that does not declare it",
-            request.clone().item(
+            "a join leg that does not declare it",
+            unchecked(join.clone().item(
                 table_col("CUSTOMER", "O_CUSTKEY"),
                 ExasolType::decimal(20, 0),
+            )),
+            &["O_CUSTKEY"],
+        ),
+        (
+            "a table the join does not read",
+            unchecked(
+                join.clone()
+                    .item(table_col("NOPE", "C_NAME"), ExasolType::varchar(100)),
             ),
-            "O_CUSTKEY",
+            &["C_NAME"],
         ),
         (
-            "a table the query does not read",
-            request
-                .clone()
-                .item(table_col("NOPE", "C_NAME"), ExasolType::varchar(100)),
-            "C_NAME",
+            "a join column with no tableName",
+            unchecked(join.column(col("C_CUSTKEY"))),
+            &["C_CUSTKEY"],
         ),
         (
-            "no tableName",
-            request.column(col("C_CUSTKEY")),
-            "C_CUSTKEY",
+            "a self-join alias that names no occurrence",
+            unchecked(fact_orders_self_join().column(aliased_col(
+                "FACT_ORDERS",
+                "C",
+                "O_ORDERKEY",
+            ))),
+            &["O_ORDERKEY", "FACT_ORDERS"],
         ),
+        ("a single-table column with no tableName", untagged, &["ID"]),
     ];
-    for (binding, request, column) in cases {
-        let error = join_gate(&request.build_unchecked().0, &leaves)
-            .expect_err(&format!("a column naming {binding} fails"));
-        assert_mentions(&user_message(error), &[column]);
+    for (case, request, mentioned) in cases {
+        let error = request_check(&request).expect_err(&format!("{case} fails"));
+        assert_mentions(&user_message(error), mentioned);
     }
-}
-
-/// Scenario: A column the request does not declare fails the request
-#[test]
-fn a_self_join_column_whose_alias_matches_no_occurrence_fails_the_request() {
-    let request = pushdown_request("FACT_ORDERS", &[("O_ORDERKEY", ExasolType::decimal(20, 0))])
-        .column(aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"))
-        .build_unchecked()
-        .0;
-    let leaves = [
-        leaf("FACT_ORDERS", Some("A")),
-        leaf("FACT_ORDERS", Some("B")),
-    ];
-
-    let error = join_gate(&request, &leaves).expect_err("alias C names neither occurrence");
-    assert_mentions(&user_message(error), &["O_ORDERKEY", "FACT_ORDERS"]);
 }
