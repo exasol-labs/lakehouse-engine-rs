@@ -33,25 +33,25 @@ services:
       - "${LH_UNITY_PORT:-18080}:8080"
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.50
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.50
 
   proxy:
     extra_hosts:
-      - "unitycatalog-via-proxy:10.84.0.50"
+      - "unitycatalog-via-proxy:${LH_SUBNET_PREFIX:-10.84}.0.50"
 
   # Re-declares the base /etc/hosts loop to add unitycatalog.
   exasol:
     extra_hosts:
-      - "unitycatalog:10.84.0.50"
+      - "unitycatalog:${LH_SUBNET_PREFIX:-10.84}.0.50"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ]; then
-              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 seaweedfs\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])unitycatalog([[:space:]]|$)' /etc/hosts || printf '10.84.0.50 unitycatalog\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.10 seaweedfs\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.11 iceberg-rest\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])unitycatalog([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.50 unitycatalog\n' >> /etc/hosts
             fi
             sleep 2
           done ) &

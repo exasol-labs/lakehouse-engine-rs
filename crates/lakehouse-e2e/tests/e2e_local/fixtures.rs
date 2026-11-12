@@ -15,8 +15,9 @@ use crate::common::seed::{
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY,
-    PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
-    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+    PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
+    local_stack_connection_password, proxy_url_internal, wait_for_exasol, wait_for_iceberg_catalog,
+    wait_for_seaweedfs,
 };
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -300,7 +301,8 @@ pub fn refresh(vs_name: &str) {
 pub fn proxy_virtual_schemas() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
-        let proxy = [("HTTP_PROXY", PROXY_URL_INTERNAL)];
+        let proxy_url = proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         setup_proxy(PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
         write_parquet_fixture(
             &format!("{BASE_DIRECT}rows/file1.parquet"),
