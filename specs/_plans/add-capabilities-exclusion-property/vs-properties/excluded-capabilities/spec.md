@@ -41,9 +41,9 @@ The virtual schema property `EXCLUDED_CAPABILITIES` withholds named capabilities
 * *THEN* each query SHALL return the rows it returns over a virtual schema without the exclusion
 * *AND* the adapter MUST NOT return different rows for a request shape that only an exclusion makes reachable, because Exasol does not re-check a delegated capability
 
-### Scenario: Create and set reject an entry the adapter does not advertise
+### Scenario: Create, refresh, and set reject an entry the adapter does not advertise
 
-* *GIVEN* a `createVirtualSchema` or `setProperties` request whose effective `EXCLUDED_CAPABILITIES` is `'FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK'`
+* *GIVEN* a `createVirtualSchema`, `refresh`, or `setProperties` request whose effective `EXCLUDED_CAPABILITIES` is `'FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK'`
 * *WHEN* the adapter checks the properties
 * *THEN* the request SHALL fail with one entry `invalid value '<entry>' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name` per distinct entry that is not an advertised name, in the order the value lists them, in the one error of `vs-properties/property-value-validation`
 * *AND* for an entry that is at most two single-character edits from an advertised name, compared without regard to case, the entry SHALL append `(did you mean '<capability>'?)` with the nearest advertised name per the nearest-name rule of `vs-properties/property-name-validation`, so `FN_PRED_LIK` and `fn_pred_like` suggest `FN_PRED_LIKE` and `MADE_UP` gets no suggestion
@@ -53,7 +53,8 @@ The virtual schema property `EXCLUDED_CAPABILITIES` withholds named capabilities
 
 ### Scenario: getCapabilities ignores an entry the adapter does not advertise
 
-* *GIVEN* a virtual schema whose persisted `EXCLUDED_CAPABILITIES` is `'NO_SUCH_CAPABILITY, FN_PRED_LIKE'`, which an adapter that advertised `NO_SUCH_CAPABILITY`, or an adapter without this check, accepted
+* *GIVEN* a virtual schema whose persisted `EXCLUDED_CAPABILITIES` is `'NO_SUCH_CAPABILITY, FN_PRED_LIKE'`, which an earlier adapter version that advertised `NO_SUCH_CAPABILITY` accepted
 * *WHEN* the user runs a `LIKE` query over one of its virtual tables
 * *THEN* the `getCapabilities` response SHALL withhold `FN_PRED_LIKE` and ignore `NO_SUCH_CAPABILITY`
 * *AND* the adapter MUST NOT fail a `getCapabilities` request because of the `EXCLUDED_CAPABILITIES` value, so the query SHALL return the table's rows
+* *AND* a `refresh` or `setProperties` request SHALL fail with the entry for `NO_SUCH_CAPABILITY` until a `setProperties` request removes it from the value

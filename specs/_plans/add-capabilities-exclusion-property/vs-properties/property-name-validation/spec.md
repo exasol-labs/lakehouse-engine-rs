@@ -1,8 +1,6 @@
-<!-- DELTA:CHANGED -->
 # Feature: Virtual Schema Property Name Validation
 
-`CREATE VIRTUAL SCHEMA` and `ALTER VIRTUAL SCHEMA ... SET` reject a property name the adapter does not read, with one error that names every such property (#534). This feature owns the complete list of virtual schema property names. `vs-properties/property-value-validation` owns the checks of tuning values and the request lifecycle around both checks.
-<!-- /DELTA:CHANGED -->
+`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... REFRESH`, and `ALTER VIRTUAL SCHEMA ... SET` reject a property name the adapter does not read, with one error that names every such property (#534). This feature owns the complete list of virtual schema property names. `vs-properties/property-value-validation` owns the checks of tuning values and the request lifecycle around both checks.
 
 ## Background
 
@@ -11,17 +9,6 @@
 * The required-property checks of `CATALOG_CONNECTION` and `NAMESPACE` belong to `vs-adapter/create-virtual-schema` and `direct-storage/direct-storage-properties`, and run after the name check.
 
 ## Scenarios
-
-<!-- DELTA:CHANGED -->
-### Scenario: An unknown property name fails the statement
-
-* *GIVEN* a `createVirtualSchema` or `setProperties` request whose effective properties hold a name outside the known property names
-* *WHEN* the adapter receives the request
-* *THEN* the adapter SHALL fail the request with an error that names each unknown property as `unknown property '<name>'`
-* *AND* the adapter SHALL match names exactly and case-sensitively, so `"Namespace"` is unknown even though `NAMESPACE` is known
-* *AND* the error MUST NOT contain the value of an unknown property, because a misspelled property can hold any text
-* *AND* the adapter SHALL fail before it reads the CONNECTION or contacts any catalog or object store, so a request that also names a CONNECTION that does not exist fails with the unknown-property error
-<!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
 ### Scenario: Every property the adapter reads is known under every catalog kind

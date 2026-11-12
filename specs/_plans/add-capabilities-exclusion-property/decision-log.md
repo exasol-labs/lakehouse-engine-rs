@@ -11,6 +11,9 @@
 - Q: Couple LIMIT/LIMIT_WITH_OFFSET/ORDER_BY_* exclusions? → A: No. ORDER BY in a VS is a known Exasol limitation; the property only subtracts listed names from the list, no special handling of capabilities that must be advertised together.
 - Q: Cover the issue's "ORDER_BY_COLUMN excluded while LIMIT stays" example in E2E? → A: No. It was only an example; LIMIT and ORDER_BY exclusions are problematic combinations and stay out of E2E.
 - Q: How to document the ORDER BY with LIMIT behavior? → A: In docs/semantic-differences.md, with a reference to Exasol's virtual schema limitations: https://docs.exasol.com/db/latest/database_concepts/virtual_schema/user_guide.htm#Virtualschemalimitations
+- Q: What does REFRESH do with a saved invalid property? → A: It runs no check and has no special handling; a REFRESH whose properties cannot be used just fails. Only CREATE and SET validate, because they write properties.
+- Correction to the first entry: the Java adapters run full property validation (names and values of the other properties) on CREATE, REFRESH, and SET; only the `EXCLUDED_CAPABILITIES` value goes unchecked until `getCapabilities`.
+- Q: Final REFRESH rule? → A: REFRESH behaves as today and as the Java virtual schemas: it runs the same checks as CREATE and SET. We do not want the VS ecosystems to diverge.
 
 ## Design Decisions
 
@@ -24,18 +27,13 @@
   - `docs/semantic-differences.md` documents the `ORDER BY ... LIMIT n OFFSET m` effect, links Exasol's virtual schema limitations, and gives the workaround of also excluding `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`. `docs/tuning.md` states the effect and links that section.
 - **Promotes to ADR:** no
 
-### [2] Refresh reads a value the checks would reject as absent
+### [2] Refresh runs the same property checks as create and set
 
-- **Decision:** A `refresh` request runs no property name or value check. A tuning or table pattern value that CREATE or SET would reject reads as absent, so it takes its default.
-- **Rationale:** The interview removes every property check from `refresh`. Failing on a value that `refresh` consumes would be the same check under another name. CREATE and SET reject every such value, so only a schema persisted before the checks existed can hold one, and the adapters of that time already read such a value as its default.
-- **Alternatives:** Keep the previous tuning values from the persisted `adapterNotes`: adds a second source for values that every full and partial refresh rebuilds from the properties.
-- **Promotes to ADR:** no
-
-### [3] Refresh still needs the properties that locate the source
-
-- **Decision:** `refresh` runs no check whose only purpose is validation: the property catalog's name and value checks (#534), the `EXCLUDED_CAPABILITIES` check, and the `PERMISSION_CHECK` and `USER_MAPPING` checks, including the catalog-kind and `/catalog` URI requirements of the permission check. It still fails when `CATALOG_KIND`, `CATALOG_CONNECTION`, `NAMESPACE`, `MERGE_SCHEMA`, or `HIVE_PARTITIONING` cannot be used, because it reads them to list the source and declare its tables.
-- **Rationale:** Listing cannot proceed without the catalog kind, the CONNECTION, and the namespace. Reading an unusable `MERGE_SCHEMA` or `HIVE_PARTITIONING` as absent would silently change the declared columns of a direct-storage table. A rejected table pattern reads as absent instead, because the patterns and their check arrived in one change (#544): only a schema whose properties another adapter script wrote can hold one. The permission properties have no effect on a `refresh`, which lists as the CONNECTION's identity.
-- **Alternatives:** Read every unusable property as absent on `refresh`: an unusable `CATALOG_KIND` would select the Iceberg REST client for a different catalog.
+- **Decision:** A `refresh` runs the property name and value checks of `createVirtualSchema` and `setProperties`, and the `EXCLUDED_CAPABILITIES` check joins them. The permission property checks on `refresh` stay as recorded. `getCapabilities` does not check the value and ignores an entry the adapter does not advertise.
+- **Rationale:** `refresh` keeps its current behavior (#534), which matches the Java virtual schemas: they validate the properties on `createVirtualSchema`, `refresh`, and `setProperties`. The user does not want the virtual schema ecosystems to diverge.
+- **Alternatives:** A `refresh` that checks nothing: diverges from the current behavior and from the Java virtual schemas.
+- **Consequences:**
+  - When a later adapter stops advertising a listed name, `REFRESH` and `SET` fail until a `SET` removes that entry. `getCapabilities` ignores the entry, so queries keep working. `docs/tuning.md` states this.
 - **Promotes to ADR:** no
 
 ## Review Findings
