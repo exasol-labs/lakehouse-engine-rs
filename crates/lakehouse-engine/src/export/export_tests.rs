@@ -1,5 +1,6 @@
 use super::*;
 use crate::export::batch::BATCH_ROWS;
+use crate::export::batch::tests::measured_column;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -9,7 +10,6 @@ use exasol_udf_sdk::value::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use vs_expression::udf_column_test_support::measured_column;
 
 const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","table":"ns.t","export_id":"00ff","columns":["ID"],"single_commit":false,"allow_http":false}"#;
 const SENTINELS: [&str; 3] = [

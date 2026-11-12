@@ -4,9 +4,7 @@
 //! The type rules and refusals are the export's (decisions [3] and [8]).
 
 use super::refusal;
-use crate::types::exasol_type::{
-    ExasolType, UdfColumnType, exasol_type_from_column_info, is_reported_spelling,
-};
+use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
@@ -242,12 +240,8 @@ pub(super) fn arrow_schema(names: &[String], columns: &[ColumnInfo]) -> Result<S
 
 fn arrow_type(name: &str, column: &ColumnInfo) -> Result<DataType, UdfError> {
     let exasol_type = match exasol_type_from_column_info(column) {
-        UdfColumnType::Known(exasol_type)
-            if is_reported_spelling(exasol_type, &column.type_name) =>
-        {
-            exasol_type
-        }
-        _ => return Err(unwritable(name, &column.type_name)),
+        UdfColumnType::Known(exasol_type) => exasol_type,
+        UdfColumnType::Unrecognized { .. } => return Err(unwritable(name, &column.type_name)),
     };
     Ok(match exasol_type {
         ExasolType::Decimal(decimal) => {
@@ -274,4 +268,4 @@ fn unwritable(name: &str, type_name: &str) -> UdfError {
 
 #[cfg(test)]
 #[path = "batch_tests.rs"]
-mod tests;
+pub(super) mod tests;
