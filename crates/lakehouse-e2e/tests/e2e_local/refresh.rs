@@ -6,8 +6,8 @@ use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::rest_replace_current_schema;
 use crate::common::stack::{
-    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
-    iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
+    iceberg_catalog_url_internal, local_stack_connection_password, proxy_url_internal,
 };
 use crate::fixtures::{
     append_file, drop_table_if_exists, ensure_id_val_table, id_val_schema, load, seed_catalog,
@@ -575,7 +575,7 @@ fn refresh_tables_heals_and_refreshes_only_the_requested_tables() {
     create_proxied_schema_and_scripts(
         &mut conn,
         PARTIAL_ADAPTER_SCHEMA,
-        &[("HTTP_PROXY", PROXY_URL_INTERNAL)],
+        &[("HTTP_PROXY", proxy_url_internal().as_str())],
         &[],
         &[],
     );
