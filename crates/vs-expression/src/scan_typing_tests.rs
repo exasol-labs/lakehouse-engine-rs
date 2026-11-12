@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::*;
-use crate::{SqlFragment, render_scan_expression};
+use crate::{CHECKED_INT_DIV_FN, SqlFragment, render_scan_expression};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -197,6 +197,11 @@ fn a_computed_integer_converts_like_a_column() {
             false,
         ),
         (
+            "integer quotient",
+            to_text(scalar_fn("DIV", [col("I"), num_lit(2)])),
+            true,
+        ),
+        (
             "CASE over integers",
             to_text(searched_case([col("I"), num_lit(1)])),
             true,
@@ -246,6 +251,73 @@ fn a_computed_integer_converts_like_a_column() {
         let rendered = render(&expr);
         assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
     }
+}
+
+#[test]
+fn div_runs_in_the_scan_only_over_integer_operands() {
+    let cases = [
+        (
+            "integer column and literal",
+            scalar_fn("DIV", [col("I"), num_lit(2)]),
+            true,
+        ),
+        (
+            "two integer columns",
+            scalar_fn("DIV", [col("I"), col("I18")]),
+            true,
+        ),
+        (
+            "NULL numerator",
+            scalar_fn("DIV", [null_lit(), col("I")]),
+            true,
+        ),
+        (
+            "NULL divisor",
+            scalar_fn("DIV", [col("I"), null_lit()]),
+            true,
+        ),
+        (
+            "nested integer sum",
+            scalar_fn(
+                "DIV",
+                [scalar_fn("ADD", [col("I"), num_lit(1)]), num_lit(2)],
+            ),
+            true,
+        ),
+        (
+            "scaled decimal numerator",
+            scalar_fn("DIV", [col("N"), num_lit(2)]),
+            false,
+        ),
+        (
+            "scaled decimal divisor",
+            scalar_fn("DIV", [col("I"), col("N")]),
+            false,
+        ),
+        (
+            "DOUBLE numerator",
+            scalar_fn("DIV", [col("F"), num_lit(2)]),
+            false,
+        ),
+        (
+            "DOUBLE divisor",
+            scalar_fn("DIV", [col("I"), col("F")]),
+            false,
+        ),
+        (
+            "text divisor",
+            scalar_fn("DIV", [col("I"), col("S")]),
+            false,
+        ),
+    ];
+    for (label, expr, pushed) in cases {
+        let rendered = render(&expr);
+        assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
+    }
+    assert_eq!(
+        render(&scalar_fn("DIV", [col("I"), num_lit(2)])).unwrap(),
+        format!(r#"{CHECKED_INT_DIV_FN}("I", 2)"#)
+    );
 }
 
 #[test]

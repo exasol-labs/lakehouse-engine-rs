@@ -33,6 +33,7 @@ This page lists every property and shows how to see what a scan does. Set these 
 | `USER_MAPPING` | with `PERMISSION_CHECK` | absent | A Jinja template with one variable, `user` | Maps the querying Exasol user to a Lakekeeper principal. Ignored while `PERMISSION_CHECK` is off. See [USER_MAPPING](security.md#user_mapping). |
 | `TABLE_INCLUDE` | no | absent (every table) | Comma-separated patterns over the virtual table name. `*` matches any run, `?` matches one character, and an empty entry is rejected. | Exposes only the tables that match a pattern. See [Choosing which tables to expose](catalogs.md#choosing-which-tables-to-expose). |
 | `TABLE_EXCLUDE` | no | absent (no table hidden) | Same as `TABLE_INCLUDE` | Hides every table that matches a pattern, including a table that `TABLE_INCLUDE` matches. See [Choosing which tables to expose](catalogs.md#choosing-which-tables-to-expose). |
+| `EXCLUDED_CAPABILITIES` | no | absent (the adapter advertises every capability) | Comma-separated names of capabilities the adapter advertises, such as `'FN_PRED_LIKE'`. Names match exactly and case-sensitively. Whitespace around a name and empty entries are ignored. `CREATE`, `REFRESH`, and `SET` reject a name the adapter does not advertise. | Withdraws the listed capabilities from this virtual schema, so Exasol evaluates those constructs itself. A `SET` applies from the next query, with no `REFRESH`. See [Excluding a capability](capabilities.md#excluding-a-capability). |
 
 Create these three scripts in the same schema as `LAKEHOUSE_ADAPTER`:
 

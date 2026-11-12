@@ -24,7 +24,7 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 
 * *GIVEN* an Exasol session that has installed the VS adapter script
 * *WHEN* Exasol sends a `getCapabilities` request to the adapter
-* *THEN* the adapter SHALL return a JSON response of type `getCapabilities` whose list is the adapter's `CAPABILITIES` list
+* *THEN* the adapter SHALL return a JSON response of type `getCapabilities` whose list is the adapter's `CAPABILITIES` list, less the names that the virtual schema's `EXCLUDED_CAPABILITIES` withholds per `vs-properties/excluded-capabilities`
 * *AND* the capabilities list MUST NOT include `FN_PRED_GREATER` or `FN_PRED_GREATEREQUAL` (those names do not exist in the Exasol capability vocabulary, Exasol normalises `a > b` to `b < a` and `a >= b` to `b <= a` before it reaches the adapter), geospatial (`FN_ST_*`), Exasol-only session functions (`FN_CURRENT_USER`/`FN_SYS_GUID`/`FN_CURRENT_SCHEMA`), the now-family date/time functions (`FN_CURRENT_DATE`/`FN_CURRENT_TIMESTAMP`/`FN_SYSDATE`/`FN_SYSTIMESTAMP`), whose withdrawal and reason are owned by `pushdown-capabilities/pushdown-planning-capability-extensions`, `LITERAL_INTERVAL`, `FN_AGG_MEDIAN`, `FN_AGG_APPROXIMATE_COUNT_DISTINCT`, any `FN_AGG_GROUP_CONCAT*`/`FN_AGG_LISTAGG`, or an outer, all-condition, or Cartesian join capability
 * *AND* every advertised capability name MUST be one the adapter can either translate via the VS expression translator or decompose into a correct partial/merge plan, so the advertised set never claims behaviour the engine cannot execute correctly
 

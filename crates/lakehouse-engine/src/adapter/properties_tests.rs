@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 21] = [
+const ALL_NAMES: [&str; 22] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -23,6 +23,7 @@ const ALL_NAMES: [&str; 21] = [
     "USER_MAPPING",
     "TABLE_INCLUDE",
     "TABLE_EXCLUDE",
+    "EXCLUDED_CAPABILITIES",
 ];
 
 /// Name, minimum, and maximum of each whole-number tuning property.
@@ -85,13 +86,14 @@ fn every_known_name_passes() {
         ("USER_MAPPING", "not-checked-here"),
         ("TABLE_INCLUDE", "ORDERS*, ?_LOG"),
         ("TABLE_EXCLUDE", "TMP_*"),
+        ("EXCLUDED_CAPABILITIES", "FN_PRED_LIKE, LIMIT"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 21 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 22 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 20 names of vs-properties/property-name-validation"
+        "the adapter must accept exactly the 22 names of vs-properties/property-name-validation"
     );
 
     check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
@@ -463,4 +465,39 @@ fn values_the_owning_modules_check_are_not_checked_here() {
         ("NAMESPACE", ""),
     ]))
     .expect("the catalog checks only the names of these properties");
+}
+
+const EXCLUDED_CAPABILITIES: &str = "EXCLUDED_CAPABILITIES";
+
+#[test]
+fn unadvertised_capability_entries_are_reported_once_each_with_a_suggestion() {
+    assert_eq!(
+        message(&[(
+            EXCLUDED_CAPABILITIES,
+            "FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK, FN_PRED_LIKE"
+        )]),
+        "invalid virtual schema properties: \
+         invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'fn_pred_like' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'MADE_UP' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name"
+    );
+}
+
+#[test]
+fn every_advertised_capability_is_accepted_alone_and_all_together() {
+    for capability in CAPABILITIES {
+        check_properties(&props(&[(EXCLUDED_CAPABILITIES, capability)]))
+            .unwrap_or_else(|e| panic!("{capability} must pass: {e:?}"));
+    }
+
+    check_properties(&props(&[(EXCLUDED_CAPABILITIES, &CAPABILITIES.join(","))]))
+        .expect("every advertised name together must pass");
+}
+
+#[test]
+fn excluded_capability_entries_accept_whitespace_and_empty_entries() {
+    for value in [" FN_PRED_LIKE ,, LIMIT,", " , ", ",", " \t FN_PRED_LIKE\n"] {
+        check_properties(&props(&[(EXCLUDED_CAPABILITIES, value)]))
+            .unwrap_or_else(|e| panic!("{value:?} must pass: {e:?}"));
+    }
 }
