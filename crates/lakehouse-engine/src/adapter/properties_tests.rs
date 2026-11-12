@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 21] = [
+const ALL_NAMES: [&str; 22] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -23,6 +23,7 @@ const ALL_NAMES: [&str; 21] = [
     "USER_MAPPING",
     "TABLE_INCLUDE",
     "TABLE_EXCLUDE",
+    "EXCLUDED_CAPABILITIES",
 ];
 
 /// Name, minimum, and maximum of each whole-number tuning property.
@@ -85,13 +86,14 @@ fn every_known_name_passes() {
         ("USER_MAPPING", "not-checked-here"),
         ("TABLE_INCLUDE", "ORDERS*, ?_LOG"),
         ("TABLE_EXCLUDE", "TMP_*"),
+        ("EXCLUDED_CAPABILITIES", "FN_PRED_LIKE, LIMIT"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 21 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 22 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 20 names of vs-properties/property-name-validation"
+        "the adapter must accept exactly the 22 names of vs-properties/property-name-validation"
     );
 
     check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
@@ -463,4 +465,114 @@ fn values_the_owning_modules_check_are_not_checked_here() {
         ("NAMESPACE", ""),
     ]))
     .expect("the catalog checks only the names of these properties");
+}
+
+const EXCLUDED_CAPABILITIES: &str = "EXCLUDED_CAPABILITIES";
+
+fn excluded_capabilities_message(value: &str) -> String {
+    message(&[(EXCLUDED_CAPABILITIES, value)])
+}
+
+fn excluded_capabilities_entry(entry: &str, suggestion: Option<&str>) -> String {
+    let expected = match suggestion {
+        Some(capability) => {
+            format!("an advertised capability name (did you mean '{capability}'?)")
+        }
+        None => "an advertised capability name".to_string(),
+    };
+    invalid_entry(EXCLUDED_CAPABILITIES, entry, &expected)
+}
+
+#[test]
+fn excluded_capability_entries_name_each_unadvertised_entry() {
+    let msg = excluded_capabilities_message("FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK");
+
+    assert_eq!(
+        msg,
+        format!(
+            "invalid virtual schema properties: {}; {}; {}",
+            excluded_capabilities_entry("FN_PRED_LIK", Some("FN_PRED_LIKE")),
+            excluded_capabilities_entry("fn_pred_like", Some("FN_PRED_LIKE")),
+            excluded_capabilities_entry("MADE_UP", None),
+        )
+    );
+}
+
+#[test]
+fn an_excluded_capability_is_suggested_within_two_edits_only() {
+    assert_eq!(
+        excluded_capabilities_message("FN_PRED_LIKEXY, FN_PRED_LIKEXYZ"),
+        format!(
+            "invalid virtual schema properties: {}; {}",
+            excluded_capabilities_entry("FN_PRED_LIKEXY", Some("FN_PRED_LIKE")),
+            excluded_capabilities_entry("FN_PRED_LIKEXYZ", None)
+        )
+    );
+}
+
+#[test]
+fn excluded_capability_entries_echo_under_the_echo_rule() {
+    let long = "x".repeat(101);
+
+    let msg = excluded_capabilities_message(&format!("it's, {long}"));
+
+    assert!(msg.contains("invalid value 'it''s' for"), "{msg}");
+    assert!(
+        msg.contains(&format!("invalid value '{}…' for", "x".repeat(100))),
+        "{msg}"
+    );
+}
+
+#[test]
+fn excluded_capability_entries_share_the_alphabetical_slot_of_the_property() {
+    let msg = message(&[
+        ("PARALLELISM_FACTOR", "0"),
+        (EXCLUDED_CAPABILITIES, "MADE_UP, ANOTHER_ONE"),
+        ("DATAFUSION_BATCH_SIZE", "abc"),
+        ("MADE_UP_PROPERTY", "x"),
+    ]);
+
+    let positions: Vec<usize> = [
+        "unknown property 'MADE_UP_PROPERTY'",
+        "for 'DATAFUSION_BATCH_SIZE'",
+        "invalid value 'MADE_UP' for 'EXCLUDED_CAPABILITIES'",
+        "invalid value 'ANOTHER_ONE' for 'EXCLUDED_CAPABILITIES'",
+        "for 'PARALLELISM_FACTOR'",
+    ]
+    .iter()
+    .map(|part| msg.find(part).unwrap_or_else(|| panic!("{part}: {msg}")))
+    .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "{msg}");
+}
+
+#[test]
+fn every_advertised_capability_is_accepted_alone_and_all_together() {
+    for capability in CAPABILITIES {
+        check_properties(&props(&[(EXCLUDED_CAPABILITIES, capability)]))
+            .unwrap_or_else(|e| panic!("{capability} must pass: {e:?}"));
+    }
+
+    check_properties(&props(&[(EXCLUDED_CAPABILITIES, &CAPABILITIES.join(","))]))
+        .expect("every advertised name together must pass");
+}
+
+#[test]
+fn excluded_capability_entries_accept_whitespace_and_empty_entries() {
+    for value in [" FN_PRED_LIKE ,, LIMIT,", " , ", ",", " \t FN_PRED_LIKE\n"] {
+        check_properties(&props(&[(EXCLUDED_CAPABILITIES, value)]))
+            .unwrap_or_else(|e| panic!("{value:?} must pass: {e:?}"));
+    }
+}
+
+#[test]
+fn the_excluded_capabilities_accessor_returns_the_raw_nonempty_value() {
+    assert_eq!(
+        resolve_excluded_capabilities(&props(&[(EXCLUDED_CAPABILITIES, " A , B ")])),
+        Some(" A , B ")
+    );
+    assert_eq!(
+        resolve_excluded_capabilities(&props(&[(EXCLUDED_CAPABILITIES, "")])),
+        None
+    );
+    assert_eq!(resolve_excluded_capabilities(&props(&[])), None);
 }

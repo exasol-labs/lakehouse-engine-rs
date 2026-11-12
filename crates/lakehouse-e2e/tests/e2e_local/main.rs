@@ -6,6 +6,7 @@ mod fixtures;
 
 mod assume_role;
 mod capability;
+mod capability_exclusion;
 mod complex_type;
 mod count_distinct;
 mod credential_exposure;

@@ -1,6 +1,7 @@
 //! The virtual schema property catalog: every property name the adapter reads, and the value
-//! rule of each tuning property.
+//! rule of each tuning property and of EXCLUDED_CAPABILITIES.
 
+use super::capabilities::{CAPABILITIES, split_excluded_capabilities};
 use super::nonempty_str;
 use super::table_filter::{TableFilter, parse_patterns};
 pub(super) use crate::exasol::parse_boolean;
@@ -37,10 +38,11 @@ pub(super) const PERMISSION_CHECK: &str = "PERMISSION_CHECK";
 pub(super) const USER_MAPPING: &str = "USER_MAPPING";
 const PROP_TABLE_INCLUDE: &str = "TABLE_INCLUDE";
 const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
+const PROP_EXCLUDED_CAPABILITIES: &str = "EXCLUDED_CAPABILITIES";
 
 /// Every name a virtual schema may set; the value rules of the properties whose owning module
 /// checks the value stay in that module.
-const PROPERTY_NAMES: [&str; 21] = [
+const PROPERTY_NAMES: [&str; 22] = [
     PROP_CATALOG_KIND,
     PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
@@ -62,6 +64,7 @@ const PROPERTY_NAMES: [&str; 21] = [
     USER_MAPPING,
     PROP_TABLE_INCLUDE,
     PROP_TABLE_EXCLUDE,
+    PROP_EXCLUDED_CAPABILITIES,
 ];
 
 const ERROR_PREFIX: &str = "invalid virtual schema properties: ";
@@ -97,8 +100,9 @@ pub(super) struct CheckedProperties {
     pub(super) table_filter: TableFilter,
 }
 
-/// Rejects every unknown property name and every invalid tuning or table pattern value in one
-/// error. Each value is checked on its own: no property's validity depends on another property.
+/// Rejects every unknown property name, every invalid tuning or table pattern value, and every
+/// unadvertised EXCLUDED_CAPABILITIES entry in one error. Each value is checked on its own: no
+/// property's validity depends on another property.
 pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfError> {
     let mut entries: Vec<String> = unknown_names(props)
         .into_iter()
@@ -122,6 +126,12 @@ pub(super) fn resolve_allow_http(props: &Json) -> bool {
 /// Read at every pushdown, so a SET applies from the next query.
 pub(super) fn resolve_binary_as_string(props: &Json) -> bool {
     resolve_boolean(props, PROP_BINARY_AS_STRING)
+}
+
+/// Read at every `getCapabilities` request, so a SET applies from the next query. It is the raw
+/// value: `capabilities` owns the entry syntax.
+pub(super) fn resolve_excluded_capabilities(props: &Json) -> Option<&str> {
+    nonempty_str(props, PROP_EXCLUDED_CAPABILITIES)
 }
 
 /// Applies the TRUE/FALSE rule that `check_properties` applies. A rejected value counts as
@@ -148,6 +158,16 @@ fn unknown_entry(name: &str) -> String {
         Some(known) => format!("unknown property '{name}' (did you mean '{known}'?)"),
         None => format!("unknown property '{name}'"),
     }
+}
+
+fn unadvertised_capability_entry(entry: &str) -> String {
+    let expected = match nearest_name(entry, CAPABILITIES) {
+        Some(capability) => {
+            format!("an advertised capability name (did you mean '{capability}'?)")
+        }
+        None => "an advertised capability name".to_string(),
+    };
+    invalid_entry(PROP_EXCLUDED_CAPABILITIES, entry, &expected)
 }
 
 /// The candidate at most [`SUGGESTION_MAX_EDITS`] edits from `unknown`, ignoring case; a tie
@@ -183,6 +203,7 @@ fn check_values(props: &Json) -> Result<CheckedProperties, Vec<String>> {
     let mut checker = TuningChecker::new(props);
     let tuning = checker.tuning();
     let table_filter = checker.table_filter();
+    checker.excluded_capabilities();
     if checker.invalid.is_empty() {
         Ok(CheckedProperties {
             tuning,
@@ -229,6 +250,21 @@ impl<'a> TuningChecker<'a> {
             self.value(PROP_TABLE_INCLUDE, parse_patterns),
             self.value(PROP_TABLE_EXCLUDE, parse_patterns),
         )
+    }
+
+    fn excluded_capabilities(&mut self) {
+        let Some(raw) = resolve_excluded_capabilities(self.props) else {
+            return;
+        };
+        let entries: Vec<String> = split_excluded_capabilities(raw)
+            .unadvertised
+            .into_iter()
+            .map(unadvertised_capability_entry)
+            .collect();
+        if !entries.is_empty() {
+            self.invalid
+                .insert(PROP_EXCLUDED_CAPABILITIES, entries.join("; "));
+        }
     }
 
     /// Applies `rule` to a present value; a rejection is recorded with the expectation the rule

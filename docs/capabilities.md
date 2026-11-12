@@ -152,3 +152,15 @@ The adapter does not advertise these capabilities, so Exasol evaluates them itse
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
 | `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` | `WHERE created_at < CURRENT_TIMESTAMP` | The scan receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE` and holds no statement anchor, so Exasol evaluates the clock itself, once per statement, in its own zones. Results are correct; a predicate over one of these names prunes no files |
 | Geospatial and session functions | — | Exasol evaluates them. No lakehouse type maps to GEOMETRY |
+
+## Excluding a capability
+
+The property `EXCLUDED_CAPABILITIES` withdraws advertised capabilities from one virtual schema. Exasol then evaluates each excluded construct itself over the rows the scan returns, as it does for the capabilities in the section above. The property takes a comma-separated list of capability names from the tables above. Use it to stop pushing a capability that misbehaves or runs slowly for a workload, with no new adapter release.
+
+```sql
+ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_PRED_LIKE';
+```
+
+After this statement, a `WHERE name LIKE 'event-1%'` predicate no longer reaches the scan, and a pushed-down query returns the same rows as before. The change applies from the next query, with no `REFRESH`. `SET EXCLUDED_CAPABILITIES = null` restores the full advertised set.
+
+The exclusion subtracts the listed names and nothing else. The adapter does not withhold a capability because another one is excluded. Excluding `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised changes the result of `ORDER BY ... LIMIT n OFFSET m`. [Semantic differences](semantic-differences.md#order-by-with-limit-under-excluded_capabilities) describes the effect and its workaround. [Parameters](tuning.md) lists the accepted values and the errors.

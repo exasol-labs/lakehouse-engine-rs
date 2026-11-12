@@ -79,23 +79,27 @@ fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
     resolve_tuning_notes(&checked(props), nr_of_cores)
 }
 
-#[test]
-fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
+#[track_caller]
+fn assert_every_schema_request_fails_before_the_connection_is_read(
+    property: &str,
+    value: &str,
+    expected_entry: &str,
+) {
     for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
         let request = schema_request(
             request_type,
             serde_json::json!({
                 PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                "NAMESPCE": "sales",
+                property: value,
             }),
         );
 
-        let err = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an unknown property name must fail the request");
+        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+            .expect_err("an invalid property must fail the request")
+            .to_string();
 
-        let message = err.to_string();
         assert!(
-            message.contains("unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)"),
+            message.contains(expected_entry),
             "{request_type}: {message}"
         );
         assert!(
@@ -103,6 +107,15 @@ fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_
             "{request_type} must fail before it reads the CONNECTION: {message}"
         );
     }
+}
+
+#[test]
+fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
+    assert_every_schema_request_fails_before_the_connection_is_read(
+        "NAMESPCE",
+        "sales",
+        "unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)",
+    );
 }
 
 #[test]
@@ -129,26 +142,20 @@ fn a_misspelled_required_property_is_reported_instead_of_the_missing_one() {
 
 #[test]
 fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_read() {
-    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
-        let request = schema_request(
-            request_type,
-            serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                PROP_DF_BATCH_SIZE: "0",
-            }),
-        );
+    assert_every_schema_request_fails_before_the_connection_is_read(
+        PROP_DF_BATCH_SIZE,
+        "0",
+        "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295",
+    );
+}
 
-        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an invalid tuning value must fail the request")
-            .to_string();
-
-        assert!(
-            message.contains(
-                "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295"
-            ),
-            "{request_type}: {message}"
-        );
-    }
+#[test]
+fn an_unadvertised_excluded_capability_fails_every_schema_request_before_the_connection_is_read() {
+    assert_every_schema_request_fails_before_the_connection_is_read(
+        "EXCLUDED_CAPABILITIES",
+        "FN_PRED_LIK, FN_PRED_LIKE",
+        "invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?)",
+    );
 }
 
 #[test]

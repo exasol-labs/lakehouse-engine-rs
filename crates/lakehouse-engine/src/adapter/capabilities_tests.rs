@@ -15,12 +15,12 @@ fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
 #[test]
 fn capabilities_are_assembled_without_the_catalog_kind() {
     let _capabilities: &[&str] = CAPABILITIES;
-    let _response_builder: fn() -> Json = get_capabilities_response;
+    let _response_builder: fn(Option<&str>) -> Json = get_capabilities_response;
 }
 
 #[test]
 fn reports_group_by_capabilities() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -79,7 +79,7 @@ fn reports_group_by_capabilities() {
 /// Scenario: Adapter reports its pushdown capabilities
 #[test]
 fn reports_audited_capability_set() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -351,7 +351,7 @@ fn reports_audited_capability_set() {
 
 #[test]
 fn advertises_order_by_column_and_expression() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -367,7 +367,7 @@ fn advertises_order_by_column_and_expression() {
 
 #[test]
 fn reports_projection_filter_and_limit_capabilities() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -381,7 +381,7 @@ fn reports_projection_filter_and_limit_capabilities() {
 /// Scenario: Adapter advertises aggregate pushdown for supported functions
 #[test]
 fn reports_supported_aggregate_capabilities() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -452,7 +452,7 @@ fn reports_supported_aggregate_capabilities() {
 
 #[test]
 fn capabilities_advertise_count_distinct() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -468,7 +468,7 @@ fn capabilities_advertise_count_distinct() {
 
 #[test]
 fn cast_neg_week_introduce_no_join_capability() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -486,7 +486,7 @@ fn cast_neg_week_introduce_no_join_capability() {
 
 #[test]
 fn advertises_inner_equi_join_capabilities() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -518,7 +518,7 @@ fn advertises_inner_equi_join_capabilities() {
 
 #[test]
 fn reports_capabilities_includes_inner_join() {
-    let resp = get_capabilities_response();
+    let resp = get_capabilities_response(None);
     let caps = resp["capabilities"].as_array().unwrap();
     let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
@@ -575,4 +575,76 @@ fn capabilities_doc_lists_exactly_the_advertised_set() {
         "docs/capabilities.md drifted from CAPABILITIES: advertised but undocumented \
          {missing_from_doc:?}; documented but not advertised {not_advertised:?}"
     );
+}
+
+fn advertised_names(excluded: Option<&str>) -> Vec<String> {
+    get_capabilities_response(excluded)["capabilities"]
+        .as_array()
+        .expect("capabilities array")
+        .iter()
+        .map(|c| c.as_str().expect("capability name").to_string())
+        .collect()
+}
+
+fn full_list_without(withheld: &[&str]) -> Vec<String> {
+    CAPABILITIES
+        .iter()
+        .filter(|c| !withheld.contains(c))
+        .map(|c| c.to_string())
+        .collect()
+}
+
+#[test]
+fn excluded_capabilities_are_withheld_in_advertised_order() {
+    let cases: [(Option<&str>, &[&str]); 9] = [
+        (
+            Some(" FN_PRED_LIKE ,, FN_AGG_COUNT_DISTINCT,"),
+            &["FN_PRED_LIKE", "FN_AGG_COUNT_DISTINCT"],
+        ),
+        (
+            Some("FN_AGG_COUNT_DISTINCT,FN_PRED_LIKE"),
+            &["FN_PRED_LIKE", "FN_AGG_COUNT_DISTINCT"],
+        ),
+        (Some("fn_pred_like"), &[]),
+        (Some("FN_PRED_LIK"), &[]),
+        (Some("NO_SUCH_CAPABILITY, FN_PRED_LIKE"), &["FN_PRED_LIKE"]),
+        (None, &[]),
+        (Some(""), &[]),
+        (Some(" , "), &[]),
+        (Some(",,"), &[]),
+    ];
+
+    for (value, withheld) in cases {
+        assert_eq!(
+            advertised_names(value),
+            full_list_without(withheld),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn an_exclusion_withholds_only_the_listed_names() {
+    let names = advertised_names(Some("LIMIT_WITH_OFFSET"));
+
+    assert!(names.contains(&"LIMIT".to_string()));
+    assert!(!names.contains(&"LIMIT_WITH_OFFSET".to_string()));
+    assert_eq!(names, full_list_without(&["LIMIT_WITH_OFFSET"]));
+}
+
+#[test]
+fn the_response_keeps_its_type() {
+    assert_eq!(
+        get_capabilities_response(Some("FN_PRED_LIKE"))["type"],
+        "getCapabilities"
+    );
+}
+
+#[test]
+fn the_split_reports_each_unadvertised_entry_once_in_value_order() {
+    let entries =
+        split_excluded_capabilities(" MADE_UP, FN_PRED_LIKE,fn_pred_like ,MADE_UP,,LIMIT");
+
+    assert_eq!(entries.advertised, vec!["FN_PRED_LIKE", "LIMIT"]);
+    assert_eq!(entries.unadvertised, vec!["MADE_UP", "fn_pred_like"]);
 }
