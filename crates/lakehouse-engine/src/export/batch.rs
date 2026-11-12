@@ -263,4 +263,4 @@ fn unwritable(name: &str, type_name: &str) -> UdfError {
 
 #[cfg(test)]
 #[path = "batch_tests.rs"]
-pub(super) mod tests;
+mod tests;

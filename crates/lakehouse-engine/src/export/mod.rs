@@ -311,5 +311,9 @@ fn stream_rows(
 }
 
 #[cfg(test)]
+#[path = "test_support_tests.rs"]
+mod test_support;
+
+#[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;

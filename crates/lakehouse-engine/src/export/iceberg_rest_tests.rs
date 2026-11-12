@@ -1,12 +1,8 @@
 use super::*;
-use lakehouse_catalog::ConnectionCreds;
+use crate::export::test_support::static_key_connection;
 
 fn connection() -> ExportConnection {
-    ExportConnection {
-        address: "https://catalog.example".into(),
-        creds: ConnectionCreds::default(),
-        allow_http: false,
-    }
+    static_key_connection("https://catalog.example", false)
 }
 
 #[test]

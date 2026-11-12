@@ -1,8 +1,7 @@
 use super::*;
-use exasol_udf_sdk::connection::ConnectionObject;
+use crate::export::test_support::{CONNECTION, connection_object, merged};
 use exasol_udf_sdk::test_support::TestContext;
 
-const CONNECTION: &str = "EXPORT_CONN";
 const SECRET: &str = "sentinel-secret-key";
 
 fn context(address: &str, password: serde_json::Value) -> TestContext {
@@ -11,12 +10,7 @@ fn context(address: &str, password: serde_json::Value) -> TestContext {
         .with_current_user("EXPORTER")
         .with_connection(
             CONNECTION,
-            ConnectionObject {
-                kind: "password".to_string(),
-                address: address.to_string(),
-                user: String::new(),
-                password: password.to_string(),
-            },
+            connection_object(address, "", &password.to_string()),
         )
 }
 
@@ -31,10 +25,8 @@ fn static_keys() -> serde_json::Value {
     })
 }
 
-fn with(mut password: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
-    let fields = password.as_object_mut().expect("an object");
-    fields.extend(extra.as_object().cloned().unwrap_or_default());
-    password
+fn with(password: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    merged(password, extra)
 }
 
 fn refusal_of(address: &str, password: serde_json::Value, allow_http: bool) -> String {
@@ -65,13 +57,13 @@ fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
         (
             "no warehouse",
             serde_json::json!({ "token": "t" }),
-            vec!["CONNECTION 'EXPORT_CONN'", "warehouse"],
+            vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "warehouse"],
         ),
         (
             "Azure account key",
             serde_json::json!({ "warehouse": "wh", "account_name": "acct", "account_key": SECRET }),
             vec![
-                "CONNECTION 'EXPORT_CONN'",
+                "CONNECTION 'LAKEHOUSE_CATALOG_CREDS'",
                 "account_name, account_key",
                 "S3-compatible",
             ],
@@ -79,17 +71,21 @@ fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
         (
             "Azure SAS token",
             serde_json::json!({ "warehouse": "wh", "account_name": "acct", "sas_token": SECRET }),
-            vec!["CONNECTION 'EXPORT_CONN'", "sas_token", "S3-compatible"],
+            vec![
+                "CONNECTION 'LAKEHOUSE_CATALOG_CREDS'",
+                "sas_token",
+                "S3-compatible",
+            ],
         ),
         (
             "SigV4 signing",
             with(static_keys(), serde_json::json!({ "use_sigv4": true })),
-            vec!["CONNECTION 'EXPORT_CONN'", "use_sigv4", "SigV4"],
+            vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "use_sigv4", "SigV4"],
         ),
         (
             "a shared check: half an OAuth2 client",
             serde_json::json!({ "warehouse": "wh", "client_id": "id" }),
-            vec!["CONNECTION 'EXPORT_CONN'", "client_secret"],
+            vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "client_secret"],
         ),
     ];
 
@@ -118,7 +114,8 @@ fn a_password_that_is_no_json_object_is_refused_naming_the_connection() {
     );
 
     assert!(
-        message.contains("CONNECTION 'EXPORT_CONN' password is not a valid JSON object"),
+        message
+            .contains("CONNECTION 'LAKEHOUSE_CATALOG_CREDS' password is not a valid JSON object"),
         "{message}"
     );
 }
@@ -161,7 +158,7 @@ fn plain_http_is_refused_per_field_without_allow_http_and_accepted_with_it() {
     for (field, address, password) in cases {
         let message = refusal_of(address, password.clone(), false);
         for fragment in [
-            format!("field {field} of CONNECTION 'EXPORT_CONN'"),
+            format!("field {field} of CONNECTION 'LAKEHOUSE_CATALOG_CREDS'"),
             "plain HTTP".to_string(),
             "ALLOW_HTTP = 'true'".to_string(),
         ] {

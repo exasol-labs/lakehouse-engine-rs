@@ -1,23 +1,12 @@
 use super::*;
-use crate::export::batch::tests::measured_column;
-use exasol_udf_sdk::connection::ConnectionObject;
+use crate::export::test_support::{CONNECTION, SENTINELS, connection_object, merged};
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
+use vs_expression::udf_column_test_support::measured_column;
 
-const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","table":"ns.t","export_id":"00ff","columns":["ID"],"single_commit":false,"allow_http":false}"#;
-const SENTINELS: [&str; 3] = [
-    "https://sentinel-address.example",
-    "sentinel-user",
-    "sentinel-password",
-];
-
-fn sentinel_connection() -> ConnectionObject {
-    ConnectionObject {
-        kind: "password".to_string(),
-        address: SENTINELS[0].to_string(),
-        user: SENTINELS[1].to_string(),
-        password: serde_json::json!({ "warehouse": "wh", "token": SENTINELS[2] }).to_string(),
-    }
+fn sentinel_connection() -> exasol_udf_sdk::connection::ConnectionObject {
+    let password = serde_json::json!({ "warehouse": "wh", "token": SENTINELS[2] });
+    connection_object(SENTINELS[0], SENTINELS[1], &password.to_string())
 }
 
 fn granted(ctx: TestContext) -> TestContext {
@@ -53,7 +42,7 @@ fn writer_row(spec: &str, id: i64) -> Vec<Value> {
 }
 
 fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> String {
-    let mut spec = serde_json::json!({
+    let spec = serde_json::json!({
         "has_truncate": false,
         "has_replace": false,
         "source_column_names": [r#""T"."A""#],
@@ -62,17 +51,10 @@ fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> 
             {"key": "TABLE_NAME", "value": "ns.t"},
         ],
     });
-    let fields = spec.as_object_mut().expect("the spec is an object");
-    fields.extend(connection.as_object().cloned().unwrap_or_default());
-    fields.extend(extra.as_object().cloned().unwrap_or_default());
-    spec.to_string()
+    merged(merged(spec, connection), extra).to_string()
 }
 
-fn no_at_clause() -> serde_json::Value {
-    serde_json::json!({})
-}
-
-fn no_extra() -> serde_json::Value {
+fn no_fields() -> serde_json::Value {
     serde_json::json!({})
 }
 
@@ -94,7 +76,7 @@ fn assert_no_connection_value(text: &str, what: &str) {
 
 fn export_spec_with_columns(columns: &[&str]) -> String {
     let mut spec: serde_json::Value =
-        serde_json::from_str(&export_spec_json(no_at_clause(), no_extra())).unwrap();
+        serde_json::from_str(&export_spec_json(no_fields(), no_fields())).unwrap();
     spec["source_column_names"] = serde_json::json!(columns);
     spec.to_string()
 }
@@ -111,7 +93,7 @@ fn rendered_writer_spec(sql: &str) -> serde_json::Value {
 fn generated_sql_and_errors_carry_no_connection_value() {
     let sql = hook(
         &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
+        &export_spec_json(no_fields(), no_fields()),
     )
     .expect("a valid export yields SQL");
     assert!(
@@ -135,14 +117,14 @@ fn generated_sql_and_errors_carry_no_connection_value() {
             "inline CONNECTION",
             generate_export_sql(
                 &mut granted(hook_context()),
-                &export_spec_json(inline, no_extra()),
+                &export_spec_json(inline, no_fields()),
             ),
         ),
         (
             "missing script grant in the hook",
             generate_export_sql(
                 &mut hook_context(),
-                &export_spec_json(no_at_clause(), no_extra()),
+                &export_spec_json(no_fields(), no_fields()),
             ),
         ),
     ];
@@ -152,7 +134,10 @@ fn generated_sql_and_errors_carry_no_connection_value() {
     let writer_refusals = [
         (
             "missing script grant in the writer",
-            run_writer(&mut writer_context(vec![writer_row(WRITER_SPEC, 1)])),
+            run_writer(&mut writer_context(vec![writer_row(
+                &writer_spec(false),
+                1,
+            )])),
         ),
         (
             "forged writer spec",
@@ -171,7 +156,7 @@ fn generated_sql_and_errors_carry_no_connection_value() {
 fn hook_without_script_grant_names_connection_script_user_and_grant() {
     let message = error_text(generate_export_sql(
         &mut hook_context(),
-        &export_spec_json(no_at_clause(), no_extra()),
+        &export_spec_json(no_fields(), no_fields()),
     ));
 
     for fragment in [
@@ -217,7 +202,7 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
 
 #[test]
 fn writer_refuses_a_spec_whose_table_breaks_the_table_name_rule() {
-    let forged = WRITER_SPEC.replace(r#""table":"ns.t""#, r#""table":"t""#);
+    let forged = writer_spec(false).replace(r#""table":"ns.t""#, r#""table":"t""#);
 
     let message = error_text(run_writer(&mut granted(writer_context(vec![writer_row(
         &forged, 1,
@@ -299,7 +284,8 @@ fn a_column_named_like_an_iceberg_metadata_column_is_refused() {
 
 #[test]
 fn missing_grant_without_a_known_user_names_a_user_placeholder() {
-    let mut ctx = TestContext::set(vec![writer_row(WRITER_SPEC, 1)]).with_script_schema("LHVS");
+    let mut ctx =
+        TestContext::set(vec![writer_row(&writer_spec(false), 1)]).with_script_schema("LHVS");
 
     let message = error_text(run_writer(&mut ctx));
 
@@ -407,18 +393,6 @@ mod sql {
     }
 }
 
-pub(in crate::export) const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
-
-/// A CONNECTION the export accepts, named [`CONNECTION`].
-pub(in crate::export) fn export_connection(address: &str, token: &str) -> ConnectionObject {
-    ConnectionObject {
-        kind: "password".to_string(),
-        address: address.to_string(),
-        user: String::new(),
-        password: serde_json::json!({ "warehouse": "wh", "token": token }).to_string(),
-    }
-}
-
 fn writer_spec(single_commit: bool) -> String {
     serde_json::json!({
         "connection": CONNECTION,
@@ -440,7 +414,11 @@ fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
         .with_current_user("EXPORTER")
         .with_connection(
             CONNECTION,
-            export_connection("https://catalog.example", "t"),
+            connection_object(
+                "https://catalog.example",
+                "",
+                &serde_json::json!({ "warehouse": "wh", "token": "t" }).to_string(),
+            ),
         )
         .with_input_columns(vec![
             measured_column("VARCHAR(2000000) UTF8"),

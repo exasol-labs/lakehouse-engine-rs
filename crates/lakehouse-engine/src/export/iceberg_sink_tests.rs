@@ -1,9 +1,8 @@
 use super::super::iceberg_rest::target;
-use super::super::target::ExportConnection;
+use crate::export::test_support::static_key_connection;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use lakehouse_catalog::ConnectionCreds;
 use lakehouse_catalog::exported_test_support::spawn_server;
 use lakehouse_catalog_write::CommitTag;
 use std::sync::{Arc, Mutex};
@@ -63,23 +62,6 @@ async fn catalog_and_storage(commit: (u16, &'static str)) -> (String, Arc<Mutex<
     .await
 }
 
-/// A static-key CONNECTION whose catalog and storage are both the fake at `uri`.
-fn connection(uri: &str) -> ExportConnection {
-    ExportConnection {
-        address: uri.to_string(),
-        creds: ConnectionCreds {
-            warehouse: "wh".into(),
-            endpoint: uri.to_string(),
-            region: "us-east-1".into(),
-            access_key: "STATIC_ACCESS_KEY".into(),
-            secret_key: "STATIC_SECRET_KEY".into(),
-            path_style: Some(true),
-            ..Default::default()
-        },
-        allow_http: true,
-    }
-}
-
 /// The data file paths of the recorded requests whose method is `method`.
 fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
     requests
@@ -104,7 +86,7 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
         writer_id: "w1".into(),
     };
     let (uri, requests) = catalog_and_storage((504, "{}")).await;
-    let target = target(connection(&uri), "ns.t").unwrap();
+    let target = target(static_key_connection(&uri, true), "ns.t").unwrap();
     let mut sink = target.open_table(&schema, &tag, false).await.unwrap();
     let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
     let batch = RecordBatch::try_new(sink.schema(), vec![ids]).unwrap();
