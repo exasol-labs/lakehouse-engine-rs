@@ -8,7 +8,6 @@ use chrono::{NaiveDate, NaiveDateTime};
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::{Decimal, ExaType, Value};
 use std::sync::Arc;
-use vs_expression::udf_column_test_support::measured_column;
 
 const SPEC: &str = "the writer spec";
 
@@ -366,5 +365,49 @@ fn a_column_without_a_measured_spelling_is_refused_naming_it() {
             message.contains(&format!("column G has type {}", column.type_name)),
             "{message}"
         );
+    }
+}
+
+/// Column metadata as the Rust SLC reported an input column on `exasol/docker-db:2025.1.16`,
+/// for the type spellings the export's tests use. Panics on any other spelling.
+pub(in crate::export) fn measured_column(type_name: &str) -> ColumnInfo {
+    let digits = |prefix: &str| -> Option<Vec<u32>> {
+        let args = type_name.strip_prefix(prefix)?.split(')').next()?;
+        Some(
+            args.split(',')
+                .map(|n| n.parse().expect("number"))
+                .collect(),
+        )
+    };
+    let (typ, size, precision, scale) = if let Some(args) = digits("DECIMAL(") {
+        let (precision, scale) = (args[0], args[1]);
+        let typ = match (precision, scale) {
+            (0..=9, 0) => ExaType::Int32,
+            (10..=18, 0) => ExaType::Int64,
+            _ => ExaType::Numeric { precision, scale },
+        };
+        (typ, 0, precision, scale)
+    } else if let Some(args) = digits("TIMESTAMP(") {
+        (ExaType::Timestamp { precision: args[0] }, 0, args[0], 0)
+    } else if let Some(args) = digits("VARCHAR(") {
+        (ExaType::String { size: args[0] }, args[0], 0, 0)
+    } else if let Some(args) = digits("CHAR(") {
+        (ExaType::Char { size: args[0] }, args[0], 0, 0)
+    } else {
+        let typ = match type_name {
+            "DOUBLE" => ExaType::Double,
+            "BOOLEAN" => ExaType::Boolean,
+            "DATE" => ExaType::Date,
+            unmeasured => panic!("no measured column metadata for {unmeasured}"),
+        };
+        (typ, 0, 0, 0)
+    };
+    ColumnInfo {
+        name: "0".to_string(),
+        typ,
+        type_name: type_name.to_string(),
+        size: Some(size),
+        precision: Some(precision),
+        scale: Some(scale),
     }
 }
