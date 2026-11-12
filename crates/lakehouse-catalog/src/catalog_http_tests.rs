@@ -267,6 +267,170 @@ fn identity(text: &str) -> String {
     text.to_owned()
 }
 
+/// An error of a retried request redacts the bearer the retry carried, not the caller's first one.
+#[tokio::test]
+async fn an_error_after_a_renewal_redacts_the_renewed_bearer() {
+    use crate::auth::{ClientAuthentication, ClientCredentialsGrant};
+    use std::sync::atomic::AtomicU64;
+
+    let grants = Arc::new(AtomicUsize::new(0));
+    let granted = grants.clone();
+    let (token_uri, _) = spawn_server("application/json", move |_| {
+        let n = granted.fetch_add(1, Ordering::SeqCst);
+        (
+            200,
+            format!(r#"{{"access_token":"TOKEN_{n}","expires_in":3600}}"#),
+        )
+    })
+    .await;
+    let time = Arc::new(AtomicU64::new(0));
+    let moved = time.clone();
+    let answered = Arc::new(AtomicUsize::new(0));
+    let (catalog_uri, _) = spawn_server("text/plain", move |_| {
+        if answered.fetch_add(1, Ordering::SeqCst) == 0 {
+            moved.store(4_000_000, Ordering::SeqCst);
+            (503, "busy".into())
+        } else {
+            (400, "rejected TOKEN_1".into())
+        }
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let token = OAuth2Token::lazy(
+        ClientCredentialsGrant {
+            http: http.clone(),
+            token_url: token_uri,
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            scope: None,
+            authentication: ClientAuthentication::Form,
+            label: "OAuth2 token request",
+            require_expiry: false,
+        },
+        crate::exported_test_support::clock_reading(&time),
+    );
+    let first = token.bearer().await.unwrap();
+    let request = http.get(&catalog_uri).bearer_auth(&first).build().unwrap();
+
+    let error = http
+        .send_json::<serde_json::Value>(
+            request,
+            RepeatSafety::Safe,
+            Some(&token),
+            "catalog request",
+            |msg, bearer| bearer.map_or_else(|| msg.to_owned(), |b| msg.replace(b, "***")),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "catalog request failed with HTTP 400: rejected ***"
+    );
+}
+
+/// A renewed token that is not a valid header value leaves the old one on the request, so the error
+/// redacts the old one and no retry sends it again.
+#[tokio::test]
+async fn an_unusable_renewed_bearer_keeps_redacting_the_one_still_sent() {
+    use crate::auth::{ClientAuthentication, ClientCredentialsGrant};
+    use std::sync::atomic::AtomicU64;
+
+    let grants = Arc::new(AtomicUsize::new(0));
+    let granted = grants.clone();
+    let (token_uri, _) = spawn_server("application/json", move |_| {
+        if granted.fetch_add(1, Ordering::SeqCst) == 0 {
+            (
+                200,
+                r#"{"access_token":"TOKEN_0","expires_in":3600}"#.into(),
+            )
+        } else {
+            (
+                200,
+                r#"{"access_token":"BAD\nTOKEN","expires_in":3600}"#.into(),
+            )
+        }
+    })
+    .await;
+    let time = Arc::new(AtomicU64::new(0));
+    let moved = time.clone();
+    let (catalog_uri, requests) = spawn_server("text/plain", move |_| {
+        moved.store(4_000_000, Ordering::SeqCst);
+        (503, "echo TOKEN_0".into())
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let token = OAuth2Token::lazy(
+        ClientCredentialsGrant {
+            http: http.clone(),
+            token_url: token_uri,
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            scope: None,
+            authentication: ClientAuthentication::Form,
+            label: "OAuth2 token request",
+            require_expiry: false,
+        },
+        crate::exported_test_support::clock_reading(&time),
+    );
+    let first = token.bearer().await.unwrap();
+    let request = http.get(&catalog_uri).bearer_auth(&first).build().unwrap();
+
+    let error = http
+        .send_json::<serde_json::Value>(
+            request,
+            RepeatSafety::Safe,
+            Some(&token),
+            "catalog request",
+            |msg, bearer| bearer.map_or_else(|| msg.to_owned(), |b| msg.replace(b, "***")),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "catalog request failed with HTTP 503: echo ***"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// The bearer is a live token, so no `Debug` output of an answer or a failure shows it.
+#[tokio::test]
+async fn debug_output_of_an_answer_and_a_failure_hides_the_bearer() {
+    let (base_uri, _) = spawn_server("application/json", |_| (200, "{}".into())).await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let answer = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
+        .await
+        .unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_uri = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let failure = http
+        .send(get(&http, &dead_uri), RepeatSafety::Unsafe, None)
+        .await
+        .unwrap_err();
+
+    for debug in [format!("{answer:?}"), format!("{failure:?}")] {
+        assert!(!debug.contains(BEARER_TOK), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+    }
+}
+
+/// A request that never renewed is redacted by the bearer it was built with.
+#[tokio::test]
+async fn an_answer_reports_the_bearer_its_request_was_built_with() {
+    let (base_uri, _) = spawn_server("application/json", |_| (200, "{}".into())).await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let answer = http
+        .send(get(&http, &base_uri), RepeatSafety::Safe, None)
+        .await
+        .unwrap();
+
+    assert_eq!(answer.bearer.as_deref(), Some(BEARER_TOK));
+}
+
 /// A retry carries the bearer the token's holder gives then, not the one the first attempt carried.
 #[tokio::test]
 async fn a_retry_carries_the_current_oauth2_bearer() {
@@ -319,6 +483,7 @@ async fn a_retry_carries_the_current_oauth2_bearer() {
         .unwrap();
 
     assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.bearer.as_deref(), Some("TOKEN_1"));
     let sent = requests.lock().unwrap().clone();
     assert_eq!(sent.len(), 2);
     assert!(
@@ -662,7 +827,7 @@ async fn a_refused_json_answer_quotes_its_body_redacted_and_cut() {
             RepeatSafety::Safe,
             None,
             "catalog request",
-            |msg| msg.replace(BEARER_TOK, "***"),
+            |msg, _| msg.replace(BEARER_TOK, "***"),
         )
         .await
         .unwrap_err();
