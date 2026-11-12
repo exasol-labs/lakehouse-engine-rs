@@ -504,10 +504,11 @@ pub(crate) fn build_dispatch_sql(
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let keys = parse_order_by_keys(pushdown_req);
+        let mut keys = parse_order_by_keys(pushdown_req);
         // Exasol does not re-sort a delegated ordering, so an unrenderable key must
         // decline before any SQL is built (#198).
         topn::ensure_every_sort_key_renders(&keys)?;
+        topn::sort_by_select_items(&mut keys, pushdown_req, &projection);
         topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
