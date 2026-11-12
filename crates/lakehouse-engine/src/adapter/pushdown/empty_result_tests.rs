@@ -122,7 +122,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
             format!(
                 "SELECT CAST(SUM(\"LHS_T0\".\"{column}\") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS {ty}) \
                  AS \"{column}\" \
-                 FROM DUAL WHERE 1=0) AS \"LHS_T0\""
+                 FROM DUAL WHERE 1=0) AS \"LHS_T0\" GROUP BY ()"
             )
         );
     }
@@ -142,7 +142,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         sql,
         "SELECT CAST('X' AS VARCHAR(2000000)), CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT \
          CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
-         WHERE 1=0) AS \"LHS_T0\" HAVING (COUNT(*) = 0)"
+         WHERE 1=0) AS \"LHS_T0\" GROUP BY () HAVING (COUNT(*) = 0)"
     );
 }
 

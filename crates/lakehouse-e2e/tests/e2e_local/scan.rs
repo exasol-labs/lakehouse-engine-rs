@@ -2887,51 +2887,35 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
     }
 }
 
-// #52: Exasol flattens `COUNT(*) FROM (SELECT k, COUNT(*) ... GROUP BY k)` into one
-// group_by request with a literal-only select list; the scan must keep the GROUP BY
-// so Exasol's outer COUNT(*) counts group rows.
-
+/// Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     lakehouse_vs();
     let mut conn = exa_conn();
+    let events = events_table();
 
-    // Must be 4, not the 20 a row-scan fallback would return; `GROUP BY id` alone cannot
-    // tell the two apart.
-    let sql_duplicate_keys = format!(
-        "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
-        events_table()
-    );
-    let cols = conn.query_columns(&sql_duplicate_keys);
-    assert_eq!(
-        cols.len(),
-        1,
-        "nested COUNT(*) must return one column: {cols:?}"
-    );
-    assert_eq!(
-        cols[0].len(),
-        1,
-        "nested COUNT(*) must return one row: {cols:?}"
-    );
-    let distinct_group_count = parse_int(&cols[0][0]);
-    assert_eq!(
-        distinct_group_count, 4,
-        "COUNT(*) over (GROUP BY MOD(id,4)) sub-select must be 4 (distinct groups), \
-         got {distinct_group_count} — 20 would indicate an unsafe row-scan fallback \
-         instead of a correctly preserved grouped scan"
-    );
-
-    let sql_unique_key = format!(
-        "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
-        events_table()
-    );
-    let cols_unique = conn.query_columns(&sql_unique_key);
-    let unique_group_count = parse_int(&cols_unique[0][0]);
-    assert_eq!(
-        unique_group_count, 20,
-        "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
-         got {unique_group_count}"
-    );
+    // Exasol flattens each into one group_by request with a literal-only select list (#52).
+    // `MOD(id, 4)` tells a kept GROUP BY (4) from a row-scan fallback (20); `id` alone cannot.
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {events} GROUP BY MOD(id, 4))"
+            ),
+            4,
+        ),
+        (
+            format!("SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {events} GROUP BY id)"),
+            20,
+        ),
+    ] {
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            (cols.len(), cols[0].len()),
+            (1, 1),
+            "must return one column and one row: {sql}\n{cols:?}"
+        );
+        assert_eq!(parse_int(&cols[0][0]), expected, "{sql}");
+    }
 }
 
 // ORDER BY ... LIMIT n OFFSET m coverage (#191) for each wrapper site routed through
