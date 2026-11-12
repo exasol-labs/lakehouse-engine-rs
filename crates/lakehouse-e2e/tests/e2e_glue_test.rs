@@ -32,8 +32,8 @@ use common::seed::{
     TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
-    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL,
-    build_create_connection_sql, proxy_log_mark, proxy_log_since, wait_for_exasol,
+    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, build_create_connection_sql, proxy_log_mark,
+    proxy_log_since, proxy_url_internal, wait_for_exasol,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -948,7 +948,8 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
     const PROXY_REST_CONN: &str = "GLUE_PROXY_REST_CREDS";
     let env = run.env();
     let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
-    let proxy = [("HTTPS_PROXY", PROXY_URL_INTERNAL)];
+    let proxy_url = proxy_url_internal();
+    let proxy = [("HTTPS_PROXY", proxy_url.as_str())];
     create_proxied_schema_and_scripts(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy, &[]);
     let since = proxy_log_mark();
     let database = run.database();

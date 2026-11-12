@@ -5,7 +5,7 @@ use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
-    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
+    ColumnTypes, InvolvedColumns, aggregation_type, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
@@ -224,29 +224,6 @@ pub(in super::super) fn involved_table<'r>(
     })
 }
 
-/// The broadcast in-UDF join renders only projection, filter, and join condition, so any
-/// aggregation must be executed by Exasol over the materialized join.
-fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
-    let has_aggregate_item = pushdown_req
-        .get("selectList")
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| {
-            list.iter()
-                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
-        });
-    let has_group_by = pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    let is_group_by_aggregation =
-        pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by");
-    let has_having = pushdown_req
-        .get("having")
-        .filter(|h| !h.is_null())
-        .is_some();
-    has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
-}
-
 /// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
 #[derive(Debug, Clone, PartialEq)]
 pub(in super::super) enum JoinWindowPlan {
@@ -267,7 +244,9 @@ pub(in super::super) enum JoinWindowPlan {
 /// a projection here would let an aggregate-carrying join reach a render that can `Err` on
 /// absent column metadata.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    if carries_aggregation_clause(pushdown_req) {
+    // The broadcast in-UDF join renders only projection, filter, and join condition, so
+    // Exasol aggregates over the materialized join instead.
+    if aggregation_type(pushdown_req).is_some() {
         return JoinWindowPlan::ExasolPostProcessed;
     }
     let limit = extract_limit(pushdown_req);

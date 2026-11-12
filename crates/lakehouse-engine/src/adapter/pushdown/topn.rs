@@ -3,8 +3,9 @@ use serde_json::Value as Json;
 use vs_expression::render_expression_exasol;
 
 use super::support::{
-    BOUND_BY_TRANSLATOR, ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref,
-    emits_ident, extract_limit, extract_offset, render_limit_offset,
+    AggregationType, BOUND_BY_TRANSLATOR, ColumnTypes, ProjectedColumn, aggregation_type,
+    collect_all_column_names, column_node_ref, emits_ident, extract_limit, extract_offset,
+    render_limit_offset,
 };
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
@@ -158,7 +159,7 @@ pub(super) fn detect_topn(
     }
 
     // Top-N over grouped results is out of scope.
-    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by") {
+    if aggregation_type(pushdown_req) == Some(AggregationType::GroupBy) {
         return None;
     }
     if pushdown_req

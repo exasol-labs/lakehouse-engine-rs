@@ -385,6 +385,17 @@ const SINGLE_GROUP_SELECTS: &[&str] = &[
     "LENGTH(MAX(P)), COUNT(*)",
 ];
 
+/// The outer query references no column of the inner aggregate, so Exasol strips its
+/// aggregates (#627). `{H}` takes each of `HAVINGS`.
+const NESTED_SHAPES: &[&str] = &[
+    "SELECT COUNT(*) FROM (SELECT SUM(ID) FROM {T} WHERE {F}{H})",
+    "SELECT COUNT(*) FROM (SELECT COUNT(DISTINCT ID) FROM {T} WHERE {F}{H})",
+    "SELECT COUNT(*) FROM (SELECT SUM(ID) FROM {T} WHERE {F}{H} LIMIT 0)",
+    "SELECT 1 FROM (SELECT SUM(ID) FROM {T} WHERE {F}{H})",
+];
+
+const DECLINED_FILTER: &str = "SECOND(TS, 3) > 1";
+
 const JOIN_SELECTS: &[&str] = &["COUNT(*), 'X'", "SUM(B.S)"];
 
 const HAVINGS: &[&str] = &[
@@ -472,7 +483,26 @@ pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: F
                 let query = format!("SELECT {select} FROM {{T}} WHERE {filter}{having}");
                 failures.extend(oracle_mismatch(conn, &query, format));
             }
+            for shape in NESTED_SHAPES {
+                let query = shape.replace("{F}", filter).replace("{H}", having);
+                failures.extend(oracle_mismatch(conn, &query, format));
+            }
         }
+    }
+    let declined: Vec<String> = NESTED_SHAPES
+        .iter()
+        .map(|shape| shape.replace("{F}", DECLINED_FILTER).replace("{H}", ""))
+        .collect();
+    for query in &declined {
+        failures.extend(oracle_mismatch(conn, query, format));
+    }
+    // A declined filter returns the rows a pushed one would, so only the plan tells them apart.
+    let plan = isolated_pushdown_statement(conn, &declined[0].replace("{T}", &format.table()));
+    if !OuterWhere.holds(&plan) {
+        failures.push(format!(
+            "`{}` must apply its filter in the outer WHERE: {plan}",
+            declined[0]
+        ));
     }
     for filter in format.prunes_every_file() {
         let join = format!("FROM {{T}} A JOIN {{T}} B ON A.ID = B.ID WHERE A.{filter}");
@@ -488,6 +518,8 @@ pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: F
                 let query = format!("SELECT {select} {join}{having}");
                 failures.extend(oracle_mismatch(conn, &query, format));
             }
+            let nested = format!("SELECT COUNT(*) FROM (SELECT SUM(B.ID) {join}{having})");
+            failures.extend(oracle_mismatch(conn, &nested, format));
         }
     }
     assert!(

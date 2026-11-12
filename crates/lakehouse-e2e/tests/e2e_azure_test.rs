@@ -468,7 +468,8 @@ fn azure_static_and_vended_creds_end_to_end() {
 /// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
 fn adls_reads_tunnel_through_the_https_proxy(conn: &mut ExaConn, fixture: &AzureFixture) {
     const PROXY_VS: &str = "AZ_PROXY_VS";
-    let proxy = [("HTTPS_PROXY", stack::PROXY_URL_INTERNAL)];
+    let proxy_url = stack::proxy_url_internal();
+    let proxy = [("HTTPS_PROXY", proxy_url.as_str())];
     create_proxied_schema_and_scripts(conn, stack::PROXY_ADAPTER_SCHEMA, &proxy, &proxy, &[]);
     let since = stack::proxy_log_mark();
     create_virtual_schema_with_password(

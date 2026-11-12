@@ -12,7 +12,7 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{events, stack, vs_table};
+use crate::fixtures::{JOIN_ORACLE, copy_join_tables_natively, events, stack, vs_table};
 
 use parquet::file::statistics::Statistics;
 
@@ -530,6 +530,7 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     );
 }
 
+/// Scenario: Aggregate over a join routes through the unified qualified wrapper
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
     setup_e2e();
@@ -569,6 +570,11 @@ fn e2e_aggregate_over_join_result_correct() {
             expected_min,
             "MIN(O_ORDERDATE) over the join must equal the single-table MIN for {vs_name}"
         );
+
+        let nested = format!("SELECT COUNT(*) FROM ({})", aggregate_join_query(vs_name));
+        let cols = conn.query_columns(&nested);
+        assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
+        assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
     }
 }
 
@@ -1194,22 +1200,6 @@ fn custkey_like(custkey: &str) -> bool {
     custkey.starts_with('1')
 }
 
-/// Holds native copies of the fact and dimension tables under their virtual names, so a join
-/// query that names its schema `{T}` runs over either.
-const JOIN_ORACLE: &str = "JOIN_ORACLE";
-
-fn copy_join_tables_natively(conn: &mut ExaConn) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
-    for (native, virtual_table) in [
-        (vs_fact_table(JOIN_ORACLE), vs_fact_table(VS_NAME)),
-        (vs_dim_table(JOIN_ORACLE), vs_dim_table(VS_NAME)),
-    ] {
-        conn.execute(&format!(
-            "CREATE OR REPLACE TABLE {native} AS SELECT * FROM {virtual_table}"
-        ));
-    }
-}
-
 /// `query` names its schema `{T}`. Over `vs_name` it must return what it returns natively and
 /// take the N-scan fallback, whose pushdown statement this returns.
 #[track_caller]
@@ -1270,7 +1260,7 @@ fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
 #[test]
 fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
     setup_e2e();
-    copy_join_tables_natively(&mut exa_conn());
+    copy_join_tables_natively(&mut exa_conn(), VS_NAME);
 
     for (setting, own_format_filter) in
         [(DEFAULT_SESSION, ORDERDATE_LIKE), (DMY, ORDERDATE_LIKE_DMY)]
@@ -1293,7 +1283,7 @@ fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
 fn e2e_n_scan_leg_keeps_its_computed_conjunct_beside_a_declined_one() {
     setup_e2e();
     let mut conn = exa_conn();
-    copy_join_tables_natively(&mut conn);
+    copy_join_tables_natively(&mut conn, VS_NAME);
 
     let query = like_join_query("{T}", &format!("{CUSTKEY_LIKE} AND {ORDERDATE_LIKE}"));
     assert_narrows_fact_table(&mut conn, &query);

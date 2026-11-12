@@ -1328,18 +1328,6 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
 }
 
 #[test]
-fn div_falls_through_as_unsupported() {
-    // DataFusion has no `div`, and a TRUNC(m/n) emulation diverges from Exasol on DOUBLE
-    // division by zero (22012 vs infinity); operand types are not carried in the node.
-    let expr = scalar_fn("DIV", [col("a"), col("b")]);
-    let err = render_expression(&expr).unwrap_err();
-    assert!(
-        err.to_string().contains("DIV"),
-        "error must name DIV as unsupported: {err}"
-    );
-}
-
-#[test]
 fn to_char_and_to_number_fall_through_as_unsupported() {
     // DataFusion's `to_char` uses strftime masks, not Exasol format models, and it has no
     // `to_number`.
@@ -1989,6 +1977,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     ] {
         fixtures.push(verbatim(name, vec![col("a"), col("b")]));
     }
+    fixtures.push(verbatim("DIV", vec![col("a"), col("b")]));
 
     for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"] {
         fixtures.push(verbatim(name, vec![col("d"), col("n")]));
@@ -2199,6 +2188,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "nullif(",
             "coalesce(",
             CHECKED_FLOAT_DIV_FN,
+            CHECKED_INT_DIV_FN,
         ] {
             assert!(
                 !rendered.contains(token),

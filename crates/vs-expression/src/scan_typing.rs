@@ -152,7 +152,7 @@ impl ScalarFunction {
     fn class(self, args: &[TypeClass]) -> TypeClass {
         match self.result {
             ResultRule::Text => TypeClass::Text,
-            ResultRule::Integer => TypeClass::INTEGER,
+            ResultRule::Integer | ResultRule::IntegerOverIntegers => TypeClass::INTEGER,
             ResultRule::Number => TypeClass::Number,
             ResultRule::Arithmetic if args.iter().all(|c| c.is_integer()) => TypeClass::INTEGER,
             ResultRule::Arithmetic | ResultRule::NumberOverNumbers
@@ -447,6 +447,13 @@ fn scalar_function_class(
         .map(|(_, c)| *c)
         .collect();
     refuse_implicit_text(node, &converted)?;
+    if function.result == ResultRule::IntegerOverIntegers && !args.iter().all(|c| c.is_integer()) {
+        return Err(decline(format!(
+            "{} computes over integer operands only: {}",
+            function.name,
+            short(node)
+        )));
+    }
     Ok(function.class(args))
 }
 

@@ -191,3 +191,89 @@ async fn overflow_past_128_bits_raises_and_is_recorded_on_the_session() {
             .is_some_and(|o| o.starts_with("data exception - numeric value out of range"))
     );
 }
+
+#[tokio::test]
+async fn div_truncates_toward_zero_over_the_full_integer_range() {
+    let ctx = session();
+    for (sql, expected) in [
+        ("SELECT CAST(vs_checked_int_div(-7, 2) AS VARCHAR)", "-3"),
+        ("SELECT CAST(vs_checked_int_div(7, -2) AS VARCHAR)", "-3"),
+        ("SELECT CAST(vs_checked_int_div(-7, -2) AS VARCHAR)", "3"),
+        (
+            "SELECT CAST(vs_checked_int_div(arrow_cast('-9223372036854775808', 'Int64'), -1) \
+             AS VARCHAR)",
+            "9223372036854775808",
+        ),
+        (
+            "SELECT CAST(vs_checked_int_div(arrow_cast('18446744073709551615', 'UInt64'), 1) \
+             AS VARCHAR)",
+            "18446744073709551615",
+        ),
+        (
+            "SELECT CAST(vs_checked_int_div(arrow_cast('999999999999999999999999999999999999', \
+             'Decimal128(36, 0)'), 7) AS VARCHAR)",
+            "142857142857142857142857142857142857",
+        ),
+        (
+            "SELECT CAST(vs_checked_int_div(n, 0) AS VARCHAR) FROM t WHERE l IS NULL",
+            "",
+        ),
+        ("SELECT CAST(vs_checked_int_div(NULL, 0) AS VARCHAR)", ""),
+        (
+            "SELECT CAST(vs_checked_int_div(l, NULL) AS VARCHAR) FROM t LIMIT 1",
+            "",
+        ),
+    ] {
+        assert_eq!(rows(&ctx, sql).await, [expected], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn div_takes_the_numerator_precision_whatever_the_divisor() {
+    let ctx = session();
+    for (sql, expected) in [
+        (
+            "SELECT arrow_typeof(vs_checked_int_div(arrow_cast(7, 'Int16'), arrow_cast(2, 'UInt64')))",
+            "Decimal128(5, 0)",
+        ),
+        (
+            "SELECT arrow_typeof(vs_checked_int_div(l, arrow_cast(2, 'Int8'))) FROM t LIMIT 1",
+            "Decimal128(19, 0)",
+        ),
+        (
+            "SELECT arrow_typeof(vs_checked_int_div(NULL, l)) FROM t LIMIT 1",
+            "Decimal128(1, 0)",
+        ),
+    ] {
+        assert_eq!(rows(&ctx, sql).await, [expected], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn div_by_zero_raises_and_is_recorded_on_the_session() {
+    for sql in [
+        "SELECT vs_checked_int_div(l, l - l) FROM t",
+        "SELECT vs_checked_int_div(l - l, l - l) FROM t",
+    ] {
+        let ctx = session();
+        ctx.sql(sql).await.unwrap().collect().await.expect_err(sql);
+
+        assert_eq!(
+            session_raised_failure(&ctx).as_deref(),
+            Some("data exception - division by zero in vs_checked_int_div"),
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn div_refuses_a_non_integer_operand_at_planning() {
+    let ctx = session();
+    for sql in [
+        "SELECT vs_checked_int_div(dec36, 2) FROM t",
+        "SELECT vs_checked_int_div(l, d) FROM t",
+    ] {
+        let error = ctx.sql(sql).await.expect_err(sql).to_string();
+        assert!(error.contains("divides integers only"), "{sql}: {error}");
+    }
+}

@@ -1,6 +1,8 @@
 //! The one table of translated scalar functions: how the renderer emits each in both dialects, and
 //! how the scan's typed pass types it. The DataFusion dialect declines a name absent here.
 
+use crate::CHECKED_INT_DIV_FN;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExasolForm {
     /// `<NAME>(<rendered args>)` with no arity check: Exasol emitted the call, so
@@ -34,6 +36,8 @@ pub(crate) enum ResultRule {
     Arithmetic,
     /// A number over numbers, never an integer: `SQRT(2)` is not one.
     NumberOverNumbers,
+    /// An integer, and the scan computes the call only over integer operands.
+    IntegerOverIntegers,
     FirstArgument,
     /// Exasol brings every argument to one type, as for CASE branches.
     Unified,
@@ -60,8 +64,8 @@ pub(crate) struct ScalarFunction {
     /// Text arguments that are parameters, not values: a format model or a unit.
     pub(crate) parameters: &'static [usize],
     pub(crate) result: ResultRule,
-    /// The DataFusion function of a same-arity string call the renderer's generic arm emits.
-    pub(crate) string_call: Option<&'static str>,
+    /// The DataFusion function of a same-arity call the renderer's generic arm emits.
+    pub(crate) datafusion_call: Option<&'static str>,
 }
 
 impl ScalarFunction {
@@ -72,7 +76,7 @@ impl ScalarFunction {
             text_args: TextArgs::Never,
             parameters: &[],
             result: ResultRule::Other,
-            string_call: None,
+            datafusion_call: None,
         }
     }
 
@@ -96,9 +100,9 @@ impl ScalarFunction {
         Self { parameters, ..self }
     }
 
-    const fn string_call(self, datafusion_name: &'static str) -> Self {
+    const fn datafusion_call(self, datafusion_name: &'static str) -> Self {
         Self {
-            string_call: Some(datafusion_name),
+            datafusion_call: Some(datafusion_name),
             ..self
         }
     }
@@ -116,6 +120,9 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::shaped("SUB").typed(T::Never, R::Arithmetic),
         F::shaped("MULT").typed(T::Never, R::Arithmetic),
         F::shaped("FLOAT_DIV").typed(T::Never, R::NumberOverNumbers),
+        F::verbatim("DIV")
+            .typed(T::Never, R::IntegerOverIntegers)
+            .datafusion_call(CHECKED_INT_DIV_FN),
         F::shaped("NEG").typed(T::Never, R::Arithmetic),
         F::shaped("CAST"),
         // MOD: Exasol requires `MOD(a, b)`, DataFusion the `%` operator.
@@ -153,67 +160,67 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("ATAN2").typed(T::Never, R::NumberOverNumbers),
         F::verbatim("LOWER")
             .typed(T::First, R::Text)
-            .string_call("lower"),
+            .datafusion_call("lower"),
         F::verbatim("UPPER")
             .typed(T::First, R::Text)
-            .string_call("upper"),
+            .datafusion_call("upper"),
         F::verbatim("SUBSTR")
             .typed(T::First, R::Text)
-            .string_call("substr"),
+            .datafusion_call("substr"),
         F::verbatim("TRIM")
             .typed(T::All, R::Text)
-            .string_call("trim"),
+            .datafusion_call("trim"),
         F::verbatim("LTRIM")
             .typed(T::All, R::Text)
-            .string_call("ltrim"),
+            .datafusion_call("ltrim"),
         F::verbatim("RTRIM")
             .typed(T::All, R::Text)
-            .string_call("rtrim"),
+            .datafusion_call("rtrim"),
         F::verbatim("REPLACE")
             .typed(T::All, R::Text)
-            .string_call("replace"),
+            .datafusion_call("replace"),
         F::verbatim("REPEAT")
             .typed(T::First, R::Text)
-            .string_call("repeat"),
+            .datafusion_call("repeat"),
         F::verbatim("REVERSE")
             .typed(T::First, R::Text)
-            .string_call("reverse"),
+            .datafusion_call("reverse"),
         F::verbatim("LPAD")
             .typed(T::Pad, R::Text)
-            .string_call("lpad"),
+            .datafusion_call("lpad"),
         F::verbatim("RPAD")
             .typed(T::Pad, R::Text)
-            .string_call("rpad"),
+            .datafusion_call("rpad"),
         F::verbatim("ASCII")
             .typed(T::First, R::Integer)
-            .string_call("ascii"),
+            .datafusion_call("ascii"),
         F::verbatim("CHR")
             .typed(T::Never, R::Text)
-            .string_call("chr"),
+            .datafusion_call("chr"),
         F::verbatim("INITCAP")
             .typed(T::First, R::Text)
-            .string_call("initcap"),
+            .datafusion_call("initcap"),
         F::verbatim("LEFT")
             .typed(T::First, R::Text)
-            .string_call("left"),
+            .datafusion_call("left"),
         F::verbatim("RIGHT")
             .typed(T::First, R::Text)
-            .string_call("right"),
+            .datafusion_call("right"),
         F::verbatim("TRANSLATE")
             .typed(T::All, R::Text)
-            .string_call("translate"),
+            .datafusion_call("translate"),
         F::verbatim("LENGTH")
             .typed(T::First, R::Integer)
-            .string_call("character_length"),
+            .datafusion_call("character_length"),
         F::verbatim("OCTET_LENGTH")
             .typed(T::First, R::Integer)
-            .string_call("octet_length"),
+            .datafusion_call("octet_length"),
         F::verbatim("UNICODE")
             .typed(T::First, R::Integer)
-            .string_call("ascii"),
+            .datafusion_call("ascii"),
         F::verbatim("UNICODECHR")
             .typed(T::Never, R::Text)
-            .string_call("chr"),
+            .datafusion_call("chr"),
         // Exasol's INSTR/LOCATE accept the optional start argument natively.
         F::verbatim("INSTR").typed(T::FirstTwo, R::Integer),
         F::verbatim("LOCATE").typed(T::FirstTwo, R::Integer),

@@ -858,6 +858,22 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
+/// Exasol's `aggregationType`, which it sets on every request that aggregates, including one whose
+/// select list it stripped of every aggregate (#627).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AggregationType {
+    SingleGroup,
+    GroupBy,
+}
+
+pub(super) fn aggregation_type(pushdown_req: &Json) -> Option<AggregationType> {
+    match pushdown_req.get("aggregationType").and_then(Json::as_str)? {
+        "single_group" => Some(AggregationType::SingleGroup),
+        "group_by" => Some(AggregationType::GroupBy),
+        _ => None,
+    }
+}
+
 /// A `pushdownRequest` paired with the type Exasol declares for each of its select-list items.
 /// [`PushdownRequest::parse`] is the only constructor, so every holder has passed the strict type
 /// and count check, and no consumer re-reads `selectListDataTypes` to turn an error into no type.

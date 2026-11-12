@@ -11,8 +11,9 @@ use crate::common::seed::{
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper, events_table,
-    lakehouse_vs, typed_table, vs_char_pad_table, vs_dim_table, vs_fact_table,
+    TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
+    echoed_pushdown_requests, events_table, lakehouse_vs, typed_table, vs_char_pad_table,
+    vs_dim_table, vs_fact_table,
 };
 
 /// The measured worst-case divergence of the scan's float division from native Exasol is
@@ -1881,15 +1882,9 @@ fn assert_no_hidden_columns(names: &[String], sql: &str) {
 /// `explain_virtual_sql`'s flattened blob is too coarse for asserting Exasol's wire
 /// payload: `contains("limit")` would also match the adapter's own scan-spec keys.
 fn explain_virtual_pushdown_request(conn: &mut ExaConn, sql: &str) -> serde_json::Value {
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {sql}"));
-    let result_set = resp["responseData"]["results"][0]["resultSet"].clone();
-    conn.fetch_result_columns(&result_set)
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .flat_map(|v| v.as_array().cloned().unwrap_or_default())
-        .find_map(|entry| entry.get("pushdownRequest").cloned())
+    echoed_pushdown_requests(conn, sql)
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("EXPLAIN VIRTUAL carried no echoed pushdownRequest for:\n{sql}"))
 }
 

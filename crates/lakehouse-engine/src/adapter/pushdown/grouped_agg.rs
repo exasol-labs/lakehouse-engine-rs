@@ -9,8 +9,8 @@ use super::scalar_over_agg::{
     substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
-    ColumnTypes, PushdownRequest, ScanTranslator, build_fan_out_inner, output_select_list,
-    quote_ident, render_limit_offset,
+    AggregationType, ColumnTypes, PushdownRequest, ScanTranslator, aggregation_type,
+    build_fan_out_inner, output_select_list, quote_ident, render_limit_offset,
 };
 use super::topn::sort_flags;
 
@@ -85,7 +85,7 @@ pub fn detect_group_by_aggregates(
     scan: ScanTranslator<'_>,
 ) -> Option<GroupedAggregateDetection> {
     let pushdown_req = pushdown.json();
-    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
+    if aggregation_type(pushdown_req) != Some(AggregationType::GroupBy) {
         return None;
     }
 
