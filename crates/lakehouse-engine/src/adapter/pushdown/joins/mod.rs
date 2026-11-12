@@ -32,10 +32,8 @@ pub(super) use sql_builders::{
     FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
 };
 
-pub(super) use planning::JoinWindowPlan;
-use planning::{
-    classify_join_window, involved_table, resolve_one_join_side, select_broadcast_sides,
-};
+pub(super) use planning::{JoinWindowPlan, involved_table};
+use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
 use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{

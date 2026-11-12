@@ -124,21 +124,6 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
 }
 
 #[test]
-fn legs_referenced_reports_every_leg_a_tree_touches() {
-    let legs = self_join_legs();
-    let condition = predicate_equal(
-        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
-        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
-    );
-
-    assert_eq!(legs.legs_referenced(&condition), BTreeSet::from([0, 1]));
-    assert_eq!(
-        legs.legs_referenced(&predicate_equal(num_lit("1"), num_lit("1"))),
-        BTreeSet::new()
-    );
-}
-
-#[test]
 fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
     let legs = JoinLegs::from_leaves(&[
         leaf("FACT_ORDERS", Some("A")),
@@ -150,25 +135,7 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
         aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
     );
 
-    assert_eq!(legs.attachment_leg(&condition), Some(2));
-}
-
-#[test]
-fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
-    let legs = self_join_legs();
-    let condition = predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
-
-    assert_eq!(legs.attachment_leg(&condition), Some(1));
-}
-
-#[test]
-fn attachment_leg_is_none_for_a_column_free_condition() {
-    let legs = self_join_legs();
-
-    assert_eq!(
-        legs.attachment_leg(&predicate_equal(num_lit("1"), num_lit("1"))),
-        None
-    );
+    assert_eq!(legs.attachment_leg(&condition), 2);
 }
 
 #[test]

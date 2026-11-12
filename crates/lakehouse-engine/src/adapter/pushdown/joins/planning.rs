@@ -213,7 +213,7 @@ pub(super) async fn resolve_one_join_side(
 }
 
 /// One leg's column types and notes from the same pass.
-pub(super) fn involved_table<'r>(
+pub(in super::super) fn involved_table<'r>(
     request: &'r Json,
     table_name: &str,
 ) -> Result<InvolvedColumns<'r>, UdfError> {

@@ -440,18 +440,6 @@ pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
     )
 }
 
-/// The columns `request` declares for its involved table `name`, as `plan_join` reads each leg's.
-fn table_columns<'r>(
-    request: &'r Json,
-    name: &str,
-) -> Result<support::InvolvedColumns<'r>, UdfError> {
-    support::involved_columns(request, |tables| {
-        tables
-            .iter()
-            .find(|table| table["name"].as_str() == Some(name))
-    })
-}
-
 /// `sides` with each side's map built, as the resolver builds it, from the columns `request`
 /// declares for the side's table and the side's declared schema.
 pub(crate) fn request_typed(
@@ -461,7 +449,7 @@ pub(crate) fn request_typed(
     sides
         .iter()
         .map(|side| {
-            let involved = table_columns(request, &side.table_name).unwrap();
+            let involved = joins::involved_table(request, &side.table_name).unwrap();
             joins::ResolvedJoinSide {
                 column_types: ColumnTypes::of(&involved, &side.logical_schema, false),
                 ..side.clone()
@@ -593,6 +581,38 @@ pub(crate) fn project_split(
 /// returns only its JSON or whose select list a test replaced in place.
 pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
     PushdownRequest::parse(pd(request)).expect("the fixture declares a valid selectListDataTypes")
+}
+
+/// The qualified single-table wrapper over `request` once the scan declines its whole WHERE,
+/// which the wrapper then self-applies; the fan-out spec carries no filter. Asserts the decline,
+/// since a fixture whose filter renders would assert nothing.
+pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
+    let pushdown = parsed_pushdown(request);
+    let (scan_filter, declined) = scan_of(request).split_where(pushdown.json().get("filter"));
+    assert!(
+        scan_filter.is_none(),
+        "fixture precondition: a declining filter must never reach the scan spec: {scan_filter:?}"
+    );
+    let declined = declined
+        .expect("fixture precondition: a declining filter must be handed back for self-applying");
+    let col_types = first_table_column_types(request);
+    let fan_out = joins::FanOutProjection::new(
+        crate::scan::spec::CommonScanSpec {
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
+        },
+        &col_types,
+    );
+    joins::build_qualified_single_table_fallback_sql(
+        request,
+        &pushdown,
+        &fan_out,
+        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        Some(declined),
+    )
+    .expect("the wrapper must render the declined predicate")
 }
 
 /// [`project_split`] over `request`'s first involved table, as `handle_pushdown` projects it.
@@ -1518,22 +1538,20 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
 /// the join's legs, or over the request's one table.
 pub(crate) fn request_check(request: &Json) -> Result<(), UdfError> {
     let pushdown = &request["pushdownRequest"];
-    let join = match detect_join(request, pushdown)? {
-        JoinShape::Join(join) => Some(join),
-        JoinShape::NotAJoin => None,
+    let (join, declared) = match detect_join(request, pushdown)? {
+        JoinShape::Join(join) => {
+            let declared = join
+                .tables
+                .iter()
+                .map(|leaf| joins::involved_table(request, &leaf.table_name))
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(join), declared)
+        }
+        JoinShape::NotAJoin => (
+            None,
+            vec![support::involved_columns(request, |tables| tables.first())?],
+        ),
     };
-    let table_names: Vec<&str> = match &join {
-        Some(join) => join
-            .tables
-            .iter()
-            .map(|leaf| leaf.table_name.as_str())
-            .collect(),
-        None => vec![request["involvedTables"][0]["name"].as_str().unwrap_or("")],
-    };
-    let declared = table_names
-        .into_iter()
-        .map(|name| table_columns(request, name))
-        .collect::<Result<Vec<_>, _>>()?;
     ensure_columns_declared(
         request,
         pushdown,

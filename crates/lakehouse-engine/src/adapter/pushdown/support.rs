@@ -332,14 +332,6 @@ impl InvolvedColumns<'_> {
     }
 }
 
-/// A column node binds no column the request declares. Exasol declares every column a query
-/// reads in `involvedTables`, so this is an adapter bug or a request shape it does not know.
-pub(super) fn undeclared_column_error(name: &str) -> UdfError {
-    UdfError::User(format!(
-        "the pushdown request names column {name}, which its involved table does not declare"
-    ))
-}
-
 /// The invariant every type lookup of a request column relies on once [`ScanTranslator::over`]
 /// has built the translator over that request.
 pub(super) const BOUND_BY_TRANSLATOR: &str =

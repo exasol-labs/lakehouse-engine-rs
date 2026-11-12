@@ -2,7 +2,7 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
-use crate::adapter::pushdown::support::{InvolvedColumns, undeclared_column_error};
+use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::relation_alias;
 use exasol_udf_sdk::error::UdfError;
 use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
@@ -101,10 +101,13 @@ impl JoinLegs {
     }
 
     /// The highest referenced leg index: the earliest join point of a left-to-right chain with
-    /// every referenced leg in scope. `None` when the tree has no column, so the caller must
-    /// apply it where every leg is in scope.
-    pub(super) fn attachment_leg(&self, expr: &Json) -> Option<usize> {
-        self.legs_referenced(expr).last().copied()
+    /// every referenced leg in scope. Exasol pushes only a join whose condition references both
+    /// of its sides, so a condition always references a leg after the first.
+    pub(super) fn attachment_leg(&self, condition: &Json) -> usize {
+        match self.legs_referenced(condition).last() {
+            Some(&leg) if leg >= 1 => leg,
+            _ => panic!("Exasol pushes only a join condition that references both of its sides"),
+        }
     }
 
     /// `None` when the conjunct has no column or spans several legs; the caller then applies it
@@ -161,6 +164,14 @@ fn unbound_column_error(column: ColumnNode<'_>) -> UdfError {
         "the pushdown request names column {} of table {table} with {alias}, which binds no \
          single table of the query",
         column.upper_name()
+    ))
+}
+
+/// Exasol declares every column a query reads in `involvedTables`, so this is an adapter bug or
+/// a request shape it does not know.
+fn undeclared_column_error(name: &str) -> UdfError {
+    UdfError::User(format!(
+        "the pushdown request names column {name}, which its involved table does not declare"
     ))
 }
 

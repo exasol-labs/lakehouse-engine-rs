@@ -125,26 +125,16 @@ fn exceeds_identifier_limit(item: &ProjectionItem) -> bool {
 
 /// Each condition attaches greedily to the earliest join point with every referenced leg
 /// in scope, as decided by [`JoinLegs::attachment_leg`] (never by table or column name). A
-/// join point with none renders `ON 1=1`. Unattachable conditions are returned as outer
-/// WHERE residuals, which for an inner join is result-equivalent to `ON`.
+/// join point with none renders `ON 1=1`.
 fn build_n_scan_join_from(
     fan_outs: &[String],
     legs: &JoinLegs,
     raw_conditions: &[Json],
     conditions: &[String],
-) -> (String, Vec<String>) {
-    let last_join_point = fan_outs.len().saturating_sub(1);
-
+) -> String {
     let mut on_at: Vec<Vec<String>> = vec![Vec::new(); fan_outs.len()];
-    let mut residual: Vec<String> = Vec::new();
     for (raw, rendered) in raw_conditions.iter().zip(conditions) {
-        // With a single leg there is no join point (and `clamp(1, 0)` would panic).
-        match legs.attachment_leg(raw) {
-            Some(m) if last_join_point >= 1 => {
-                on_at[m.clamp(1, last_join_point)].push(rendered.clone())
-            }
-            _ => residual.push(rendered.clone()),
-        }
+        on_at[legs.attachment_leg(raw)].push(rendered.clone());
     }
 
     let mut from = format!("({}) AS {}", fan_outs[0], quote_ident(&legs.leg_alias(0)));
@@ -163,7 +153,7 @@ fn build_n_scan_join_from(
             quote_ident(&legs.leg_alias(k))
         ));
     }
-    (from, residual)
+    from
 }
 
 fn n_full_row_qualified_items(
@@ -346,20 +336,11 @@ pub(in super::super) fn build_n_scan_join_sql(
     let OuterWrapperClauses { select, trailing } =
         outer_wrapper_clauses(pushdown, &legs, &cols_per_side)?;
 
-    let (from, residual_conditions) =
-        build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
-
-    let mut where_parts: Vec<String> = residual_conditions
-        .iter()
-        .map(|c| format!("({c})"))
-        .collect();
-    if let Some(f) = &filter {
-        where_parts.push(format!("({f})"));
-    }
+    let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
     let mut sql = format!("SELECT {select} FROM {from}");
-    if !where_parts.is_empty() {
-        sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
+    if let Some(f) = &filter {
+        sql.push_str(&format!(" WHERE ({f})"));
     }
     sql.push_str(&trailing);
     Ok(sql)

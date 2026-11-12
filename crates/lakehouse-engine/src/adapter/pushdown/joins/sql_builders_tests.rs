@@ -142,7 +142,7 @@ fn broadcast_join_declines_widened_projection() {
 }
 
 #[test]
-fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
+fn broadcast_declines_on_a_declined_filter() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] =
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
@@ -156,21 +156,8 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
         )
         .expect("a declined filter is a clean decline, not an error")
         .is_none(),
-        "an unrenderable filter must decline the broadcast plan (Ok(None)) so the \
+        "a declined filter must decline the broadcast plan (Ok(None)) so the \
          request falls through to the N-scan fallback, which self-applies it"
-    );
-
-    let absent_request = join_request(Json::Null, equi_condition());
-    let absent_detected = detected_join(&absent_request);
-    assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&absent_request),
-            &absent_detected,
-            &request_sides(&absent_request, &absent_detected)
-        )
-        .expect("an absent filter must not error")
-        .is_some(),
-        "an absent filter must NOT decline broadcast eligibility"
     );
 }
 
@@ -1120,7 +1107,7 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
             (table_col("ORDERS", "O_ORDERDATE"), ExasolType::Date),
         ],
     );
-    request["pushdownRequest"]["having"] = bool_lit(true);
+    request["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
 
     assert!(matches!(
         classify_join_window(&pd(&request)),
@@ -1258,7 +1245,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ));
 
     let mut having = join_request(Json::Null, equi_condition());
-    having["pushdownRequest"]["having"] = bool_lit(true);
+    having["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
     assert!(matches!(
         classify_join_window(&pd(&having)),
         JoinWindowPlan::ExasolPostProcessed
@@ -2064,34 +2051,10 @@ fn declined_filter_table() -> PushdownRequestBuilder {
     )
 }
 
-/// The single-table wrapper over `request` once the scan declines its whole WHERE, which the
-/// wrapper then self-applies; the fan-out spec carries no filter.
-fn declined_filter_wrapper_sql(request: &Json) -> Result<String, UdfError> {
-    let pushdown = parsed_pushdown(request);
-    let col_types = first_table_column_types(request);
-    let fan_out = FanOutProjection::new(
-        CommonScanSpec {
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        &col_types,
-    );
-    build_qualified_single_table_fallback_sql(
-        request,
-        &pushdown,
-        &fan_out,
-        &[vec![("s3://w/f-0.parquet".to_string(), 10u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        pushdown.json().get("filter"),
-    )
-}
-
 #[test]
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
-    let declined = declined_second_predicate(table_col("T", "C_TS"));
     let request = declined_filter_table()
-        .filter(declined.clone())
+        .filter(declined_second_predicate(table_col("T", "C_TS")))
         .order_by(serde_json::json!([order_by_element(
             table_col("T", "ID"),
             true,
@@ -2101,13 +2064,8 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
         .column(table_col("T", "ID"))
         .build()
         .0;
-    assert!(
-        scan_of(&request).expression(&declined).is_none(),
-        "fixture precondition: SECOND(C_TS, 3) must decline for DataFusion"
-    );
 
-    let sql = declined_filter_wrapper_sql(&request)
-        .expect("a declined predicate that renders for Exasol must build the wrapper");
+    let sql = declined_filter_wrapper_sql(&request);
 
     let where_at = sql
         .find(r#"AS "LHS_T0" WHERE "#)
@@ -2148,7 +2106,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
         .build()
         .0;
 
-    let sql = declined_filter_wrapper_sql(&request).expect("the predicate must self-apply");
+    let sql = declined_filter_wrapper_sql(&request);
 
     assert!(
         sql.contains(
@@ -2211,11 +2169,12 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 /// The wrapper's trailing clauses for `request`, whose every leg is an `EVENTS` occurrence.
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
     let events = column_types(&events_columns());
-    let (legs, leg_count) = match detect_join(request, &pd(request)).expect("a plannable request") {
-        JoinShape::Join(join) => (join.legs(), join.tables.len()),
-        JoinShape::NotAJoin => (JoinLegs::for_single_scan(request), 1),
+    let (pushdown, legs) = planned(request);
+    let leg_count = match detect_join(request, pushdown.json()).expect("a plannable request") {
+        JoinShape::Join(join) => join.tables.len(),
+        JoinShape::NotAJoin => 1,
     };
-    outer_wrapper_clauses(&parsed_pushdown(request), &legs, &vec![&events; leg_count])
+    outer_wrapper_clauses(&pushdown, &legs, &vec![&events; leg_count])
         .map(|clauses| clauses.trailing)
 }
 

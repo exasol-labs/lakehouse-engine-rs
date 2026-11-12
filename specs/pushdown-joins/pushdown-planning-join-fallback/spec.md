@@ -12,7 +12,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * The wrapper resolves its own `LIMIT` and `OFFSET` and renders them on its outer SELECT over limit-free, sort-free fan-out legs. A row limit that leaked into a leg would cap that leg's pre-join input and return wrong rows. A non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`).
 * The broadcast path declines, and this wrapper serves: a non-zero offset without `orderBy`, a non-column sort key, a sort key absent from the broadcast projection, and the four Exasol-postprocessing conditions.
 * A top-level WHERE conjunct reaches a leg only if it is local to that leg and the scan translator renders it against that leg's own column metadata (`pushdown-types/pushdown-planning-scan-text-conversion`). Every other conjunct is residual and lands in the outer wrapper's `WHERE`. The leg and residual sets are exact complements (`pushdown/pushdown-declined-filter-self-apply`).
-* The outer `WHERE` render has two outcomes. An absent residual set emits no clause. Any other residual set renders through the qualified Exasol-dialect render as it is. Exasol keeps the `TRUE` that a folded `'' IS NULL` leaves in a conjunction, so a residual set can be a lone `TRUE`, which renders as `WHERE (TRUE)`.
+* The outer `WHERE` render has two outcomes. An absent residual set emits no clause. Any other residual set renders through the qualified Exasol-dialect render as it is.
 
 ## Scenarios
 
@@ -61,7 +61,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *AND* each leg-local conjunct SHALL be rendered exactly once, against its leg's column types, and the leg's filter SHALL be the conjunction of the accepted conjuncts' rendered SQL, so no second render can decline it
 * *AND* each leg's Iceberg manifest-pruning predicate SHALL keep every conjunct attributed to THAT LEG in its RAW form, declined or not, so no decline SHALL change which files are opened, and a conjunct attributed to a DIFFERENT leg of the same table MUST NOT reach it
 * *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, so Exasol applies its own conversions with the session's settings
-* *AND* a residual set that is a lone `TRUE` conjunct SHALL render as the outer `WHERE (TRUE)` and SHALL NOT error
+* *AND* a residual set that is a lone `TRUE` conjunct SHALL render as the outer `WHERE (TRUE)` and SHALL NOT error, because Exasol keeps the `TRUE` that a folded `'' IS NULL` leaves in a conjunction
 * *AND* an N-scan request in which no table occurs twice and whose filter has no declined conjunct SHALL emit the SQL that the golden-SQL fixtures pin for that shape
 * *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node, for any assignment of conditions to join points
 

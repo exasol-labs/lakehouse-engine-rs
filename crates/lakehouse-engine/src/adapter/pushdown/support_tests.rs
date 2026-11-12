@@ -1743,51 +1743,24 @@ fn filter_in_common_arg() {
     );
 }
 
-/// Asserts the fixture genuinely declines, since a quietly rendering fixture would
-/// assert nothing.
-fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
-    let request = pushdown_request("T", col_types)
-        .filter(filter.clone())
-        .build()
-        .0;
-    let (scan_filter, declined) = scan_of(&request).split_where(Some(filter));
-    assert!(
-        scan_filter.is_none(),
-        "fixture precondition: a declining filter must never reach the scan spec: \
-         {scan_filter:?}"
-    );
-    let declined = declined
-        .expect("fixture precondition: a declining filter must be handed back for self-applying");
-    let fan_out_spec = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
-    let type_map = first_table_column_types(&request);
-    let fan_out = super::super::joins::FanOutProjection::new(fan_out_spec, &type_map);
-    super::super::joins::build_qualified_single_table_fallback_sql(
-        &request,
-        &parsed_pushdown(&request),
-        &fan_out,
-        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        Some(declined),
-    )
-    .expect("the wrapper must render the declined predicate")
-}
-
 #[test]
 fn nested_like_decline_routes_to_wrapper_where() {
     let filter = and([
         string_equal("T", "STATUS", "OPEN"),
         like(table_col("T", "AMOUNT"), "9%"),
     ]);
-    let col_types = vec![
-        ("STATUS".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("AMOUNT".to_string(), ExasolType::decimal(9, 2)),
-    ];
+    let request = pushdown_request(
+        "T",
+        &[
+            ("STATUS", ExasolType::WIDEST_VARCHAR),
+            ("AMOUNT", ExasolType::decimal(9, 2)),
+        ],
+    )
+    .filter(filter)
+    .build()
+    .0;
 
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
+    let sql = declined_filter_wrapper_sql(&request);
 
     let where_at = sql
         .find(r#"AS "LHS_T0" WHERE "#)
@@ -1801,10 +1774,12 @@ fn nested_like_decline_routes_to_wrapper_where() {
 
 #[test]
 fn declined_like_on_date_column_routes_to_wrapper_where() {
-    let filter = like(table_col("T", "SHIPPED"), "2024%");
-    let col_types = vec![("SHIPPED".to_string(), ExasolType::Date)];
+    let request = pushdown_request("T", &[("SHIPPED", ExasolType::Date)])
+        .filter(like(table_col("T", "SHIPPED"), "2024%"))
+        .build()
+        .0;
 
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
+    let sql = declined_filter_wrapper_sql(&request);
 
     assert!(
         sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."SHIPPED" LIKE '2024%')"#),

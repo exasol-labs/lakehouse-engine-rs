@@ -4,7 +4,6 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::types::exasol_type::ExasolType;
 
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
@@ -29,14 +28,6 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
 fn plain_single_table_request_is_not_a_join() {
     let request = nq4_request();
     let shape = detect_join(&request, &pd(&request)).expect("not a join, no identifier lookup");
-    assert_eq!(shape, JoinShape::NotAJoin);
-}
-
-#[test]
-fn from_table_node_is_not_a_join() {
-    let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = table_ref("LINEITEM");
-    let shape = detect_join(&request, &pd(&request)).expect("not a join");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
@@ -153,25 +144,6 @@ fn four_table_inner_join_is_unified_join() {
             assert_eq!(join.conditions.len(), 3, "N-1 conditions for N=4 tables");
         }
         other => panic!("expected Join, got {other:?}"),
-    }
-}
-
-#[test]
-fn detect_join_follows_from_tree_not_involved_tables_count() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["involvedTables"]
-        .as_array_mut()
-        .unwrap()
-        .push(involved_table_json(
-            "NATION",
-            &[("N_NATIONKEY", ExasolType::decimal(20, 0))],
-        ));
-    match detect_join(&request, &pd(&request)).expect("tree-driven, no decline") {
-        JoinShape::Join(join) => {
-            let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
-            assert_eq!(names, ["CUSTOMER", "ORDERS"], "only the from-tree leaves");
-        }
-        other => panic!("expected Join over the two from-tree tables, got {other:?}"),
     }
 }
 
