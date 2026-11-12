@@ -1,7 +1,7 @@
 use super::*;
 use crate::export::batch::BATCH_ROWS;
 use crate::export::batch::tests::measured_column;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use exasol_udf_sdk::connection::ConnectionObject;
@@ -31,9 +31,15 @@ fn granted(ctx: TestContext) -> TestContext {
     ctx.with_connection(CONNECTION, sentinel_connection())
 }
 
-/// The hook over a target that records its calls and makes no request.
+/// The writer SELECT the hook plans before it makes any catalog call.
 fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
-    export_hook(ctx, json, fake_target(&Calls::default(), None))
+    plan_export(ctx, json).map(|plan| plan.select)
+}
+
+/// The writer plan of a group, with the context standing on its first row as in a real run.
+fn writer_plan(ctx: &mut TestContext) -> Result<WriterPlan, UdfError> {
+    ctx.next().expect("the group has a first row");
+    plan_writer(ctx)
 }
 
 fn hook_context() -> TestContext {
@@ -190,34 +196,6 @@ fn hook_refuses_a_specification_it_cannot_parse() {
         .expect_err("an unparseable specification is refused");
 
     assert!(matches!(error, UdfError::Type(_)), "{error:?}");
-}
-
-#[test]
-fn the_hook_prepares_its_target_before_it_answers() {
-    let calls = Calls::default();
-
-    let sql = export_hook(
-        &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
-        fake_target(&calls, None),
-    );
-
-    assert!(sql.is_ok(), "{sql:?}");
-    assert_eq!(
-        calls.recorded(),
-        ["target ns.t at https://sentinel-address.example", "prepare"]
-    );
-}
-
-#[test]
-fn a_target_that_refuses_the_table_fails_the_hook_with_its_error() {
-    let refused = export_hook(
-        &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
-        fake_target(&Calls::default(), Some("prepare")),
-    );
-
-    assert_eq!(error_text(refused), "prepare failed");
 }
 
 #[test]
@@ -454,23 +432,6 @@ impl Calls {
     }
 }
 
-/// A target that records its calls and fails the one named by `fail_at`, such as `"prepare"`.
-pub(in crate::export) fn fake_target(
-    calls: &Calls,
-    fail_at: Option<&'static str>,
-) -> impl FnOnce(ExportConnection, &str) -> Result<Box<dyn ExportTarget>, UdfError> {
-    let calls = calls.clone();
-    move |connection, table| {
-        calls.record(format!("target {table} at {}", connection.address));
-        Ok(Box::new(FakeTarget { calls, fail_at }))
-    }
-}
-
-struct FakeTarget {
-    calls: Calls,
-    fail_at: Option<&'static str>,
-}
-
 struct FakeSink {
     calls: Calls,
     fail_at: Option<&'static str>,
@@ -481,45 +442,6 @@ fn failure(call: &str, fail_at: Option<&str>) -> Result<(), UdfError> {
     match fail_at {
         Some(failing) if failing == call => Err(UdfError::User(format!("{call} failed"))),
         _ => Ok(()),
-    }
-}
-
-#[async_trait(?Send)]
-impl ExportTarget for FakeTarget {
-    async fn prepare(&self) -> Result<(), UdfError> {
-        self.calls.record("prepare".into());
-        failure("prepare", self.fail_at)
-    }
-
-    async fn open_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        Ok(self.sink("open_table", schema, tag))
-    }
-
-    async fn stage_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        Ok(self.sink("stage_table", schema, tag))
-    }
-}
-
-impl FakeTarget {
-    fn sink(&self, call: &str, schema: &Schema, tag: &WriterTag) -> Box<dyn ExportSink> {
-        self.calls.record(format!(
-            "{call} export_id={} writer_id={}",
-            tag.export_id,
-            tag.writer_id.len()
-        ));
-        Box::new(FakeSink {
-            calls: self.calls.clone(),
-            fail_at: self.fail_at,
-            schema: Arc::new(schema.clone()),
-        })
     }
 }
 
@@ -583,32 +505,37 @@ fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
         ])
 }
 
+/// Streams a group's rows into a recording sink, as `run_writer` does once its table is open.
+fn stream(
+    ctx: &mut TestContext,
+    calls: &Calls,
+    fail_at: Option<&'static str>,
+) -> Result<i64, UdfError> {
+    let plan = writer_plan(ctx).expect("the group plans");
+    let mut sink = FakeSink {
+        calls: calls.clone(),
+        fail_at,
+        schema: Arc::new(plan.schema),
+    };
+    write_rows(ctx, &export_runtime()?, &mut sink, &plan.spec.columns)
+}
+
 #[test]
 fn a_writer_streams_its_rows_in_batches_into_the_sink_and_commits_once() {
-    for (single_commit, opened) in [
-        (true, "stage_table export_id=00ff writer_id=16"),
-        (false, "open_table export_id=00ff writer_id=16"),
-    ] {
-        let calls = Calls::default();
-        let rows = BATCH_ROWS + 1;
+    let calls = Calls::default();
+    let rows = BATCH_ROWS + 1;
 
-        let written = write_group(
-            &mut group(&writer_spec(single_commit), rows, "DECIMAL(18,0)"),
-            fake_target(&calls, None),
-        );
+    let written = stream(
+        &mut group(&writer_spec(false), rows, "DECIMAL(18,0)"),
+        &calls,
+        None,
+    );
 
-        assert_eq!(written.expect("the writer succeeds"), rows as i64);
-        assert_eq!(
-            calls.recorded(),
-            [
-                "target ns.t at https://catalog.example",
-                opened,
-                &format!("write {BATCH_ROWS}"),
-                "write 1",
-                "finish",
-            ]
-        );
-    }
+    assert_eq!(written.expect("the writer succeeds"), rows as i64);
+    assert_eq!(
+        calls.recorded(),
+        [&format!("write {BATCH_ROWS}"), "write 1", "finish"]
+    );
 }
 
 #[test]
@@ -616,9 +543,10 @@ fn a_failed_write_or_commit_aborts_the_sink_and_fails_the_writer() {
     for failing in ["write", "finish"] {
         let calls = Calls::default();
 
-        let error = write_group(
+        let error = stream(
             &mut group(&writer_spec(false), 3, "DECIMAL(18,0)"),
-            fake_target(&calls, Some(failing)),
+            &calls,
+            Some(failing),
         )
         .expect_err("the writer fails");
 
@@ -628,27 +556,18 @@ fn a_failed_write_or_commit_aborts_the_sink_and_fails_the_writer() {
 }
 
 #[test]
-fn an_empty_group_opens_no_table() {
-    let calls = Calls::default();
-
-    let written = write_group(
-        &mut group(&writer_spec(false), 0, "TIMESTAMP(9)"),
-        fake_target(&calls, None),
-    );
+fn an_empty_group_reads_no_connection_and_opens_no_table() {
+    // The context grants no CONNECTION, so a writer that read it would fail.
+    let written = run_writer(&mut writer_context(vec![]));
 
     assert_eq!(written.expect("an empty group succeeds"), 0);
-    assert!(calls.recorded().is_empty());
 }
 
 #[test]
-fn an_unwritable_column_fails_the_writer_before_its_target_is_opened() {
-    let calls = Calls::default();
-
-    let error = write_group(
-        &mut group(&writer_spec(false), 1, "TIMESTAMP(9)"),
-        fake_target(&calls, None),
-    )
-    .expect_err("TIMESTAMP(9) is refused");
+fn an_unwritable_column_fails_the_writer_before_its_table_is_opened() {
+    let error = writer_plan(&mut group(&writer_spec(false), 1, "TIMESTAMP(9)"))
+        .err()
+        .expect("TIMESTAMP(9) is refused");
 
     assert!(
         error
@@ -656,23 +575,18 @@ fn an_unwritable_column_fails_the_writer_before_its_target_is_opened() {
             .contains("column ID has type TIMESTAMP(9)"),
         "{error}"
     );
-    assert!(calls.recorded().is_empty());
 }
 
 #[test]
 fn a_spec_whose_columns_do_not_match_the_input_is_refused() {
     let spec = writer_spec(false).replace(r#"["ID"]"#, r#"["ID","EXTRA"]"#);
-    let calls = Calls::default();
 
-    let error = write_group(
-        &mut group(&spec, 1, "DECIMAL(18,0)"),
-        fake_target(&calls, None),
-    )
-    .expect_err("the column count differs");
+    let error = writer_plan(&mut group(&spec, 1, "DECIMAL(18,0)"))
+        .err()
+        .expect("the column count differs");
 
     assert!(
         error.to_string().contains("runs as the target of EXPORT"),
         "{error}"
     );
-    assert!(calls.recorded().is_empty());
 }
