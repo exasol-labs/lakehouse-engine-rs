@@ -32,7 +32,7 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 * *GIVEN* the adapter's advertised capability set
 * *WHEN* Exasol requests `getCapabilities`
 * *THEN* the response SHALL advertise `FN_WEEK`, backed by the `crates/vs-expression` `WEEK` arm rendering `date_part('week', …)`, whose ISO-8601 result matches Exasol `WEEK` (see `sql-functions/vs-expression-translator-date-fns`)
-* *AND* `FN_ADD_DAYS`, `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_SECONDS`, `FN_ADD_WEEKS`, `FN_ADD_MONTHS`, `FN_ADD_YEARS`, `FN_DAYS_BETWEEN`, `FN_HOURS_BETWEEN`, `FN_MINUTES_BETWEEN`, `FN_SECONDS_BETWEEN`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, `FN_LAST_DAY`, and `FN_CONVERT_TZ` SHALL remain absent
+* *AND* `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_ADD_YEARS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, `FN_LAST_DAY`, and `FN_CONVERT_TZ` SHALL remain absent, while `FN_ADD_DAYS`, `FN_ADD_WEEKS`, `FN_ADD_HOURS`, and `FN_ADD_MINUTES` (`sql-functions/vs-expression-translator-date-add-fns`) and the `*_BETWEEN` family (`sql-functions/vs-expression-translator-date-diff-fns`) are advertised
 * *AND* Cartesian-product capabilities SHALL remain absent and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`) SHALL be advertised, so advertising `FN_WEEK` introduces no additional join or cross-join capability
 
 ### Scenario: Bitwise operator function capabilities remain absent
