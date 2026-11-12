@@ -8,7 +8,7 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 * The pair identifies exactly one leg. SQL forbids two occurrences of a table with the same alias and allows at most one occurrence without an alias. An absent alias is part of the key.
 * A `tableName` that names exactly one leg resolves by name alone, because Exasol stamps no `tableAlias` on an unaliased FROM clause.
 * One binding, derived from the detected join's leaves, is the only resolver of column-to-leg attribution. Expression rendering, leg-local WHERE attribution, join-condition attachment, per-leg projection narrowing, and the broadcast join's per-occurrence relation aliases (`pushdown-joins/pushdown-planning-join`) all use it.
-* A column reference that matches no leg key is a hard client error, because rendering it against an arbitrary leg returns wrong rows.
+* A column reference that matches no leg key fails the request before planning (`pushdown/pushdown-planning` "A column the request does not declare fails the request"), because rendering it against an arbitrary leg returns wrong rows.
 
 ## Scenarios
 
@@ -55,17 +55,6 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 * *AND* the same one-leg attribution SHALL govern BOTH consumers of that conjunct, the leg's DataFusion `ScanSpec.filter` and the leg's Iceberg manifest-pruning predicate, so a leg cannot prune files by a predicate its rows are not subject to
 * *AND* a conjunct referencing BOTH occurrences SHALL be RESIDUAL and rendered in the outer wrapper's `WHERE`, exactly as a cross-table conjunct is
 * *AND* the returned result SHALL equal the result of the same filtered self-join evaluated on a single node
-
-### Scenario: A column reference no leg key matches fails loudly
-
-* *GIVEN* a `pushdown` request over an inner join in which some `tableName` names MORE THAN ONE leg
-* *AND* a `column` node of that `tableName` whose (`tableName`, `tableAlias`) pair matches no leaf's (`name`, `alias`) pair
-* *WHEN* the adapter renders the unified unaccelerated fallback SQL
-* *THEN* the adapter SHALL return the wrapper's HARD client-facing error rather than render that reference against an arbitrarily chosen leg, because an arbitrary choice returns wrong rows with no error
-* *AND* the error message SHALL name the unattributable column and its table, so the failure is diagnosable from the client
-* *AND* the adapter MUST NOT fall back to bare, unqualified rendering for such a column, which Exasol would reject as ambiguous across the wrapper's subqueries
-* *AND* this state SHALL be UNREACHABLE for a well-formed request, because a table joined to itself is only legal SQL with distinct occurrences, and Exasol stamps each occurrence's alias on every `column` node of an aliased FROM clause, including columns written unqualified
-* *AND* a `column` node whose `tableName` names EXACTLY ONE leg SHALL resolve by name alone and SHALL NOT consult its alias, because Exasol stamps no `tableAlias` at all on an unaliased FROM clause, so a request in which no table occurs twice needs no alias to resolve
 
 ### Scenario: A shared-column-name join on the fallback renders each column qualified by its leg
 

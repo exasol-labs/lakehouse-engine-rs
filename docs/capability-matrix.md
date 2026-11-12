@@ -41,7 +41,7 @@ The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capa
 | `LIMIT` | ✓ | On a plain row scan each shard stops early. Exasol SQL re-applies the limit. |
 | `LIMIT_WITH_OFFSET` | ✓ | Exasol SQL applies the offset. A non-zero offset drops the per-shard limit. |
 | `ORDER_BY_COLUMN` | ✓ | DataFusion runs a per-shard top-N for `ORDER BY ... LIMIT n` on projected columns, without aggregation or offset. Otherwise Exasol SQL sorts. See [Capabilities](capabilities.md#filtering). |
-| `ORDER_BY_EXPRESSION` | ✓ | Always sorted in Exasol SQL, never as a per-shard top-N. A sort key the adapter cannot render fails the query. |
+| `ORDER_BY_EXPRESSION` | ✓ | Always sorted in Exasol SQL, never as a per-shard top-N. |
 | `SELECTLIST_EXPRESSIONS` | ✓ | DataFusion evaluates them when it can render every item. Otherwise Exasol SQL does. |
 | `SELECTLIST_PROJECTION` | ✓ |  |
 
@@ -166,7 +166,7 @@ sends the query to the adapter.
 | `IS_NUMBER` |  |  |
 | `IS_TIMESTAMP` |  |  |
 | `IS_YMINTERVAL` |  |  |
-| `JSON_VALUE` |  |  |
+| `JSON_VALUE` | ✓ | Runs in the scan for the forms [Capabilities](capabilities.md#scalar-functions) lists. Other forms run in Exasol SQL. |
 | `LAST_DAY` |  | Not translated. |
 | `LEAST` | ✓ |  |
 | `LEFT` | ✓ |  |

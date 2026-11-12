@@ -953,7 +953,11 @@ fn pushdown_request_involving(involved: &str) -> Json {
 /// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
 fn pushdown_without_an_identifier_note_fails_naming_refresh() {
-    let request = pushdown_request_involving("UNKNOWN_TABLE");
+    let mut request = pushdown_request_involving("UNKNOWN_TABLE");
+    request["involvedTables"][0]
+        .as_object_mut()
+        .expect("an involved table")
+        .remove("adapterNotes");
 
     let message = resolve_pushdown_identifier(&request)
         .unwrap_err()
@@ -992,12 +996,24 @@ fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
         build_listing_virtual_tables(&[], &listing, EngineTimestampSupport::MillisecondOnly)
             .unwrap();
 
-    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
-        resolve_pushdown_identifier(&request).unwrap(),
+        resolve_pushdown_identifier(&pushdown_over(&tables, "ORDERS")).unwrap(),
         "Orders",
         "the recorded bare directory name round-trips through pushdown resolution"
     );
+}
+
+/// A pushdown request over the one listed virtual table named `name`.
+fn pushdown_over(tables: &impl serde::Serialize, name: &str) -> Json {
+    let tables = serde_json::to_value(tables).unwrap();
+    let table = tables
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["name"] == name)
+        .unwrap_or_else(|| panic!("no listed table {name}: {tables}"))
+        .clone();
+    json!({"type": "pushdown", "involvedTables": [table]})
 }
 
 fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
@@ -1033,13 +1049,12 @@ fn create_vs_records_the_multi_level_identifier_in_the_table_note() {
     )
     .unwrap();
 
-    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
-        resolve_pushdown_identifier(&request).unwrap(),
+        resolve_pushdown_identifier(&pushdown_over(&tables, "ORDERS")).unwrap(),
         "prod.finance.orders"
     );
     assert_eq!(
-        read_identifier(&request, "EU__ORDERS").unwrap(),
+        read_identifier(&pushdown_over(&tables, "EU__ORDERS"), "EU__ORDERS").unwrap(),
         "prod.finance.eu.orders"
     );
 }

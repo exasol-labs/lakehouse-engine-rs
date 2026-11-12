@@ -15,8 +15,9 @@ use vs_expression::SqlFragment;
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = agg_item("SUM", Some("x"), false);
-    let plans =
-        vec![parse_agg_item(&sum_node, aggregate_scan()).expect("SUM(x) must parse to a plan")];
+    let plans = vec![
+        parse_agg_item(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan"),
+    ];
     let node = cast_to(
         ExasolType::Char {
             size: 20,
@@ -24,10 +25,14 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         },
         sum_node,
     );
-    let sql =
-        render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), aggregate_scan())
-            .expect("CAST over a mergeable aggregate must render")
-            .sql;
+    let sql = render_scalar_over_merge(
+        &node,
+        &plans,
+        &merge_select_items(&plans),
+        typed_scan(&AGGREGATED),
+    )
+    .expect("CAST over a mergeable aggregate must render")
+    .sql;
     assert!(
         sql.contains("CHAR(20) ASCII"),
         "Exasol-parsed merge wrapper needs the declared length-qualified CHAR \
@@ -46,17 +51,22 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = agg_item("SUM", Some("x"), false);
-    let plans =
-        vec![parse_agg_item(&sum_node, aggregate_scan()).expect("SUM(x) must parse to a plan")];
+    let plans = vec![
+        parse_agg_item(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan"),
+    ];
     let char_type = ExasolType::Char {
         size: 20,
         ascii: true,
     };
     let node = cast_to(char_type, cast_to(char_type, sum_node));
-    let sql =
-        render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), aggregate_scan())
-            .expect("a nested CAST over a mergeable aggregate must render")
-            .sql;
+    let sql = render_scalar_over_merge(
+        &node,
+        &plans,
+        &merge_select_items(&plans),
+        typed_scan(&AGGREGATED),
+    )
+    .expect("a nested CAST over a mergeable aggregate must render")
+    .sql;
     assert_eq!(
         sql.matches("CHAR(20) ASCII").count(),
         2,
@@ -70,20 +80,21 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
 
 #[test]
 fn grouped_count_distinct_falls_back_to_row_scan() {
-    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+    let (req, scan) = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![col("REGION")])
         .column(col("REGION"))
         .item(
             agg_item("COUNT", Some("L_SHIPMODE"), true),
             ExasolType::WIDEST_VARCHAR,
         )
-        .build_pushdown();
+        .declare(&[("L_SHIPMODE", ExasolType::varchar(10))])
+        .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "grouped COUNT(DISTINCT) must still decline (row-scan fallback)"
     );
     assert!(
-        detect_aggregates(&req, aggregate_scan()).is_none(),
+        detect_aggregates(&req, scan).is_none(),
         "the single-group path rejects any request carrying a non-empty GROUP BY"
     );
 }
@@ -149,17 +160,16 @@ fn grouped_aggregate_sum_over_varchar_declines_the_split() {
         ("REGION", ExasolType::WIDEST_VARCHAR),
         ("NAME", ExasolType::WIDEST_VARCHAR),
     ];
-    let req = pushdown_request("T", &columns)
+    let (req, scan) = pushdown_request("T", &columns)
         .group_by(vec![col("REGION")])
         .column(col("REGION"))
         .item(
             agg_item("SUM", Some("NAME"), false),
             ExasolType::DoublePrecision,
         )
-        .build_pushdown();
-    let col_types = column_types(&columns);
+        .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, ScanTranslator::new(&col_types)).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "SUM over VARCHAR parses the text by the session's NLS settings, so the split declines"
     );
 }
@@ -180,17 +190,21 @@ fn upper_item(column: &str) -> serde_json::Value {
     scalar_fn("UPPER", [col(column)])
 }
 
+/// `SECOND(TS, 3)`: Exasol sends it, and the DataFusion dialect declines it on arity.
+fn declined_second_item() -> serde_json::Value {
+    scalar_fn("SECOND", [col("TS"), num_lit(3)])
+}
+
 #[test]
 fn detect_group_by_aggregates_column_key() {
-    let req = grouped_request(
+    let (req, scan) = grouped_request(
         &[("REGION", ExasolType::WIDEST_VARCHAR)],
         vec![col("REGION")],
     )
     .column(col("REGION"))
     .count_star()
-    .build_pushdown();
-    let result =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+    .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     let keys = result.group_keys;
     let plans = result.aggregates.plans;
     assert_eq!(keys.len(), 1, "one group key");
@@ -278,7 +292,7 @@ impl GroupedSql {
             aggregates,
             select_items,
             select_types,
-            columns: ColumnTypes::default(),
+            columns: column_types(NO_COLUMNS),
             limit: None,
             offset: 0,
             having: None,
@@ -350,7 +364,7 @@ impl GroupedSql {
             &self.select_types,
             self.limit,
             self.offset,
-            ScanTranslator::new(&self.columns),
+            scan_over(&self.columns),
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             self.having.as_deref(),
@@ -370,7 +384,7 @@ fn order_by_over_merge(
         aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
-    build_grouped_order_by_clause(req.json(), &scope, ScanTranslator::new(col_types))
+    build_grouped_order_by_clause(req.json(), &scope, scan_for(col_types, req.json()))
 }
 
 /// A HAVING over `detection`'s merge, scoped as `classify_request_shape` scopes it.
@@ -383,7 +397,7 @@ fn having_over_merge(
         aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
-    render_having_over_merge(node, &scope, ScanTranslator::new(col_types))
+    render_having_over_merge(node, &scope, scan_over(col_types))
 }
 
 /// A HAVING over `plans` alone, each merged by its uncast partial merge, with no group key.
@@ -399,20 +413,20 @@ fn having_over_plans(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
         aggregates: &aggregates,
         group_keys: &[],
     };
-    render_having_over_merge(node, &scope, aggregate_scan())
+    render_having_over_merge(node, &scope, typed_scan(&AGGREGATED))
 }
 
 #[test]
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
-    let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(count_star(), ExasolType::decimal(20, 0))
         .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
-        .build_pushdown();
+        .build_scanned();
 
-    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
+    let result = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &result, aggregate_scan().columns()),
+        order_by_over_merge(&req, &result, scan.columns()),
         Some(GroupedOrderBy::Clause(
             r#""GK_0" ASC NULLS LAST"#.to_string()
         )),
@@ -432,7 +446,7 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
 
 #[test]
 fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
-    let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
@@ -442,11 +456,12 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
             order_by_element(agg_item("SUM", Some("AMOUNT"), false), false, true),
             order_by_element(col("ID"), true, false),
         ]))
-        .build_pushdown();
+        .declare(&[("AMOUNT", ExasolType::decimal(18, 2))])
+        .build_scanned();
 
-    let detection = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
+    let detection = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &detection, aggregate_scan().columns()),
+        order_by_over_merge(&req, &detection, scan.columns()),
         Some(GroupedOrderBy::Clause(
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) DESC NULLS LAST, "GK_0" ASC NULLS FIRST"#
                 .to_string()
@@ -458,7 +473,7 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
 
 #[test]
 fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
-    let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(count_star(), ExasolType::decimal(20, 0))
         .order_by(serde_json::json!([order_by_element(
@@ -466,11 +481,12 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
             false,
             true
         )]))
-        .build_pushdown();
+        .declare(&[("AMOUNT", ExasolType::decimal(18, 2))])
+        .build_scanned();
 
-    let detection = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
+    let detection = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &detection, aggregate_scan().columns()),
+        order_by_over_merge(&req, &detection, scan.columns()),
         Some(GroupedOrderBy::Unresolvable),
         "an aggregate with no matching plan must not resolve to a fabricated partial"
     );
@@ -479,18 +495,20 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
 #[test]
 fn detect_group_by_aggregates_expression_key() {
     let key = predicate_equal(col("STATUS"), str_lit("active"));
-    let req = grouped_request(NO_COLUMNS, vec![key.clone()])
-        .item(key, ExasolType::Boolean)
-        .item(
-            agg_item("SUM", Some("AMOUNT"), false),
-            ExasolType::WIDEST_VARCHAR,
-        )
-        .build_pushdown();
-    let col_types = column_types(&[
-        ("STATUS", ExasolType::WIDEST_VARCHAR),
-        ("AMOUNT", ExasolType::decimal(18, 2)),
-    ]);
-    let result = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types));
+    let (req, scan) = grouped_request(
+        &[
+            ("STATUS", ExasolType::WIDEST_VARCHAR),
+            ("AMOUNT", ExasolType::decimal(18, 2)),
+        ],
+        vec![key.clone()],
+    )
+    .item(key, ExasolType::Boolean)
+    .item(
+        agg_item("SUM", Some("AMOUNT"), false),
+        ExasolType::WIDEST_VARCHAR,
+    )
+    .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan);
     assert!(result.is_some(), "renderable expression key must succeed");
     let GroupedAggregateDetection {
         group_keys: keys,
@@ -504,14 +522,14 @@ fn detect_group_by_aggregates_expression_key() {
 
 #[test]
 fn detect_group_by_unsupported_expression_falls_back() {
-    let req = grouped_request(
-        NO_COLUMNS,
-        vec![serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"})],
+    let (req, scan) = grouped_request(
+        &[("TS", ExasolType::BARE_TIMESTAMP)],
+        vec![declined_second_item()],
     )
     .count_star()
-    .build_pushdown();
+    .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "unsupported expression must fall back to None"
     );
 }
@@ -519,12 +537,22 @@ fn detect_group_by_unsupported_expression_falls_back() {
 #[test]
 fn detect_group_by_mixed_select_falls_back() {
     let year = scalar_fn("YEAR", [col("TS")]);
-    let req = grouped_request(NO_COLUMNS, vec![col("REGION")])
-        .item(year, ExasolType::WIDEST_VARCHAR)
-        .count_star()
-        .build_pushdown();
+    let (req, scan) = grouped_request(
+        &[
+            ("REGION", ExasolType::varchar(25)),
+            ("TS", ExasolType::BARE_TIMESTAMP),
+        ],
+        vec![col("REGION")],
+    )
+    .item(year.clone(), ExasolType::decimal(4, 0))
+    .count_star()
+    .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
+        scan.expression(&year).is_some(),
+        "the scan computes YEAR(TS), so only the select-list rule may decline it"
+    );
+    assert!(
+        detect_group_by_aggregates(&req, scan).is_none(),
         "non-aggregate non-column in selectList must fall back"
     );
 }
@@ -532,14 +560,13 @@ fn detect_group_by_mixed_select_falls_back() {
 #[test]
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     let group_key = numbered_col("EVENTS", 0, "ID");
-    let req = pushdown_request("T", NO_COLUMNS)
+    let (req, scan) = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(20, 0))])
         .field("from", table_ref("EVENTS"))
         .group_by(vec![group_key])
         .field("type", "select")
         .item(null_lit(), ExasolType::Boolean)
-        .build_pushdown();
-    let col_types = column_types(&[("ID", ExasolType::decimal(20, 0))]);
-    let result = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types)).expect(
+        .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect(
         "composed literal-only selectList must preserve GROUP BY, not fall back to row scan",
     );
     assert_eq!(result.group_keys.len(), 1, "one group key from groupBy");
@@ -565,7 +592,9 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     );
 
     // A row-scan fallback would return one row per source row, not per group.
-    let sql = GroupedSql::of(&result, &req).columns(col_types).build();
+    let sql = GroupedSql::of(&result, &req)
+        .columns(scan.columns().clone())
+        .build();
     assert!(
         !sql.contains(r#""NULL""#),
         "grouped scan SQL must not reference a phantom \"NULL\" identifier: {sql}"
@@ -582,12 +611,12 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
 
 #[test]
 fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
-    let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(bool_lit(true), ExasolType::Boolean)
         .item(count_star(), ExasolType::decimal(20, 0))
-        .build_pushdown();
-    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect(
+        .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect(
         "a literal_bool selectList item must classify as Constant, not abort detection to None",
     );
     assert!(
@@ -606,15 +635,14 @@ fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
 
 #[test]
 fn detect_group_by_aggregates_preserves_select_list_order() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(
             agg_item("SUM", Some("SCORE"), false),
             ExasolType::WIDEST_VARCHAR,
         )
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let result =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 1, "one group key");
     assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
@@ -636,7 +664,7 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
 
 #[test]
 fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
-    let req = grouped_request(
+    let (req, scan) = grouped_request(
         &[
             ("REGION", ExasolType::WIDEST_VARCHAR),
             ("YEAR", ExasolType::WIDEST_VARCHAR),
@@ -649,9 +677,9 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
         ExasolType::WIDEST_VARCHAR,
     )
     .column(col("YEAR"))
-    .build_pushdown();
-    let result =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+    .declare(&AGGREGATED)
+    .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 2, "two group keys");
     assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
@@ -677,12 +705,11 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
 
 #[test]
 fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .count_star()
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let result =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(
         result.select_items,
         vec![
@@ -702,7 +729,7 @@ fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
 
 #[test]
 fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
-    let req = pushdown_request("T", NO_COLUMNS)
+    let (req, scan) = pushdown_request("T", &AGGREGATED)
         .group_by(vec![mod_item("ID", 4)])
         .field(
             "having",
@@ -717,9 +744,8 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
             ExasolType::WIDEST_VARCHAR,
         )
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let result =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let result = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(
         result.select_items,
         vec![
@@ -739,17 +765,19 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
 
 #[test]
 fn detect_group_by_all_expression_multi_key() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4), upper_item("NAME")])
-        .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-        .item(upper_item("NAME"), ExasolType::WIDEST_VARCHAR)
-        .count_star()
-        .build_pushdown();
-    let col_types = column_types(&[
-        ("ID", ExasolType::decimal(18, 0)),
-        ("NAME", ExasolType::WIDEST_VARCHAR),
-    ]);
-    let result = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
-        .expect("all-expression multi-key must detect");
+    let (req, scan) = grouped_request(
+        &[
+            ("ID", ExasolType::decimal(18, 0)),
+            ("NAME", ExasolType::WIDEST_VARCHAR),
+        ],
+        vec![mod_item("ID", 4), upper_item("NAME")],
+    )
+    .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
+    .item(upper_item("NAME"), ExasolType::WIDEST_VARCHAR)
+    .count_star()
+    .build_scanned();
+    let result =
+        detect_group_by_aggregates(&req, scan).expect("all-expression multi-key must detect");
     assert_eq!(result.group_keys.len(), 2, "two expression group keys");
     assert!(
         result.group_keys[0].contains('%') && result.group_keys[0].contains('4'),
@@ -796,22 +824,19 @@ fn detect_group_by_all_expression_multi_key() {
         "built SQL must emit both group-key slots: {sql}"
     );
 
-    let bad_req = grouped_request(
-        NO_COLUMNS,
-        vec![
-            mod_item("ID", 4),
-            serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"}),
+    let (bad_req, bad_req_scan) = grouped_request(
+        &[
+            ("ID", ExasolType::decimal(18, 0)),
+            ("TS", ExasolType::BARE_TIMESTAMP),
         ],
+        vec![mod_item("ID", 4), declined_second_item()],
     )
     .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
-    .item(
-        serde_json::json!({"type": "fn_custom_unsupported", "name": "MYSTERY"}),
-        ExasolType::WIDEST_VARCHAR,
-    )
+    .item(declined_second_item(), ExasolType::decimal(5, 3))
     .count_star()
-    .build_pushdown();
+    .build_scanned();
     assert!(
-        detect_group_by_aggregates(&bad_req, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&bad_req, bad_req_scan).is_none(),
         "one untranslatable tuple element must force full fallback to None"
     );
 }
@@ -999,13 +1024,13 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
 
 #[test]
 fn grouped_merge_renders_limit_offset_in_clause_order() {
-    let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(count_star(), ExasolType::decimal(20, 0))
         .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
-        .build_pushdown();
+        .build_scanned();
 
-    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
+    let result = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
     let sql = GroupedSql::of(&result, &req)
         .columns(column_types(&[("ID", ExasolType::decimal(20, 0))]))
         .limit(2)
@@ -1300,42 +1325,40 @@ fn round_pct_over_aggregates() -> serde_json::Value {
     )
 }
 
-fn soa_col_types() -> Vec<(String, ExasolType)> {
-    vec![
-        ("L_RETURNFLAG".to_string(), ExasolType::varchar(1)),
-        ("L_QUANTITY".to_string(), ExasolType::decimal(36, 2)),
-        ("L_EXTENDEDPRICE".to_string(), ExasolType::DoublePrecision),
+fn soa_columns() -> [(&'static str, ExasolType); 3] {
+    [
+        ("L_RETURNFLAG", ExasolType::varchar(1)),
+        ("L_QUANTITY", ExasolType::decimal(36, 2)),
+        ("L_EXTENDEDPRICE", ExasolType::DoublePrecision),
     ]
 }
 
 /// Mirrors the production grouped branch of `handle_pushdown`.
-fn build_grouped_from_detection(req: &PushdownRequest) -> String {
-    let columns = column_types(&soa_col_types());
-    let d = detect_group_by_aggregates(req, ScanTranslator::new(&columns))
+fn build_grouped_from_detection(req: &PushdownRequest, scan: ScanTranslator<'_>) -> String {
+    let d = detect_group_by_aggregates(req, scan)
         .expect("must detect the grouped scalar-over-aggregate pushdown");
-    GroupedSql::of(&d, req).columns(columns).build()
+    GroupedSql::of(&d, req)
+        .columns(scan.columns().clone())
+        .build()
 }
 
 #[test]
 fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
-    let req = grouped_request(
-        &[("L_RETURNFLAG", ExasolType::varchar(1))],
-        vec![col("L_RETURNFLAG")],
-    )
-    .column(col("L_RETURNFLAG"))
-    .item(
-        agg_item("SUM", Some("L_QUANTITY"), false),
-        ExasolType::decimal(36, 2),
-    )
-    .item(
-        agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
-        ExasolType::DoublePrecision,
-    )
-    .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
-    .count_star()
-    .build_pushdown();
-    let d = detect_group_by_aggregates(&req, ScanTranslator::new(&column_types(&soa_col_types())))
-        .expect("must detect grouped scalar-over-aggregate");
+    let (req, scan) = grouped_request(&soa_columns(), vec![col("L_RETURNFLAG")])
+        .column(col("L_RETURNFLAG"))
+        .item(
+            agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
+            agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
+            ExasolType::DoublePrecision,
+        )
+        .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
+        .count_star()
+        .build_scanned();
+    let d =
+        detect_group_by_aggregates(&req, scan).expect("must detect grouped scalar-over-aggregate");
 
     assert!(
         matches!(
@@ -1385,22 +1408,19 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
 
 #[test]
 fn grouped_scalar_over_aggregate_renders_merged_partials() {
-    let req = grouped_request(
-        &[("L_RETURNFLAG", ExasolType::varchar(1))],
-        vec![col("L_RETURNFLAG")],
-    )
-    .column(col("L_RETURNFLAG"))
-    .item(
-        agg_item("SUM", Some("L_QUANTITY"), false),
-        ExasolType::decimal(36, 2),
-    )
-    .item(
-        agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
-        ExasolType::DoublePrecision,
-    )
-    .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
-    .build_pushdown();
-    let sql = build_grouped_from_detection(&req);
+    let (req, scan) = grouped_request(&soa_columns(), vec![col("L_RETURNFLAG")])
+        .column(col("L_RETURNFLAG"))
+        .item(
+            agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
+            agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
+            ExasolType::DoublePrecision,
+        )
+        .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
+        .build_scanned();
+    let sql = build_grouped_from_detection(&req, scan);
     let items = outer_select_items(&sql);
     assert_eq!(
         items.len(),
@@ -1433,18 +1453,15 @@ fn grouped_scalar_over_aggregate_renders_merged_partials() {
 
 #[test]
 fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
-    let req = grouped_request(
-        &[("L_RETURNFLAG", ExasolType::varchar(1))],
-        vec![col("L_RETURNFLAG")],
-    )
-    .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
-    .column(col("L_RETURNFLAG"))
-    .item(
-        agg_item("SUM", Some("L_QUANTITY"), false),
-        ExasolType::decimal(36, 2),
-    )
-    .build_pushdown();
-    let sql = build_grouped_from_detection(&req);
+    let (req, scan) = grouped_request(&soa_columns(), vec![col("L_RETURNFLAG")])
+        .item(round_pct_over_aggregates(), ExasolType::decimal(5, 2))
+        .column(col("L_RETURNFLAG"))
+        .item(
+            agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .build_scanned();
+    let sql = build_grouped_from_detection(&req, scan);
     let items = outer_select_items(&sql);
     assert_eq!(
         items.len(),
@@ -1499,7 +1516,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let pushdown = parsed_pushdown(&request);
 
     assert!(
-        detect_group_by_aggregates(&pushdown, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&pushdown, scan_of(&request)).is_none(),
         "a nested COUNT(DISTINCT) must decline the grouped partial/merge path"
     );
 
@@ -1574,22 +1591,21 @@ fn score_double() -> ColumnTypes {
 
 #[test]
 fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(
             agg_item("SUM", Some("SCORE"), false),
             ExasolType::DoublePrecision,
         )
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
-        .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
 
     let having_node = compare(
         "predicate_greater",
         agg_item("SUM", Some("SCORE"), false),
         num_lit(250),
     );
-    let having = having_over_merge(&having_node, &detection, aggregate_scan().columns())
+    let having = having_over_merge(&having_node, &detection, scan.columns())
         .expect("HAVING must render over the merge decomposition");
 
     let sql = GroupedSql::of(&detection, &req)
@@ -1626,7 +1642,7 @@ fn having_over_a_group_key_reads_its_gk_column() {
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
+    let detection = detect_group_by_aggregates(&req, scan_for(&col_types, req.json()))
         .expect("grouped aggregate");
     let having = predicate_equal(col("REGION"), str_lit("EU"));
 
@@ -1651,7 +1667,7 @@ fn having_over_a_key_inside_a_scalar_with_an_aggregate_reads_both_merged() {
             ExasolType::decimal(20, 0),
         )
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
+    let detection = detect_group_by_aggregates(&req, scan_for(&col_types, req.json()))
         .expect("grouped aggregate");
     let having = compare(
         "predicate_greater",
@@ -1668,15 +1684,14 @@ fn having_over_a_key_inside_a_scalar_with_an_aggregate_reads_both_merged() {
 
 #[test]
 fn grouped_wrapper_outer_select_follows_select_list_order() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(
             agg_item("SUM", Some("SCORE"), false),
             ExasolType::DoublePrecision,
         )
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
-        .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     let sql = GroupedSql::of(&detection, &req)
         .columns(score_double())
         .build();
@@ -1695,7 +1710,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
 
 #[test]
 fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
-    let req = grouped_request(
+    let (req, scan) = grouped_request(
         &[("REGION", ExasolType::varchar(100))],
         vec![col("REGION"), mod_item("ID", 4)],
     )
@@ -1705,9 +1720,12 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         ExasolType::DoublePrecision,
     )
     .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
-    .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+    .declare(&[
+        ("ID", ExasolType::decimal(18, 0)),
+        ("SCORE", ExasolType::DoublePrecision),
+    ])
+    .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
 
     let having_node = compare(
@@ -1715,7 +1733,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         agg_item("SUM", Some("SCORE"), false),
         num_lit(100),
     );
-    let having = having_over_merge(&having_node, &detection, aggregate_scan().columns())
+    let having = having_over_merge(&having_node, &detection, scan.columns())
         .expect("HAVING must render over the merge decomposition");
 
     let sql = GroupedSql::of(&detection, &req)
@@ -1768,15 +1786,14 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
 
 #[test]
 fn group_key_type_resolved_by_index_not_string_match() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(
             agg_item("SUM", Some("SCORE"), false),
             ExasolType::DoublePrecision,
         )
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
-        .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
 
     let group_keys = vec![SqlFragment::new(r#"("id" % 4)"#, None)];
     let select_items = detection.select_items.clone();
@@ -1792,16 +1809,16 @@ fn group_key_type_resolved_by_index_not_string_match() {
 
 #[test]
 fn group_key_types_multi_key_mixed_types() {
-    let req = grouped_request(
+    let (req, scan) = grouped_request(
         &[("REGION", ExasolType::varchar(100))],
         vec![col("REGION"), mod_item("ID", 4)],
     )
     .column(col("REGION"))
     .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
     .count_star()
-    .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+    .declare(&[("ID", ExasolType::decimal(18, 0))])
+    .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
 
     let types = detection.group_key_types.clone();
@@ -1826,7 +1843,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
         [compare("predicate_less", col("C_DECIMAL_A"), num_lit(0))],
         [str_lit("NEG"), str_lit("POS")],
     );
-    let req = grouped_request(NO_COLUMNS, vec![case_key.clone()])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![case_key.clone()])
         .item(
             case_key,
             ExasolType::Char {
@@ -1835,8 +1852,8 @@ fn group_key_exasol_types_resolves_char_case_key() {
             },
         )
         .count_star()
-        .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, aggregate_scan())
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan)
         .expect("equal-length CASE group key must be detected as a grouped aggregate");
     assert_eq!(detection.group_keys.len(), 1, "one group key");
 
@@ -1856,12 +1873,11 @@ fn group_key_exasol_types_resolves_char_case_key() {
 /// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 #[test]
 fn group_key_exasol_types_resolves_varchar_key_unchanged() {
-    let req = grouped_request(&[("REGION", ExasolType::varchar(10))], vec![col("REGION")])
+    let (req, scan) = grouped_request(&[("REGION", ExasolType::varchar(10))], vec![col("REGION")])
         .column(col("REGION"))
         .count_star()
-        .build_pushdown();
-    let detection =
-        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
 
     let types = detection.group_key_types.clone();
 
@@ -1895,24 +1911,22 @@ fn a_cast_to_char_declines_the_split() {
         ),
     ];
     for (label, req) in cases {
-        let detection = detect_group_by_aggregates(
-            &req.build_pushdown(),
-            ScanTranslator::new(&column_types(&columns)),
-        );
+        let req = req.build_pushdown();
+        let detection =
+            detect_group_by_aggregates(&req, scan_for(&column_types(&columns), req.json()));
         assert!(detection.is_none(), "{label}: the scan does not blank-pad");
     }
 }
 
 #[test]
 fn an_unprojected_sized_varchar_key_travels_as_any_text() {
-    let req = grouped_request(
-        NO_COLUMNS,
+    let (req, scan) = grouped_request(
+        &[("NAME", ExasolType::WIDEST_VARCHAR)],
         vec![cast_to(ExasolType::varchar(10), col("NAME"))],
     )
     .count_star()
-    .build_pushdown();
-    let col_types = column_types(&[("NAME", ExasolType::WIDEST_VARCHAR)]);
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
+    .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan)
         .expect("an unprojected group key must still detect as a grouped aggregate");
 
     assert_eq!(
@@ -1924,27 +1938,28 @@ fn an_unprojected_sized_varchar_key_travels_as_any_text() {
 
 #[test]
 fn unprojected_computed_group_key_without_a_cast_declines_the_split() {
-    let col_types = column_types(&[("ID", ExasolType::decimal(18, 0))]);
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
-        .count_star()
-        .build_pushdown();
+    let (req, scan) = grouped_request(
+        &[("ID", ExasolType::decimal(18, 0))],
+        vec![mod_item("ID", 4)],
+    )
+    .count_star()
+    .build_scanned();
 
     assert!(
-        detect_group_by_aggregates(&req, ScanTranslator::new(&col_types)).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "an unprojected MOD(ID, 4) key has no exact type to travel in (#476)"
     );
 }
 
 #[test]
 fn unprojected_cast_group_key_keeps_its_cast_type() {
-    let col_types = column_types(&[("ID", ExasolType::decimal(18, 0))]);
     let key = cast_to(ExasolType::decimal(9, 0), mod_item("ID", 4));
-    let req = grouped_request(NO_COLUMNS, vec![key])
+    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(18, 0))], vec![key])
         .count_star()
-        .build_pushdown();
+        .build_scanned();
 
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
-        .expect("a CAST key states its exact type");
+    let detection =
+        detect_group_by_aggregates(&req, scan).expect("a CAST key states its exact type");
 
     assert_eq!(detection.group_key_types, vec![ExasolType::decimal(9, 0)]);
 }
@@ -1952,13 +1967,11 @@ fn unprojected_cast_group_key_keeps_its_cast_type() {
 #[test]
 fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     let key = || cast_to(ExasolType::varchar(20), col("NAME"));
-    let req = grouped_request(NO_COLUMNS, vec![key()])
+    let (req, scan) = grouped_request(&[("NAME", ExasolType::WIDEST_VARCHAR)], vec![key()])
         .item(key(), ExasolType::varchar(30))
         .count_star()
-        .build_pushdown();
-    let col_types = column_types(&[("NAME", ExasolType::WIDEST_VARCHAR)]);
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
-        .expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
 
     let types = detection.group_key_types.clone();
 
@@ -1972,7 +1985,7 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
 
 #[test]
 fn constant_projection_casts_literal_to_char() {
-    let req = grouped_request(NO_COLUMNS, vec![col("REGION")])
+    let (req, scan) = grouped_request(&[("REGION", ExasolType::varchar(100))], vec![col("REGION")])
         .item(
             str_lit("X"),
             ExasolType::Char {
@@ -1981,10 +1994,8 @@ fn constant_projection_casts_literal_to_char() {
             },
         )
         .count_star()
-        .build_pushdown();
-    let col_types = column_types(&[("REGION", ExasolType::varchar(100))]);
-    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
-        .expect("must detect grouped aggregate");
+        .build_scanned();
+    let detection = detect_group_by_aggregates(&req, scan).expect("must detect grouped aggregate");
 
     let projection = detection
         .select_items
@@ -2007,29 +2018,30 @@ fn constant_projection_casts_literal_to_char() {
 
 #[test]
 fn detect_group_by_aggregates_no_group_by_type_returns_none() {
-    let req1 = pushdown_request("T", NO_COLUMNS)
+    let (req1, req1_scan) = pushdown_request("T", &AGGREGATED)
         .field("groupBy", serde_json::json!([col("REGION")]))
         .count_star()
-        .build_pushdown();
-    assert!(detect_group_by_aggregates(&req1, aggregate_scan()).is_none());
+        .declare(&[("REGION", ExasolType::varchar(25))])
+        .build_scanned();
+    assert!(detect_group_by_aggregates(&req1, req1_scan).is_none());
 
-    let req2 = pushdown_request("T", NO_COLUMNS)
+    let (req2, req2_scan) = pushdown_request("T", &AGGREGATED)
         .single_group()
         .count_star()
-        .build_pushdown();
-    assert!(detect_group_by_aggregates(&req2, aggregate_scan()).is_none());
+        .build_scanned();
+    assert!(detect_group_by_aggregates(&req2, req2_scan).is_none());
 }
 
 #[test]
 fn detect_group_by_aggregates_empty_group_by_returns_none() {
-    let req = pushdown_request("T", NO_COLUMNS)
+    let (req, scan) = pushdown_request("T", &AGGREGATED)
         .group_by(vec![])
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::WIDEST_VARCHAR,
         )
-        .build_pushdown();
-    assert!(detect_group_by_aggregates(&req, aggregate_scan()).is_none());
+        .build_scanned();
+    assert!(detect_group_by_aggregates(&req, scan).is_none());
 }
 
 #[test]
@@ -2228,15 +2240,15 @@ fn having_clause_appears_in_outer_wrapper_only() {
 
 #[test]
 fn grouped_stat_aggregate_over_expression_argument_declines() {
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
         .item(
             agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
             ExasolType::DoublePrecision,
         )
-        .build_pushdown();
+        .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "a grouped STDDEV over an expression argument must decline the grouped \
              partial/merge path"
     );
@@ -2249,16 +2261,16 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
         [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
     );
     assert!(
-        classify_scalar_over_aggregate(&sqrt_over_stat, aggregate_scan()).is_none(),
+        classify_scalar_over_aggregate(&sqrt_over_stat, typed_scan(&AGGREGATED)).is_none(),
         "a scalar wrapping a stat aggregate over an expression must not classify"
     );
 
-    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+    let (req, scan) = grouped_request(&AGGREGATED, vec![mod_item("ID", 4)])
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
         .item(sqrt_over_stat, ExasolType::DoublePrecision)
-        .build_pushdown();
+        .build_scanned();
     assert!(
-        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
+        detect_group_by_aggregates(&req, scan).is_none(),
         "an unclassifiable scalar-over-aggregate item must decline the whole \
              grouped detection"
     );
@@ -2289,7 +2301,7 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
 fn numeric_aggregates_split_only_over_double_and_decimal_columns() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
         let col_types = column_types(&[("X", exa_type)]);
-        let scan = ScanTranslator::new(&col_types);
+        let scan = scan_over(&col_types);
         let numeric = match exa_type {
             ExasolType::DoublePrecision | ExasolType::Decimal(_) => true,
             ExasolType::Boolean
@@ -2324,7 +2336,7 @@ fn numeric_aggregates_split_only_over_double_and_decimal_columns() {
 #[test]
 fn numeric_aggregates_over_a_text_or_boolean_expression_decline() {
     let col_types = column_types(&[("I", ExasolType::decimal(9, 0)), ("B", ExasolType::Boolean)]);
-    let scan = ScanTranslator::new(&col_types);
+    let scan = scan_over(&col_types);
     let cases = [
         cast_to(ExasolType::varchar(30), col("I")),
         case_when([col("B")], [col("B"), bool_lit(false)]),

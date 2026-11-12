@@ -23,8 +23,6 @@ fn the_encoded_note_round_trips_through_the_reader() {
 fn a_missing_or_unreadable_note_fails_naming_the_table_and_refresh() {
     let unreadable = [
         json!({"involvedTables": [{"name": "ORDERS"}]}),
-        json!({"involvedTables": []}),
-        json!({}),
         request_with_note("ORDERS", Json::Null),
         request_with_note("ORDERS", json!("")),
         request_with_note("ORDERS", json!("not json")),

@@ -1,8 +1,7 @@
-use crate::adapter::pushdown::test_support::untyped_scan_filter;
 use crate::adapter::pushdown::test_support::{
     alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
     fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, sales_col,
-    sales_equal, str_lit,
+    sales_equal, scan_filter_sql, str_lit,
 };
 
 use super::*;
@@ -25,9 +24,7 @@ fn binary_fields() -> [LogicalField; 3] {
 
 fn rendered(filter: &Json) -> String {
     let types = declared_column_types(&HEX_COLUMNS, &binary_fields());
-    vs_expression::render_scan_filter(&compare_binary_bytes(filter.clone(), &types), &types)
-        .expect("renders")
-        .expect("a comparison is never trivially true")
+    scan_filter_sql(filter, &types).expect("renders")
 }
 
 #[test]
@@ -221,7 +218,7 @@ fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
     ]);
     let on = |alias: &str| predicate_equal(alias_col(alias, "X"), str_lit("0a1b"));
     assert_eq!(
-        untyped_scan_filter(&compare_binary_bytes(on("LHS_T0"), &columns)).expect("renders"),
+        scan_filter_sql(&on("LHS_T0"), &columns).expect("renders"),
         "(\"LHS_T0\".\"_LH_BYTES_X\" = X'0a1b')",
         "the binary leg compares its own relation's raw bytes"
     );

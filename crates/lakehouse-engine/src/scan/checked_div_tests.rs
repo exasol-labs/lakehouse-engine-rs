@@ -1,30 +1,20 @@
 use super::*;
 use crate::scan::raised_failure::session_raised_failure;
 use crate::scan::scan_session_context;
+use crate::scan::test_support::invoke_scalar_udf;
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
 };
-use arrow::datatypes::{DataType, Field, Float64Type};
-use datafusion::common::config::ConfigOptions;
+use arrow::datatypes::{DataType, Float64Type};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
 
-/// Drives `invoke_with_args` as DataFusion does per batch, asserting observable output only.
+/// Asserts observable output only.
 fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionError> {
     let rows = left.len();
-    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
-    let args = ScalarFunctionArgs {
-        arg_fields: vec![
-            Arc::new(Field::new("left", left.data_type().clone(), true)),
-            Arc::new(Field::new("right", right.data_type().clone(), true)),
-        ],
-        args: vec![ColumnarValue::Array(left), ColumnarValue::Array(right)],
-        number_rows: rows,
-        return_field: Arc::new(Field::new("quotient", DataType::Float64, true)),
-        config_options: Arc::new(ConfigOptions::default()),
-    };
-    let evaluated = udf.invoke_with_args(args)?;
+    let args = vec![ColumnarValue::Array(left), ColumnarValue::Array(right)];
+    let evaluated = invoke_scalar_udf(&CheckedFloatDivUdf::new(Arc::default()), args, rows)?;
     let array = evaluated.to_array(rows)?;
     Ok(array.as_primitive::<Float64Type>().clone())
 }
@@ -63,25 +53,8 @@ fn raised(left: ArrayRef, right: ArrayRef) -> DataFusionError {
 /// `Signature::any(2, ..)` rejects other arities at plan time, so only a direct call reaches them.
 fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue, DataFusionError> {
     let rows = arguments.first().map_or(0, |first| first.len());
-    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
-    let args = ScalarFunctionArgs {
-        arg_fields: arguments
-            .iter()
-            .enumerate()
-            .map(|(position, argument)| {
-                Arc::new(Field::new(
-                    format!("arg{position}"),
-                    argument.data_type().clone(),
-                    true,
-                ))
-            })
-            .collect(),
-        args: arguments.into_iter().map(ColumnarValue::Array).collect(),
-        number_rows: rows,
-        return_field: Arc::new(Field::new("quotient", DataType::Float64, true)),
-        config_options: Arc::new(ConfigOptions::default()),
-    };
-    udf.invoke_with_args(args)
+    let args = arguments.into_iter().map(ColumnarValue::Array).collect();
+    invoke_scalar_udf(&CheckedFloatDivUdf::new(Arc::default()), args, rows)
 }
 
 #[test]

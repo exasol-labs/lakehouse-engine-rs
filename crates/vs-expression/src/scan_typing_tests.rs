@@ -157,23 +157,6 @@ fn only_string_positions_convert_to_text() {
     }
 }
 
-/// Scenario: A column of unknown type declines
-#[test]
-fn a_column_of_unknown_type_declines_where_it_meets_text() {
-    for expr in [
-        like(col("UNKNOWN"), "1%"),
-        scalar_fn("UPPER", [col("UNKNOWN")]),
-        predicate_equal(col("UNKNOWN"), str_lit("1")),
-        cast_to(ExasolType::WIDEST_VARCHAR, col("UNKNOWN")),
-    ] {
-        assert!(render(&expr).is_err(), "{expr} must decline");
-    }
-    assert!(
-        render(&predicate_equal(col("UNKNOWN"), num_lit(1))).is_ok(),
-        "no text conversion, so the column's type does not matter"
-    );
-}
-
 #[test]
 fn integer_and_text_sources_keep_their_pushdown() {
     assert_eq!(
@@ -599,7 +582,7 @@ fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
 
 #[test]
 fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
-    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns()).unwrap();
+    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns());
     assert_eq!(
         typed(&cast_to(ExasolType::char(3), col("S10"))),
         SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))

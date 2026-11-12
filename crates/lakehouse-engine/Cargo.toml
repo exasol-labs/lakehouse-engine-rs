@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.58.2"
+version = "0.58.3"
 edition = "2024"
 license.workspace = true
 
@@ -49,6 +49,7 @@ delta_kernel_default_engine = { version = "0.30.0", default-features = false, fe
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+jiter      = { workspace = true }
 
 chrono  = { workspace = true }
 futures = { workspace = true }

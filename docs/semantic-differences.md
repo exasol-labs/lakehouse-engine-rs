@@ -117,6 +117,23 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 
 A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
 
+## JSON_VALUE without a DEFAULT ON ERROR
+
+The scan reads a document only until no `JSON_VALUE` path over it can select another item, and it takes only the first member of each name in an object. Native Exasol reads and checks the whole document, and reads repeated members as several items. So a document that is broken after the selected value, or that repeats a member the path selects, can give a value where Exasol takes the `ON ERROR` behavior, or the reverse.
+
+A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document, anywhere in the query, makes the scan read and check the whole document for every call over it, in the select list, the filter, the grouping, and the aggregates alike. The results then match native Exasol. Exasol sends `NULL ON ERROR` also when the clause is absent, and it sends `DEFAULT NULL ON ERROR` and `DEFAULT '' ON ERROR` as `NULL ON ERROR`, so none of these three asks for the whole read.
+
+| Expression | Virtual schema | Native Exasol |
+|---|---|---|
+| `JSON_VALUE('{"a":1} x', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"a":1,"a":2}', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
+| `JSON_VALUE('{"a":{"c":2},"a":{"b":1}}', '$.a.b')` | `NULL` (`ON EMPTY`) | `'1'` |
+| `JSON_VALUE('nul', '$.a' DEFAULT 'E' ON EMPTY)` | `'E'` (`ON EMPTY`) | `NULL` (`ON ERROR`) |
+
+## JSON_VALUE on deeply nested documents
+
+The scan reads a document nested at most about 200 levels deep, with or without a `DEFAULT ... ON ERROR`. A deeper document takes the `ON ERROR` behavior, while native Exasol reads it.
+
 ## ORDER BY with LIMIT under `EXCLUDED_CAPABILITIES`
 
 When `EXCLUDED_CAPABILITIES` lists `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised, `ORDER BY ... LIMIT n OFFSET m` returns the first n rows and ignores the offset. Exasol pushes the `ORDER BY` without the limit, removes its own `ORDER BY`, applies `LIMIT n` to the rows it receives, and drops the `OFFSET`. `ORDER BY id LIMIT 5 OFFSET 3` over the ids 1 to 20 returns 1 to 5 instead of 4 to 8 (observed on Exasol 2026.2.0-nano.3). Advertising all three capabilities, or none, returns 4 to 8.

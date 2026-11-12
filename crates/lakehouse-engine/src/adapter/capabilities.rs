@@ -114,6 +114,7 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_LEAST",
     "FN_NULLIFZERO",
     "FN_ZEROIFNULL",
+    "FN_JSON_VALUE",
     "AGGREGATE_SINGLE_GROUP",
     "FN_AGG_COUNT",
     "FN_AGG_COUNT_STAR",

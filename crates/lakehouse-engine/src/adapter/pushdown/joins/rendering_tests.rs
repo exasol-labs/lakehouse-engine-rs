@@ -6,7 +6,7 @@ use super::super::sql_builders::{
 };
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    resolved_side, two_scan_tuning,
+    request_legs, resolved_side, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
@@ -48,21 +48,22 @@ fn self_join_legs() -> JoinLegs {
 
 #[test]
 fn join_condition_renders_via_translator() {
+    let request = join_request(Json::Null, equi_condition());
+    let detected = detected_join(&request);
+    let sides = request_sides(&request, &detected);
+    let both_legs = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
     assert_eq!(
-        untyped_scan_expression(&equi_condition()).as_deref(),
+        scan_over(&both_legs)
+            .expression(&equi_condition())
+            .map(|fragment| fragment.sql)
+            .as_deref(),
         Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
 
-    let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = render_broadcast_join(&parsed_pushdown(&request), &detected, &sides)
+        .expect("renderable join")
+        .expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
         "each operand is qualified by its own leg's alias"
@@ -123,6 +124,75 @@ fn join_projection_emits_attribute_each_side_owning_type() {
         types,
         vec![ExasolType::varchar(100), ExasolType::Date],
         "each column's EMITS type comes from the side that owns it"
+    );
+}
+
+/// Tables `A` and `B` joined on `K`, both carrying a column `X` of a different type.
+fn shared_name_join() -> PushdownRequestBuilder {
+    pushdown_request(
+        "A",
+        &[
+            ("K", ExasolType::decimal(18, 0)),
+            ("X", ExasolType::decimal(18, 0)),
+        ],
+    )
+    .table(
+        "B",
+        &[
+            ("K", ExasolType::decimal(18, 0)),
+            ("X", ExasolType::varchar(10)),
+        ],
+    )
+    .field(
+        "from",
+        inner_join(
+            table_ref("A"),
+            table_ref("B"),
+            predicate_equal(table_col("A", "K"), table_col("B", "K")),
+        ),
+    )
+}
+
+#[test]
+fn a_shared_column_name_projects_with_each_leg_relation_and_type() {
+    let selecting = shared_name_join()
+        .column(table_col("B", "X"))
+        .column(table_col("A", "X"))
+        .build()
+        .0;
+    let (items, types, widened) = broadcast_projection(&selecting);
+    assert!(!widened);
+    assert_eq!(
+        items,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+        ]
+    );
+    assert_eq!(
+        types,
+        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
+    );
+
+    let (full_row, full_types, _) = broadcast_projection(&shared_name_join().build().0);
+    assert_eq!(
+        full_row,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "K")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "K")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+        ],
+        "the full row lists each leg's columns in leg order"
+    );
+    assert_eq!(
+        full_types,
+        vec![
+            ExasolType::decimal(18, 0),
+            ExasolType::decimal(18, 0),
+            ExasolType::decimal(18, 0),
+            ExasolType::varchar(10),
+        ]
     );
 }
 
@@ -368,9 +438,11 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit(7)),
     ]);
     let legs = self_join_legs();
+    let fact_orders = column_types(&[("O_ORDERKEY", ExasolType::decimal(20, 0))]);
 
-    let occurrence_a = untyped_scan_filter(
+    let occurrence_a = scan_filter_sql(
         &leg_local_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
+        &fact_orders,
     )
     .expect("renders");
     assert!(
@@ -378,8 +450,9 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         "occurrence A's leg-local filter must carry only its own conjunct: {occurrence_a}"
     );
 
-    let occurrence_b = untyped_scan_filter(
+    let occurrence_b = scan_filter_sql(
         &leg_local_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
+        &fact_orders,
     )
     .expect("renders");
     assert!(
@@ -410,7 +483,8 @@ fn screen_leg_filter_renders_the_accepted_set_bare() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -432,7 +506,8 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -454,7 +529,8 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
 
     let pruning = leg_local_filter(&filter, &customer_orders_legs(), 1)
         .expect("both conjuncts are ORDERS-leg-local");
-    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()));
+    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, Some(date_like.clone()));
     assert_eq!(
@@ -471,7 +547,8 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
+        .expect("every column of the leg filter binds the leg");
 
     assert_eq!(leg, None);
     assert_eq!(declined, Some(filter));
@@ -479,50 +556,53 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
 
 #[test]
 fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
-    let request = serde_json::json!({
-        "involvedTables": [
-            involved_table_json("DATED", &[("SHARED_KEY", ExasolType::Date)]),
-            involved_table_json("NUMBERED", &[("SHARED_KEY", ExasolType::decimal(20, 0))]),
-        ]
-    });
-    let filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
-    let screen = |table: &str| {
-        screen_leg_filter(
-            &filter,
-            &column_types(&involved_table(&request, table).unwrap().types),
-        )
+    let dated_filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
+    let numbered_filter = like(table_col("NUMBERED", "SHARED_KEY"), "1995%");
+    let screen = |filter: &Json, exa_type: ExasolType| {
+        screen_leg_filter(filter, &column_types(&[("SHARED_KEY", exa_type)]))
+            .expect("every column of the leg filter binds the leg")
     };
 
     assert_eq!(
-        screen("DATED"),
-        (None, Some(filter.clone())),
+        screen(&dated_filter, ExasolType::Date),
+        (None, Some(dated_filter.clone())),
         "a DATE's text depends on NLS_DATE_FORMAT, so the DATE side declines"
     );
-    let (numeric_leg, numeric_declined) = screen("NUMBERED");
+    let (numeric_leg, numeric_declined) = screen(&numbered_filter, ExasolType::decimal(20, 0));
     assert!(numeric_leg.is_some_and(|sql| sql.contains("SHARED_KEY")));
     assert_eq!(numeric_declined, None);
 }
 
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
-    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
-        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .build_pushdown();
+    let full = [
+        ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+        ("C_NAME", ExasolType::varchar(100)),
+        ("C_ADDRESS", ExasolType::varchar(100)),
+        ("C_PHONE", ExasolType::varchar(20)),
+    ];
     let condition = predicate_equal(
         table_col("CUSTOMER", "C_CUSTKEY"),
         table_col("ORDERS", "O_CUSTKEY"),
     );
-    let full = vec![
-        ("C_CUSTKEY".to_string(), ExasolType::decimal(20, 0)),
-        ("C_NAME".to_string(), ExasolType::varchar(100)),
-        ("C_ADDRESS".to_string(), ExasolType::varchar(100)),
-        ("C_PHONE".to_string(), ExasolType::varchar(20)),
-    ];
+    let request = pushdown_request("CUSTOMER", &full)
+        .table("ORDERS", &[("O_CUSTKEY", ExasolType::decimal(20, 0))])
+        .field(
+            "from",
+            inner_join(
+                table_ref("CUSTOMER"),
+                table_ref("ORDERS"),
+                condition.clone(),
+            ),
+        )
+        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .build()
+        .0;
     let narrowed = referenced_leg_columns(
-        pushdown_req.json(),
+        &pd(&request),
         &condition,
-        &customer_orders_legs(),
+        &request_legs(&request),
         0,
         &column_types(&full),
     );
@@ -900,7 +980,8 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types);
+    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types)
+        .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }

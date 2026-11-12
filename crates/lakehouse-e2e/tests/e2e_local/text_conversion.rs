@@ -1,10 +1,14 @@
-//! Text and BOOLEAN conversions under the case's session settings: each query over the virtual
-//! table must match the same query over a native copy, and take the path the case names.
+//! Text and BOOLEAN conversions under the case's session settings, and `JSON_VALUE`: each query
+//! over the virtual table must match the same query over a native copy, and take the path the
+//! case names.
 
 use crate::common::e2e_harness::PathCheck::{Has, Lacks, NScan, Split, Wrapper};
 use crate::common::e2e_harness::*;
-use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS};
-use crate::fixtures::{LAKEHOUSE_VS, TYPED_COLUMNS, lakehouse_vs, typed_table, vs_char_pad_table};
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS, JSON_DOCS};
+use crate::fixtures::{
+    LAKEHOUSE_VS, TYPED_COLUMNS, json_table, lakehouse_vs, typed_table, vs_char_pad_table,
+};
 
 const YDM: &str = "NLS_DATE_FORMAT = 'YYYY-DD-MM'";
 const TS_DMY: &str = "NLS_TIMESTAMP_FORMAT = 'DD.MM.YYYY HH24:MI:SS.FF6'";
@@ -462,6 +466,48 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 
 /// Scenario: Text the session format converts runs in Exasol
 /// Scenario: Integer and boolean text runs in the scan
+/// Scenario: A JSON_VALUE without a DEFAULT ON ERROR stops reading once no path can select more
+#[test]
+fn json_value_fast_read_differs_from_native_as_documented() {
+    lakehouse_vs();
+    let table = json_table();
+    let mut conn = exa_conn();
+    let rows = |conn: &mut ExaConn, sql: &str| -> Vec<Vec<String>> {
+        conn.query_columns(sql)
+            .iter()
+            .map(|column| column.iter().map(value_to_string).collect())
+            .collect()
+    };
+    // Document 6 repeats `locale`, and document 7 ends without its closing brace.
+    let calls = "JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.order.id')";
+    let scan = rows(
+        &mut conn,
+        &format!("SELECT ID, {calls} FROM {table} WHERE ID IN (6, 7) ORDER BY ID"),
+    );
+    let ids = vec!["6".to_string(), "7".to_string()];
+    let big = "12345678901234567890123".to_string();
+    let de = "de_DE".to_string();
+    assert_eq!(
+        scan,
+        vec![ids, vec![de.clone(), de], vec![big.clone(), "44".into()]]
+    );
+    for (id, locale, order_id) in [(6, "null", big.as_str()), (7, "null", "null")] {
+        let doc = JSON_DOCS[id - 1].expect("a document").replace('\'', "''");
+        let native = rows(
+            &mut conn,
+            &format!(
+                "SELECT {} FROM DUAL",
+                calls.replace("DOC", &format!("'{doc}'"))
+            ),
+        );
+        assert_eq!(
+            native,
+            vec![vec![locale.to_string()], vec![order_id.to_string()]],
+            "{id}"
+        );
+    }
+}
+
 /// Scenario: A digits-only literal compares with an integer as a number
 /// Scenario: A group key travels with its exact type
 /// Scenario: A CAST of text to CHAR runs in Exasol
@@ -474,16 +520,19 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 #[test]
 fn text_conversions_match_native_under_session_settings() {
     lakehouse_vs();
-    let table = typed_table();
-    create_native_copy(&mut exa_conn(), &table, TYPED_COLUMNS);
+    assert_cases_match_native(&typed_table(), TYPED_COLUMNS, CASES, ERROR_CASES);
+}
 
-    let cases = CASES
+/// Native Exasol returns rows for `cases` and raises an error for `error_cases`.
+fn assert_cases_match_native(table: &str, columns: &str, cases: &[Case], error_cases: &[Case]) {
+    create_native_copy(&mut exa_conn(), table, columns);
+    let cases = cases
         .iter()
         .map(|case| (case, Expect::Rows))
-        .chain(ERROR_CASES.iter().map(|case| (case, Expect::Error)));
+        .chain(error_cases.iter().map(|case| (case, Expect::Error)));
     let failures: Vec<String> = cases
         .clone()
-        .filter_map(|(case, expect)| mismatch(&table, case, expect))
+        .filter_map(|(case, expect)| mismatch(table, case, expect))
         .collect();
 
     assert!(
@@ -492,6 +541,178 @@ fn text_conversions_match_native_under_session_settings() {
         failures.len(),
         cases.count(),
         failures.join("\n")
+    );
+}
+
+/// The scan's projection when a declined `JSON_VALUE` leaves Exasol only the document to read.
+const DOCUMENT_ONLY: &str = r#""projection":["ID","DOC"]"#;
+
+/// Without a `DEFAULT ... ON ERROR`, documents 6 and 7 read as
+/// `json_value_fast_read_differs_from_native_as_documented` checks, so `$.locale` cases skip them.
+const JSON_VALUE_CASES: &[Case] = &[
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT COUNT(JSON_VALUE(DOC, '$.locale')), MAX(JSON_VALUE(DOC, '$.locale')), COUNT(JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR)) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR) FROM {T} WHERE JSON_VALUE(DOC, '$.locale') = 'de_DE'",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale') FROM {T} WHERE ID NOT IN (6, 7)",
+        path: Has(r#""projection":["ID",{"expr""#),
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.id'), JSON_VALUE(DOC, '$.order.price'), JSON_VALUE(DOC, '$.note'), JSON_VALUE(DOC, '$.active') FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.tags[1]' RETURNING VARCHAR(5) DEFAULT 'none' ON EMPTY DEFAULT 'bad' ON ERROR) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order' DEFAULT 'empty' ON EMPTY DEFAULT 'error' ON ERROR), JSON_VALUE(DOC, '$.order[1].id' DEFAULT 'empty' ON EMPTY) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.note' RETURNING VARCHAR(5) DEFAULT 'long' ON ERROR) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.active' RETURNING BOOLEAN), JSON_VALUE(DOC, '$.missing' RETURNING BOOLEAN DEFAULT TRUE ON EMPTY DEFAULT FALSE ON ERROR) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.locale') = 'de_DE' AND ID NOT IN (6, 7)",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale' DEFAULT 'bad' ON ERROR), JSON_VALUE(DOC, '$.order.id') FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale' DEFAULT 'bad' ON ERROR) FROM {T} ORDER BY 2, 1",
+        path: Lacks(r#"},"DOC"]"#),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.active' RETURNING BOOLEAN)",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.note') IS NULL",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.locale' DEFAULT 'none' ON EMPTY DEFAULT 'bad' ON ERROR) IN ('none', 'bad')",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT JSON_VALUE(DOC, '$.locale'), COUNT(*) FROM {T} WHERE ID NOT IN (6, 7) GROUP BY JSON_VALUE(DOC, '$.locale')",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT MAX(JSON_VALUE(DOC, '$.locale')) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT LENGTH(MIN(JSON_VALUE(DOC, '$.note' RETURNING VARCHAR(5)))) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.id' RETURNING DECIMAL(18,0)) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.id' RETURNING DECIMAL(18,0)) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.price' RETURNING DOUBLE) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DMY,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.day' RETURNING DATE) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.day' RETURNING TIMESTAMP) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale' RETURNING VARCHAR(10) ASCII) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.tags[*]') FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE JSON_VALUE(DOC, '$.order.id' RETURNING DECIMAL(18,0)) > 42",
+        path: Lacks(SCAN_FILTER),
+    },
+];
+
+const JSON_VALUE_ERROR_CASES: &[Case] = &[
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order' ERROR ON ERROR) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.missing' ERROR ON EMPTY) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.note' RETURNING VARCHAR(3) DEFAULT 'toolong' ON ERROR) FROM {T}",
+        path: Has(DOCUMENT_ONLY),
+    },
+];
+
+/// Scenario: JSON_VALUE with a session-free form runs in the scan
+/// Scenario: JSON_VALUE in the scan reads the document and the path as Exasol does
+/// Scenario: JSON_VALUE in the scan converts the item as Exasol does
+/// Scenario: A JSON_VALUE the scan cannot compute runs in Exasol over the document column
+/// Scenario: A JSON_VALUE without a DEFAULT ON ERROR stops reading once no path can select more
+#[test]
+fn json_value_matches_native() {
+    lakehouse_vs();
+    assert_cases_match_native(
+        &json_table(),
+        "DOC",
+        JSON_VALUE_CASES,
+        JSON_VALUE_ERROR_CASES,
     );
 }
 

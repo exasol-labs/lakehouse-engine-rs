@@ -58,14 +58,12 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * *AND* the adapter MAY leave that pushed `orderBy` unrendered for these two shapes ONLY, because a one-row result admits exactly one ordering, so no ordering the adapter omits is observable
 * *AND* the anti-wrong-truncation invariant SHALL remain intact for every multi-row shape, and specifically the row-scan declined path SHALL still withhold the per-shard `LIMIT` entirely and re-apply the request's `LIMIT` only on its own outer wrapper AFTER the global `ORDER BY`, so no rule here moves a limit ahead of an ordering the adapter did not itself render
 
-### Scenario: Hidden sort-key columns are appended at most once and never invented
+### Scenario: Hidden sort-key columns are appended at most once
 
-* *GIVEN* a declined-`ORDER BY` row-scan `pushdown` request whose `orderBy` names a column already present as a bare-column item of the derived projection, or names the same column in more than one sort key, or names a column absent from `involvedTables[0].columns`, or consists only of elements that yield no renderable sort key
+* *GIVEN* a declined-`ORDER BY` row-scan `pushdown` request whose `orderBy` names a column already present as a bare-column item of the derived projection, or names the same column in more than one sort key
 * *WHEN* the adapter appends hidden sort-key columns and builds the wrapper
 * *THEN* a sort-key column already present as a bare-column item of the derived projection SHALL NOT be appended, and a column named by two or more sort keys SHALL be appended at most once, because a repeated EMITS identifier is a duplicate-column error
 * *AND* a column referenced by an EXPRESSION sort key SHALL obey the same at-most-once rule across every sort key and every pre-existing bare-column projection item, so two sort expressions over the same base column append it once
-* *AND* a sort-key column that cannot be resolved from `involvedTables[0].columns` SHALL be left unresolved, neither appended nor otherwise special-cased, preserving the existing shape for this defensive case, which is unreachable in practice because every pushed sort key names a real table column
-* *AND* a NON-EMPTY `orderBy` that yields ZERO renderable sort keys SHALL return a `User` decline naming the unrenderable `ORDER BY`, and MUST NOT return the unwrapped scan-driving SQL as if no ordering had been pushed, because Exasol delegates a pushed `orderBy` and does not re-sort, so returning it unchanged is the silent-wrong-order outcome
 * *AND* an ABSENT or EMPTY `orderBy` SHALL still return the unwrapped scan-driving SQL unchanged, emitting neither a wrapper nor an `ORDER BY` clause, because no ordering was pushed and none is owed
 * *AND* when the derived projection has no item to name explicitly the adapter SHALL leave the wrapper's `SELECT *` in place, because an empty explicit select list is not valid SQL
 
@@ -76,7 +74,7 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * *THEN* the adapter SHALL fall back to the unoptimized declined path for that shape, carrying neither a per-shard row limit nor per-shard sort keys ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
 * *AND* the adapter SHALL render the ordering ITSELF, as a self-contained global `ORDER BY` (plus the request's full retained window, `LIMIT n`, and `OFFSET m` when non-zero) wrapping the unbounded fan-out, and SHALL NOT rely on Exasol re-applying an `ORDER BY` it retains, once a sort-key capability is advertised Exasol delegates the pushed `orderBy` and does not re-sort the returned rows, and once `LIMIT_WITH_OFFSET` is advertised it re-applies neither bound of the window either, so rendering the `LIMIT` alone returns the wrong window
 * *AND* that wrapper SHALL preserve the derived projection's pre-extension column count and order, emitting any column the ordering needs but the projection lacks as a hidden scan column, so a declined `ORDER BY` never becomes an Exasol column-count rejection nor a reference to a column the scan does not emit
-* *AND* for EVERY reachable ordered shape the outcome SHALL be exactly one of two: the ordering is rendered faithfully, or the pushdown declines with a `User` error naming the unrenderable key, never a result that is both silently unordered and successful, and never a result carrying a column the client did not select
+* *AND* every reachable ordered shape SHALL be rendered faithfully, because Exasol states both sort flags on every `orderBy` element and the Exasol dialect renders every sort key Exasol sends, so the result is never silently unordered and never carries a column the client did not select
 
 ### Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
 

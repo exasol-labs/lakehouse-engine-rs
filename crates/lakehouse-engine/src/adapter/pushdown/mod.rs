@@ -76,11 +76,11 @@ mod joins;
 // Several re-exports are consumed only by tests and the reachability probe.
 #[allow(unused_imports)]
 pub(crate) use joins::{
-    DetectedJoin, IneligibleJoinReason, JoinLeaf, JoinShape, JoinSides, RenderedJoinPushdown,
-    ResolvedJoinSide, detect_join, render_broadcast_join,
+    DetectedJoin, JoinLeaf, JoinShape, JoinSides, RenderedJoinPushdown, ResolvedJoinSide,
+    detect_join, render_broadcast_join,
 };
 use joins::{
-    EmptyRelation, ineligible_join_decline, plan_join, qualified_single_table_fallback_pushdown,
+    EmptyRelation, ensure_columns_declared, plan_join, qualified_single_table_fallback_pushdown,
     qualify_udf,
 };
 
@@ -126,11 +126,9 @@ pub(crate) async fn handle_pushdown(
     let props = get_properties(request);
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
-    // join falling through would silently scan one table. `Ineligible` is a hard error
-    // because Exasol does not re-plan on an adapter error.
+    // join falling through would silently scan one table.
     match detect_join(request, pushdown.json())? {
         JoinShape::NotAJoin => {}
-        JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
         JoinShape::Join(join) => {
             return plan_join(
                 request,
@@ -161,6 +159,7 @@ pub(crate) async fn handle_pushdown(
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
     let involved = involved_columns(request, |tables| tables.first())?;
+    ensure_columns_declared(request, pushdown_req, None, &[&involved])?;
 
     let limit = extract_limit(pushdown_req);
 
@@ -185,7 +184,7 @@ pub(crate) async fn handle_pushdown(
     ) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
-    let scan = ScanTranslator::new(&col_types);
+    let scan = ScanTranslator::over(&col_types, &[pushdown_req])?;
     let (projection, projection_widened) = project_columns(&pushdown, scan)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
@@ -419,7 +418,7 @@ pub(crate) fn build_dispatch_sql(
                     },
                     files: vec![],
                 };
-                let Some(sql) = support::build_count_distinct_scan_sql(
+                let sql = support::build_count_distinct_scan_sql(
                     &base_spec,
                     shards,
                     &items,
@@ -427,9 +426,7 @@ pub(crate) fn build_dispatch_sql(
                     limit,
                     udf_name,
                     distribute_udf_name,
-                ) else {
-                    return fallback();
-                };
+                );
                 return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
             }
             // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
@@ -474,7 +471,6 @@ pub(crate) fn build_dispatch_sql(
     // SELECT to drop it (#225).
     let topn = if aggregates.is_none() {
         detect_topn(
-            request,
             pushdown_req,
             &projection_items(&projection),
             &logical_schema,
@@ -504,10 +500,8 @@ pub(crate) fn build_dispatch_sql(
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let keys = parse_order_by_keys(pushdown_req);
-        // Exasol does not re-sort a delegated ordering, so an unrenderable key must
-        // decline before any SQL is built (#198).
-        topn::ensure_every_sort_key_renders(&keys)?;
+        let mut keys = parse_order_by_keys(pushdown_req);
+        topn::sort_by_select_items(&mut keys, pushdown_req, &projection);
         topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {

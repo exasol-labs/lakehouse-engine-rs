@@ -34,6 +34,7 @@ pub use sql_support::build_alias_items;
 
 mod checked_div;
 mod exasol_numeric;
+mod json_value;
 mod raised_failure;
 
 pub(crate) mod parquet_reader;
@@ -138,6 +139,7 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     binary_hex::register_binary_hex_udf(&ctx);
     binary_text::register_binary_text_udf(&ctx);
     checked_div::register_checked_float_div_udf(&ctx, raised);
+    json_value::register_json_value_udfs(&ctx);
     ctx
 }
 

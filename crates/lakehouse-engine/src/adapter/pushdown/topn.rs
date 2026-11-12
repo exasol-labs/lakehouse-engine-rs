@@ -1,23 +1,21 @@
 use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
-use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::render_expression_exasol_safe;
+use vs_expression::render_expression_exasol;
 
 use super::support::{
-    ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref, emits_ident,
-    extract_limit, extract_offset, render_limit_offset,
+    BOUND_BY_TRANSLATOR, ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref,
+    emits_ident, extract_limit, extract_offset, render_limit_offset,
 };
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
-/// only. Expression sort keys use [`parse_sort_flags`] instead.
+/// only. Expression sort keys use [`sort_flags`] instead.
 ///
 /// A node's `tableAlias` qualifies the key, so a broadcast join's key keeps the leg its
 /// qualification stamped; the single-table paths strip every alias first, so their keys stay
 /// bare.
 pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
     let column = column_node_ref(element.get("expression")?)?;
-    let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
-    let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
+    let (ascending, nulls_last) = sort_flags(element);
     Some(SortKey {
         column,
         ascending,
@@ -25,12 +23,14 @@ pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
     })
 }
 
-/// `None` when either flag is absent: a defaulted direction or NULL placement would
-/// be a wrong order.
-pub(super) fn parse_sort_flags(element: &Json) -> Option<(bool, bool)> {
-    let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
-    let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
-    Some((ascending, nulls_last))
+/// `(ascending, nulls_last)`: Exasol states both flags on every `orderBy` element.
+pub(super) fn sort_flags(element: &Json) -> (bool, bool) {
+    let flag = |key: &str| {
+        element[key]
+            .as_bool()
+            .unwrap_or_else(|| panic!("Exasol states {key} on every orderBy element"))
+    };
+    (flag("isAscending"), flag("nullsLast"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,9 +44,6 @@ pub(super) enum ParsedSortKey {
         ascending: bool,
         nulls_last: bool,
     },
-    /// Kept in the parsed list rather than dropped so a caller can see an element was
-    /// lost and decline instead of returning an under-ordered result.
-    Unrenderable,
 }
 
 impl ParsedSortKey {
@@ -54,20 +51,18 @@ impl ParsedSortKey {
         match self {
             Self::Column(key) => vec![key.column.name.as_str()],
             Self::Expression { columns, .. } => columns.iter().map(String::as_str).collect(),
-            Self::Unrenderable => Vec::new(),
         }
     }
 
-    fn render_order_by_element(&self) -> Option<String> {
+    fn render_order_by_element(&self) -> String {
         match self {
-            Self::Column(key) => Some(key.render_order_by_element()),
+            Self::Column(key) => key.render_order_by_element(),
             Self::Expression {
                 rendered,
                 ascending,
                 nulls_last,
                 ..
-            } => Some(render_ordered(rendered, *ascending, *nulls_last)),
-            Self::Unrenderable => None,
+            } => render_ordered(rendered, *ascending, *nulls_last),
         }
     }
 }
@@ -78,14 +73,9 @@ fn parse_declined_sort_key(element: &Json) -> ParsedSortKey {
     if let Some(key) = parse_sort_key_element(element) {
         return ParsedSortKey::Column(key);
     }
-    let (Some((ascending, nulls_last)), Some(expr)) =
-        (parse_sort_flags(element), element.get("expression"))
-    else {
-        return ParsedSortKey::Unrenderable;
-    };
-    let Some(rendered) = render_expression_exasol_safe(expr) else {
-        return ParsedSortKey::Unrenderable;
-    };
+    let (ascending, nulls_last) = sort_flags(element);
+    let expr = &element["expression"];
+    let rendered = render_expression_exasol(expr);
     let mut names = std::collections::HashSet::new();
     collect_all_column_names(expr, &mut names);
     let mut columns: Vec<String> = names.into_iter().collect();
@@ -101,8 +91,7 @@ fn parse_declined_sort_key(element: &Json) -> ParsedSortKey {
 }
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the declined paths must
-/// reproduce the global sort. Yields exactly one key per element, including
-/// `Unrenderable`, so callers can detect a partially rendered clause.
+/// reproduce the global sort, one key per element.
 pub(super) fn parse_order_by_keys(pushdown_req: &Json) -> Vec<ParsedSortKey> {
     pushdown_req
         .get("orderBy")
@@ -111,24 +100,44 @@ pub(super) fn parse_order_by_keys(pushdown_req: &Json) -> Vec<ParsedSortKey> {
         .unwrap_or_default()
 }
 
-/// Exasol does not re-apply a delegated `ORDER BY`, so returning SQL built from the
-/// surviving keys would silently answer a different query. Any unrenderable element
-/// declines with a hard error; there is no native re-plan to fall back to.
-pub(super) fn ensure_every_sort_key_renders(keys: &[ParsedSortKey]) -> Result<(), UdfError> {
-    let positions = keys
-        .iter()
-        .enumerate()
-        .filter(|(_, key)| matches!(key, ParsedSortKey::Unrenderable))
-        .map(|(i, _)| (i + 1).to_string())
-        .collect::<Vec<_>>();
-    if positions.is_empty() {
-        return Ok(());
+/// A key equal to a select-list item sorts by the column the scan emits for it, so the wrapper
+/// needs none of the item's base columns and Exasol does not compute the item again.
+/// `projection` must hold one column per select-list item, as the row-scan path does.
+pub(super) fn sort_by_select_items(
+    keys: &mut [ParsedSortKey],
+    pushdown_req: &Json,
+    projection: &[ProjectedColumn],
+) {
+    let items = pushdown_req.get("selectList").and_then(Json::as_array);
+    let elements = pushdown_req.get("orderBy").and_then(Json::as_array);
+    let (Some(items), Some(elements)) = (items, elements) else {
+        return;
+    };
+    if items.len() != projection.len() {
+        return;
     }
-    Err(UdfError::User(format!(
-        "ORDER BY pushdown declined: sort key at clause position {} could not be rendered \
-         for the declined row-scan wrapper; this is a hard error, not a native re-plan",
-        positions.join(", ")
-    )))
+    for (key, element) in keys.iter_mut().zip(elements) {
+        let ParsedSortKey::Expression {
+            ascending,
+            nulls_last,
+            ..
+        } = *key
+        else {
+            continue;
+        };
+        let Some(index) = items
+            .iter()
+            .position(|item| Some(item) == element.get("expression"))
+        else {
+            continue;
+        };
+        *key = ParsedSortKey::Expression {
+            rendered: emits_ident(&projection[index].item, index),
+            columns: Vec::new(),
+            ascending,
+            nulls_last,
+        };
+    }
 }
 
 /// Guards (any failure returns `None`):
@@ -139,7 +148,6 @@ pub(super) fn ensure_every_sort_key_renders(keys: &[ParsedSortKey]) -> Result<()
 ///   native value, so the outer merge would re-rank lexicographically and corrupt
 ///   the global top-N.
 pub(super) fn detect_topn(
-    request: &Json,
     pushdown_req: &Json,
     proj_cols: &[ProjectionItem],
     logical_schema: &[LogicalField],
@@ -166,15 +174,6 @@ pub(super) fn detect_topn(
         .filter(|h| !h.is_null())
         .is_some()
     {
-        return None;
-    }
-
-    let table_count = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .map(|t| t.len())
-        .unwrap_or(0);
-    if table_count != 1 {
         return None;
     }
 
@@ -223,9 +222,9 @@ pub(super) fn extend_projection_with_sort_keys(
         if already_emitted {
             continue;
         }
-        let Some(column_type) = col_types.get(&ColumnRef::from(column)) else {
-            continue;
-        };
+        let column_type = col_types
+            .get(&ColumnRef::from(column))
+            .expect(BOUND_BY_TRANSLATOR);
         projection.push(ProjectedColumn {
             item: ProjectionItem::from(column),
             exa_type: column_type.exa_type,
@@ -237,9 +236,8 @@ pub(super) fn extend_projection_with_sort_keys(
 /// global sort. The window is rendered here, not in the fan-out, since a per-shard
 /// `OFFSET` does not compose (#191); Exasol rejects `OFFSET` without `ORDER BY`.
 ///
-/// Returns `sql` unchanged when no key renders (callers must guarantee one does;
-/// the broadcast caller `debug_assert`s on it). `visible_count == 0` falls back to
-/// `SELECT *`, since `SELECT  FROM (…)` is invalid.
+/// `keys` is never empty: both callers wrap only a non-empty `orderBy`. `visible_count == 0`
+/// falls back to `SELECT *`, since `SELECT  FROM (…)` is invalid.
 pub(super) fn wrap_declined_order_by(
     sql: &str,
     proj_cols: &[ProjectionItem],
@@ -250,12 +248,9 @@ pub(super) fn wrap_declined_order_by(
 ) -> String {
     let order_by = keys
         .iter()
-        .filter_map(ParsedSortKey::render_order_by_element)
+        .map(ParsedSortKey::render_order_by_element)
         .collect::<Vec<_>>()
         .join(", ");
-    if order_by.is_empty() {
-        return sql.to_string();
-    }
     let visible_list = if visible_count == 0 {
         "*".to_string()
     } else {
