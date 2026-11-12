@@ -381,9 +381,12 @@ fn projection_carried_in_common_literal_and_emits() {
 
 #[test]
 fn pushdown_translates_or_omits_predicate() {
-    let ages = column_types(&[("AGE", ExasolType::decimal(20, 0))]);
-    let translatable = compare("predicate_greater", col("age"), num_lit(18));
-    let filter_rendered = scan_filter_sql(&translatable, &ages);
+    let columns = column_types(&[
+        ("AGE", ExasolType::decimal(20, 0)),
+        ("PRICE", ExasolType::decimal(9, 2)),
+    ]);
+    let translatable = compare("predicate_greater", col("AGE"), num_lit(18));
+    let filter_rendered = scan_filter_sql(&translatable, &columns);
     assert!(
         filter_rendered.is_some(),
         "translatable predicate must produce a filter string"
@@ -400,8 +403,8 @@ fn pushdown_translates_or_omits_predicate() {
 
     // Kept out of the scan spec only; the adapter still self-applies it (see
     // `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`).
-    let untranslatable = like(col("age"), "1%");
-    let omitted = scan_filter_sql(&untranslatable, &ages);
+    let untranslatable = like(col("PRICE"), "1%");
+    let omitted = scan_filter_sql(&untranslatable, &columns);
     assert!(
         omitted.is_none(),
         "untranslatable predicate must be omitted (None), not mistranslated"
