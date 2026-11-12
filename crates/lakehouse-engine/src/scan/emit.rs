@@ -1,4 +1,4 @@
-use crate::scan::checked_div::find_checked_float_div_error;
+use crate::scan::checked_div::find_checked_div_error;
 use crate::scan::convert::check_date32_in_exasol_range;
 use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
@@ -230,7 +230,7 @@ fn drifted_decimal(declared: &ColumnInfo, precision: u32, scale: u32) -> UdfErro
 /// `Context`/`External`/`ArrowError` nesting (DataFusion's sort wraps OOM with `.context()`).
 /// Credential redaction applies on every path.
 pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
-    if let Some(division) = find_checked_float_div_error(&e) {
+    if let Some(division) = find_checked_div_error(&e) {
         return raised_failure_error(&division.to_string(), secrets);
     }
     match e.find_root() {

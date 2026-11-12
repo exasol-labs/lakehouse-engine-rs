@@ -1,13 +1,17 @@
-//! The scalar function every DataFusion-dialect `FLOAT_DIV` renders as, so division by zero
-//! fails the query instead of silently changing a pushed filter's row count (#370). Safe because
-//! it sees only operands of a division the pushdown synthesised, unlike `arrow_value_at`'s
-//! `is_nan()` guard, which cannot tell a computed non-finite from a stored one.
+//! The scalar functions every DataFusion-dialect `FLOAT_DIV` and `DIV` render as, so division by
+//! zero fails the query instead of silently changing a pushed filter's row count (#370).
+//! `vs_checked_float_div` is safe because it sees only operands of a division the pushdown
+//! synthesised, unlike `arrow_value_at`'s `is_nan()` guard, which cannot tell a computed
+//! non-finite from a stored one. `vs_checked_int_div` exists because DataFusion's `/` does not
+//! reproduce `DIV`: over `Decimal128(p, 0)` it returns a scaled decimal, `i64::MIN / -1`
+//! overflows `Int64`, and its zero-divisor error is not recognised by type.
 
-use super::exasol_numeric::numeric_overflow;
+use super::exasol_numeric::{as_i128, exact_ps, numeric_overflow};
 use super::raised_failure::RaisedFailure;
-use arrow::array::{Array, AsArray, Float64Array};
+use arrow::array::{Array, AsArray, Decimal128Array, Float64Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Float64Type};
+use datafusion::common::plan_err;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
@@ -17,26 +21,44 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use vs_expression::CHECKED_FLOAT_DIV_FN;
+use vs_expression::{CHECKED_FLOAT_DIV_FN, CHECKED_INT_DIV_FN};
 
 /// Arrow keeps the values buffer full-length behind the null mask; nothing reads this slot.
 const NULL_ROW_FILLER: f64 = 0.0;
 
-/// Recognised BY TYPE via [`find_checked_float_div_error`], never by message text. `ZeroDivisor`
+/// The integer counterpart of [`NULL_ROW_FILLER`].
+const NULL_ROW_INTEGER_FILLER: i128 = 0;
+
+/// A Null operand types as the smallest decimal, one digit.
+const NULL_OPERAND_PRECISION: u8 = 1;
+
+/// Recognised BY TYPE via [`find_checked_div_error`], never by message text. `ZeroDivisor`
 /// wins whenever the divisor is zero; `NonFiniteResult` covers any other non-finite quotient.
+/// `IntegerZeroDivisor` is the `DIV` counterpart.
 #[derive(Debug)]
-pub(super) enum CheckedFloatDivError {
+pub(super) enum CheckedDivError {
     /// Either sign: IEEE-754 `-0.0` equals `0.0`.
-    ZeroDivisor { numerator: f64, divisor: f64 },
+    ZeroDivisor {
+        numerator: f64,
+        divisor: f64,
+    },
     /// An overflow from two finite operands, or a non-finite operand read from the table.
     NonFiniteResult {
         numerator: f64,
         divisor: f64,
         quotient: f64,
     },
+    IntegerZeroDivisor {
+        numerator: i128,
+    },
+    /// `i128::MIN / -1`, reachable only through a stored value outside its declared precision.
+    IntegerOverflow {
+        numerator: i128,
+        divisor: i128,
+    },
 }
 
-impl fmt::Display for CheckedFloatDivError {
+impl fmt::Display for CheckedDivError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroDivisor { numerator, divisor } => write!(
@@ -53,20 +75,29 @@ impl fmt::Display for CheckedFloatDivError {
                 "{CHECKED_FLOAT_DIV_FN}({numerator}, {divisor}) evaluates to {quotient}, and \
                  Exasol's DOUBLE admits no non-finite value"
             ))),
+            Self::IntegerZeroDivisor { numerator } => write!(
+                f,
+                "data exception - division by zero: \
+                 {CHECKED_INT_DIV_FN}({numerator}, 0) has no result"
+            ),
+            Self::IntegerOverflow { numerator, divisor } => {
+                f.write_str(&numeric_overflow(format_args!(
+                    "{CHECKED_INT_DIV_FN}({numerator}, {divisor}) exceeds the 128-bit internal \
+                     number representation"
+                )))
+            }
         }
     }
 }
 
-impl Error for CheckedFloatDivError {}
+impl Error for CheckedDivError {}
 
 /// DataFusion may wrap the error in `External`, `Context`, `ArrowError::ExternalError`, or an
 /// `Arc`; walking `Error::source` recognises it through all of them.
-pub(super) fn find_checked_float_div_error(
-    error: &DataFusionError,
-) -> Option<&CheckedFloatDivError> {
+pub(super) fn find_checked_div_error(error: &DataFusionError) -> Option<&CheckedDivError> {
     let mut level: &(dyn Error + 'static) = error;
     loop {
-        if let Some(found) = level.downcast_ref::<CheckedFloatDivError>() {
+        if let Some(found) = level.downcast_ref::<CheckedDivError>() {
             return Some(found);
         }
         level = level.source()?;
@@ -159,7 +190,7 @@ fn divide_checked(
     left: &[f64],
     right: &[f64],
     nulls: Option<&NullBuffer>,
-) -> Result<Vec<f64>, CheckedFloatDivError> {
+) -> Result<Vec<f64>, CheckedDivError> {
     let mut quotients = Vec::with_capacity(left.len());
     for (row, (&numerator, &divisor)) in left.iter().zip(right).enumerate() {
         if nulls.is_some_and(|mask| mask.is_null(row)) {
@@ -174,25 +205,148 @@ fn divide_checked(
 /// Exasol admits no non-finite DOUBLE (rejects `CAST('inf' AS DOUBLE)` at `22018`, `1E400` at
 /// `22003`), so no non-finite quotient is ever correct. Checking `divisor == 0.0` after the
 /// finiteness test also classifies `-0.0` as zero.
-fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedFloatDivError> {
+fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedDivError> {
     let quotient = numerator / divisor;
     if quotient.is_finite() {
         return Ok(quotient);
     }
     if divisor == 0.0 {
-        return Err(CheckedFloatDivError::ZeroDivisor { numerator, divisor });
+        return Err(CheckedDivError::ZeroDivisor { numerator, divisor });
     }
-    Err(CheckedFloatDivError::NonFiniteResult {
+    Err(CheckedDivError::NonFiniteResult {
         numerator,
         divisor,
         quotient,
     })
 }
 
+/// `DIV`: `Signature::any` like the float function, over Arrow integers or `Decimal128(p, 0)`.
+/// The typed scan pass declines every other operand, so a non-integer type reaching here fails
+/// planning instead of returning a wrong value.
+#[derive(Debug)]
+struct CheckedIntDivUdf {
+    signature: Signature,
+    raised: Arc<RaisedFailure>,
+}
+
+impl CheckedIntDivUdf {
+    fn new(raised: Arc<RaisedFailure>) -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+            raised,
+        }
+    }
+}
+
+impl PartialEq for CheckedIntDivUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+
+impl Eq for CheckedIntDivUdf {}
+
+impl Hash for CheckedIntDivUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for CheckedIntDivUdf {
+    fn name(&self) -> &str {
+        CHECKED_INT_DIV_FN
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        let [numerator, divisor] = arg_types else {
+            return plan_err!(
+                "{CHECKED_INT_DIV_FN} takes exactly two arguments, got {}",
+                arg_types.len()
+            );
+        };
+        integer_operand_precision(divisor)?;
+        Ok(DataType::Decimal128(
+            integer_operand_precision(numerator)?,
+            0,
+        ))
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let [left, right] = args.args.as_slice() else {
+            return Err(DataFusionError::Execution(format!(
+                "{CHECKED_INT_DIV_FN} takes exactly two arguments, got {}",
+                args.args.len()
+            )));
+        };
+        let precision = integer_operand_precision(args.arg_fields[0].data_type())?;
+        let left = as_i128(left, args.number_rows)?;
+        let right = as_i128(right, args.number_rows)?;
+
+        let nulls = NullBuffer::union(left.nulls(), right.nulls());
+        let quotients =
+            divide_integers(left.values(), right.values(), nulls.as_ref()).map_err(|failure| {
+                self.raised.record(failure.to_string());
+                DataFusionError::External(Box::new(failure))
+            })?;
+
+        let quotients =
+            Decimal128Array::new(quotients.into(), nulls).with_precision_and_scale(precision, 0)?;
+        Ok(ColumnarValue::Array(Arc::new(quotients)))
+    }
+}
+
+/// The precision of an integer operand, or a planning failure: a scaled decimal or any other
+/// type would divide to a value `DIV` does not return.
+fn integer_operand_precision(operand: &DataType) -> datafusion::error::Result<u8> {
+    if operand == &DataType::Null {
+        return Ok(NULL_OPERAND_PRECISION);
+    }
+    match exact_ps(operand) {
+        Ok((precision, 0)) => Ok(precision),
+        _ => plan_err!("{CHECKED_INT_DIV_FN} divides integers only, got {operand}"),
+    }
+}
+
+/// A NULL row is skipped without dividing, so NULL over zero yields NULL rather than raising.
+/// `checked_div` truncates toward zero like `DIV`. A stored value outside its declared precision
+/// can still reach `i128::MIN / -1`, so that case fails instead of panicking.
+fn divide_integers(
+    left: &[i128],
+    right: &[i128],
+    nulls: Option<&NullBuffer>,
+) -> Result<Vec<i128>, CheckedDivError> {
+    let mut quotients = Vec::with_capacity(left.len());
+    for (row, (&numerator, &divisor)) in left.iter().zip(right).enumerate() {
+        if nulls.is_some_and(|mask| mask.is_null(row)) {
+            quotients.push(NULL_ROW_INTEGER_FILLER);
+            continue;
+        }
+        if divisor == 0 {
+            return Err(CheckedDivError::IntegerZeroDivisor { numerator });
+        }
+        quotients.push(
+            numerator
+                .checked_div(divisor)
+                .ok_or(CheckedDivError::IntegerOverflow { numerator, divisor })?,
+        );
+    }
+    Ok(quotients)
+}
+
 /// Registered unconditionally once per session: every scan path splices the same rendered
 /// expressions, and a spec with no division is unaffected.
-pub(super) fn register_checked_float_div_udf(ctx: &SessionContext, raised: Arc<RaisedFailure>) {
-    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf::new(raised)));
+pub(super) fn register_checked_div_udfs(ctx: &SessionContext, raised: Arc<RaisedFailure>) {
+    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf::new(Arc::clone(
+        &raised,
+    ))));
+    ctx.register_udf(ScalarUDF::from(CheckedIntDivUdf::new(raised)));
 }
 
 #[cfg(test)]

@@ -225,6 +225,13 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
 /// exactly as in a projection.
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
+/// The scalar UDF the DataFusion dialect renders `DIV` as, registered by `lakehouse-engine`.
+/// It MUST take two integer arguments (Arrow signed or unsigned integers, `Decimal128(p,0)`, or
+/// Null), truncate toward zero, return `Decimal128(<numerator precision>,0)`, skip NULL rows before
+/// the zero check, and error on a zero divisor, so division by zero fails in a filter exactly as
+/// in a projection.
+pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
+
 fn render_cast(
     args: Option<&Vec<Json>>,
     data_type: Option<&Json>,
@@ -553,7 +560,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 .to_uppercase();
             let args = value("arguments").and_then(|a| a.as_array());
 
-            // An Exasol-dialect `VerbatimCall` and a DataFusion string call render here, ahead
+            // An Exasol-dialect `VerbatimCall` and a DataFusion call render here, ahead
             // of the per-name arms, so arm order carries no dialect precedence.
             let Some(function) = scalar_function(&fn_name) else {
                 return Err(UdfError::User(format!(
@@ -564,7 +571,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 Dialect::Exasol => {
                     (function.exasol == ExasolForm::VerbatimCall).then_some(fn_name.as_str())
                 }
-                Dialect::DataFusion => function.string_call,
+                Dialect::DataFusion => function.datafusion_call,
             };
             if let Some(call_name) = verbatim {
                 let args = args.ok_or_else(|| {

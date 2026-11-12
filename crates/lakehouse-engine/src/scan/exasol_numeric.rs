@@ -341,7 +341,7 @@ fn integer_precision(t: &DataType) -> Option<u8> {
     })
 }
 
-fn exact_ps(t: &DataType) -> Result<(u8, i8)> {
+pub(super) fn exact_ps(t: &DataType) -> Result<(u8, i8)> {
     match t {
         DataType::Decimal128(p, s) => Ok((*p, *s)),
         _ => match integer_precision(t) {
@@ -543,7 +543,7 @@ impl Operand {
     }
 }
 
-fn as_i128(value: &ColumnarValue, rows: usize) -> Result<Decimal128Array> {
+pub(super) fn as_i128(value: &ColumnarValue, rows: usize) -> Result<Decimal128Array> {
     let array: ArrayRef = value.to_array(rows)?;
     Ok(match array.data_type() {
         DataType::Decimal128(..) => array.as_primitive::<Decimal128Type>().clone(),

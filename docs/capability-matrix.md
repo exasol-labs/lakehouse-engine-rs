@@ -134,7 +134,7 @@ sends the query to the adapter.
 | `DAYS_BETWEEN` | ✓ |  |
 | `DBTIMEZONE` |  | The scan sees neither the session nor the database time zone. |
 | `DEGREES` | ✓ |  |
-| `DIV` |  | Needs truncating division, and the request carries no operand types. |
+| `DIV` | ✓ | The scan computes integer operands. Exasol SQL computes decimal and DOUBLE operands. |
 | `DUMP` |  |  |
 | `EDIT_DISTANCE` |  |  |
 | `EXP` | ✓ |  |

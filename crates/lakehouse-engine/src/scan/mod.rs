@@ -137,7 +137,7 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     raw_scan::register_nested_json_render_udf(&ctx);
     binary_hex::register_binary_hex_udf(&ctx);
     binary_text::register_binary_text_udf(&ctx);
-    checked_div::register_checked_float_div_udf(&ctx, raised);
+    checked_div::register_checked_div_udfs(&ctx, raised);
     ctx
 }
 
