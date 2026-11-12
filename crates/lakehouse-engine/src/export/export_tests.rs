@@ -439,3 +439,36 @@ fn a_spec_whose_columns_do_not_match_the_input_is_refused() {
         "{error}"
     );
 }
+
+#[test]
+fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
+    let plan = writer_plan(&mut group(&writer_spec(true), 1, "DECIMAL(18,0)"))
+        .expect("the spec matches the input");
+
+    assert_eq!(plan.spec.export_id, "00ff");
+    assert!(plan.spec.single_commit);
+    let fields: Vec<_> = plan
+        .schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.is_nullable()))
+        .collect();
+    assert_eq!(fields, [("ID", true)]);
+}
+
+#[test]
+fn export_and_writer_ids_are_fresh_hex_of_their_length() {
+    let (export_id, writer_id) = (new_export_id(), new_writer_id());
+
+    assert_eq!((export_id.len(), writer_id.len()), (32, 16));
+    assert!(export_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(writer_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(new_export_id(), export_id);
+}
+
+#[test]
+fn the_export_runtime_drives_a_future() {
+    let runtime = export_runtime().expect("a runtime");
+
+    assert_eq!(runtime.block_on(async { 7 }), 7);
+}
