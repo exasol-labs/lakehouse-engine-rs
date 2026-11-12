@@ -1,6 +1,8 @@
 //! The Exasol SQL type the adapter declares, emits, and casts to: read from a VS request's
-//! `dataType` JSON, rendered as Exasol SQL (`Display`) and as `dataType` JSON. Pure: no I/O.
+//! `dataType` JSON and from UDF column metadata, rendered as Exasol SQL (`Display`) and as
+//! `dataType` JSON. Pure: no I/O.
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use serde_json::{Value as Json, json};
 use std::fmt;
 
@@ -359,6 +361,74 @@ where
 
 fn invalid(dt: &Json, constraint: &str) -> UdfError {
     UdfError::User(format!("invalid Exasol dataType {dt}: {constraint}"))
+}
+
+/// The type of a UDF input or output column. An unrecognized column keeps its `type_name`, so
+/// each caller decides: the scan emits it as JSON text, and the export refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdfColumnType {
+    Known(ExasolType),
+    Unrecognized { type_name: String },
+}
+
+/// Reads a UDF column's metadata by the bin Exasol reported (`typ`), and reads `type_name` only
+/// for what the bin lacks: an integer DECIMAL's absent precision, a bare `TIMESTAMP`'s
+/// precision 3, a local-time-zone timestamp, and the `ASCII` character set.
+pub fn exasol_type_from_column_info(column: &ColumnInfo) -> UdfColumnType {
+    let type_name = column.type_name.as_str();
+    let known = match &column.typ {
+        ExaType::Boolean => Some(ExasolType::Boolean),
+        ExaType::Double => Some(ExasolType::DoublePrecision),
+        ExaType::Date => Some(ExasolType::Date),
+        ExaType::Int32 | ExaType::Int64 => column
+            .precision
+            .or_else(|| integer_decimal_precision(type_name))
+            .and_then(|precision| decimal_of(precision, 0)),
+        ExaType::Numeric { precision, scale } => decimal_of(*precision, *scale),
+        ExaType::Timestamp { .. } if type_name == "TIMESTAMP" => Some(ExasolType::BARE_TIMESTAMP),
+        ExaType::Timestamp { precision } => u8::try_from(*precision)
+            .ok()
+            .filter(|precision| *precision <= MAX_FRACTIONAL_DIGITS)
+            .map(|precision| {
+                // Exasol reports a local-time-zone timestamp in the plain timestamp bin.
+                if type_name.contains("WITH LOCAL TIME ZONE") {
+                    ExasolType::TimestampWithLocalTimeZone { precision }
+                } else {
+                    ExasolType::timestamp(precision)
+                }
+            }),
+        ExaType::String { size } => {
+            (1..=MAX_VARCHAR_SIZE)
+                .contains(size)
+                .then(|| ExasolType::Varchar {
+                    size: *size,
+                    ascii: type_name.ends_with(" ASCII"),
+                })
+        }
+        ExaType::Char { size } => (1..=MAX_CHAR_SIZE)
+            .contains(size)
+            .then(|| ExasolType::Char {
+                size: *size,
+                ascii: type_name.ends_with(" ASCII"),
+            }),
+        ExaType::Unsupported => None,
+    };
+    match known {
+        Some(exasol_type) => UdfColumnType::Known(exasol_type),
+        None => UdfColumnType::Unrecognized {
+            type_name: column.type_name.clone(),
+        },
+    }
+}
+
+fn decimal_of(precision: u32, scale: u32) -> Option<ExasolType> {
+    Decimal::new(u8::try_from(precision).ok()?, u8::try_from(scale).ok()?).map(ExasolType::Decimal)
+}
+
+/// The `p` of `DECIMAL(p,0)`.
+fn integer_decimal_precision(type_name: &str) -> Option<u32> {
+    let arguments = type_name.strip_prefix("DECIMAL(")?.strip_suffix(",0)")?;
+    arguments.parse().ok()
 }
 
 #[cfg(test)]

@@ -149,11 +149,15 @@ impl UnityCatalogSession {
         kind: &str,
     ) -> Result<T, UdfError> {
         let (builder, bearer) = self.auth.apply(builder).await?;
-        let redact = |msg: &str| redact_catalog_auth_error(msg, &self.creds, bearer.as_deref());
+        let redact =
+            |msg: &str, bearer: Option<&str>| redact_catalog_auth_error(msg, &self.creds, bearer);
         let what = format!("Unity Catalog {kind} request");
-        let request = builder
-            .build()
-            .map_err(|e| UdfError::User(format!("{what} failed: {}", redact(&error_chain(&e)))))?;
+        let request = builder.build().map_err(|e| {
+            UdfError::User(format!(
+                "{what} failed: {}",
+                redact(&error_chain(&e), bearer.as_deref())
+            ))
+        })?;
         Ok(self
             .http
             .send_json(
