@@ -1,4 +1,4 @@
-//! The seam of the export's fixed flow (decision [8]): a target checks the catalog and opens the
+//! The seam of the export's fixed flow: a target checks the catalog and opens the
 //! table, and the sink it returns takes Arrow batches and writes and commits them its own way.
 //! Also the export's CONNECTION, read and checked before any request.
 
@@ -13,13 +13,7 @@ use async_trait::async_trait;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{ConnectionCreds, scheme_of};
-
-/// Identifies one writer: its export statement's ID and its own ID.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct WriterTag {
-    pub(super) export_id: String,
-    pub(super) writer_id: String,
-}
+use lakehouse_catalog_write::CommitTag;
 
 /// Where an export writes: one catalog and table format.
 #[async_trait(?Send)]
@@ -29,19 +23,13 @@ pub(super) trait ExportTarget {
     async fn prepare(&self) -> Result<(), UdfError>;
 
     /// Creates the table, or takes the one another writer of the same export created, so every
-    /// writer's sink commits into the one table.
+    /// writer's sink commits into the one table. With `single_commit` it prepares the table
+    /// without creating it: the table appears only when the sink commits its data.
     async fn open_table(
         &self,
         schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError>;
-
-    /// Prepares the table without creating it, for `SINGLE_COMMIT`: it appears only when the
-    /// sink commits its data.
-    async fn stage_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
+        tag: &CommitTag,
+        single_commit: bool,
     ) -> Result<Box<dyn ExportSink>, UdfError>;
 }
 

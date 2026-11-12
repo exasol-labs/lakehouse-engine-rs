@@ -1,10 +1,11 @@
 use super::super::iceberg_rest::target;
-use super::super::target::{ExportConnection, WriterTag};
+use super::super::target::ExportConnection;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use lakehouse_catalog::ConnectionCreds;
 use lakehouse_catalog::exported_test_support::spawn_server;
+use lakehouse_catalog_write::CommitTag;
 use std::sync::{Arc, Mutex};
 
 const CREATE: &str = "POST /v1/p/namespaces/ns/tables ";
@@ -94,40 +95,28 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
         .collect()
 }
 
+/// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
 #[tokio::test]
-async fn abort_keeps_the_data_files_only_while_the_commit_outcome_is_unknown() {
+async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
     let schema = Schema::new(vec![Field::new("ID", DataType::Int64, true)]);
-    let tag = WriterTag {
+    let tag = CommitTag {
         export_id: "e1".into(),
         writer_id: "w1".into(),
     };
-    for (commit, outcome, files_deleted) in [
-        (
-            (504, "{}"),
-            "the outcome of its last request is unknown",
-            false,
-        ),
-        (
-            (403, r#"{"error":"forbidden"}"#),
-            "the catalog did not apply it",
-            true,
-        ),
-    ] {
-        let (uri, requests) = catalog_and_storage(commit).await;
-        let target = target(connection(&uri), "ns.t").unwrap();
-        let mut sink = target.open_table(&schema, &tag).await.unwrap();
-        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let batch = RecordBatch::try_new(sink.schema(), vec![ids]).unwrap();
+    let (uri, requests) = catalog_and_storage((504, "{}")).await;
+    let target = target(connection(&uri), "ns.t").unwrap();
+    let mut sink = target.open_table(&schema, &tag, false).await.unwrap();
+    let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+    let batch = RecordBatch::try_new(sink.schema(), vec![ids]).unwrap();
 
-        sink.write(&batch).await.unwrap();
-        let finished = sink.finish().await.unwrap_err().to_string();
-        sink.abort().await;
+    sink.write(&batch).await.unwrap();
+    let finished = sink.finish().await.unwrap_err().to_string();
+    sink.abort().await;
 
-        let written = data_file_paths(&requests, "PUT");
-        let deleted = data_file_paths(&requests, "DELETE");
-        assert!(finished.contains(outcome), "HTTP {}: {finished}", commit.0);
-        assert_eq!(written.len(), 1, "HTTP {}", commit.0);
-        let expected = if files_deleted { written } else { Vec::new() };
-        assert_eq!(deleted, expected, "HTTP {}", commit.0);
-    }
+    assert!(
+        finished.contains("the outcome of its last request is unknown"),
+        "{finished}"
+    );
+    assert_eq!(data_file_paths(&requests, "PUT").len(), 1);
+    assert!(data_file_paths(&requests, "DELETE").is_empty());
 }

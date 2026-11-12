@@ -15,11 +15,12 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::ExportSpec;
 use exasol_udf_sdk::value::ColumnInfo;
 use iceberg::metadata_columns::is_metadata_column_name;
+use lakehouse_catalog_write::CommitTag;
 use options::{ExportOptions, WriterLayout, check_table_name};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
-use target::{ExportConnection, ExportSink, WriterTag, read_connection};
+use target::{ExportConnection, ExportSink, read_connection};
 use tokio::runtime::Runtime;
 
 /// The script name the installer creates and the writer SELECT calls.
@@ -48,16 +49,13 @@ pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
     let plan = plan_writer(ctx)?;
     let runtime = export_runtime()?;
     let target = iceberg_rest::target(plan.connection, &plan.spec.table)?;
-    let tag = WriterTag {
+    let tag = CommitTag {
         export_id: plan.spec.export_id.clone(),
         writer_id: new_writer_id(),
     };
-    let mut sink = if plan.spec.single_commit {
-        runtime.block_on(target.stage_table(&plan.schema, &tag))?
-    } else {
-        runtime.block_on(target.open_table(&plan.schema, &tag))?
-    };
-    write_rows(ctx, &runtime, sink.as_mut(), &plan.spec.columns)
+    let mut sink =
+        runtime.block_on(target.open_table(&plan.schema, &tag, plan.spec.single_commit))?;
+    write_rows(ctx, &runtime, sink.as_mut())
 }
 
 /// What the hook decides before its first network call.
@@ -280,9 +278,8 @@ fn write_rows(
     ctx: &mut dyn UdfContext,
     runtime: &Runtime,
     sink: &mut dyn ExportSink,
-    columns: &[String],
 ) -> Result<i64, UdfError> {
-    let written = stream_rows(ctx, runtime, sink, columns);
+    let written = stream_rows(ctx, runtime, sink);
     if written.is_err() {
         runtime.block_on(sink.abort());
     }
@@ -293,9 +290,8 @@ fn stream_rows(
     ctx: &mut dyn UdfContext,
     runtime: &Runtime,
     sink: &mut dyn ExportSink,
-    columns: &[String],
 ) -> Result<i64, UdfError> {
-    let mut batch = BatchBuilder::bind(sink.schema(), columns)?;
+    let mut batch = BatchBuilder::bind(sink.schema())?;
     let mut rows = 0;
     loop {
         batch.append_row(ctx)?;

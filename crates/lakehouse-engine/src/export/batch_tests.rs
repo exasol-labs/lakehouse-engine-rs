@@ -20,13 +20,9 @@ fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
     ))
 }
 
-fn names(fields: &[(&str, DataType)]) -> Vec<String> {
-    fields.iter().map(|(name, _)| name.to_string()).collect()
-}
-
 /// The batch of `rows`, each given without the writer spec of input column 0.
 fn batch_of(fields: &[(&str, DataType)], rows: Vec<Vec<Value>>) -> Result<RecordBatch, UdfError> {
-    let mut builder = BatchBuilder::bind(schema(fields), &names(fields))?;
+    let mut builder = BatchBuilder::bind(schema(fields))?;
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -227,7 +223,7 @@ fn a_decimal_too_large_for_the_table_column_is_refused_naming_the_column() {
 
 #[test]
 fn a_table_field_of_an_unwritable_arrow_type_is_refused_naming_it() {
-    let refused = BatchBuilder::bind(schema(&[("N", DataType::Int64)]), &["N".into()]);
+    let refused = BatchBuilder::bind(schema(&[("N", DataType::Int64)]));
 
     let message = refused.err().expect("a refusal").to_string();
     assert!(
@@ -237,36 +233,9 @@ fn a_table_field_of_an_unwritable_arrow_type_is_refused_naming_it() {
 }
 
 #[test]
-fn source_columns_bind_to_table_fields_by_name() {
-    let fields = [("A", DataType::Utf8), ("B", DataType::Float64)];
-    let mut builder = BatchBuilder::bind(schema(&fields), &["B".into(), "A".into()])
-        .expect("both fields have a source column");
-    let mut ctx = TestContext::set(vec![vec![
-        Value::String(SPEC.into()),
-        Value::Double(2.0),
-        Value::String("a".into()),
-    ]]);
-    ctx.next().unwrap();
-
-    builder.append_row(&ctx).unwrap();
-    let batch = builder.take().unwrap();
-
-    assert_eq!(column::<StringArray>(&batch, 0).value(0), "a");
-    assert_eq!(column::<Float64Array>(&batch, 1).value(0), 2.0);
-}
-
-#[test]
-fn a_table_field_without_a_source_column_is_refused_naming_it() {
-    let refused = BatchBuilder::bind(schema(&[("MISSING", DataType::Utf8)]), &["A".into()]);
-
-    let message = refused.err().expect("a refusal").to_string();
-    assert!(message.contains("MISSING"), "{message}");
-}
-
-#[test]
 fn a_batch_fills_at_its_row_limit_and_starts_empty_after_it_is_taken() {
     let fields = [("ID", DataType::Decimal128(9, 0))];
-    let mut builder = BatchBuilder::bind(schema(&fields), &names(&fields)).unwrap();
+    let mut builder = BatchBuilder::bind(schema(&fields)).unwrap();
     let rows = (0..BATCH_ROWS as i32)
         .map(|id| vec![Value::String(SPEC.into()), Value::Int32(id)])
         .collect();

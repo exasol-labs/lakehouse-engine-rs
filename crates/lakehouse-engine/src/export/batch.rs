@@ -1,7 +1,7 @@
 //! Maps the export's source columns to Arrow, the type model every target format derives its own
 //! schema from, and turns the writer's input rows into Arrow batches of the sink's table schema,
 //! binding each source column to its table field by name and taking decimal scales from the table.
-//! The type rules and refusals are the export's (decisions [3] and [8]).
+//! The type rules and refusals are the export's.
 
 use super::refusal;
 use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
@@ -46,24 +46,19 @@ enum Values {
 }
 
 impl BatchBuilder {
-    /// Binds each field of `schema` to the source column of its name in `source_columns`.
-    pub(super) fn bind(schema: SchemaRef, source_columns: &[String]) -> Result<Self, UdfError> {
+    /// Binds field `i` of `schema` to input column `i + 1`, after the writer spec. Every writer
+    /// of one export derives the schema from the same source columns in input order, and the
+    /// catalog refuses a table another export created, so the two always line up.
+    pub(super) fn bind(schema: SchemaRef) -> Result<Self, UdfError> {
         let columns = schema
             .fields()
             .iter()
-            .map(|field| {
+            .enumerate()
+            .map(|(index, field)| {
                 let name = field.name();
-                let position = source_columns
-                    .iter()
-                    .position(|source| source == name)
-                    .ok_or_else(|| {
-                        refusal(format_args!(
-                            "table column {name} has no source column of that name"
-                        ))
-                    })?;
                 Ok(ColumnBuilder {
                     name: name.clone(),
-                    input: position + 1,
+                    input: index + 1,
                     values: Values::of(name, field.data_type())?,
                 })
             })

@@ -1,5 +1,5 @@
 //! The Iceberg sink: Arrow batches become Parquet data files under the table location, and one
-//! commit tagged with the writer adds them to the table (decision [2]).
+//! commit tagged with the writer adds them to the table.
 
 use super::target::ExportSink;
 use arrow::datatypes::SchemaRef;

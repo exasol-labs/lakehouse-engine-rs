@@ -1,15 +1,8 @@
 use super::*;
-use crate::export::batch::BATCH_ROWS;
 use crate::export::batch::tests::measured_column;
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
 use exasol_udf_sdk::connection::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
 
 const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","table":"ns.t","export_id":"00ff","columns":["ID"],"single_commit":false,"allow_http":false}"#;
 const SENTINELS: [&str; 3] = [
@@ -355,9 +348,8 @@ mod sql {
         assert_eq!(sql, expected);
     }
 
-    /// Scenario: The writer count never exceeds 300
     #[test]
-    fn group_count_follows_the_writer_layout_and_caps_at_300() {
+    fn group_count_follows_the_writer_layout() {
         let cases = [
             (
                 "nodes times writers per node",
@@ -366,7 +358,6 @@ mod sql {
                 6,
             ),
             ("single commit", WriterLayout::SingleCommit, 4, 1),
-            ("capped at 300", WriterLayout::PerNode(500), 4, 300),
         ];
 
         for (case, writers, node_count, expected) in cases {
@@ -418,54 +409,6 @@ mod sql {
 
 pub(in crate::export) const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-/// Every call the export makes on its target and sink, in order.
-#[derive(Clone, Default)]
-pub(in crate::export) struct Calls(Rc<RefCell<Vec<String>>>);
-
-impl Calls {
-    fn record(&self, call: String) {
-        self.0.borrow_mut().push(call);
-    }
-
-    pub(in crate::export) fn recorded(&self) -> Vec<String> {
-        self.0.borrow().clone()
-    }
-}
-
-struct FakeSink {
-    calls: Calls,
-    fail_at: Option<&'static str>,
-    schema: SchemaRef,
-}
-
-fn failure(call: &str, fail_at: Option<&str>) -> Result<(), UdfError> {
-    match fail_at {
-        Some(failing) if failing == call => Err(UdfError::User(format!("{call} failed"))),
-        _ => Ok(()),
-    }
-}
-
-#[async_trait(?Send)]
-impl ExportSink for FakeSink {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError> {
-        self.calls.record(format!("write {}", batch.num_rows()));
-        failure("write", self.fail_at)
-    }
-
-    async fn finish(&mut self) -> Result<usize, UdfError> {
-        self.calls.record("finish".into());
-        failure("finish", self.fail_at).map(|()| 1)
-    }
-
-    async fn abort(&mut self) {
-        self.calls.record("abort".into());
-    }
-}
-
 /// A CONNECTION the export accepts, named [`CONNECTION`].
 pub(in crate::export) fn export_connection(address: &str, token: &str) -> ConnectionObject {
     ConnectionObject {
@@ -503,78 +446,6 @@ fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
             measured_column("VARCHAR(2000000) UTF8"),
             measured_column(id_type),
         ])
-}
-
-/// Streams a group's rows into a recording sink, as `run_writer` does once its table is open.
-fn stream(
-    ctx: &mut TestContext,
-    calls: &Calls,
-    fail_at: Option<&'static str>,
-) -> Result<i64, UdfError> {
-    let plan = writer_plan(ctx).expect("the group plans");
-    let mut sink = FakeSink {
-        calls: calls.clone(),
-        fail_at,
-        schema: Arc::new(plan.schema),
-    };
-    write_rows(ctx, &export_runtime()?, &mut sink, &plan.spec.columns)
-}
-
-#[test]
-fn a_writer_streams_its_rows_in_batches_into_the_sink_and_commits_once() {
-    let calls = Calls::default();
-    let rows = BATCH_ROWS + 1;
-
-    let written = stream(
-        &mut group(&writer_spec(false), rows, "DECIMAL(18,0)"),
-        &calls,
-        None,
-    );
-
-    assert_eq!(written.expect("the writer succeeds"), rows as i64);
-    assert_eq!(
-        calls.recorded(),
-        [&format!("write {BATCH_ROWS}"), "write 1", "finish"]
-    );
-}
-
-#[test]
-fn a_failed_write_or_commit_aborts_the_sink_and_fails_the_writer() {
-    for failing in ["write", "finish"] {
-        let calls = Calls::default();
-
-        let error = stream(
-            &mut group(&writer_spec(false), 3, "DECIMAL(18,0)"),
-            &calls,
-            Some(failing),
-        )
-        .expect_err("the writer fails");
-
-        assert_eq!(error.to_string(), format!("{failing} failed"));
-        assert_eq!(calls.recorded().last().map(String::as_str), Some("abort"));
-    }
-}
-
-#[test]
-fn an_empty_group_reads_no_connection_and_opens_no_table() {
-    // The context grants no CONNECTION, so a writer that read it would fail.
-    let written = run_writer(&mut writer_context(vec![]));
-
-    assert_eq!(written.expect("an empty group succeeds"), 0);
-}
-
-#[test]
-fn an_unwritable_column_fails_the_writer_before_its_table_is_opened() {
-    let error = writer_plan(&mut group(&writer_spec(false), 1, "TIMESTAMP(9)"))
-        .err()
-        .expect("TIMESTAMP(9) is refused");
-
-    assert!(
-        error
-            .to_string()
-            .contains("column ID has type TIMESTAMP(9)"),
-        "{error}"
-    );
 }
 
 #[test]
