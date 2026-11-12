@@ -3,10 +3,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::ProjectionItem;
 
-fn relation(col_types: &[(String, ExasolType)]) -> EmptyRelation {
-    EmptyRelation::single_scan(&serde_json::json!({}), &column_types(col_types))
-}
-
 #[test]
 fn empty_file_list_returns_empty_select() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -73,19 +69,20 @@ fn empty_select_list_casts_a_null_to_each_declared_type_in_order() {
 fn empty_result_sql_dispatches_by_plan_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(18, 2))];
 
-    let grouped = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
+    let request = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
         .group_by(vec![col("K")])
         .column(col("K"))
         .count_star()
-        .build_pushdown();
+        .build()
+        .0;
+    let (grouped, scan) = (parsed_pushdown(&request), scan_of(&request));
     let grouped_sql = empty_result_sql(
         &grouped,
         &projected_columns(&proj, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .unwrap()["sql"]
         .as_str()
@@ -96,24 +93,25 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         "grouped shape is zero rows: {grouped_sql}"
     );
 
-    let text_col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
-    for (column, ty, col_types) in [
-        ("AMOUNT", "DECIMAL(18,2)", &col_types),
-        ("NAME", "VARCHAR(2000000)", &text_col_types),
+    for (column, ty, exa_type) in [
+        ("AMOUNT", "DECIMAL(18,2)", ExasolType::decimal(18, 2)),
+        ("NAME", "VARCHAR(2000000)", ExasolType::WIDEST_VARCHAR),
     ] {
-        let single = pushdown_request("T", NO_COLUMNS)
+        let request = pushdown_request("T", &[(column, exa_type)])
             .single_group()
             .item(
                 agg_item("SUM", Some(column), false),
                 ExasolType::decimal(36, 2),
             )
-            .build_pushdown();
+            .build()
+            .0;
+        let (single, scan) = (parsed_pushdown(&request), scan_of(&request));
         let sql = empty_result_sql(
             &single,
             &projected_columns(&proj, &proj_types),
             false,
-            ScanTranslator::new(&column_types(col_types)),
-            &relation(col_types),
+            scan,
+            &EmptyRelation::single_scan(&request, scan.columns()),
         )
         .unwrap()["sql"]
             .as_str()
@@ -122,7 +120,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         assert_eq!(
             sql,
             format!(
-                "SELECT CAST(SUM(\"{column}\") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS {ty}) \
+                "SELECT CAST(SUM(\"LHS_T0\".\"{column}\") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS {ty}) \
                  AS \"{column}\" \
                  FROM DUAL WHERE 1=0) AS \"LHS_T0\""
             )
@@ -132,19 +130,20 @@ fn empty_result_sql_dispatches_by_plan_shape() {
 
 #[test]
 fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
-    let col_types = vec![("ID".to_string(), ExasolType::decimal(19, 0))];
-    let request = pushdown_request("T", NO_COLUMNS)
+    let request = pushdown_request("T", &[("ID", ExasolType::decimal(19, 0))])
         .single_group()
         .field("having", predicate_equal(count_star(), num_lit(0)))
         .item(str_lit("X"), ExasolType::WIDEST_VARCHAR)
         .count_star()
-        .build_pushdown();
+        .build()
+        .0;
+    let (pushdown, scan) = (parsed_pushdown(&request), scan_of(&request));
     let sql = empty_result_sql(
-        &request,
+        &pushdown,
         &projected_columns(&[], &[]),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .unwrap()["sql"]
         .as_str()
@@ -162,23 +161,30 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
 fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
-    let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
-    let grouped_non_numeric = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
-        .group_by(vec![col("K")])
-        .column(col("K"))
-        .item(
-            agg_item("SUM", Some("name"), false),
-            ExasolType::decimal(36, 2),
-        )
-        .build_pushdown();
+    let request = pushdown_request(
+        "T",
+        &[
+            ("K", ExasolType::decimal(20, 0)),
+            ("NAME", ExasolType::WIDEST_VARCHAR),
+        ],
+    )
+    .group_by(vec![col("K")])
+    .column(col("K"))
+    .item(
+        agg_item("SUM", Some("name"), false),
+        ExasolType::decimal(36, 2),
+    )
+    .build()
+    .0;
+    let (grouped_non_numeric, scan) = (parsed_pushdown(&request), scan_of(&request));
 
     let row_sql = empty_result_sql(
         &grouped_non_numeric,
         &projected_columns(&proj, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .unwrap()["sql"]
         .as_str()
@@ -196,24 +202,31 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
 fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
-    let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
-    let grouped_having = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
-        .group_by(vec![col("K")])
-        .field("having", serde_json::json!({"type": "predicate_greater"}))
-        .column(col("K"))
-        .item(
-            agg_item("SUM", Some("name"), false),
-            ExasolType::decimal(36, 2),
-        )
-        .build_pushdown();
+    let request = pushdown_request(
+        "T",
+        &[
+            ("K", ExasolType::decimal(20, 0)),
+            ("NAME", ExasolType::WIDEST_VARCHAR),
+        ],
+    )
+    .group_by(vec![col("K")])
+    .field("having", serde_json::json!({"type": "predicate_greater"}))
+    .column(col("K"))
+    .item(
+        agg_item("SUM", Some("name"), false),
+        ExasolType::decimal(36, 2),
+    )
+    .build()
+    .0;
+    let (grouped_having, scan) = (parsed_pushdown(&request), scan_of(&request));
 
     let row_sql = empty_result_sql(
         &grouped_having,
         &projected_columns(&proj, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .unwrap()["sql"]
         .as_str()
@@ -229,23 +242,22 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 
 #[test]
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
-    let pushdown_req = pushdown_request("T", NO_COLUMNS)
+    let col_types = [
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::WIDEST_VARCHAR),
+        ("SCORE", ExasolType::DoublePrecision),
+    ];
+    let request = pushdown_request("T", &col_types)
         .item(
             scalar_fn("LENGTH", [table_col("T", "SCORE")]),
             ExasolType::decimal(18, 0),
         )
-        .build_pushdown();
-    let col_types = vec![
-        ("ID".to_string(), ExasolType::decimal(20, 0)),
-        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("SCORE".to_string(), ExasolType::DoublePrecision),
-    ];
+        .build()
+        .0;
+    let (pushdown_req, scan) = (parsed_pushdown(&request), scan_of(&request));
     assert!(
         matches!(
-            classify_request_shape(
-                &pushdown_req,
-                ScanTranslator::new(&column_types(&col_types))
-            ),
+            classify_request_shape(&pushdown_req, scan),
             RequestShape::RowScan
         ),
         "the fixture must classify as RowScan for this test to exercise its arm"
@@ -258,8 +270,8 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         true,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .expect("the widened empty row-scan result must build")["sql"]
         .as_str()
@@ -275,8 +287,8 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
-        &relation(&col_types),
+        scan,
+        &EmptyRelation::single_scan(&request, scan.columns()),
     )
     .expect("the non-widened empty row-scan result must build")["sql"]
         .as_str()

@@ -10,7 +10,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * The adapter schema-qualifies the UDF names from `ctx.script_schema()`. No VS property supplies the schema.
 * The adapter reads the node count from `UdfContext::node_count()` per pushdown, not from `adapterNotes`. It captures the value in `dispatch` before the tokio runtime is entered and passes it to planning as a plain integer. `node_count()` returns `0` only without a live handshake, and `0` maps to a node count of `1`.
 * The common spec's `projection` field carries the projected columns only for the row-scan and join paths. An aggregate or GROUP BY request leaves it empty: see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`.
-* Exasol does not re-apply a predicate whose capability the adapter advertised, so the adapter's own SQL applies any predicate it cannot translate. See `pushdown/pushdown-declined-filter-self-apply`. An absent or trivially-true filter is omitted and the wrapper-free scan is unchanged. A declined filter routes to the qualified single-table wrapper, which applies the predicate in its `WHERE`.
+* Exasol does not re-apply a predicate whose capability the adapter advertised, so the adapter's own SQL applies any predicate it cannot translate. See `pushdown/pushdown-declined-filter-self-apply`. An absent filter is omitted and the wrapper-free scan is unchanged. A declined filter routes to the qualified single-table wrapper, which applies the predicate in its `WHERE`.
 * Which expressions the scan computes is decided by `pushdown-types/pushdown-planning-scan-text-conversion`.
 * The plan-time file-pruning predicate has a per-format owner. For Iceberg it is `iceberg::expr::Predicate`, owned by `file-planning/pushdown-file-pruning`. For Delta it is the Delta stats predicate, owned by `delta/delta-file-pruning`. Scenario clauses naming `iceberg::expr::Predicate` describe the Iceberg arm.
 
@@ -99,12 +99,12 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 
 ### Scenario: A column the request does not declare fails the request
 
-* *GIVEN* a `pushdown` request with a `column` node, in any clause, that binds no column its `involvedTables` entry declares, or that binds no single table of a join: it has no `tableName` in a join, its `tableName` names no table of the query, or its `tableName` names a table that occurs several times and its `tableAlias` matches no occurrence
+* *GIVEN* a `pushdown` request with a `column` node, in any clause, that binds no single table of the query, or whose table's `involvedTables` entry does not declare it
 * *WHEN* the adapter plans the pushdown
 * *THEN* the adapter SHALL fail the query before any catalog request, with an error that names the column
-* *AND* the adapter MUST NOT guess a type for the column, decline the expression in its place, or bind it to one of several tables
-* *AND* a single-table request's `column` node without a `tableName` SHALL bind that one table
-* *AND* this state SHALL be unreachable for a request Exasol sends, because Exasol declares every column a query reads in `involvedTables` and stamps its table on every `column` node of a join
+* *AND* a `column` node SHALL bind a table by its `tableName`, and by its `tableAlias` when that table occurs several times, so a node with no `tableName`, a `tableName` the query does not read, or a `tableAlias` that names no occurrence binds none
+* *AND* this state SHALL be unreachable for a request Exasol sends, because Exasol stamps a table of the query on every `column` node, single-table requests included, and declares every column a query reads in `involvedTables`
+* *AND* no later step SHALL handle a column that binds no table, because this check has already failed such a request
 
 ### Scenario: Every request of a supported Exasol version passes the strict type check
 

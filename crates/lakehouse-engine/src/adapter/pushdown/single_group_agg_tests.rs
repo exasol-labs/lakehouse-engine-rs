@@ -525,30 +525,29 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
 }
 
 #[test]
-fn unrenderable_agg_arg_falls_back_to_row_scan() {
-    let unknown = scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]);
-    for name in &["SUM", "MIN", "MAX", "AVG", "COUNT"] {
-        let (req, scan) = pushdown_request("T", &AGGREGATED)
+fn an_aggregate_over_an_argument_the_scan_declines_falls_back_to_row_scan() {
+    // DataFusion has no `SECOND` with a precision argument; the Exasol wrapper renders it.
+    let declined = scalar_fn("SECOND", [col("C_TS"), num_lit(3)]);
+    let table = [("C_TS", ExasolType::BARE_TIMESTAMP)];
+    for (name, distinct) in [
+        ("SUM", false),
+        ("MIN", false),
+        ("MAX", false),
+        ("AVG", false),
+        ("COUNT", false),
+        ("COUNT", true),
+    ] {
+        let (req, scan) = pushdown_request("T", &table)
             .item(
-                agg_item_expr(name, unknown.clone(), false),
+                agg_item_expr(name, declined.clone(), distinct),
                 ExasolType::WIDEST_VARCHAR,
             )
             .build_scanned();
         assert!(
             detect_aggregates(&req, scan).is_none(),
-            "{name} over an unrenderable argument must fall back to row scan"
+            "{name} (distinct: {distinct}) over a declined argument must fall back to row scan"
         );
     }
-    let (req, scan) = pushdown_request("T", &AGGREGATED)
-        .item(
-            agg_item_expr("COUNT", unknown.clone(), true),
-            ExasolType::WIDEST_VARCHAR,
-        )
-        .build_scanned();
-    assert!(
-        detect_aggregates(&req, scan).is_none(),
-        "COUNT(DISTINCT unrenderable) must fall back to row scan"
-    );
 }
 
 #[test]
@@ -1012,32 +1011,6 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
         single_group_merge_select(&items, &plans, req.select_types(), scan),
         None,
         "a distinct item carries no merge expression, so the whole assembly declines"
-    );
-}
-
-#[test]
-fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
-    let node = serde_json::json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [count_star()]
-    });
-    let items = vec![SingleGroupItem::ScalarOverAggregate {
-        node,
-        nested: vec![],
-    }];
-    let plans = single_group_plans(&items, &[], typed_scan(&AGGREGATED))
-        .expect("an unclassifiable scalar contributes no slot to type");
-
-    assert_eq!(
-        single_group_merge_select(
-            &items,
-            &plans,
-            &[ExasolType::decimal(18, 0)],
-            typed_scan(&AGGREGATED)
-        ),
-        None,
-        "an unrenderable scalar structure carries no merge expression, so the \
-         whole assembly declines"
     );
 }
 

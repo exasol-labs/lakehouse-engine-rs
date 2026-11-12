@@ -1,18 +1,16 @@
 use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
-use super::super::ineligible_join_decline;
 use super::super::planning::{
-    IneligibleJoinReason, JoinLeaf, JoinShape, classify_join_window, detect_join,
-    select_broadcast_sides,
+    JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
 };
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    nq3_join_request, resolved_side, self_join_request, three_table_join_request, two_scan_tuning,
+    nq3_join_request, request_legs, resolved_side, self_join_request, three_table_join_request,
+    two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
-use vs_expression::render_expression_exasol_safe;
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
@@ -28,18 +26,6 @@ fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
         "SCAN",
         "DISTRIBUTE",
     )
-}
-
-/// Asserts `err` refuses the `no_such_node_type_in_either_dialect` predicate by name.
-fn assert_refuses_the_unrenderable_predicate(err: &UdfError) {
-    assert!(
-        matches!(err, UdfError::User(msg) if msg.contains("neither dialect")),
-        "the refusal must name the both-dialects decline: {err}"
-    );
-    assert!(
-        matches!(err, UdfError::User(msg) if msg.contains("no_such_node_type_in_either_dialect")),
-        "the refusal must name the offending predicate tree: {err}"
-    );
 }
 
 /// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
@@ -97,44 +83,6 @@ fn q1_join_request() -> Json {
             ("REGION", "lh.region"),
         ],
     )
-}
-
-/// Scenario: A join outside the broadcast contract is declined safely
-#[test]
-fn join_outside_contract_declined_safely() {
-    for reason in [
-        IneligibleJoinReason::NotInnerJoinType,
-        IneligibleJoinReason::UnsupportedShape,
-    ] {
-        let err = ineligible_join_decline(reason);
-        match err {
-            UdfError::User(msg) => {
-                assert!(
-                    msg.contains("join pushdown declined") && msg.contains("cannot"),
-                    "ineligible reason {reason:?} must be a plain hard-error decline: {msg}"
-                );
-                assert!(
-                    !msg.contains("retry"),
-                    "ineligible reason {reason:?} must NOT claim a native retry: {msg}"
-                );
-            }
-            other => panic!("ineligible join must be a User decline, got {other:?}"),
-        }
-    }
-
-    let outer = join_request(
-        serde_json::json!({"join_type": "left_outer"}),
-        equi_condition(),
-    );
-    assert!(
-        matches!(
-            detect_join(&outer, &pd(&outer)),
-            Ok(JoinShape::Ineligible(
-                IneligibleJoinReason::NotInnerJoinType
-            ))
-        ),
-        "an outer join must classify Ineligible so the decline path is taken"
-    );
 }
 
 #[test]
@@ -254,7 +202,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
 }
 
 #[test]
-fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
+fn broadcast_absent_filter_stays_eligible() {
     let absent_request = join_request(Json::Null, equi_condition());
     let absent_detected = detected_join(&absent_request);
     let absent = render_broadcast_join(
@@ -269,22 +217,28 @@ fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
         "an absent filter must carry no scan-spec filter: {:?}",
         absent.filter
     );
+}
 
-    let mut trivial_request = join_request(Json::Null, equi_condition());
-    trivial_request["pushdownRequest"]["filter"] = bool_lit(true);
-    let trivial_detected = detected_join(&trivial_request);
-    let trivial = render_broadcast_join(
-        &parsed_pushdown(&trivial_request),
-        &trivial_detected,
-        &request_sides(&trivial_request, &trivial_detected),
-    )
-    .expect("a trivially-true filter must not error")
-    .expect("a trivially-true filter must keep the broadcast plan");
-    assert!(
-        trivial.filter.is_none(),
-        "a trivially-true filter must carry no scan-spec filter: {:?}",
-        trivial.filter
-    );
+/// Exasol keeps the `TRUE` a folded `'' IS NULL` leaves in a conjunction, so once the leg takes
+/// `C_CUSTKEY > 1` the residual is that lone `TRUE`.
+#[test]
+fn a_lone_true_residual_renders_as_the_outer_where() {
+    let mut request = join_request(Json::Null, equi_condition());
+    request["pushdownRequest"]["filter"] = serde_json::json!({
+        "type": "predicate_and",
+        "expressions": [
+            {
+                "type": "predicate_less",
+                "left": num_lit(1),
+                "right": table_col("CUSTOMER", "C_CUSTKEY"),
+            },
+            bool_lit(true),
+        ],
+    });
+
+    let sql = n_scan_sql(&request).expect("a lone TRUE residual must render, not error");
+
+    assert!(sql.ends_with(" WHERE (TRUE)"), "{sql}");
 }
 
 #[test]
@@ -323,19 +277,6 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     assert!(
         !sql.contains("\"join\":{"),
         "the fallback must not embed a broadcast join block: {sql}"
-    );
-}
-
-#[test]
-fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = bool_lit(true);
-    let sql = n_scan_sql(&request)
-        .expect("a trivially-true residual is a correct no-op, never a hard error");
-
-    assert!(
-        !sql.contains(" WHERE "),
-        "a trivially-true residual must emit NO outer WHERE: {sql}"
     );
 }
 
@@ -679,70 +620,6 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
     );
 }
 
-#[test]
-fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
-    let mut request = self_join_request(&[Some("A"), Some("B")]);
-    request = selecting(
-        request,
-        &[(
-            aliased_col("FACT_ORDERS", "Z", "O_ORDERKEY"),
-            ExasolType::decimal(20, 0),
-        )],
-    );
-    let sides = vec![
-        resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
-        resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
-    ];
-
-    let err = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected_join(&request),
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect_err("a reference no leg key matches must be a hard error, never an arbitrary guess");
-
-    match err {
-        UdfError::User(msg) => {
-            assert!(msg.contains("O_ORDERKEY"), "{msg}");
-            assert!(msg.contains("FACT_ORDERS"), "{msg}");
-            assert!(msg.contains("binds no single table of the query"), "{msg}");
-        }
-        other => panic!("expected a User decline, got {other:?}"),
-    }
-}
-
-#[test]
-fn a_leg_count_disagreeing_with_the_resolved_sides_declines_naming_both_counts() {
-    let request = self_join_request(&[Some("A"), Some("B")]);
-    let sides = vec![resolved_side(
-        "FACT_ORDERS",
-        vec![("s3://w/f0.parquet", 10)],
-    )];
-
-    let err = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected_join(&request),
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect_err("a leg index that cannot index the resolved sides must decline, not panic");
-
-    match err {
-        UdfError::User(msg) => assert_eq!(
-            msg,
-            "join pushdown declined: leg count (2) and resolved-side count (1) disagree, \
-             so a leg index cannot index the resolved sides; this is a hard error, not a \
-             native re-plan"
-        ),
-        other => panic!("expected a User decline, got {other:?}"),
-    }
-}
-
 /// `O_CUSTKEY` of the self-join occurrence aliased `alias`.
 fn custkey(alias: &str) -> Json {
     aliased_col("FACT_ORDERS", alias, "O_CUSTKEY")
@@ -857,6 +734,7 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
     );
 }
 
+/// Scenario: A join outside the broadcast contract is declined safely
 #[test]
 fn above_threshold_join_falls_back_inner_join_on() {
     let request = join_request(Json::Null, equi_condition());
@@ -1129,12 +1007,6 @@ fn seam_legs() -> JoinLegs {
     legs_from_leaves(leaves)
 }
 
-fn single_scan_legs(table_name: &str) -> JoinLegs {
-    JoinLegs::for_single_scan(&serde_json::json!({
-        "involvedTables": [{ "name": table_name }]
-    }))
-}
-
 #[test]
 fn render_expression_qualified_renders_scalar_over_aggregate() {
     let legs = seam_legs();
@@ -1165,9 +1037,7 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
         ],
     );
 
-    let sql = render_expression_qualified(&item, &legs)
-        .expect("every reference names exactly one leg")
-        .expect("a scalar-over-aggregate item must render, never decline to None");
+    let sql = render_expression_qualified(&item, &legs);
     assert!(
         sql.contains(r#"SUM(CASE WHEN ("LHS_T2"."L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
         "the nested SUM(CASE ...) must render with its column table-qualified: {sql}"
@@ -1184,26 +1054,17 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
 
     let sum = agg_item_expr("SUM", table_col("ORDERS", "O_TOTALPRICE"), false);
     assert_eq!(
-        render_expression_qualified(&sum, &legs)
-            .expect("every reference names exactly one leg")
-            .as_deref(),
-        Some(r#"SUM("LHS_T1"."O_TOTALPRICE")"#)
+        render_expression_qualified(&sum, &legs),
+        r#"SUM("LHS_T1"."O_TOTALPRICE")"#
     );
 
     let count_star = count_star();
-    assert_eq!(
-        render_expression_qualified(&count_star, &legs)
-            .expect("every reference names exactly one leg")
-            .as_deref(),
-        Some("COUNT(*)")
-    );
+    assert_eq!(render_expression_qualified(&count_star, &legs), "COUNT(*)");
 
     let count_distinct = agg_item_expr("COUNT", table_col("CUSTOMER", "C_CUSTKEY"), true);
     assert_eq!(
-        render_expression_qualified(&count_distinct, &legs)
-            .expect("every reference names exactly one leg")
-            .as_deref(),
-        Some(r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#)
+        render_expression_qualified(&count_distinct, &legs),
+        r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#
     );
 }
 
@@ -1221,9 +1082,7 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
         ),
         true,
     );
-    let sql = render_expression_qualified(&item, &legs)
-        .expect("every reference names exactly one leg")
-        .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
+    let sql = render_expression_qualified(&item, &legs);
     assert!(
         sql.contains("CHAR(20) ASCII"),
         "Exasol-parsed qualified wrapper needs the declared length-qualified \
@@ -1809,16 +1668,6 @@ fn broadcast_ordered_unprojected_key_downgrades_to_the_fallback() {
 }
 
 #[test]
-#[should_panic(expected = "must render an ORDER BY")]
-fn broadcast_ordered_plan_rendering_no_order_by_is_a_programming_error() {
-    let _ = broadcast_window_sql(JoinWindowPlan::Ordered {
-        keys: Vec::new(),
-        limit: Some(5),
-        offset: 0,
-    });
-}
-
-#[test]
 fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10, "offset": 4});
@@ -1879,28 +1728,24 @@ fn golden_n_scan_join_sql_unchanged() {
 
 #[test]
 fn golden_grouped_qualified_fallback_sql_unchanged() {
-    let request = serde_json::json!({
-        "involvedTables": [involved_table_json(
-            "CUSTOMER",
-            &[
-                ("C_CUSTKEY", ExasolType::decimal(20, 0)),
-                ("C_NAME", ExasolType::varchar(100)),
-            ],
-        )],
-    });
-    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::varchar(100))])
-        .group_by(vec![table_col("CUSTOMER", "C_NAME")])
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .count_star()
-        .build_pushdown();
+    let request = pushdown_request(
+        "CUSTOMER",
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+        ],
+    )
+    .group_by(vec![table_col("CUSTOMER", "C_NAME")])
+    .column(table_col("CUSTOMER", "C_NAME"))
+    .count_star()
+    .build()
+    .0;
+    let pushdown_req = parsed_pushdown(&request);
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
-    let col_types = column_types(&[
-        ("C_CUSTKEY", ExasolType::decimal(20, 0)),
-        ("C_NAME", ExasolType::varchar(100)),
-    ]);
+    let col_types = first_table_column_types(&request);
     let fan_out = FanOutProjection::new(fan_out_spec, &col_types);
     let actual = build_qualified_single_table_fallback_sql(
         &request,
@@ -1915,87 +1760,6 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     assert_eq!(
         actual,
         r#"SELECT "LHS_T0"."C_NAME", CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
-    );
-}
-
-#[test]
-fn golden_n_scan_render_decline_messages_unchanged() {
-    let unrenderable = || serde_json::json!({"type": "totally_unsupported_node_type"});
-    let legs = legs_from_leaves(Vec::new());
-
-    let select_list_req = pushdown_request("T", NO_COLUMNS)
-        .item(unrenderable(), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let msg = user_message(
-        n_scan_join_select_items(&select_list_req, &legs, &[])
-            .expect_err("an unrenderable select-list item must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: a select-list item could not be rendered for the \
-         qualified N-scan join (unsupported expression node type: \
-         totally_unsupported_node_type); this is a hard error, not a native re-plan"
-    );
-
-    let mut no_columns_request = join_request(Json::Null, equi_condition());
-    no_columns_request["involvedTables"][1]["columns"] = serde_json::json!([]);
-    let msg = user_message(
-        n_scan_sql(&no_columns_request)
-            .expect_err("an involved table with no column metadata must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: an involved table carries no column metadata, so the \
-         unaccelerated N-scan fallback cannot be built; this is a hard error, not a \
-         native re-plan"
-    );
-
-    let bad_condition_request = join_request(Json::Null, unrenderable());
-    let msg = user_message(
-        n_scan_sql(&bad_condition_request)
-            .expect_err("an unrenderable join condition must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: a join condition could not be rendered against the \
-         qualified N-scan schema; this is a hard error, not a native re-plan"
-    );
-
-    let group_by_req = serde_json::json!({ "groupBy": [unrenderable()] });
-    let msg = user_message(
-        qualified_join_group_by(&group_by_req, &legs)
-            .expect_err("an unrenderable GROUP BY key must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
-         N-scan join (unsupported expression node type: totally_unsupported_node_type); \
-         this is a hard error, not a native re-plan"
-    );
-
-    let having_req = serde_json::json!({ "having": unrenderable() });
-    let msg = user_message(
-        qualified_join_having(&having_req, &legs)
-            .expect_err("an unrenderable HAVING expression must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: HAVING could not be rendered for the qualified \
-         N-scan join (unsupported expression node type: totally_unsupported_node_type); \
-         this is a hard error, not a native re-plan"
-    );
-
-    let order_by_req = serde_json::json!({
-        "orderBy": [order_by_element(unrenderable(), true, false)],
-    });
-    let msg = user_message(
-        qualified_join_order_by(&order_by_req, &legs)
-            .expect_err("an unrenderable ORDER BY expression must decline"),
-    );
-    assert_eq!(
-        msg,
-        "join pushdown declined: an ORDER BY key could not be rendered for the qualified \
-         N-scan join; this is a hard error, not a native re-plan"
     );
 }
 
@@ -2019,7 +1783,6 @@ fn fallback_projection_narrows_to_referenced_columns() {
             .collect()
     }
 
-    let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let shards = [vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
 
     let all_cols = vec![
@@ -2041,7 +1804,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         [string_equal("T", "REGION", "R"), num_lit(1), num_lit(0)],
     );
     let sum_case = agg_item_expr("SUM", region_flag, false);
-    let rich_req = pushdown_request("T", &[("GK", ExasolType::WIDEST_VARCHAR)])
+    let rich_req = pushdown_request("T", &all_cols)
         .group_by(vec![table_col("T", "GK")])
         .field("having", having)
         .order_by(order_by)
@@ -2082,11 +1845,13 @@ fn fallback_projection_narrows_to_referenced_columns() {
         col("REGION", ExasolType::varchar(10)),
         col("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
-    let grouped_req = pushdown_request("T", &[("GK", ExasolType::WIDEST_VARCHAR)])
+    let grouped_request = pushdown_request("T", &grouped_all)
         .group_by(vec![table_col("T", "GK")])
         .column(table_col("T", "GK"))
         .item(sum_case, ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
+        .build()
+        .0;
+    let grouped_req = parsed_pushdown(&grouped_request);
     let grouped = referenced_columns(grouped_req.json(), &column_types(&grouped_all));
     let (gproj, _) = split_projection(&grouped.projection());
     assert_eq!(
@@ -2097,7 +1862,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
     let gfan_out = FanOutProjection::new(fan_out_base(), &grouped);
     let gsql = build_qualified_single_table_fallback_sql(
-        &request,
+        &grouped_request,
         &grouped_req,
         &gfan_out,
         &shards,
@@ -2121,7 +1886,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         col("B", ExasolType::varchar(10)),
         col("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
-    let sg_req = pushdown_request("T", NO_COLUMNS)
+    let sg_request = pushdown_request("T", &sg_all)
         .item(
             agg_item_expr("COUNT", table_col("T", "A"), true),
             ExasolType::WIDEST_VARCHAR,
@@ -2130,7 +1895,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
             agg_item_expr("COUNT", table_col("T", "B"), true),
             ExasolType::WIDEST_VARCHAR,
         )
-        .build_pushdown();
+        .build()
+        .0;
+    let sg_req = parsed_pushdown(&sg_request);
     let single_group = referenced_columns(sg_req.json(), &column_types(&sg_all));
     let (sproj, _) = split_projection(&single_group.projection());
     assert_eq!(
@@ -2140,7 +1907,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
     let sfan_out = FanOutProjection::new(fan_out_base(), &single_group);
     let ssql = build_qualified_single_table_fallback_sql(
-        &request,
+        &sg_request,
         &sg_req,
         &sfan_out,
         &shards,
@@ -2202,12 +1969,12 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
 
 #[test]
 fn referenced_columns_narrows_with_a_real_select_list() {
-    let all_cols = vec![
-        ("GK".to_string(), ExasolType::varchar(10)),
-        ("FCOL".to_string(), ExasolType::decimal(18, 0)),
-        ("IRRELEVANT_COL".to_string(), ExasolType::varchar(10)),
+    let all_cols = [
+        ("GK", ExasolType::varchar(10)),
+        ("FCOL", ExasolType::decimal(18, 0)),
+        ("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
-    let req = pushdown_request("T", &[("GK", ExasolType::WIDEST_VARCHAR)])
+    let req = pushdown_request("T", &all_cols)
         .filter(predicate_equal(table_col("T", "FCOL"), num_lit(5)))
         .column(table_col("T", "GK"))
         .build_pushdown();
@@ -2246,44 +2013,6 @@ fn referenced_columns_falls_back_to_first_column() {
     assert_eq!(types, vec![ExasolType::decimal(18, 0)]);
 }
 
-#[test]
-fn n_scan_join_untranslatable_select_item_is_hard_error() {
-    let unknown = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
-    assert!(
-        typed_scan(NO_COLUMNS).expression(&unknown).is_none()
-            && render_expression_exasol_safe(&unknown).is_none(),
-        "the fixture node must be untranslatable under BOTH dialects"
-    );
-
-    let mut request = join_request(Json::Null, equi_condition());
-    request = selecting(
-        request,
-        &[
-            (table_col("CUSTOMER", "C_NAME"), ExasolType::varchar(100)),
-            (unknown, ExasolType::WIDEST_VARCHAR),
-        ],
-    );
-    let detected = detected_join(&request);
-    assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&request),
-            &detected,
-            &request_sides(&request, &detected)
-        )
-        .expect("the broadcast decline is never an error")
-        .is_none(),
-        "the widened projection declines broadcast, so the request reaches the \
-         N-scan fallback"
-    );
-
-    let err =
-        n_scan_sql(&request).expect_err("an untranslatable select-list item must be a hard error");
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
-        "the refusal must come from the select-list render site: {err}"
-    );
-}
-
 /// The qualified single-table wrapper over one shard of `request`'s first table.
 fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
     let (request, _) = request.build();
@@ -2309,21 +2038,6 @@ fn table_t_with_id() -> PushdownRequestBuilder {
 }
 
 #[test]
-fn qualified_single_table_untranslatable_select_item_is_hard_error() {
-    let request = table_t_with_id().column(table_col("T", "ID")).item(
-        serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
-        ExasolType::WIDEST_VARCHAR,
-    );
-
-    let err = qualified_fallback_for(request)
-        .expect_err("an untranslatable select-list item must be a hard error");
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
-        "the refusal must come from the shared select-list render site: {err}"
-    );
-}
-
-#[test]
 fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zone() {
     let request = table_t_with_id().item(
         lit("literal_timestamputc", "2024-03-01 09:00:00"),
@@ -2343,63 +2057,44 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
     );
 }
 
-fn declined_filter_request() -> Json {
-    serde_json::json!({
-        "involvedTables": [involved_table_json(
-            "T",
-            &[
-                ("ID", ExasolType::decimal(20, 0)),
-                ("C_TS", ExasolType::BARE_TIMESTAMP),
-            ],
-        )],
-    })
+/// `T (ID, C_TS)`, the table the declined-filter wrapper tests read.
+fn declined_filter_table() -> PushdownRequestBuilder {
+    pushdown_request(
+        "T",
+        &[
+            ("ID", ExasolType::decimal(20, 0)),
+            ("C_TS", ExasolType::BARE_TIMESTAMP),
+        ],
+    )
 }
 
-/// `filter` stays `None`: on the decline route the predicate lives only in the
-/// wrapper's `WHERE`.
-fn declined_filter_fan_out_spec() -> CommonScanSpec {
-    CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-}
-
-fn declined_filter_column_types() -> ColumnTypes {
-    column_types(&[
-        ("ID", ExasolType::decimal(20, 0)),
-        ("C_TS", ExasolType::BARE_TIMESTAMP),
-    ])
-}
-
-fn declined_filter_wrapper_sql(
-    pushdown: &PushdownRequest,
-    declined: Option<&Json>,
-) -> Result<String, UdfError> {
-    let col_types = declined_filter_column_types();
-    let fan_out = FanOutProjection::new(declined_filter_fan_out_spec(), &col_types);
+/// The single-table wrapper over `request` once the scan declines its whole WHERE, which the
+/// wrapper then self-applies; the fan-out spec carries no filter.
+fn declined_filter_wrapper_sql(request: &Json) -> Result<String, UdfError> {
+    let pushdown = parsed_pushdown(request);
+    let col_types = first_table_column_types(request);
+    let fan_out = FanOutProjection::new(
+        CommonScanSpec {
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
+        },
+        &col_types,
+    );
     build_qualified_single_table_fallback_sql(
-        &declined_filter_request(),
-        pushdown,
+        request,
+        &pushdown,
         &fan_out,
         &[vec![("s3://w/f-0.parquet".to_string(), 10u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-        declined,
+        pushdown.json().get("filter"),
     )
 }
 
 #[test]
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
     let declined = declined_second_predicate(table_col("T", "C_TS"));
-    assert!(
-        ScanTranslator::new(&first_table_column_types(&declined_filter_request()))
-            .expression(&declined)
-            .is_none()
-            && render_expression_exasol_safe(&declined).is_some(),
-        "fixture precondition: SECOND(C_TS, 3) must decline for DataFusion and \
-         render for Exasol"
-    );
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
+    let request = declined_filter_table()
         .filter(declined.clone())
         .order_by(serde_json::json!([order_by_element(
             table_col("T", "ID"),
@@ -2408,9 +2103,14 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
         )]))
         .limit(5)
         .column(table_col("T", "ID"))
-        .build_pushdown();
+        .build()
+        .0;
+    assert!(
+        scan_of(&request).expression(&declined).is_none(),
+        "fixture precondition: SECOND(C_TS, 3) must decline for DataFusion"
+    );
 
-    let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&declined))
+    let sql = declined_filter_wrapper_sql(&request)
         .expect("a declined predicate that renders for Exasol must build the wrapper");
 
     let where_at = sql
@@ -2446,16 +2146,13 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
         table_col("T", "C_TS"),
         lit("literal_timestamputc", "2024-03-01 09:00:00"),
     );
-    assert!(
-        render_expression_exasol_safe(&declined).is_some(),
-        "fixture precondition: the predicate must render for Exasol"
-    );
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
+    let request = declined_filter_table()
+        .filter(declined)
         .column(table_col("T", "ID"))
-        .build_pushdown();
+        .build()
+        .0;
 
-    let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&declined))
-        .expect("the predicate must self-apply");
+    let sql = declined_filter_wrapper_sql(&request).expect("the predicate must self-apply");
 
     assert!(
         sql.contains(
@@ -2468,52 +2165,26 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
 }
 
 #[test]
-fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
-    let trivially_true = bool_lit(true);
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
-        .column(table_col("T", "ID"))
-        .build_pushdown();
-
-    let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&trivially_true))
-        .expect("a trivially-true predicate must not fail the wrapper");
-
-    assert!(
-        !sql.contains(" WHERE "),
-        "a trivially-true predicate must emit no WHERE clause at all: {sql}"
-    );
-}
-
-/// Scenario: A predicate unrenderable under both dialects returns a clean error
-#[test]
-fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialect() {
-    let unrenderable = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
-        .column(table_col("T", "ID"))
-        .build_pushdown();
-
-    let err = declined_filter_wrapper_sql(&pushdown_req, Some(&unrenderable))
-        .expect_err("a predicate applicable nowhere must fail the query");
-
-    assert_refuses_the_unrenderable_predicate(&err);
-}
-
-#[test]
 fn outer_wrapper_renders_qualified_expression_sort_key() {
-    let legs = single_scan_legs("T");
-    let leg = column_types(&[
-        ("ID", ExasolType::decimal(20, 0)),
-        ("NAME", ExasolType::varchar(100)),
-    ]);
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
-        .field("groupBy", serde_json::json!([table_col("T", "ID")]))
-        .order_by(serde_json::json!([order_by_element(
-            scalar_fn("UPPER", [table_col("T", "NAME")]),
-            false,
-            true
-        )]))
-        .limit(4)
-        .column(table_col("T", "ID"))
-        .build_pushdown();
+    let request = pushdown_request(
+        "T",
+        &[
+            ("ID", ExasolType::decimal(20, 0)),
+            ("NAME", ExasolType::varchar(100)),
+        ],
+    )
+    .field("groupBy", serde_json::json!([table_col("T", "ID")]))
+    .order_by(serde_json::json!([order_by_element(
+        scalar_fn("UPPER", [table_col("T", "NAME")]),
+        false,
+        true
+    )]))
+    .limit(4)
+    .column(table_col("T", "ID"))
+    .build()
+    .0;
+    let (pushdown_req, legs) = planned(&request);
+    let leg = first_table_column_types(&request);
 
     let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[&leg])
         .expect("a renderable expression sort key must render, not decline");
@@ -2541,34 +2212,59 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     );
 }
 
-fn seam_trailing(pushdown: &PushdownRequest, legs: &JoinLegs) -> Result<String, UdfError> {
-    let cols = vec![
-        ("ID".to_string(), ExasolType::decimal(20, 0)),
-        ("NAME".to_string(), ExasolType::varchar(100)),
-        ("SCORE".to_string(), ExasolType::DoublePrecision),
-    ];
-    let cols_per_leg = vec![column_types(&cols); legs.leg_count()];
-    outer_wrapper_clauses(pushdown, legs, &cols_per_leg.iter().collect::<Vec<_>>())
+/// The wrapper's trailing clauses for `request`, whose every leg is an `EVENTS` occurrence.
+fn seam_trailing(request: &Json) -> Result<String, UdfError> {
+    let events = column_types(&events_columns());
+    let leg_count = match detect_join(request, &pd(request)) {
+        Ok(JoinShape::Join(join)) => join.tables.len(),
+        _ => 1,
+    };
+    let (pushdown_req, legs) = planned(request);
+    outer_wrapper_clauses(&pushdown_req, &legs, &vec![&events; leg_count])
         .map(|clauses| clauses.trailing)
 }
 
-/// The four live-captured offset-carrying shapes reaching this seam (#191 capture rows
-/// 8-11), each with the binding production builds for it; each carries an `orderBy`.
-fn offset_carrying_seam_fixtures() -> Vec<(&'static str, PushdownRequest, JoinLegs, &'static str)> {
-    let single_scan = single_scan_legs("EVENTS");
-    let self_join = legs_from_leaves(vec![
-        JoinLeaf {
-            table_name: "EVENTS".to_string(),
-            table_alias: Some("A".to_string()),
-            table_identifier: "lh.events".to_string(),
-        },
-        JoinLeaf {
-            table_name: "EVENTS".to_string(),
-            table_alias: Some("B".to_string()),
-            table_identifier: "lh.events".to_string(),
-        },
-    ]);
+fn events_columns() -> [(&'static str, ExasolType); 3] {
+    [
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::varchar(100)),
+        ("SCORE", ExasolType::DoublePrecision),
+    ]
+}
 
+/// `EVENTS`, the table the seam fixtures read.
+fn events() -> PushdownRequestBuilder {
+    pushdown_request("EVENTS", &events_columns())
+}
+
+/// [`events`] joined to itself as occurrences `A` and `B` on `ID`.
+fn events_self_join() -> PushdownRequestBuilder {
+    let occurrence = |alias: &str| {
+        let mut leaf = table_ref("EVENTS");
+        leaf["alias"] = Json::String(alias.to_string());
+        leaf
+    };
+    events().field(
+        "from",
+        inner_join(
+            occurrence("A"),
+            occurrence("B"),
+            predicate_equal(
+                aliased_col("EVENTS", "A", "ID"),
+                aliased_col("EVENTS", "B", "ID"),
+            ),
+        ),
+    )
+}
+
+/// `request`'s parsed pushdown and the legs production binds for it.
+fn planned(request: &Json) -> (PushdownRequest, JoinLegs) {
+    (parsed_pushdown(request), request_legs(request))
+}
+
+/// The four live-captured offset-carrying shapes reaching this seam (#191 capture rows
+/// 8-11); each carries an `orderBy`.
+fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
     let id = table_col("EVENTS", "ID");
     let mod_key = scalar_fn("MOD", [id.clone(), num_lit(4)]);
     let ascending = |expr: &Json| order_by_element(expr.clone(), true, false);
@@ -2577,51 +2273,44 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, PushdownRequest, JoinLe
     let id_a = aliased_col("EVENTS", "A", "ID");
     let score_a = aliased_col("EVENTS", "A", "SCORE");
     let name_a = aliased_col("EVENTS", "A", "NAME");
+    let shape = |name, builder: PushdownRequestBuilder, tail| (name, builder.build().0, tail);
 
     vec![
-        (
+        shape(
             "row 8: grouped COUNT(DISTINCT) qualified wrapper",
-            pushdown_request("T", NO_COLUMNS)
+            events()
                 .group_by(vec![mod_key.clone()])
                 .order_by(serde_json::json!([ascending(&mod_key)]))
                 .field("limit", serde_json::json!({"numElements": 2, "offset": 1}))
                 .item(mod_key.clone(), ExasolType::WIDEST_VARCHAR)
-                .item(count_distinct_id, ExasolType::WIDEST_VARCHAR)
-                .build_pushdown(),
-            single_scan.clone(),
+                .item(count_distinct_id, ExasolType::WIDEST_VARCHAR),
             r#" ORDER BY MOD("LHS_T0"."ID", 4) ASC NULLS FIRST LIMIT 2 OFFSET 1"#,
         ),
-        (
+        shape(
             "row 9: self-join, ORDER BY ordinal over a projected column",
-            pushdown_request("T", NO_COLUMNS)
+            events_self_join()
                 .order_by(serde_json::json!([ascending(&id_a)]))
                 .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
-                .item(id_a.clone(), ExasolType::WIDEST_VARCHAR)
-                .item(score_a, ExasolType::WIDEST_VARCHAR)
-                .build_pushdown(),
-            self_join.clone(),
+                .column(id_a.clone())
+                .column(score_a),
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
-        (
+        shape(
             "row 10: self-join, sort key outside the select list",
-            pushdown_request("T", NO_COLUMNS)
+            events_self_join()
                 .order_by(serde_json::json!([ascending(&id_a)]))
                 .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
-                .item(name_a, ExasolType::WIDEST_VARCHAR)
-                .build_pushdown(),
-            self_join.clone(),
+                .column(name_a),
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
-        (
+        shape(
             "row 11: self-join + GROUP BY",
-            pushdown_request("T", NO_COLUMNS)
+            events_self_join()
                 .group_by(vec![id_a.clone()])
                 .order_by(serde_json::json!([ascending(&id_a)]))
                 .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
-                .item(id_a.clone(), ExasolType::WIDEST_VARCHAR)
-                .item(count_star, ExasolType::WIDEST_VARCHAR)
-                .build_pushdown(),
-            self_join,
+                .column(id_a.clone())
+                .item(count_star, ExasolType::WIDEST_VARCHAR),
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
     ]
@@ -2629,8 +2318,8 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, PushdownRequest, JoinLe
 
 #[test]
 fn qualified_wrapper_renders_limit_offset() {
-    for (shape, pushdown_req, legs, expected_tail) in offset_carrying_seam_fixtures() {
-        let trailing = seam_trailing(&pushdown_req, &legs)
+    for (shape, request, expected_tail) in offset_carrying_seam_fixtures() {
+        let trailing = seam_trailing(&request)
             .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
         assert!(
             trailing.ends_with(expected_tail),
@@ -2641,21 +2330,19 @@ fn qualified_wrapper_renders_limit_offset() {
 
 #[test]
 fn qualified_wrapper_never_renders_offset_without_order_by() {
-    let mut cases: Vec<(&str, PushdownRequest, JoinLegs)> = offset_carrying_seam_fixtures()
+    let mut cases: Vec<(&str, Json)> = offset_carrying_seam_fixtures()
         .into_iter()
-        .map(|(shape, req, legs, _)| (shape, req, legs))
+        .map(|(shape, request, _)| (shape, request))
         .collect();
-    cases.push((
-        "control: limit, no orderBy, no offset",
-        pushdown_request("EVENTS", &[("ID", ExasolType::WIDEST_VARCHAR)])
-            .limit(5)
-            .column(table_col("EVENTS", "ID"))
-            .build_pushdown(),
-        single_scan_legs("EVENTS"),
-    ));
+    let control = events()
+        .limit(5)
+        .column(table_col("EVENTS", "ID"))
+        .build()
+        .0;
+    cases.push(("control: limit, no orderBy, no offset", control));
 
-    for (shape, pushdown_req, legs) in cases {
-        let trailing = seam_trailing(&pushdown_req, &legs)
+    for (shape, request) in cases {
+        let trailing = seam_trailing(&request)
             .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
         if let Some(offset_at) = trailing.find("OFFSET") {
             let order_at = trailing.find("ORDER BY").unwrap_or(usize::MAX);
@@ -2670,23 +2357,20 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
 
 #[test]
 fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
-    let legs = single_scan_legs("EVENTS");
     let limited = |limit: Json| {
-        pushdown_request("EVENTS", &[("ID", ExasolType::WIDEST_VARCHAR)])
+        events()
             .field("limit", limit)
             .column(table_col("EVENTS", "ID"))
-            .build_pushdown()
+            .build()
+            .0
     };
-    let bare = seam_trailing(&limited(serde_json::json!({"numElements": 5})), &legs)
+    let bare = seam_trailing(&limited(serde_json::json!({"numElements": 5})))
         .expect("a plain limited request must render");
     assert_eq!(bare, " LIMIT 5");
 
     // Exasol normalises `OFFSET 0` away; an explicit zero must still render identically.
-    let zero = seam_trailing(
-        &limited(serde_json::json!({"numElements": 5, "offset": 0})),
-        &legs,
-    )
-    .expect("an explicit zero offset must render");
+    let zero = seam_trailing(&limited(serde_json::json!({"numElements": 5, "offset": 0})))
+        .expect("an explicit zero offset must render");
     assert_eq!(zero, bare);
 }
 
@@ -2908,64 +2592,6 @@ fn output_name_over_identifier_limit_declines_broadcast() {
 }
 
 #[test]
-fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
-    let attribution_error = |request: &Json| {
-        let err = render_broadcast_join(
-            &parsed_pushdown(request),
-            &detected_join(request),
-            &request_sides(request, &detected_join(request)),
-        )
-        .expect_err("a column no single leg owns has no correct qualified reference");
-        let UdfError::User(message) = err else {
-            panic!("the decline must be a client-facing User error, got {err:?}");
-        };
-        message
-    };
-
-    let mut no_table_name = join_request(Json::Null, equi_condition());
-    no_table_name = selecting(no_table_name, &[(col("C_NAME"), ExasolType::varchar(100))]);
-    let mut undeclared_table = join_request(Json::Null, equi_condition());
-    undeclared_table["pushdownRequest"]["filter"] = string_equal("NOPE", "C_NAME", "ACME");
-    for (label, request) in [
-        ("no tableName", no_table_name),
-        ("an undeclared tableName", undeclared_table),
-    ] {
-        let message = attribution_error(&request);
-        assert!(
-            message.contains("C_NAME") && message.contains("binds no"),
-            "a NoLeg column ({label}) must fail like an unattributable one: {message}"
-        );
-    }
-
-    let mut unattributable = self_join_request(&[Some("A"), Some("B")]);
-    unattributable["pushdownRequest"]["orderBy"] = serde_json::json!([order_by_element(
-        aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
-        true,
-        true
-    )]);
-    let fallback_err = build_n_scan_join_sql(
-        &parsed_pushdown(&unattributable),
-        &detected_join(&unattributable),
-        &request_typed(
-            &unattributable,
-            &[
-                resolved_side("FACT_ORDERS", vec![("s3://w/f-0.parquet", 10)]),
-                resolved_side("FACT_ORDERS", vec![("s3://w/f-0.parquet", 10)]),
-            ],
-        ),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect_err("the fallback refuses an unattributable column");
-    assert_eq!(
-        UdfError::User(attribution_error(&unattributable)).to_string(),
-        fallback_err.to_string(),
-        "the broadcast path raises the fallback's own error"
-    );
-}
-
-#[test]
 fn self_join_renders_each_occurrence_as_its_own_relation() {
     for aliases in [[Some("A"), Some("B")], [Some("A"), None]] {
         let request = self_join_request(&aliases);
@@ -3022,14 +2648,4 @@ fn join_block_names_the_dimension_legs_alias() {
         (serde_json::json!("LHS_T1"), serde_json::json!("LHS_T0")),
         "the smaller first leg is the dimension"
     );
-}
-
-/// Scenario: A predicate unrenderable under both dialects returns a clean error
-#[test]
-fn n_scan_wrapper_errors_when_declined_predicate_renders_in_neither_dialect() {
-    let unrenderable = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
-    let request = n_scan_request_with_filter(unrenderable);
-    let err = n_scan_sql(&request).expect_err("a predicate applicable nowhere must fail the query");
-
-    assert_refuses_the_unrenderable_predicate(&err);
 }

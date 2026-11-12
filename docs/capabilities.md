@@ -53,9 +53,8 @@ result in the correct order:
 - The qualified single-table, N-scan join wrapper renders any sortable expression directly,
   because it already qualifies column references.
 
-A sort key that the adapter cannot render in Exasol SQL fails the query with an error. Exasol does
-not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`, so dropping
-the key would return rows in the wrong order.
+Exasol does not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`,
+so the adapter renders every sort key Exasol pushes in Exasol SQL.
 
 The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
 

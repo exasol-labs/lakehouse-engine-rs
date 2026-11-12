@@ -12,7 +12,7 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, PushdownRequest, SCAN_UDF_NAME, involved_columns,
     project_columns, quote_ident,
 };
 
@@ -22,8 +22,7 @@ mod rendering;
 mod sql_builders;
 
 pub(crate) use planning::{
-    DetectedJoin, IneligibleJoinReason, JoinLeaf, JoinShape, JoinSides, ResolvedJoinSide,
-    detect_join,
+    DetectedJoin, JoinLeaf, JoinShape, JoinSides, ResolvedJoinSide, detect_join,
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
@@ -43,13 +42,26 @@ pub(super) use sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
 };
 
-/// [`attribution::JoinLegs::ensure_columns_declared`] for a single-table request.
-pub(super) fn ensure_single_scan_columns_declared(
+/// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
+/// leg of `join` or the request's one table, and that table declares it (#615). Both planners run
+/// it before any catalog request.
+pub(crate) fn ensure_columns_declared(
     request: &Json,
     pushdown: &Json,
-    involved: &InvolvedColumns<'_>,
+    join: Option<&DetectedJoin>,
 ) -> Result<(), UdfError> {
-    attribution::JoinLegs::for_single_scan(request).ensure_columns_declared(pushdown, &[involved])
+    let Some(join) = join else {
+        let involved = involved_columns(request, |tables| tables.first())?;
+        return attribution::JoinLegs::for_single_scan(request)
+            .ensure_columns_declared(pushdown, &[&involved]);
+    };
+    let involved = join
+        .tables
+        .iter()
+        .map(|leaf| involved_table(request, &leaf.table_name))
+        .collect::<Result<Vec<_>, _>>()?;
+    join.legs()
+        .ensure_columns_declared(pushdown, &involved.iter().collect::<Vec<_>>())
 }
 
 /// The generated SQL runs outside the adapter script's schema, so an unqualified name would
@@ -59,21 +71,6 @@ pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
         Some(schema) if !schema.is_empty() => format!("{}.{}", quote_ident(schema), udf),
         _ => udf.to_string(),
     }
-}
-
-/// The last-resort decline for a join the adapter cannot render at all (a non-inner join
-/// node or malformed shape). Falling through to the single-table path would scan only the
-/// first table and silently drop the join, so this must be a hard `User` error with no
-/// native re-plan.
-pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError {
-    let detail = match reason {
-        IneligibleJoinReason::NotInnerJoinType => "the join is not an inner join",
-        IneligibleJoinReason::UnsupportedShape => "the join `from` clause has an unsupported shape",
-    };
-    UdfError::User(format!(
-        "join pushdown declined: {detail}; the adapter cannot render this join shape, \
-         so this is a hard error, not a native re-plan"
-    ))
 }
 
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
@@ -154,7 +151,7 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
         .collect::<Result<Vec<_>, _>>()?;
-    legs.ensure_columns_declared(pushdown_req, &involved.iter().collect::<Vec<_>>())?;
+    ensure_columns_declared(request, pushdown_req, Some(join))?;
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
@@ -207,9 +204,8 @@ pub(super) async fn plan_join(
     };
 
     // The window is classified before sizing and rendering, so a request Exasol must
-    // post-process never reaches `render_broadcast_join`, keeping its no-column-metadata `Err`
-    // arm unreachable. A decline falls through to the N-scan fallback; a column no single leg owns fails with
-    // the fallback's own error.
+    // post-process never reaches `render_broadcast_join`. A decline falls through to the N-scan
+    // fallback.
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
     let window = classify_join_window(pushdown_req);

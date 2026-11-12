@@ -4,7 +4,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-* The public DataFusion entry points are `render_scan_expression` and `render_scan_filter`, which take the column types and decline what the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`). Both return `Err` for an unsupported node and never panic, and `render_scan_filter` returns `Ok(None)` for a trivially-true `TRUE` result and renders a `NULL` result as `FALSE`. The Exasol entry points `render_expression_exasol`, `render_expression_exasol_safe`, and `render_df_filter_exasol_safe` return `Err`, `None`, and `None` for an unsupported node, and the last applies the same `TRUE` and `NULL` rule.
+* The public DataFusion entry points are `render_scan_expression` and `render_scan_filter`, which take the column types and decline what the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`). Both return `Err` for an unsupported node and never panic, and `render_scan_filter` returns `Ok(None)` for a trivially-true `TRUE` result and renders a `NULL` result as `FALSE`. The Exasol entry points never fail on a node Exasol sends (`sql-comprehension/vs-expression-translator`).
 * `+`, `-`, `*`, and unary `-` use the same syntax in both parsers. `/` (`FLOAT_DIV`) renders differently per dialect.
 * A conversion or operator node is translated only when its DataFusion result matches Exasol. `DIV`, `TO_CHAR`, `TO_NUMBER`, and the bitwise functions fail that test and fall back to Exasol.
 * The crate is a pure, stateless translator. It reads column types only through the lookup its caller passes.
@@ -42,7 +42,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* the entry point evaluates the result
 * *THEN* for `TRUE` it SHALL return `Ok(None)` so the adapter omits the redundant filter from the scan spec
 * *AND* for `NULL` it SHALL return `Ok(Some("FALSE"))`, because a WHERE condition that is NULL keeps no row. Exasol folds a condition such as `NULL LIKE '%b%'` or `'' LIKE '%b%'` (an empty string is NULL in Exasol) to a bare `literal_null` filter, and omitting it would return every row
-* *AND* `render_df_filter_exasol_safe` and `conjoin_scan_filters` SHALL apply the same rule, so the single-table, grouped-aggregate, and join paths all return the zero rows native Exasol returns
+* *AND* `conjoin_scan_filters` SHALL apply the same rule, and an Exasol-dialect wrapper SHALL render a `NULL` filter as a `NULL` condition, which also keeps no row, so the single-table, grouped-aggregate, and join paths all return the zero rows native Exasol returns
 
 ### Scenario: Integer division DIV is deliberately not translated
 

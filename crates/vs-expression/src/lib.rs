@@ -1050,31 +1050,26 @@ pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
 /// Exasol dialect, for SQL parsed by Exasol itself (join and grouped-aggregate
 /// wrappers), never for a DataFusion `ScanSpec`. Character CAST targets are
 /// length-qualified, since Exasol has no length-less character type.
-pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
-    render_expression_inner(expr, Dialect::Exasol)?
-        .ok_or_else(|| UdfError::User("expression node is null".into()))
+///
+/// Panics on a tree Exasol does not send: Exasol pushes only the capabilities the adapter
+/// advertises, and this dialect renders every one of them.
+pub fn render_expression_exasol(expr: &Json) -> String {
+    match render_expression_inner(expr, Dialect::Exasol) {
+        Ok(Some(sql)) => sql,
+        Ok(None) => panic!("{EXASOL_RENDERS}: a null node"),
+        Err(err) => panic!("{EXASOL_RENDERS}: {err}"),
+    }
 }
+
+const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
 /// [`render_expression_exasol`] for an output select item, typed where the request states the
 /// type: the Exasol dialect renders a CAST's target and a column as they are.
-pub fn render_exasol_fragment(
-    expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-) -> Result<SqlFragment, UdfError> {
-    Ok(SqlFragment::new(
-        render_expression_exasol(expr)?,
+pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
+    SqlFragment::new(
+        render_expression_exasol(expr),
         exact_expression_type(expr, columns),
-    ))
-}
-
-/// `None` on any failure.
-pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, Dialect::Exasol).ok()?
-}
-
-/// [`render_expression_exasol_safe`] for a filter: also `None` when it is trivially true.
-pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
-    non_trivial_filter(render_expression_inner(filter_expr, Dialect::Exasol).ok()??)
+    )
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
     AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, cast_to, col, column_types,
-    count_star, float_div, num_lit, round_of, scalar_fn, typed_scan,
+    count_star, float_div, num_lit, round_of, scalar_fn, scan_over, typed_scan,
 };
 
 /// The translator these node-level units take: the aggregate fixtures' columns and the key a
@@ -378,9 +378,9 @@ fn sum_widens_a_decimal_to_precision_36_keeps_a_double_and_types_nothing_else() 
 }
 
 fn nested_type_of(agg_node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
-    let plan = parse_agg_item(agg_node, ScanTranslator::new(col_types))
+    let plan = parse_agg_item(agg_node, scan_over(col_types))
         .expect("test aggregate must parse to a plan");
-    nested_aggregate_type(agg_node, &plan, ScanTranslator::new(col_types))
+    nested_aggregate_type(agg_node, &plan, scan_over(col_types))
 }
 
 #[test]

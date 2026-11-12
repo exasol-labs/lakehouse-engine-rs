@@ -33,7 +33,7 @@ Renders `FLOAT_DIV` (Exasol's `/`) as true `DOUBLE` division. The DataFusion dia
 ### Scenario: The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator
 
 * *GIVEN* the same `function_scalar` node named `FLOAT_DIV`
-* *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`), the ones whose output Exasol's own core engine parses
+* *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `render_exasol_fragment`), the ones whose output Exasol's own core engine parses
 * *THEN* the translator SHALL return the bare `(<left> / <right>)`, because Exasol's `/` IS `FN_FLOAT_DIV`: it already divides as `DOUBLE` for every operand type AND it already raises `22012` on a zero divisor, so it needs neither the cast nor the checked call
 * *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node, `vs_checked_float_div(<l>, <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect
 * *AND* every Exasol-dialect consumer's SQL SHALL stay byte-identical, the qualified single-table wrapper, the N-scan join wrapper, the grouped merge, the single-group scalar-over-aggregate merge (`render_scalar_over_merge`, which calls `render_expression_exasol`), and the self-applied WHERE path

@@ -1751,8 +1751,11 @@ fn filter_in_common_arg() {
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
-    let (scan_filter, declined) =
-        ScanTranslator::new(&column_types(col_types)).split_where(Some(filter));
+    let request = pushdown_request("T", col_types)
+        .filter(filter.clone())
+        .build()
+        .0;
+    let (scan_filter, declined) = scan_of(&request).split_where(Some(filter));
     assert!(
         scan_filter.is_none(),
         "fixture precondition: a declining filter must never reach the scan spec: \
@@ -1760,20 +1763,15 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
     );
     let declined = declined
         .expect("fixture precondition: a declining filter must be handed back for self-applying");
-    let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
-    let pushdown = PushdownRequest::parse(
-        serde_json::json!({"filter": filter.clone(), "selectListDataTypes": []}),
-    )
-    .expect("a select-list-free request declares an empty selectListDataTypes");
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
-    let type_map = column_types(col_types);
+    let type_map = first_table_column_types(&request);
     let fan_out = super::super::joins::FanOutProjection::new(fan_out_spec, &type_map);
     super::super::joins::build_qualified_single_table_fallback_sql(
         &request,
-        &pushdown,
+        &parsed_pushdown(&request),
         &fan_out,
         &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
@@ -1816,20 +1814,6 @@ fn declined_like_on_date_column_routes_to_wrapper_where() {
     assert!(
         sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."SHIPPED" LIKE '2024%')"#),
         "the DATE-column LIKE must be applied in the wrapper WHERE: {sql}"
-    );
-}
-
-#[test]
-fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
-    let filter = like(table_col("T", "MYSTERY"), "A%");
-    let col_types = vec![("OTHER".to_string(), ExasolType::WIDEST_VARCHAR)];
-
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
-
-    assert!(
-        sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
-        "an unresolvable-subject decline must still be applied by the adapter, \
-         never omitted: {sql}"
     );
 }
 
@@ -2010,11 +1994,6 @@ fn selectlist_items_the_scan_declines_widen_to_the_full_base_row() {
         (
             "LIKE over TIMESTAMP",
             like(col("c_ts_a"), "1%"),
-            ExasolType::Boolean,
-        ),
-        (
-            "LIKE over an unresolvable column",
-            like(col("not_a_column"), "1%"),
             ExasolType::Boolean,
         ),
     ];
@@ -2450,48 +2429,6 @@ fn shared_name_universe() -> ColumnTypes {
         ("LHS_T0".to_string(), &column_types(&[("X", decimal)])),
         ("LHS_T1".to_string(), &column_types(&[("X", varchar)])),
     ])
-}
-
-#[test]
-fn qualified_universe_projects_each_column_with_its_relation_and_type() {
-    let universe = shared_name_universe();
-    let relations = pushdown_request("LHS_T0", &[("X", ExasolType::decimal(18, 0))])
-        .table("LHS_T1", &[("X", ExasolType::varchar(10))]);
-    let pushdown_req = relations
-        .clone()
-        .column(alias_col("LHS_T1", "X"))
-        .column(alias_col("LHS_T0", "X"))
-        .build_pushdown();
-    let (items, types, widened) = project_split(&pushdown_req, &universe).expect("projects");
-    assert!(!widened);
-    assert_eq!(
-        items,
-        vec![
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
-        ]
-    );
-    assert_eq!(
-        types,
-        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
-    );
-
-    let select_star = relations.build_pushdown();
-    let (projection, _) =
-        project_columns(&select_star, ScanTranslator::new(&universe)).expect("projects");
-    let (full_row, full_types) = split_projection(&projection);
-    assert_eq!(
-        full_row,
-        vec![
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
-        ],
-        "the full row lists the universe in leg order"
-    );
-    assert_eq!(
-        full_types,
-        vec![ExasolType::decimal(18, 0), ExasolType::varchar(10)]
-    );
 }
 
 #[test]

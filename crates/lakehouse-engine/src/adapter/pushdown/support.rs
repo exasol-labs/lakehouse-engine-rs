@@ -701,12 +701,6 @@ impl<'a> ScanTranslator<'a> {
         Ok(Self { columns })
     }
 
-    /// Unchecked, for unit tests that build a translator over their own column types.
-    #[cfg(test)]
-    pub(crate) fn new(columns: &'a ColumnTypes) -> Self {
-        Self { columns }
-    }
-
     pub(super) fn columns(self) -> &'a ColumnTypes {
         self.columns
     }
@@ -722,8 +716,8 @@ impl<'a> ScanTranslator<'a> {
         render_scan_expression(&self.before_typing(expr), self.columns).ok()
     }
 
-    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `scan_filter` is
-    /// `None` for a trivially true filter; `declined` is the raw tree, which Exasol applies itself.
+    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
+    /// raw tree, which Exasol applies itself.
     pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
         let Some(raw) = filter else {
             return (None, None);

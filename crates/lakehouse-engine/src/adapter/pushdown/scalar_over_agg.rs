@@ -148,7 +148,6 @@ pub(super) fn sentinelize_aggregates(
     })
 }
 
-/// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect.
 /// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
@@ -156,11 +155,10 @@ pub(super) fn classify_scalar_over_aggregate(
 ) -> Option<Vec<(AggregatePlan, Json)>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
-    let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
+    sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     if aggregates.is_empty() || residual_column {
         return None;
     }
-    render_expression_exasol(&sentinel_tree).ok()?;
     aggregates
         .into_iter()
         .map(|agg| Some((parse_agg_item(&agg, scan)?, agg)))
@@ -182,7 +180,7 @@ pub(super) fn render_scalar_over_merge(
     // targets are length-qualified.
     // The tree reads the merge output, which carries no request column, so only a CAST types it.
     let ty = stated_type(&sentinel_tree);
-    let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
+    let mut sql = render_expression_exasol(&sentinel_tree);
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;

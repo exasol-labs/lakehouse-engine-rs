@@ -40,26 +40,18 @@ fn from_table_node_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
+/// Exasol pushes a join only when its condition holds an equality; a further non-equi conjunct
+/// rides along in the same condition, as `ON c = o AND c < o` arrives.
 #[test]
-fn outer_join_is_ineligible() {
-    for outer in ["left_outer", "right_outer", "full_outer"] {
-        let request = join_request(serde_json::json!({"join_type": outer}), equi_condition());
-        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-        assert_eq!(
-            shape,
-            JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType),
-            "join_type '{outer}' must be ineligible, not broadcast-eligible"
-        );
-    }
-}
-
-#[test]
-fn non_equi_two_table_join_is_served_by_unified_fallback() {
-    let condition = compare(
-        "predicate_less",
-        table_col("CUSTOMER", "C_CUSTKEY"),
-        table_col("ORDERS", "O_CUSTKEY"),
-    );
+fn a_condition_with_a_non_equi_conjunct_is_served_by_unified_fallback() {
+    let condition = and([
+        equi_condition(),
+        compare(
+            "predicate_less",
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        ),
+    ]);
     let request = join_request(Json::Null, condition.clone());
     match detect_join(&request, &pd(&request)).expect("served, not declined") {
         JoinShape::Join(join) => {
@@ -89,17 +81,6 @@ fn three_table_inner_join_is_unified_join() {
         }
         other => panic!("expected Join, got {other:?}"),
     }
-}
-
-#[test]
-fn non_inner_node_in_join_tree_is_ineligible() {
-    let mut request = three_table_join_request();
-    request["pushdownRequest"]["from"]["left"]["join_type"] = serde_json::json!("left_outer");
-    let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-    assert_eq!(
-        shape,
-        JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType)
-    );
 }
 
 /// Scenario: Each join leg resolves its catalog identifier from its own identifier note
@@ -141,7 +122,7 @@ fn a_leg_without_an_identifier_note_is_err() {
         .as_object_mut()
         .unwrap()
         .remove("adapterNotes");
-    let err = detect_join(&request, &pd(&request))
+    let err = detect_join(&request, &request["pushdownRequest"])
         .expect_err("LINEITEM has no note: must be Err, not a decline");
     let message = err.to_string();
     assert!(

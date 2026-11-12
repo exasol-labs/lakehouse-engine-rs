@@ -4,12 +4,11 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{
     ColumnNode, ColumnTypeLookup, conjoin_scan_filters, exact_expression_type,
-    render_df_filter_exasol_safe, render_expression_exasol_safe, strip_table_alias,
-    walk_column_nodes,
+    render_expression_exasol, strip_table_alias, walk_column_nodes,
 };
 
 use super::super::support::{ColumnTypes, ScanTranslator, quote_ident};
-use super::attribution::{ColumnLeg, JoinLegs};
+use super::attribution::JoinLegs;
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
 /// leg's type.
@@ -20,11 +19,7 @@ struct LegColumnTypes<'a> {
 
 impl ColumnTypeLookup for LegColumnTypes<'_> {
     fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        let leg = self
-            .legs
-            .bind(ColumnNode::parse(column)?)
-            .ok()?
-            .unwrap_or(0);
+        let leg = self.legs.leg(ColumnNode::parse(column)?);
         self.cols_per_leg.get(leg)?.column_type(column)
     }
 }
@@ -48,21 +43,9 @@ pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
 
 /// Stamps each `column` with its leg's subquery alias, then renders in the Exasol dialect,
 /// since the N-scan wrapper is parsed by Exasol (length-qualified `VARCHAR(n)` CAST targets,
-/// unlike the DataFusion-dialect broadcast render). `Err` as [`JoinLegs::qualify`].
-pub(super) fn render_expression_qualified(
-    expr: &Json,
-    legs: &JoinLegs,
-) -> Result<Option<String>, UdfError> {
-    Ok(render_expression_exasol_safe(&legs.qualify(expr)?))
-}
-
-/// `Ok(None)` when absent, trivially true, or unrenderable; the caller must then self-apply
-/// the filter (e.g. as an outer WHERE), never omit it. Exasol dialect, as above.
-pub(super) fn render_df_filter_qualified(
-    filter: &Json,
-    legs: &JoinLegs,
-) -> Result<Option<String>, UdfError> {
-    Ok(render_df_filter_exasol_safe(&legs.qualify(filter)?))
+/// unlike the DataFusion-dialect broadcast render).
+pub(super) fn render_expression_qualified(expr: &Json, legs: &JoinLegs) -> String {
+    render_expression_exasol(&legs.qualify(expr))
 }
 
 /// An OR is never split, so an OR spanning legs stays withheld from every leg.
@@ -128,15 +111,14 @@ pub(super) fn screen_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
 ) -> Result<(Option<String>, Option<Json>), UdfError> {
-    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
-    let bare = strip_table_alias(side_local);
-    let scan = ScanTranslator::over(col_types, &[&bare])?;
-    let (mut bare_conjuncts, mut conjuncts) = (Vec::new(), Vec::new());
-    flatten_conjuncts(&bare, &mut bare_conjuncts);
+    let mut conjuncts = Vec::new();
     flatten_conjuncts(side_local, &mut conjuncts);
+    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
+    let bare: Vec<Json> = conjuncts.iter().map(|c| strip_table_alias(c)).collect();
+    let scan = ScanTranslator::over(col_types, &bare.iter().collect::<Vec<_>>())?;
     let mut rendered = Vec::new();
     let mut declined = Vec::new();
-    for (bare, conjunct) in bare_conjuncts.into_iter().zip(conjuncts) {
+    for (bare, conjunct) in bare.iter().zip(conjuncts) {
         match scan.expression(bare) {
             Some(fragment) => rendered.push(fragment.sql),
             None => declined.push(conjunct.clone()),
@@ -164,7 +146,7 @@ fn collect_leg_column_names(
     out: &mut std::collections::HashSet<String>,
 ) {
     walk_column_nodes(expr, &mut |column| {
-        if legs.resolve_column(column) == ColumnLeg::Leg(leg) {
+        if legs.leg(column) == leg {
             out.insert(column.ascii_upper_name());
         }
     });

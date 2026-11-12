@@ -21,14 +21,14 @@ use tokio::net::TcpListener;
 // Named, not globbed: a local helper of the same name would silently shadow a glob import.
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
-    cast_json, cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list,
-    is_not_null, is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
-    scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
+    cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
+    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
+    str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
 
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
-    ScanTranslator::new(col_types).split_where(Some(filter)).0
+    scan_over(col_types).split_where(Some(filter)).0
 }
 
 /// The deduplicated partial plans of a single-group select list, whatever their types.
@@ -83,20 +83,32 @@ pub(crate) const AGGREGATED: [(&str, ExasolType); 12] = [
     ("C_DECIMAL_A", ExasolType::DoublePrecision),
 ];
 
-/// The translator `handle_pushdown` derives from `request`'s first involved table. Its column map
-/// is leaked, so a test passes the translator inline as production passes its own. Panics on a
-/// request that names a column it does not declare, which `handle_pushdown` fails before any render.
+/// The translator `handle_pushdown` derives from `request`'s first involved table, through the same
+/// checks. Its column map is leaked, so a test passes the translator inline as production passes its
+/// own. Panics on a request that names a column it does not declare.
 pub(crate) fn scan_of(request: &Json) -> ScanTranslator<'static> {
-    let involved = support::involved_columns(request, |tables| tables.first()).unwrap();
-    joins::ensure_single_scan_columns_declared(request, &pd(request), &involved)
-        .unwrap_or_else(|error| panic!("{}", user_message(error)));
-    ScanTranslator::new(Box::leak(Box::new(first_table_column_types(request))))
+    scan_for(
+        Box::leak(Box::new(first_table_column_types(request))),
+        &pd(request),
+    )
 }
 
-/// A translator over `columns`, for a unit that takes a node and never a request. Its column map is
-/// leaked, as in [`scan_of`].
+/// A translator over `columns` for a unit that takes nodes, never a request, so no request tree
+/// is checked against them.
+pub(crate) fn scan_over(columns: &ColumnTypes) -> ScanTranslator<'_> {
+    ScanTranslator::over(columns, &[]).expect("no tree to check")
+}
+
+/// The translator production builds over `columns` for `pushdown_req`, through the same check.
+/// Panics on a column of the request that `columns` does not bind.
+pub(crate) fn scan_for<'c>(columns: &'c ColumnTypes, pushdown_req: &Json) -> ScanTranslator<'c> {
+    ScanTranslator::over(columns, &[pushdown_req])
+        .unwrap_or_else(|error| panic!("{}", user_message(error)))
+}
+
+/// [`scan_over`] the types of `columns`. Its column map is leaked, as in [`scan_of`].
 pub(crate) fn typed_scan<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> ScanTranslator<'static> {
-    ScanTranslator::new(Box::leak(Box::new(column_types(columns))))
+    scan_over(Box::leak(Box::new(column_types(columns))))
 }
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
@@ -562,7 +574,8 @@ pub(crate) fn project_split(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    let (projection, widened) = support::project_columns(pushdown, ScanTranslator::new(all_cols))?;
+    let scan = ScanTranslator::over(all_cols, &[pushdown.json()])?;
+    let (projection, widened) = support::project_columns(pushdown, scan)?;
     let (items, types) = split_projection(&projection);
     Ok((items, types, widened))
 }
@@ -1465,8 +1478,37 @@ pub(crate) fn nq4_request() -> Json {
     .0
 }
 
+/// `request`'s `pushdownRequest`, checked by [`assert_exasol_sends`].
 pub(crate) fn pd(request: &Json) -> Json {
-    request.get("pushdownRequest").cloned().unwrap()
+    assert_exasol_sends(request);
+    request["pushdownRequest"].clone()
+}
+
+/// Panics unless `request` passes the planners' request check, so no fixture holds a request
+/// Exasol does not send.
+/// Exasol sends a request with no join for exactly one table.
+pub(crate) fn assert_exasol_sends(request: &Json) {
+    let pushdown = &request["pushdownRequest"];
+    let join = match detect_join(request, pushdown) {
+        Ok(JoinShape::Join(join)) => Some(join),
+        Ok(JoinShape::NotAJoin) => {
+            let tables = request["involvedTables"].as_array().map_or(0, Vec::len);
+            assert_eq!(
+                tables, 1,
+                "a request Exasol does not send: no join over {tables} tables"
+            );
+            None
+        }
+        Err(error) => panic!("a request Exasol does not send: {}", user_message(error)),
+    };
+    // Exasol drops a WHERE that folds to TRUE, though it sends FALSE, NULL, and TRUE conjuncts.
+    assert_ne!(
+        pushdown["filter"],
+        serde_json::json!({"type": "literal_bool", "value": true}),
+        "a request Exasol does not send: a TRUE filter"
+    );
+    ensure_columns_declared(request, pushdown, join.as_ref())
+        .unwrap_or_else(|error| panic!("a request Exasol does not send: {}", user_message(error)));
 }
 
 /// A pushdown request as Exasol sends it, started by [`pushdown_request`]: each involved table with
@@ -1509,6 +1551,26 @@ pub(crate) fn pushdown_request<N: AsRef<str>>(
         raw_select_list_data_types: None,
     }
     .table(table, columns)
+}
+
+/// Exasol stamps the table on every `column` node, so a single-table fixture written with bare
+/// `col` nodes reads as the request Exasol sends.
+fn stamp_table_name(node: &mut Json, table: &str) {
+    match node {
+        Json::Object(map) => {
+            if map.get("type").and_then(Json::as_str) == Some("column")
+                && !map.contains_key("tableName")
+            {
+                map.insert("tableName".into(), Json::String(table.to_string()));
+            }
+            map.values_mut()
+                .for_each(|value| stamp_table_name(value, table));
+        }
+        Json::Array(items) => items
+            .iter_mut()
+            .for_each(|item| stamp_table_name(item, table)),
+        _ => {}
+    }
 }
 
 impl PushdownRequestBuilder {
@@ -1609,6 +1671,13 @@ impl PushdownRequestBuilder {
     /// The request JSON and the type of each select-list item, or of each column of every
     /// involved table when the request carries no select list.
     pub(crate) fn build(self) -> (Json, Vec<ExasolType>) {
+        let built = self.build_unchecked();
+        assert_exasol_sends(&built.0);
+        built
+    }
+
+    /// [`Self::build`] without [`assert_exasol_sends`], for a test of the request check alone.
+    pub(crate) fn build_unchecked(self) -> (Json, Vec<ExasolType>) {
         let item_types: Vec<ExasolType> = match &self.select_list {
             Some(items) => items.iter().map(|(_, exa_type)| *exa_type).collect(),
             None => self
@@ -1628,14 +1697,33 @@ impl PushdownRequestBuilder {
         if let Some(data_types) = data_types {
             pushdown.insert("selectListDataTypes".into(), data_types);
         }
+        pushdown
+            .entry("type")
+            .or_insert_with(|| Json::String("select".into()));
+        if let [(table, _)] = self.tables.as_slice() {
+            pushdown.entry("from").or_insert_with(|| table_ref(table));
+        }
+        let mut pushdown = Json::Object(pushdown);
+        if let [(table, _)] = self.tables.as_slice() {
+            stamp_table_name(&mut pushdown, table);
+        }
+        // CREATE writes every virtual table an identifier note, so each table carries one.
         let involved_tables: Vec<Json> = self
             .tables
             .iter()
-            .map(|(name, columns)| involved_table_json(name, columns))
+            .map(|(name, columns)| {
+                let mut table = involved_table_json(name, columns);
+                table["adapterNotes"] = encode_identifier_note(&CatalogTableIdent {
+                    name: name.to_lowercase(),
+                    namespace: vec!["lh".to_string()],
+                })
+                .into();
+                table
+            })
             .collect();
         let mut request = self.request_fields;
         request.insert("involvedTables".into(), Json::Array(involved_tables));
-        request.insert("pushdownRequest".into(), Json::Object(pushdown));
+        request.insert("pushdownRequest".into(), pushdown);
         (Json::Object(request), item_types)
     }
 

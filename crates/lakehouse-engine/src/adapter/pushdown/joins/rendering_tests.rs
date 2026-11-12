@@ -6,7 +6,7 @@ use super::super::sql_builders::{
 };
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    resolved_side, two_scan_tuning,
+    request_legs, resolved_side, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
@@ -53,7 +53,7 @@ fn join_condition_renders_via_translator() {
     let sides = request_sides(&request, &detected);
     let both_legs = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
     assert_eq!(
-        ScanTranslator::new(&both_legs)
+        scan_over(&both_legs)
             .expression(&equi_condition())
             .map(|fragment| fragment.sql)
             .as_deref(),
@@ -124,6 +124,75 @@ fn join_projection_emits_attribute_each_side_owning_type() {
         types,
         vec![ExasolType::varchar(100), ExasolType::Date],
         "each column's EMITS type comes from the side that owns it"
+    );
+}
+
+/// Tables `A` and `B` joined on `K`, both carrying a column `X` of a different type.
+fn shared_name_join() -> PushdownRequestBuilder {
+    pushdown_request(
+        "A",
+        &[
+            ("K", ExasolType::decimal(18, 0)),
+            ("X", ExasolType::decimal(18, 0)),
+        ],
+    )
+    .table(
+        "B",
+        &[
+            ("K", ExasolType::decimal(18, 0)),
+            ("X", ExasolType::varchar(10)),
+        ],
+    )
+    .field(
+        "from",
+        inner_join(
+            table_ref("A"),
+            table_ref("B"),
+            predicate_equal(table_col("A", "K"), table_col("B", "K")),
+        ),
+    )
+}
+
+#[test]
+fn a_shared_column_name_projects_with_each_leg_relation_and_type() {
+    let selecting = shared_name_join()
+        .column(table_col("B", "X"))
+        .column(table_col("A", "X"))
+        .build()
+        .0;
+    let (items, types, widened) = broadcast_projection(&selecting);
+    assert!(!widened);
+    assert_eq!(
+        items,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+        ]
+    );
+    assert_eq!(
+        types,
+        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
+    );
+
+    let (full_row, full_types, _) = broadcast_projection(&shared_name_join().build().0);
+    assert_eq!(
+        full_row,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "K")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "K")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+        ],
+        "the full row lists each leg's columns in leg order"
+    );
+    assert_eq!(
+        full_types,
+        vec![
+            ExasolType::decimal(18, 0),
+            ExasolType::decimal(18, 0),
+            ExasolType::decimal(18, 0),
+            ExasolType::varchar(10),
+        ]
     );
 }
 
@@ -487,51 +556,53 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
 
 #[test]
 fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
-    let request = serde_json::json!({
-        "involvedTables": [
-            involved_table_json("DATED", &[("SHARED_KEY", ExasolType::Date)]),
-            involved_table_json("NUMBERED", &[("SHARED_KEY", ExasolType::decimal(20, 0))]),
-        ]
-    });
-    let filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
-    let screen = |table: &str| {
-        screen_leg_filter(
-            &filter,
-            &column_types(&involved_table(&request, table).unwrap().types),
-        )
-        .expect("every column of the leg filter binds the leg")
+    let dated_filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
+    let numbered_filter = like(table_col("NUMBERED", "SHARED_KEY"), "1995%");
+    let screen = |filter: &Json, exa_type: ExasolType| {
+        screen_leg_filter(filter, &column_types(&[("SHARED_KEY", exa_type)]))
+            .expect("every column of the leg filter binds the leg")
     };
 
     assert_eq!(
-        screen("DATED"),
-        (None, Some(filter.clone())),
+        screen(&dated_filter, ExasolType::Date),
+        (None, Some(dated_filter.clone())),
         "a DATE's text depends on NLS_DATE_FORMAT, so the DATE side declines"
     );
-    let (numeric_leg, numeric_declined) = screen("NUMBERED");
+    let (numeric_leg, numeric_declined) = screen(&numbered_filter, ExasolType::decimal(20, 0));
     assert!(numeric_leg.is_some_and(|sql| sql.contains("SHARED_KEY")));
     assert_eq!(numeric_declined, None);
 }
 
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
-    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
-        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .build_pushdown();
+    let full = [
+        ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+        ("C_NAME", ExasolType::varchar(100)),
+        ("C_ADDRESS", ExasolType::varchar(100)),
+        ("C_PHONE", ExasolType::varchar(20)),
+    ];
     let condition = predicate_equal(
         table_col("CUSTOMER", "C_CUSTKEY"),
         table_col("ORDERS", "O_CUSTKEY"),
     );
-    let full = vec![
-        ("C_CUSTKEY".to_string(), ExasolType::decimal(20, 0)),
-        ("C_NAME".to_string(), ExasolType::varchar(100)),
-        ("C_ADDRESS".to_string(), ExasolType::varchar(100)),
-        ("C_PHONE".to_string(), ExasolType::varchar(20)),
-    ];
+    let request = pushdown_request("CUSTOMER", &full)
+        .table("ORDERS", &[("O_CUSTKEY", ExasolType::decimal(20, 0))])
+        .field(
+            "from",
+            inner_join(
+                table_ref("CUSTOMER"),
+                table_ref("ORDERS"),
+                condition.clone(),
+            ),
+        )
+        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .build()
+        .0;
     let narrowed = referenced_leg_columns(
-        pushdown_req.json(),
+        &pd(&request),
         &condition,
-        &customer_orders_legs(),
+        &request_legs(&request),
         0,
         &column_types(&full),
     );

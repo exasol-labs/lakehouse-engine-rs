@@ -596,7 +596,7 @@ fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
 
 #[test]
 fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
-    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns()).unwrap();
+    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns());
     assert_eq!(
         typed(&cast_to(ExasolType::char(3), col("S10"))),
         SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))

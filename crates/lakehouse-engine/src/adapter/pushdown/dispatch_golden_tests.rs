@@ -5,7 +5,7 @@
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
     count_star, float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
-    request_typed, round_of, sample_scan_storage, sample_storage, with_identifier_notes,
+    request_typed, round_of, sample_scan_storage, sample_storage, scan_for, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -198,11 +198,10 @@ fn dispatch_sql(
 /// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
-    let (projection, widened) = super::support::project_columns(
-        &pushdown,
-        ScanTranslator::new(&column_types(&base_col_types())),
-    )
-    .expect("the fixture must project");
+    let columns = column_types(&base_col_types());
+    let (projection, widened) =
+        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()))
+            .expect("the fixture must project");
     assert!(
         widened,
         "this fixture must exercise the widening guard, not a per-item projection"
@@ -212,7 +211,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         &pushdown,
         projection,
         widened,
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&columns, pushdown.json()),
         None,
         None,
         None,
@@ -257,7 +256,7 @@ fn dispatch_sql_with_pushdown_req(
             .expect("the fixture declares a valid selectListDataTypes"),
         projected_columns(&proj_cols, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
+        scan_for(&column_types(&col_types), pushdown_req),
         filter,
         None,
         limit,
@@ -290,7 +289,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &parsed_pushdown(request),
         &projected_columns(proj_cols, proj_types),
         false,
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&column_types(&base_col_types()), &pd(request)),
         &EmptyRelation::single_scan(request, &column_types(&base_col_types())),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
@@ -450,7 +449,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
 
     let shape = classify_request_shape(
         &parsed_pushdown(&request),
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&column_types(&base_col_types()), &pd(&request)),
     );
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),

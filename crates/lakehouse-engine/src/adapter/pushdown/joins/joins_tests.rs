@@ -227,14 +227,20 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
     }
 }
 
+/// The legs production binds for `request`: its join's legs, or its one table's.
+pub(super) fn request_legs(request: &Json) -> JoinLegs {
+    match detect_join(request, &pd(request)).expect("a plannable request") {
+        JoinShape::Join(join) => join.legs(),
+        JoinShape::NotAJoin => JoinLegs::for_single_scan(request),
+    }
+}
+
 /// The select list projected as `render_broadcast_join` projects it: every column qualified
 /// through the leg binding and typed by its own leg's universe, widened row included.
 pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
     let join = detected_join(request);
     let legs = join.legs();
-    let qualified = legs
-        .qualify(&pd(request))
-        .expect("every fixture column belongs to one leg");
+    let qualified = legs.qualify(&pd(request));
     let sides = request_sides(request, &join);
     let leg_types = ColumnTypes::per_relation(
         sides
@@ -307,24 +313,6 @@ fn qualify_udf_uses_schema_and_falls_back_when_empty() {
     assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
     assert_eq!(qualify_udf(Some(""), "UDF"), "UDF");
     assert_eq!(qualify_udf(None, "UDF"), "UDF");
-}
-
-#[test]
-fn golden_ineligible_decline_message_unchanged() {
-    let not_inner = user_message(ineligible_join_decline(
-        IneligibleJoinReason::NotInnerJoinType,
-    ));
-    let unsupported = user_message(ineligible_join_decline(
-        IneligibleJoinReason::UnsupportedShape,
-    ));
-    assert_eq!(
-        not_inner,
-        "join pushdown declined: the join is not an inner join; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
-    );
-    assert_eq!(
-        unsupported,
-        "join pushdown declined: the join `from` clause has an unsupported shape; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
-    );
 }
 
 const CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_name", "string")];

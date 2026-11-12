@@ -1,5 +1,5 @@
 //! The one table of translated scalar functions: how the renderer emits each in both dialects, and
-//! how the scan's typed pass types it. A name absent here is declined in both dialects.
+//! how the scan's typed pass types it. The DataFusion dialect declines a name absent here.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExasolForm {
