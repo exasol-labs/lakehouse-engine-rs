@@ -88,12 +88,12 @@ sends the query to the adapter.
 | `ABS` | ✓ |  |
 | `ACOS` | ✓ |  |
 | `ADD` | ✓ |  |
-| `ADD_DAYS` |  | Exasol returns DATE or TIMESTAMP by argument type, which the translator cannot see. |
-| `ADD_HOURS` |  | Exasol infers `TIMESTAMP(0)` for a DATE argument, the scan would return `TIMESTAMP(3)`. |
-| `ADD_MINUTES` |  | Exasol infers `TIMESTAMP(0)` for a DATE argument, the scan would return `TIMESTAMP(3)`. |
+| `ADD_DAYS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
+| `ADD_HOURS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
+| `ADD_MINUTES` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
 | `ADD_MONTHS` |  | Exasol keeps a month-end date at month-end. DataFusion keeps the day of month. |
 | `ADD_SECONDS` |  | Parity with DataFusion for fractional seconds is not established. |
-| `ADD_WEEKS` |  | Exasol returns DATE or TIMESTAMP by argument type, which the translator cannot see. |
+| `ADD_WEEKS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
 | `ADD_YEARS` |  | Exasol keeps a month-end date at month-end. DataFusion keeps the day of month. |
 | `ASCII` | ✓ |  |
 | `ASIN` | ✓ |  |

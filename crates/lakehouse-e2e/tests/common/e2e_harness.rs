@@ -863,8 +863,11 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
     if resp["status"] == "error" {
         let text = error_text(&resp, sql);
         // A CAST Exasol evaluates over the scanned rows fails in a UDF VM, which prefixes the
-        // same error message.
+        // same error message. A scan function that fails in the scan UDF adds its own prefix.
         let text = text.strip_prefix("VM error: ").unwrap_or(&text);
+        let text = text
+            .strip_prefix("F-UDF-CL-RUST-9001: UDF error: ")
+            .unwrap_or(text);
         return Err(text
             .split([';', '('])
             .next()

@@ -447,3 +447,35 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     );
     assert_pushed_to_scan_udf(&mut conn, &distinct_sql, "the nanosecond distinct count");
 }
+
+/// Scenario: A form the scan cannot match runs in Exasol
+#[test]
+fn date_addition_over_a_nanosecond_timestamp_runs_in_exasol() {
+    setup();
+    let mut conn = exa_conn();
+    if !engine_honors_declared_precision(&mut conn) {
+        return;
+    }
+    let qualified = qualified_probe();
+    create_native_copy(&mut conn, &qualified, "TS, TSTZ, TS_NS");
+
+    let failures: Vec<String> = ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"]
+        .into_iter()
+        .filter_map(|function| {
+            native_copy_mismatch(
+                &mut conn,
+                &qualified,
+                NATIVE_COPY,
+                &format!("SELECT ID, {function}(TS_NS, ID) FROM {{T}}"),
+                PathCheck::Lacks("vs_add_"),
+                Expect::Rows,
+            )
+        })
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "a date addition over a TIMESTAMP(9) column must run in Exasol and match native:\n{}",
+        failures.join("\n")
+    );
+}

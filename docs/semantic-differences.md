@@ -117,6 +117,31 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 
 A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
 
+## ADD_DAYS, ADD_WEEKS, ADD_HOURS, and ADD_MINUTES argument forms
+
+The scan computes these functions over a `DATE` or a `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. These argument forms run in Exasol SQL, and their results match native Exasol:
+
+- a `TIMESTAMP(7)` to `TIMESTAMP(9)` argument;
+- a `TIMESTAMP WITH LOCAL TIME ZONE` argument;
+- a text argument or a text count;
+- an argument that is a `CASE` over two date values, or another date function such as `DATE_TRUNC`;
+- a numeric literal count with a magnitude above 1e10;
+- a count that is a `DATE` or a `TIMESTAMP`.
+
+An `ADD_HOURS` or `ADD_MINUTES` call with a numeric literal count beyond 36 digits, such as `ADD_HOURS(d, 1e30)`, differs only when the query returns no rows. Native Exasol fails with `numeric value out of range` before it reads a row. The adapter prunes every file at plan time when the filter rules out all of them, for example `WHERE id < 0` over a table with only positive ids, and then answers with an empty result that leaves out the select item, so the query returns 0 rows. A query that reads at least one row fails as in native Exasol.
+
+## ADD_DAYS, ADD_WEEKS, ADD_HOURS, and ADD_MINUTES before 1582-10-15
+
+The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses the Julian calendar before 1582-10-15. A call returns a different value when the days between its argument and its result include February 29 of a year divisible by 100 but not by 400, which only the Julian calendar has, or cross 1582-10-15. A call whose arguments are all literals runs in Exasol, because Exasol computes it before pushdown.
+
+| Call | Native Exasol (2025.1.16) | Scan |
+|---|---|---|
+| `ADD_DAYS(d, 1)` with `d` = 1000-02-28 | `1000-02-29` | `1000-03-01` |
+| `ADD_DAYS(d, -1)` with `d` = 1500-03-01 | `1500-02-29` | `1500-02-28` |
+| `ADD_HOURS(d, 24)` with `d` = 1500-02-28 | `1500-02-29 00:00:00` | `1500-03-01 00:00:00` |
+| `ADD_DAYS(d, -1)` with `d` = 1582-10-15 | `1582-10-04` | `1582-10-14` |
+| `ADD_DAYS(d, -200000)` with `d` = 2024-01-01 | `1476-05-24` | `1476-06-02` |
+
 ## JSON_VALUE without a DEFAULT ON ERROR
 
 The scan reads a document only until no `JSON_VALUE` path over it can select another item, and it takes only the first member of each name in an object. Native Exasol reads and checks the whole document, and reads repeated members as several items. So a document that is broken after the selected value, or that repeats a member the path selects, can give a value where Exasol takes the `ON ERROR` behavior, or the reverse.

@@ -15,7 +15,7 @@ The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a
 - DataFusion 55.2 rejects `INTERVAL * integer`, has no function that builds an interval from a number, drops the sub-day part of `Date32 + interval`, and returns a nanosecond timestamp from `date_trunc` over a `Date32`.
 - No Iceberg table spec or Delta protocol section governs this change: it computes expressions over values the scan already reads and changes no read path, schema, or type mapping.
 - Architecture: no change. The datafusion-scan component already owns the scan session and the functions it registers.
-- Exasol uses the Julian calendar before 1582-10-15, and Arrow dates use the proleptic Gregorian calendar. On the local Exasol 2026.2.0, `ADD_DAYS(DATE '1000-01-01', 1)` returns 1000-01-03, and `ADD_DAYS(DATE '1582-10-16', -1)` returns 1582-10-16, so an argument after the switch whose result crosses it also differs. The scan computes proleptic Gregorian results, and `docs/semantic-differences.md` documents the difference. Date literals in pushed filters already meet this difference.
+- Exasol uses the Julian calendar before 1582-10-15, and Arrow dates use the proleptic Gregorian calendar. On the local Exasol 2025.1.16, rendered with `TO_CHAR`, `ADD_DAYS(DATE '1500-03-01', -1)` returns 1500-02-29, and `ADD_DAYS(DATE '1582-10-15', -1)` returns 1582-10-04, so an argument after the switch whose result crosses it also differs. The scan computes proleptic Gregorian results, and `docs/semantic-differences.md` documents the difference. Date literals in pushed filters already meet this difference.
 - Open question: whether the scan should reproduce Exasol's dates before 1582-10-15 needs a follow-up issue (#TBD).
 
 ## Features

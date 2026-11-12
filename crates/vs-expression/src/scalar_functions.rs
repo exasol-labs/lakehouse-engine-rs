@@ -37,7 +37,19 @@ pub(crate) enum ResultRule {
     FirstArgument,
     /// Exasol brings every argument to one type, as for CASE branches.
     Unified,
+    /// `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, `ADD_MINUTES`: over a TIMESTAMP the result keeps
+    /// its precision, over a DATE it is as given.
+    DateAddition(DateResult),
     Other,
+}
+
+/// What a date addition returns over a DATE argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DateResult {
+    /// `ADD_DAYS`, `ADD_WEEKS`.
+    Date,
+    /// `ADD_HOURS`, `ADD_MINUTES`: Exasol returns `TIMESTAMP(0)`.
+    Timestamp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -230,6 +242,10 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("HOURS_BETWEEN").typed(T::Never, R::Number),
         F::verbatim("MINUTES_BETWEEN").typed(T::Never, R::Number),
         F::verbatim("SECONDS_BETWEEN").typed(T::Never, R::Number),
+        F::verbatim("ADD_DAYS").typed(T::Never, R::DateAddition(DateResult::Date)),
+        F::verbatim("ADD_WEEKS").typed(T::Never, R::DateAddition(DateResult::Date)),
+        F::verbatim("ADD_HOURS").typed(T::Never, R::DateAddition(DateResult::Timestamp)),
+        F::verbatim("ADD_MINUTES").typed(T::Never, R::DateAddition(DateResult::Timestamp)),
         // Not declared: CURRENT_DATE, SYSDATE, CURRENT_TIMESTAMP, SYSTIMESTAMP. The scan
         // UDF has no session time zone, statement anchor, or connect-back.
     ]

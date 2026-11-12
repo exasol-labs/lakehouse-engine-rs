@@ -14,8 +14,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
-    render_scan_expression, render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, DATE_ADDITION_FUNCTIONS, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS,
+    SqlFragment, render_scan_expression, render_scan_filter, walk_column_nodes,
 };
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
@@ -554,38 +554,39 @@ fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnType
     })
 }
 
-/// `None` leaves the node unchanged.
+/// Rewrites a comparison, `BETWEEN`, or `IN` of a timestamp column or a date addition with a
+/// literal finer than the operand holds in the scan. `None` leaves the node unchanged.
 fn rewrite_timestamp_comparison(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let compare = |op: &str, column: &Json, literal: &Json| {
-        let node = serde_json::json!({"type": op, "left": column, "right": literal});
+    let compare = |op: &str, operand: &Json, literal: &Json| {
+        let node = serde_json::json!({"type": op, "left": operand, "right": literal});
         rewrite_timestamp_comparison(&node, col_types).unwrap_or(node)
     };
     match node.get("type")?.as_str()? {
         "predicate_between" => {
-            let column = node.get("expression")?;
+            let operand = node.get("expression")?;
             let (low, high) = (node.get("left")?, node.get("right")?);
-            timestamp_literal_floor(column, low, col_types)
-                .or_else(|| timestamp_literal_floor(column, high, col_types))?;
+            timestamp_literal_floor(operand, low, col_types)
+                .or_else(|| timestamp_literal_floor(operand, high, col_types))?;
             Some(serde_json::json!({"type": "predicate_and", "expressions": [
-                compare("predicate_greaterequal", column, low),
-                compare("predicate_lessequal", column, high),
+                compare("predicate_greaterequal", operand, low),
+                compare("predicate_lessequal", operand, high),
             ]}))
         }
         "predicate_in_constlist" => {
-            let column = node.get("expression")?;
+            let operand = node.get("expression")?;
             let values = node.get("arguments")?.as_array()?;
             values
                 .iter()
-                .find_map(|value| timestamp_literal_floor(column, value, col_types))?;
+                .find_map(|value| timestamp_literal_floor(operand, value, col_types))?;
             let expressions: Vec<Json> = values
                 .iter()
-                .map(|value| compare("predicate_equal", column, value))
+                .map(|value| compare("predicate_equal", operand, value))
                 .collect();
             Some(serde_json::json!({"type": "predicate_or", "expressions": expressions}))
         }
         op => {
             let (left, right) = (node.get("left")?, node.get("right")?);
-            let (column, floor, mirrored) = match timestamp_literal_floor(left, right, col_types) {
+            let (operand, floor, mirrored) = match timestamp_literal_floor(left, right, col_types) {
                 Some(floor) => (left, floor, false),
                 None => (
                     right,
@@ -600,26 +601,31 @@ fn rewrite_timestamp_comparison(node: &Json, col_types: &ColumnTypes) -> Option<
                 ("predicate_greaterequal", true) => "predicate_lessequal",
                 (op, _) => op,
             };
-            // `col <> col` and `col = col` keep a NULL column NULL, so an enclosing NOT stays exact.
+            // `x <> x` and `x = x` keep a NULL operand NULL, so an enclosing NOT stays exact.
             let (op, right) = match op {
-                "predicate_equal" => ("predicate_notequal", column.clone()),
-                "predicate_notequal" => ("predicate_equal", column.clone()),
+                "predicate_equal" => ("predicate_notequal", operand.clone()),
+                "predicate_notequal" => ("predicate_equal", operand.clone()),
                 "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
                 "predicate_greater" | "predicate_greaterequal" => ("predicate_greater", floor),
                 _ => return None,
             };
-            Some(serde_json::json!({"type": op, "left": column, "right": right}))
+            Some(serde_json::json!({"type": op, "left": operand, "right": right}))
         }
     }
 }
 
-/// `None` when the literal fits the column's declared precision.
-fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let is = |node: &Json, kind: &str| node.get("type").and_then(|t| t.as_str()) == Some(kind);
-    if !is(column, "column") || !is(literal, "literal_timestamp") {
+/// `literal` floored to the fractional digits `operand` holds in the scan: a column's declared
+/// digits, or 6 for a date addition, whose scan result holds whole microseconds. `None` when the
+/// literal fits those digits, or when `operand` is neither.
+fn timestamp_literal_floor(
+    operand: &Json,
+    literal: &Json,
+    col_types: &ColumnTypes,
+) -> Option<Json> {
+    if literal.get("type")?.as_str()? != "literal_timestamp" {
         return None;
     }
-    let digits = usize::from(column_exa_type(column, col_types)?.fractional_digits()?);
+    let digits = scan_fractional_digits(operand, col_types)?;
     let value = literal.get("value")?.as_str()?;
     if timestamp_literal_digits(value) <= digits {
         return None;
@@ -630,6 +636,24 @@ fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnType
         d => format!("{instant}.{}", &fraction[..d]),
     };
     Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
+}
+
+const MICROSECOND_DIGITS: usize = 6;
+
+/// `None` for an operand whose scan value the floor does not cover.
+fn scan_fractional_digits(operand: &Json, col_types: &ColumnTypes) -> Option<usize> {
+    match operand.get("type")?.as_str()? {
+        "column" => Some(usize::from(
+            column_exa_type(operand, col_types)?.fractional_digits()?,
+        )),
+        "function_scalar" => {
+            let name = operand.get("name")?.as_str()?.to_ascii_uppercase();
+            DATE_ADDITION_FUNCTIONS
+                .contains(&name.as_str())
+                .then_some(MICROSECOND_DIGITS)
+        }
+        _ => None,
+    }
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps

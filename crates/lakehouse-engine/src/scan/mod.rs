@@ -33,6 +33,7 @@ mod sql_support;
 pub use sql_support::build_alias_items;
 
 mod checked_div;
+mod datetime_add;
 mod exasol_numeric;
 mod json_value;
 mod raised_failure;
@@ -138,7 +139,8 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     raw_scan::register_nested_json_render_udf(&ctx);
     binary_hex::register_binary_hex_udf(&ctx);
     binary_text::register_binary_text_udf(&ctx);
-    checked_div::register_checked_float_div_udf(&ctx, raised);
+    checked_div::register_checked_float_div_udf(&ctx, raised.clone());
+    datetime_add::register_datetime_add_udfs(&ctx, raised);
     json_value::register_json_value_udfs(&ctx);
     ctx
 }

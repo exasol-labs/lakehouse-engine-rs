@@ -103,8 +103,10 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_TO_TIMESTAMP",
     "FN_YEAR",
     "FN_WEEK",
-    // ADD_HOURS/ADD_MINUTES are not advertised: Exasol infers TIMESTAMP(0) for
-    // ADD_HOURS(DATE, n) but the rendering yields TIMESTAMP(3), which Exasol rejects.
+    "FN_ADD_DAYS",
+    "FN_ADD_HOURS",
+    "FN_ADD_MINUTES",
+    "FN_ADD_WEEKS",
     "FN_DAYS_BETWEEN",
     "FN_HOURS_BETWEEN",
     "FN_MINUTES_BETWEEN",

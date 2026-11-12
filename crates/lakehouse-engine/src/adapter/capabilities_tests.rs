@@ -76,6 +76,8 @@ fn reports_group_by_capabilities() {
 }
 
 /// Scenario: Adapter reports its pushdown capabilities
+/// Scenario: ISO week capability is advertised so WEEK expressions push down
+/// Scenario: Unsupported date functions fall through as unsupported nodes
 #[test]
 fn reports_audited_capability_set() {
     let resp = get_capabilities_response();
@@ -104,6 +106,10 @@ fn reports_audited_capability_set() {
     }
 
     for name in &[
+        "FN_ADD_DAYS",
+        "FN_ADD_HOURS",
+        "FN_ADD_MINUTES",
+        "FN_ADD_WEEKS",
         "FN_DAYS_BETWEEN",
         "FN_HOURS_BETWEEN",
         "FN_MINUTES_BETWEEN",
@@ -124,11 +130,7 @@ fn reports_audited_capability_set() {
         "FN_REGEXP_SUBSTR",
         "FN_REGEXP_INSTR",
         "FN_REGEXP_COUNT",
-        "FN_ADD_HOURS",
-        "FN_ADD_MINUTES",
-        "FN_ADD_DAYS",
         "FN_ADD_SECONDS",
-        "FN_ADD_WEEKS",
         "FN_ADD_MONTHS",
         "FN_ADD_YEARS",
         "FN_MONTHS_BETWEEN",

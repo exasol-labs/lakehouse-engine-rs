@@ -66,6 +66,8 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *THEN* the query SHALL fail with an error whose message starts with `data exception - datetime field overflow` for a result after the range and `data exception - datetime field underflow` for a result before it, as native Exasol's error does
 * *AND* the scan SHALL record the error in the session's failure slot, so the message survives the Parquet row filter
 * *AND* an `ADD_DAYS` or `ADD_WEEKS` count outside -999,999,999 to 999,999,999 SHALL fail the query with an error whose message starts with `data exception - numeric value out of range`, where the scan checks a DOUBLE count before rounding and an exact count after rounding, as native Exasol does
+* *AND* an `ADD_HOURS` or `ADD_MINUTES` count that is not a literal and whose nanoseconds exceed 128 bits (about 4.7e25 hours or 2.8e27 minutes) SHALL fail the query with an error whose message starts with `data exception - numeric value out of range`, as native Exasol's does, and a smaller count whose result lies outside the range SHALL fail as an overflow or underflow
+* *AND* a NULL argument SHALL return NULL whatever the count, as native Exasol does
 * *AND* the scan MUST NOT return a row, a NULL, or a clamped value in place of the failure
 
 ### Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
@@ -80,17 +82,18 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 * *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call that the scan computes, whose argument or result lies before 1582-10-15
 * *WHEN* the scan computes the call
-* *THEN* the scan SHALL add the count in the proleptic Gregorian calendar, which extends the Gregorian calendar to dates before 1582-10-15, so an argument of 1000-01-01 with a count of 1 day returns 1000-01-02
+* *THEN* the scan SHALL add the count in the proleptic Gregorian calendar, which extends the Gregorian calendar to dates before 1582-10-15, so an argument of 1500-03-01 with a count of -1 day returns 1500-02-28
 * *AND* the scan MUST NOT fail the query or return NULL for such a value
-* *AND* `docs/semantic-differences.md` SHALL list this difference from native Exasol, which uses the Julian calendar before 1582-10-15 and returns 1000-01-03 for the same call
+* *AND* `docs/semantic-differences.md` SHALL list this difference from native Exasol, which uses the Julian calendar before 1582-10-15 and returns 1500-02-29 for the same call
 
 ### Scenario: A form the scan cannot match runs in Exasol
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP(7)` to `TIMESTAMP(9)` value, a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a DATE or TIMESTAMP class, such as a CASE over two dates, `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP`, or whose count is text, a DATE, or a TIMESTAMP
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP(7)` to `TIMESTAMP(9)` value, a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a DATE or TIMESTAMP class, such as a CASE over two dates, `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP`, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* `render_scan_expression` SHALL return `Err`, and the expression SHALL take its path's fallback, so Exasol computes the function
 * *AND* the query SHALL return the rows native Exasol returns
 * *AND* a `TIMESTAMP(7)` to `TIMESTAMP(9)` argument SHALL decline, because the scan can neither keep its nanosecond digits in microseconds nor return a nanosecond result after 2262-04-11, which native Exasol returns, and a text argument or count SHALL decline, because Exasol reads text by the session's NLS settings
+* *AND* a numeric literal count with a magnitude above 1e10 SHALL decline, because Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits before it reads a row
 * *AND* `docs/semantic-differences.md` SHALL list the argument forms that run in Exasol
 * *AND* the adapter SHALL still advertise the four capabilities, because the fallback computes each declined form in Exasol SQL
 

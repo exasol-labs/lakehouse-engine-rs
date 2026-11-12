@@ -228,6 +228,21 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
 /// exactly as in a projection.
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
+/// The scalar UDFs the DataFusion dialect renders `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and
+/// `ADD_MINUTES` as, registered by `lakehouse-engine`. Each MUST take a first argument of `Date32`
+/// or `Timestamp(Microsecond, None)`, which the typed pass casts to, and a number as its second.
+pub const ADD_DAYS_FN: &str = "vs_add_days";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_WEEKS_FN: &str = "vs_add_weeks";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_HOURS_FN: &str = "vs_add_hours";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_MINUTES_FN: &str = "vs_add_minutes";
+/// The Exasol functions the DataFusion dialect renders as `vs_add_*`. Each scan result holds
+/// whole microseconds, so the adapter floors a finer timestamp literal compared with one.
+pub const DATE_ADDITION_FUNCTIONS: [&str; 4] =
+    ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"];
+
 fn render_cast(
     args: Option<&Vec<Json>>,
     data_type: Option<&Json>,
@@ -947,9 +962,25 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 }
                 "TO_DATE" => render_to_datetime(FormatTarget::Date, args, dialect),
                 "TO_TIMESTAMP" => render_to_datetime(FormatTarget::Timestamp, args, dialect),
-                // ADD_HOURS/ADD_MINUTES are not translated: Exasol types ADD_HOURS(DATE, n) as
-                // TIMESTAMP(0), and the typed pass does not tell a DATE from a TIMESTAMP.
-                //
+                "ADD_DAYS" | "ADD_WEEKS" | "ADD_HOURS" | "ADD_MINUTES" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let scan_fn = match fn_name.as_str() {
+                        "ADD_DAYS" => ADD_DAYS_FN,
+                        "ADD_WEEKS" => ADD_WEEKS_FN,
+                        "ADD_HOURS" => ADD_HOURS_FN,
+                        _ => ADD_MINUTES_FN,
+                    };
+                    let rendered = render_args(args, dialect)?;
+                    Ok(Some(format!("{scan_fn}({})", rendered.join(", "))))
+                }
                 // DATE - DATE yields an Int64 day count in DataFusion; Exasol uses only
                 // the date part of a timestamp.
                 "DAYS_BETWEEN" => {
