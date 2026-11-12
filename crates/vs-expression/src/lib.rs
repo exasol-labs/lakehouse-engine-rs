@@ -229,10 +229,7 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
 /// The scalar UDF the DataFusion dialect renders `DIV` as, registered by `lakehouse-engine`.
-/// It MUST take two integer arguments (Arrow signed or unsigned integers, `Decimal128(p,0)`, or
-/// Null), truncate toward zero, return `Decimal128(<numerator precision>,0)`, skip NULL rows before
-/// the zero check, and error on a zero divisor, so division by zero fails in a filter exactly as
-/// in a projection.
+/// It raises on a zero divisor, so division by zero fails in a filter exactly as in a projection.
 pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
 
 fn render_cast(

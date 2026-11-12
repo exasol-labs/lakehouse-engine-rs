@@ -15,7 +15,7 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 
 * *GIVEN* the adapter's advertised capability set
 * *WHEN* Exasol requests `getCapabilities`
-* *THEN* the response SHALL advertise the arithmetic binary-operator scalar-function capabilities for `+`, `-`, `*`, and `/` (the Exasol capability names `FN_ADD`, `FN_SUB`, `FN_MULT`, and `FN_FLOAT_DIV`), verified against the Exasol Virtual Schema capability vocabulary
+* *THEN* the response SHALL advertise the arithmetic scalar-function capabilities for `+`, `-`, `*`, `/`, integer division `DIV`, and unary `-` (the Exasol capability names `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, `FN_DIV`, and `FN_NEG`), verified against the Exasol Virtual Schema capability vocabulary
 * *AND* each advertised arithmetic operator SHALL be backed by a `crates/vs-expression` translator arm that renders it (so an advertised operator is never one the translator would decline), keeping the capability set coherent with the translator the same way GROUP BY tuple advertisement is gated on its backing path
 * *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `pushdown-joins/pushdown-planning-join`) SHALL be advertised, advertising arithmetic operators MUST NOT introduce any additional join or cross-join capability
 

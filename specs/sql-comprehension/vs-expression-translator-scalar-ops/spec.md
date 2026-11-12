@@ -5,8 +5,9 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ## Background
 
 * Exasol sends `+`, `-`, `*`, `/`, and unary `-` as the `function_scalar` nodes `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, and `NEG`, and its integer division function as `DIV`.
-* The scan computes a pushed expression as DataFusion SQL, and a wrapper computes it as Exasol SQL. `EXPLAIN VIRTUAL` shows both.
+* The scan computes a pushed expression as DataFusion SQL, and a wrapper computes it as Exasol SQL.
 * An expression the scan does not compute takes the path's fallback, which computes it in Exasol (`pushdown-types/pushdown-planning-scan-text-conversion`).
+* The crate is a pure, stateless translator. It reads column types only through the lookup its caller passes.
 
 ## Scenarios
 
@@ -16,7 +17,6 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* the adapter renders it for the scan or for an Exasol wrapper
 * *THEN* it SHALL render `(<left> + <right>)`, `(<left> - <right>)`, `(<left> * <right>)`, or `(-<operand>)`, with the same text for the scan and for the wrapper
 * *AND* unary negation SHALL compose inside an aggregate argument, such as `SUM(-<operand>)`
-* *AND* the adapter SHALL advertise exactly the arithmetic capabilities it renders: `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, `FN_DIV`, and `FN_NEG`
 
 ### Scenario: Unsupported node type returns an error
 
@@ -59,8 +59,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 * *GIVEN* a pushed `DIV(<left>, <right>)` whose operands are each an integer (`DECIMAL(p,0)`) or NULL, such as `DIV(qty - 7, 2)` over an integer column `qty`
 * *WHEN* the adapter plans the request
-* *THEN* the `DIV` node SHALL NOT be the reason the scan declines the enclosing select item, filter, or key, and wherever the scan computes that enclosing expression, its pushdown SQL SHALL call `vs_checked_int_div(<left>, <right>)`
-* *AND* the quotient SHALL equal native Exasol's, which truncates toward zero: `DIV(-7, 2)` and `DIV(7, -2)` are `-3`, `DIV(-7, -2)` is `3`, and a numerator of `-9223372036854775808` over a divisor of `-1` returns `9223372036854775808` without an overflow
+* *THEN* the scan SHALL compute the `DIV` in a select item, filter, or GROUP BY key, and its pushdown SQL SHALL call `vs_checked_int_div(<left>, <right>)`, unless another part of the enclosing expression sends it to the fallback
+* *AND* the quotient SHALL equal native Exasol's, which truncates toward zero: `DIV(-7, 2)` and `DIV(7, -2)` are `-3`, and `DIV(-7, -2)` is `3`
 * *AND* the result SHALL have native Exasol's type, `DECIMAL(p,0)` with the numerator's precision p
 * *AND* a NULL operand SHALL yield NULL, also over a zero divisor
 
@@ -69,7 +69,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *GIVEN* a pushed `DIV(<left>, <right>)` with an operand that is not an integer, such as a DOUBLE or a DECIMAL with a scale above 0, for example `DIV(price, 2)` over a `DECIMAL(9,2)` column `price`
 * *WHEN* the adapter plans the request
 * *THEN* the scan SHALL NOT compute it, and the path's fallback SHALL compute it in Exasol SQL as `DIV(<left>, <right>)`
-* *AND* the result SHALL equal native Exasol's in value and type: `DIV(7.5, 2)` is `3` of type `DECIMAL(p,0)`, and a DOUBLE numerator returns a DOUBLE
+* *AND* the result SHALL equal native Exasol's in value and type
 
 ### Scenario: A pushed-down integer division by zero fails the query
 

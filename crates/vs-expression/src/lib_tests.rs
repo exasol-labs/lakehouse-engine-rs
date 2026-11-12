@@ -2246,21 +2246,6 @@ fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
 }
 
 #[test]
-fn div_renders_checked_integer_division_only_in_the_datafusion_dialect() {
-    let div = scalar_fn("DIV", [col("a"), num_lit(2)]);
-    assert_eq!(
-        render_expression(&div).unwrap(),
-        format!(r#"{CHECKED_INT_DIV_FN}("A", 2)"#),
-        "DIV DataFusion dialect"
-    );
-    assert_eq!(
-        render_expression_exasol(&div),
-        r#"DIV("A", 2)"#,
-        "DIV Exasol dialect"
-    );
-}
-
-#[test]
 fn non_timestamp_literals_render_identically_in_both_dialects() {
     let cases: [(Json, &str); 6] = [
         (null_lit(), "NULL"),

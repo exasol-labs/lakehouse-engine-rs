@@ -1,5 +1,6 @@
 //! Exasol's numeric typing ahead of DataFusion's `TypeCoercion` (#475): DOUBLE wins over DECIMAL,
-//! and exact `+`, `-`, `*` and `SUM` overflow at Exasol's 128 bits instead of wrapping.
+//! and exact `+`, `-`, `*` and `SUM` overflow at Exasol's 128 bits instead of wrapping. `DIV`
+//! divides integers here too, because DataFusion's `/` returns a scaled quotient over `Decimal128`.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -28,6 +29,7 @@ use datafusion::logical_expr::{
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::optimizer::AnalyzerRule;
+use vs_expression::CHECKED_INT_DIV_FN;
 
 const EXASOL_MAX_SCALE: i8 = 36;
 const EXASOL_MAX_PRECISION: u8 = 36;
@@ -45,6 +47,7 @@ pub(crate) struct ExasolNumericTyping {
     add: Arc<ScalarUDF>,
     sub: Arc<ScalarUDF>,
     mul: Arc<ScalarUDF>,
+    div: Arc<ScalarUDF>,
 }
 
 impl ExasolNumericTyping {
@@ -61,11 +64,12 @@ impl ExasolNumericTyping {
             add: udf(ExactOp::Add),
             sub: udf(ExactOp::Sub),
             mul: udf(ExactOp::Mul),
+            div: udf(ExactOp::Div),
         }
     }
 
     pub(crate) fn register_functions(&self, ctx: &SessionContext) {
-        for udf in [&self.widen, &self.add, &self.sub, &self.mul] {
+        for udf in [&self.widen, &self.add, &self.sub, &self.mul, &self.div] {
             ctx.register_udf(udf.as_ref().clone());
         }
     }
@@ -341,9 +345,11 @@ fn integer_precision(t: &DataType) -> Option<u8> {
     })
 }
 
-pub(super) fn exact_ps(t: &DataType) -> Result<(u8, i8)> {
+fn exact_ps(t: &DataType) -> Result<(u8, i8)> {
     match t {
         DataType::Decimal128(p, s) => Ok((*p, *s)),
+        // Only a pushed `DIV` takes a NULL literal operand; Exasol types it as one digit.
+        DataType::Null => Ok((1, 0)),
         _ => match integer_precision(t) {
             Some(p) => Ok((p, 0)),
             None => plan_err!("exact arithmetic over {t}"),
@@ -357,6 +363,8 @@ enum ExactOp {
     Add,
     Sub,
     Mul,
+    /// Exasol's `DIV` over integers, which truncates toward zero.
+    Div,
 }
 
 impl ExactOp {
@@ -366,6 +374,7 @@ impl ExactOp {
             Self::Add => "exa_add",
             Self::Sub => "exa_sub",
             Self::Mul => "exa_mul",
+            Self::Div => CHECKED_INT_DIV_FN,
         }
     }
 
@@ -376,7 +385,7 @@ impl ExactOp {
     /// Exasol's result type, before the 38-digit cap.
     fn result_type(self, (pa, sa): (u8, i8), (pb, sb): (u8, i8)) -> (u16, i8) {
         match self {
-            Self::Widen => (pa.into(), sa),
+            Self::Widen | Self::Div => (pa.into(), sa),
             Self::Mul => (u16::from(pa) + u16::from(pb), sa + sb),
             Self::Add | Self::Sub => {
                 let s = sa.max(sb);
@@ -392,15 +401,23 @@ impl ExactOp {
             Self::Add => x.wrapping_mul(fx).wrapping_add(y.wrapping_mul(fy)),
             Self::Sub => x.wrapping_mul(fx).wrapping_sub(y.wrapping_mul(fy)),
             Self::Mul | Self::Widen => x.wrapping_mul(y),
+            Self::Div => unreachable!("{} always divides checked", self.name()),
         }
     }
 
+    /// `None` is an overflow; a `Div` caller rules out a zero divisor first.
     fn apply_checked(self, x: i128, y: i128, fx: i128, fy: i128) -> Option<i128> {
         match self {
             Self::Add => x.checked_mul(fx)?.checked_add(y.checked_mul(fy)?),
             Self::Sub => x.checked_mul(fx)?.checked_sub(y.checked_mul(fy)?),
             Self::Mul | Self::Widen => x.checked_mul(y),
+            Self::Div => x.checked_div(y),
         }
+    }
+
+    /// A quotient fits its type, but only the checked path raises on a zero divisor.
+    fn wraps_safely(self, a: (u8, i8), b: (u8, i8)) -> bool {
+        self != Self::Div && self.result_type(a, b).0 <= u16::from(DECIMAL128_MAX_PRECISION)
     }
 }
 
@@ -442,7 +459,7 @@ impl ExactArithmeticUdf {
         let op = self.op;
         let rows = args.number_rows;
         let (left, right) = (Operand::of(left, rows)?, Operand::of(right, rows)?);
-        if op.result_type(a, b).0 <= u16::from(DECIMAL128_MAX_PRECISION) {
+        if op.wraps_safely(a, b) {
             let f = move |x: i128, y: i128| op.apply_wrapping(x, y, fa, fb);
             return Ok(match (left, right) {
                 (Operand::Int64(x), Operand::Int64(y)) => {
@@ -455,7 +472,11 @@ impl ExactArithmeticUdf {
                 (left, right) => binary(&left.into_wide(rows), &right.into_wide(rows), f)?,
             });
         }
+        // `try_binary` skips NULL slots, so a NULL over a zero divisor yields NULL.
         try_binary(&left.into_wide(rows), &right.into_wide(rows), |x, y| {
+            if op == ExactOp::Div && y == 0 {
+                return Err(ArrowError::DivideByZero);
+            }
             op.apply_checked(x, y, fa, fb).ok_or_else(|| {
                 ArrowError::ArithmeticOverflow(format!(
                     "{} exceeds the 128-bit internal number representation",
@@ -463,13 +484,16 @@ impl ExactArithmeticUdf {
                 ))
             })
         })
-        .map_err(|e| match e {
-            ArrowError::ArithmeticOverflow(detail) => {
-                let overflow = numeric_overflow(detail);
-                self.raised.record(overflow.clone());
-                DataFusionError::Execution(overflow)
-            }
-            other => other.into(),
+        .map_err(|e| {
+            let failure = match e {
+                ArrowError::ArithmeticOverflow(detail) => numeric_overflow(detail),
+                ArrowError::DivideByZero => {
+                    format!("data exception - division by zero in {}", op.name())
+                }
+                other => return other.into(),
+            };
+            self.raised.record(failure.clone());
+            DataFusionError::Execution(failure)
         })
     }
 }
@@ -484,6 +508,12 @@ impl ScalarUDFImpl for ExactArithmeticUdf {
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        // The typed scan pass declines any other operand, so one reaching here is a planner bug.
+        if self.op == ExactOp::Div
+            && let Some(t) = args.iter().find(|t| !matches!(exact_ps(t), Ok((_, 0))))
+        {
+            return plan_err!("{} divides integers only, got {t}", self.op.name());
+        }
         let a = exact_ps(&args[0])?;
         let b = match args.get(1) {
             Some(t) => exact_ps(t)?,
@@ -543,7 +573,7 @@ impl Operand {
     }
 }
 
-pub(super) fn as_i128(value: &ColumnarValue, rows: usize) -> Result<Decimal128Array> {
+fn as_i128(value: &ColumnarValue, rows: usize) -> Result<Decimal128Array> {
     let array: ArrayRef = value.to_array(rows)?;
     Ok(match array.data_type() {
         DataType::Decimal128(..) => array.as_primitive::<Decimal128Type>().clone(),
