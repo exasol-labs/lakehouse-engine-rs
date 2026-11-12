@@ -140,10 +140,29 @@ pub const CAPABILITIES: &[&str] = &[
     "JOIN_CONDITION_EQUI",
 ];
 
-pub fn get_capabilities_response() -> Json {
+/// The entries of an `EXCLUDED_CAPABILITIES` value: split on `,`, trimmed, empty ones skipped.
+/// An entry matches a capability exactly and case-sensitively.
+pub fn excluded_capability_entries(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+}
+
+/// The advertised capabilities in order, less those `excluded` lists. An entry the adapter does
+/// not advertise is ignored, so a persisted value never fails a request.
+pub fn get_capabilities_response(excluded: Option<&str>) -> Json {
+    let withheld: Vec<&str> = excluded
+        .into_iter()
+        .flat_map(excluded_capability_entries)
+        .collect();
+    let capabilities: Vec<&str> = CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| !withheld.contains(capability))
+        .collect();
     json!({
         "type": "getCapabilities",
-        "capabilities": CAPABILITIES,
+        "capabilities": capabilities,
     })
 }
 

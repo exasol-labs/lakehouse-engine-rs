@@ -133,3 +133,13 @@ A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document, anyw
 ## JSON_VALUE on deeply nested documents
 
 The scan reads a document nested at most about 200 levels deep, with or without a `DEFAULT ... ON ERROR`. A deeper document takes the `ON ERROR` behavior, while native Exasol reads it.
+
+## ORDER BY with LIMIT under `EXCLUDED_CAPABILITIES`
+
+When `EXCLUDED_CAPABILITIES` lists `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised, `ORDER BY ... LIMIT n OFFSET m` returns the first n rows and ignores the offset. `ORDER BY id LIMIT 5 OFFSET 3` over the ids 1 to 20 returns 1 to 5 instead of 4 to 8 (observed on Exasol 2026.2.0-nano.3). Advertising all three capabilities, or none, returns 4 to 8. Exasol documents ORDER BY as a known limit of virtual schemas, see the [virtual schema limitations](https://docs.exasol.com/db/latest/database_concepts/virtual_schema/user_guide.htm#Virtualschemalimitations).
+
+**Workaround:** exclude `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION` together with `LIMIT` or `LIMIT_WITH_OFFSET`, so Exasol sorts and limits the rows itself:
+
+```sql
+ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'LIMIT, LIMIT_WITH_OFFSET, ORDER_BY_COLUMN, ORDER_BY_EXPRESSION';
+```

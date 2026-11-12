@@ -1,8 +1,8 @@
 use crate::common::e2e_harness::{
-    SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts, create_schema_and_scripts,
-    create_virtual_schema, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_n_scan_wrapper, has_two_scan_wrapper, install_slc, runtime,
-    upload_so,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts,
+    create_schema_and_scripts, create_schema_and_scripts_in, create_virtual_schema,
+    create_virtual_schema_with_password, exa_conn, explain_virtual_sql, has_broadcast_join_block,
+    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, runtime, upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
@@ -90,6 +90,34 @@ pub fn lakehouse_vs() {
     });
 }
 
+/// The adapter schema of a virtual schema whose properties [`persist_properties`] sets.
+pub const STUB_ADAPTER_SCHEMA: &str = "PV_STUB_ADAPTER";
+
+/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did.
+const PERSISTING_ADAPTER_BODY: &str = r#"import json
+
+
+def adapter_call(request_json):
+    kind = json.loads(request_json)["type"]
+    if kind == "getCapabilities":
+        return json.dumps({"type": kind, "capabilities": []})
+    if kind == "setProperties":
+        return json.dumps({"type": kind})
+    raise Exception("the stub adapter answers only setProperties, got " + kind)
+"#;
+
+/// Swaps the stub in, runs `ALTER VIRTUAL SCHEMA <vs> SET <set_clause>`, and puts the engine
+/// adapter back, so the properties persist without the engine's property check. `vs` must be
+/// created `USING` [`STUB_ADAPTER_SCHEMA`], whose scripts must already exist.
+pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT \
+         {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
+    ));
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} SET {set_clause}"));
+    create_schema_and_scripts_in(conn, STUB_ADAPTER_SCHEMA);
+}
+
 pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
 }
@@ -126,6 +154,22 @@ pub fn vs_lineitem_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_LINEITEM_TABLE)
 }
 
+/// Holds native copies of the fact and dimension tables under their virtual names, so a join
+/// query that names its schema `{T}` runs over either.
+pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
+
+/// Copies the fact and dimension tables of `source_vs` into [`JOIN_ORACLE`].
+pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
+    for table in [E2E_FACT_TABLE, E2E_DIM_TABLE] {
+        conn.execute(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
+            vs_table(JOIN_ORACLE, table),
+            vs_table(source_vs, table)
+        ));
+    }
+}
+
 /// `PUSHDOWN_SQL` only: the echoed request JSON repeats the user's select list
 /// and would satisfy a naive substring probe.
 pub fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
@@ -137,6 +181,29 @@ pub fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> Stri
         .filter_map(|v| v.as_str())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The messages each pushdown of `query` echoes in the `PUSHDOWN_JSON` of `EXPLAIN VIRTUAL`.
+pub fn explain_virtual_messages(conn: &mut ExaConn, query: &str) -> Vec<Vec<serde_json::Value>> {
+    const PUSHDOWN_JSON_COLUMN: usize = 2;
+    let columns = conn.query_columns(&format!("EXPLAIN VIRTUAL {query}"));
+    columns[PUSHDOWN_JSON_COLUMN]
+        .iter()
+        .map(|cell| {
+            cell.as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or_else(|| panic!("PUSHDOWN_JSON of {query} must be a JSON array: {cell}"))
+        })
+        .collect()
+}
+
+/// The `pushdownRequest` of each pushdown that `EXPLAIN VIRTUAL` echoes for `query`.
+pub fn echoed_pushdown_requests(conn: &mut ExaConn, query: &str) -> Vec<serde_json::Value> {
+    explain_virtual_messages(conn, query)
+        .iter()
+        .filter_map(|messages| messages.iter().find_map(|m| m.get("pushdownRequest")))
+        .cloned()
+        .collect()
 }
 
 pub fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {

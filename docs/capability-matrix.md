@@ -15,6 +15,8 @@ SQL, and an aggregate runs as DataFusion partials that Exasol SQL merges. A ✓ 
 that the adapter receives the capability, not that DataFusion runs it.
 [Capabilities](capabilities.md) explains how each pushed-down capability is executed.
 
+A ✓ is the default. The virtual schema property `EXCLUDED_CAPABILITIES` withdraws a listed capability per schema, and Exasol then evaluates that capability itself. See [Excluding a capability](capabilities.md#excluding-a-capability).
+
 The capability names come from the Exasol
 [capabilities list](https://github.com/exasol/virtual-schema-common-java/blob/main/doc/development/api/capabilities_list.md).
 The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capabilities.rs`.
