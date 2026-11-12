@@ -7,16 +7,17 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * The date functions are arms of the same recursive walker behind the public entry points of `crates/vs-expression`: `render_scan_expression` and `render_scan_filter` for DataFusion, and `render_expression_exasol`, `render_expression_exasol_safe` and `render_df_filter_exasol_safe` for Exasol.
 * The Exasol dialect renders wrapper SQL text that Exasol's own engine parses. It renders the original name, argument order and argument count of every date or time function, because Exasol's compiler emitted them. Each such name is declared `VerbatimCall` in the crate's declaration of translated names (see `sql-comprehension/vs-expression-translator`), and the declaration's own branch renders it ahead of every per-name arm. `EXTRACT` is the exception: it is the node type `function_scalar_extract` and branches on dialect inside its own arm. Only the DataFusion dialect uses the `date_part` and epoch-arithmetic translations. `DATE_PART` is not an Exasol function (`function or script DATE_PART not found`, SQL code 42000), so a `date_part` rendering in Exasol-dialect wrapper SQL fails to compile.
 * The now-family `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP` and `SYSTIMESTAMP` is translated in neither dialect, and `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE` and `FN_SYSTIMESTAMP` are not advertised: see `pushdown-capabilities/pushdown-planning-capability-extensions`. Exasol reads the instant in the session time zone (`CURRENT_TIMESTAMP`) or the database time zone (`SYSTIMESTAMP`), and `CURRENT_DATE` and `SYSDATE` are `TO_DATE` of each. The scan UDF receives neither zone and has no statement anchor, so it can only read its container clock in UTC, once per shard. Exasol's now-family is statement-constant. Exasol never delegates an unadvertised capability, so withdrawal hands the four names back to the engine that owns the clock.
-* Exasol sends EXTRACT as node type `function_scalar_extract` with the field in a `toExtract` property. The DataFusion dialect renders `date_part('<FIELD>', expr)`, because the DataFusion dependency's default feature set has no EXTRACT planner. The Exasol dialect renders `EXTRACT(<FIELD> FROM expr)`.
+* Exasol sends EXTRACT as node type `function_scalar_extract` with the field in a `toExtract` property. For every field except `SECOND`, the DataFusion dialect renders `date_part('<FIELD>', expr)`, because the DataFusion dependency's default feature set has no EXTRACT planner. The Exasol dialect renders `EXTRACT(<FIELD> FROM expr)`.
 * The DataFusion dialect translates only functions whose DataFusion semantics match Exasol's. A node it refuses returns an error in raising mode and `None` in the safe variants. An omitted node is post-processed by Exasol only while its capability is unadvertised. For an advertised capability the caller applies the node itself: see `pushdown-capabilities/pushdown-planning-capability-extensions` and `pushdown/pushdown-declined-filter-self-apply`.
-* A refused arity is the same case as a refused name. The Exasol dialect renders a declared verbatim-call name at any arity, while the DataFusion dialect checks arity in each name's arm. A call with an arity no DataFusion arm accepts declines in the DataFusion dialect and renders in the Exasol dialect, and the caller self-applies it.
+* A refused arity is the same case as a refused name. The Exasol dialect renders a declared verbatim-call name at any arity, while the DataFusion dialect checks arity in each name's arm. `SECOND` is the exception: the typed scan pass computes only its one-argument call, and its DataFusion arm declines every call. A call with an arity the DataFusion dialect does not compute declines in the DataFusion dialect and renders in the Exasol dialect, and the caller self-applies it.
 * `WEEK` is translated because Exasol `WEEK` and DataFusion `date_part('week', …)` are both ISO-8601. The Exasol dialect renders `WEEK(…)` and inherits Exasol's week numbering.
+* Exasol reads the fields of a `TIMESTAMP WITH LOCAL TIME ZONE` value in the session time zone, which the scan UDF does not receive.
 
 ## Scenarios
 
 ### Scenario: A refused argument count declines for DataFusion and renders for Exasol
 
-* *GIVEN* a `function_scalar` node whose name is a declared verbatim-call date/time function and whose argument count exceeds what the DataFusion dialect's per-name arm accepts, for example `SECOND(<datetime>, <precision>)`, whose Exasol signature takes an optional precision and whose DataFusion arm accepts exactly one argument
+* *GIVEN* a `function_scalar` node whose name is a declared verbatim-call date/time function and whose argument count exceeds what the DataFusion dialect computes, for example `SECOND(<datetime>, <precision>)`, whose Exasol signature takes an optional precision and whose typed scan pass computes only the one-argument call
 * *WHEN* the node is rendered in each dialect
 * *THEN* the DataFusion dialect SHALL return an error in raising mode and `None` in the safe variants, because no DataFusion arm expresses that call
 * *AND* the Exasol dialect SHALL render the call verbatim, the name, argument order, and argument count Exasol sent, because Exasol's own compiler emitted it
@@ -24,22 +25,22 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: EXTRACT translates to the DataFusion date_part call
 
-* *GIVEN* a VS expression node of type `function_scalar_extract` carrying a `toExtract` field with a datetime field name (e.g. `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`) and an `arguments` array with a single source datetime expression
+* *GIVEN* a VS expression node of type `function_scalar_extract` carrying a `toExtract` field of `YEAR`, `MONTH`, `DAY`, `HOUR`, or `MINUTE` and an `arguments` array with a single source datetime expression
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `date_part('<FIELD>', <source_sql>)` with the field name single-quoted and the source rendered recursively
 * *AND* the rendered field name MUST be one DataFusion's `date_part` function recognises
 
 ### Scenario: EXTRACT renders Exasol's EXTRACT FROM form in the Exasol dialect
 
-* *GIVEN* the same `function_scalar_extract` node as the preceding scenario
+* *GIVEN* a `function_scalar_extract` node whose `toExtract` field is a datetime field name, `SECOND` included
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `EXTRACT(<FIELD> FROM <source_sql>)` with the field name rendered as a bare keyword, NOT single-quoted, and the source rendered recursively in the Exasol dialect
 * *AND* the rendered fragment MUST NOT contain `date_part`, because Exasol has no `DATE_PART` function and the fragment is parsed by Exasol's own core engine (`function or script DATE_PART not found`, SQL code 42000)
-* *AND* the DataFusion-dialect rendering of the same node MUST remain byte-identical to the preceding scenario
+* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or `The untyped DataFusion walker declines SECOND` in `sql-functions/vs-expression-translator-second` for a `SECOND` field
 
 ### Scenario: Field-shortcut date functions translate to date_part of the matching field
 
-* *GIVEN* a VS expression node of type `function_scalar` named `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, or `SECOND` with a single datetime argument
+* *GIVEN* a VS expression node of type `function_scalar` named `YEAR`, `MONTH`, `DAY`, `HOUR`, or `MINUTE` with a single datetime argument
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `date_part('<FIELD>', <arg_sql>)` where `<FIELD>` is the function's own name, single-quoted
 * *AND* the argument SHALL be rendered recursively
@@ -50,7 +51,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<arg_sql>)` using the function's own uppercased Exasol name, with the argument rendered recursively in the Exasol dialect
 * *AND* the rendered fragment MUST NOT contain `date_part`
-* *AND* the DataFusion-dialect rendering of the same node MUST remain byte-identical to the preceding scenario
+* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or `The untyped DataFusion walker declines SECOND` in `sql-functions/vs-expression-translator-second` for `SECOND`
 
 ### Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
 
