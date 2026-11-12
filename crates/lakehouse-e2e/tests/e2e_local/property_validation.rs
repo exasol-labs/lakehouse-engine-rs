@@ -5,7 +5,7 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
-use crate::fixtures::{lakehouse_vs, vs_table};
+use crate::fixtures::{STUB_ADAPTER_SCHEMA, lakehouse_vs, persist_properties, vs_table};
 
 use std::collections::BTreeMap;
 
@@ -220,6 +220,7 @@ fn create_accepts_every_known_property_name() {
             ("USER_MAPPING", "{{ user }}"),
             ("TABLE_INCLUDE", "*"),
             ("TABLE_EXCLUDE", "NO_SUCH_TABLE"),
+            ("EXCLUDED_CAPABILITIES", "FN_PRED_LIKE, LIMIT_WITH_OFFSET"),
         ],
     );
 
@@ -599,34 +600,63 @@ fn set_properties_rejects_problems_and_keeps_the_schema() {
     drop_vs(&mut conn, VS);
 }
 
-const STUB_ADAPTER_SCHEMA: &str = "PV_STUB_ADAPTER";
+/// Scenario: Create, refresh, and set reject an entry the adapter does not advertise
+/// Scenario: One error reports every unknown name and every invalid value
+#[test]
+fn create_and_set_reject_an_unadvertised_capability() {
+    const VS: &str = "PV_EXCLUDED_CAPS";
+    const EXCLUDED: &str = "FN_PRED_LIK, fn_pred_like, MADE_UP, FN_PRED_LIK";
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let expected = format!(
+        "{PREFIX} unknown property 'MADE_UP_PROPERTY'; \
+         invalid value 'abc' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295; \
+         invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'fn_pred_like' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?); \
+         invalid value 'MADE_UP' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name; \
+         invalid value '0' for 'PARALLELISM_FACTOR': expected a whole number from 1 to 255"
+    );
+    let mut props = base_props();
+    props.extend([
+        ("EXCLUDED_CAPABILITIES", EXCLUDED),
+        ("MADE_UP_PROPERTY", "x"),
+        ("DATAFUSION_BATCH_SIZE", "abc"),
+        ("PARALLELISM_FACTOR", "0"),
+    ]);
+    let msg = create_error(&mut conn, VS, &props);
+    assert!(msg.contains(&expected), "CREATE: {msg}");
+
+    create_ok(
+        &mut conn,
+        VS,
+        &[("EXCLUDED_CAPABILITIES", "LIMIT_WITH_OFFSET")],
+    );
+    let properties = persisted_properties(&mut conn, VS);
+    let sql = format!(
+        "ALTER VIRTUAL SCHEMA {VS} SET EXCLUDED_CAPABILITIES = '{EXCLUDED}' \
+         MADE_UP_PROPERTY = 'x' DATAFUSION_BATCH_SIZE = 'abc' PARALLELISM_FACTOR = '0'"
+    );
+    let msg = query_error(&mut conn, &sql);
+    assert!(msg.contains(&expected), "SET: {msg}");
+    assert_eq!(
+        persisted_properties(&mut conn, VS),
+        properties,
+        "a failed SET must keep the schema's properties"
+    );
+    drop_vs(&mut conn, VS);
+}
+
 const STRAY_VS: &str = "PV_STRAY";
 const STRAY_NAME: &str = "PV_STRAY_NAME";
 
-/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did.
-const PERSISTING_ADAPTER_BODY: &str = r#"import json
-
-
-def adapter_call(request_json):
-    kind = json.loads(request_json)["type"]
-    if kind == "getCapabilities":
-        return json.dumps({"type": kind, "capabilities": []})
-    if kind == "setProperties":
-        return json.dumps({"type": kind})
-    raise Exception("the stub adapter answers only setProperties, got " + kind)
-"#;
-
-/// Swaps the stub in, sets the stray properties, and puts the engine adapter back.
+/// Persists properties that the engine's own check would refuse.
 fn persist_stray_properties(conn: &mut ExaConn) {
-    conn.execute(&format!(
-        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT \
-         {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
-    ));
-    conn.execute(&format!(
-        "ALTER VIRTUAL SCHEMA {STRAY_VS} SET {STRAY_NAME} = 'x' MEMORY_POOL_FRACTION = '60' \
-         METADATA_READ_CONCURRENCY = '0'"
-    ));
-    create_schema_and_scripts_in(conn, STUB_ADAPTER_SCHEMA);
+    persist_properties(
+        conn,
+        STRAY_VS,
+        &format!("{STRAY_NAME} = 'x' MEMORY_POOL_FRACTION = '60' METADATA_READ_CONCURRENCY = '0'"),
+    );
 }
 
 /// Scenario: A schema persisted with an invalid property refuses refresh until the property is unset

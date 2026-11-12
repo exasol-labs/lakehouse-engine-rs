@@ -5,11 +5,10 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 ## Background
 
 * Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
-* Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers three outcomes: no filter, a filter that renders trivially true, and a declined filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
+* Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers two outcomes: no filter and a declined filter. Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
 * A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
-* `render_scan_filter` returns `Err` only for a declined filter and `Ok(None)` for a trivially-true one. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
 * Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
-* A predicate unrenderable under both the DataFusion and the Exasol dialect is applied nowhere. The adapter returns a clean error, the same refusal as `pushdown/pushdown-planning-selectlist-expressions`. A self-applied predicate whose Exasol render is trivially true emits no clause and is not an error, so the adapter decides the error from a non-suppressing render.
+* The adapter self-applies a declined predicate through the Exasol-dialect render. That render renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so every declined predicate is applied.
 * `handle_pushdown` computes the decline classification once per path and passes it down.
 * The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
 * On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row.
@@ -45,14 +44,6 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* no golden-SQL fixture covering a rendering filter SHALL change
 * *AND* the decline path's wrapper SHALL therefore add no cost to any request the adapter can push
 
-### Scenario: A trivially-true filter is still omitted with no wrapper
-
-* *GIVEN* a single-table `pushdown` request whose filter renders to exactly `TRUE` or `NULL`
-* *WHEN* the adapter builds the pushdown SQL
-* *THEN* the adapter SHALL omit the filter from the scan spec and SHALL NOT route the request to the wrapper, because a no-op predicate restricts nothing and omitting it cannot change a result
-* *AND* the emitted SQL SHALL be byte-identical to its pre-change output
-* *AND* the trivially-true rule SHALL stay owned by `crates/vs-expression`, so no adapter site SHALL test a rendered fragment against the literal strings `TRUE` or `NULL`
-
 ### Scenario: A declined filter does not widen the wrapper's projection
 
 * *GIVEN* a single-table `pushdown` request whose filter declines
@@ -84,15 +75,6 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* the side-local predicate each side forwards to Iceberg manifest pruning SHALL still carry the declined conjunct in RAW form, because the screen governs only what a leg renders and pruning only ever removes files that provably cannot match
 * *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, so Exasol applies its own conversions with the session's settings
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join
-
-### Scenario: A predicate unrenderable under both dialects returns a clean error
-
-* *GIVEN* a `pushdown` request whose filter carries a node that neither the DataFusion dialect nor the Exasol dialect renders, such as a node type the translator does not know
-* *WHEN* the adapter attempts to self-apply the predicate in its outer `WHERE`
-* *THEN* the adapter SHALL return a client-facing error naming the unrenderable predicate, at both the single-table wrapper and the N-scan wrapper
-* *AND* the adapter MUST NOT return SQL that omits the predicate, so the query SHALL fail rather than return rows the predicate would have excluded
-* *AND* the error SHALL redact exactly what the wrapper's other refusals redact
-* *AND* Exasol SHALL NOT re-plan on that error, so the failure is final and visible to the client
 
 ### Scenario: An absent filter is distinguished from a declined filter at every site
 

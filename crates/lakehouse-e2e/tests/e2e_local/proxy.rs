@@ -11,7 +11,8 @@ use crate::common::pos_delete_fixtures::{
 };
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
 use crate::common::stack::{
-    CLOSED_PROXY_URL_INTERNAL, ICEBERG_REST_VIA_PROXY, local_stack_connection_password,
+    ICEBERG_REST_VIA_PROXY, closed_proxy_url_internal, local_stack_connection_password,
+    proxy_host_internal,
 };
 use crate::fixtures::{
     PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, count, proxy_virtual_schemas, setup_proxy,
@@ -59,8 +60,9 @@ fn every_request_of_the_adapter_and_the_scan_goes_through_the_proxy() {
 /// Scenario: NO_PROXY hosts bypass the proxy
 #[test]
 fn no_proxy_hosts_bypass_an_unreachable_proxy() {
+    let closed_proxy = closed_proxy_url_internal();
     let env = [
-        ("HTTP_PROXY", CLOSED_PROXY_URL_INTERNAL),
+        ("HTTP_PROXY", closed_proxy.as_str()),
         ("NO_PROXY", "seaweedfs,iceberg-rest"),
     ];
     setup_proxy(LHVS_PROXY_ENV, &env, &env);
@@ -84,7 +86,8 @@ fn no_proxy_hosts_bypass_an_unreachable_proxy() {
 /// Scenario: An unreachable proxy fails CREATE without leaking its credentials
 #[test]
 fn an_unreachable_proxy_fails_create_naming_the_proxy_without_its_password() {
-    let proxy = format!("http://proxyuser:{PROXY_PASSWORD}@10.84.0.12:1");
+    let closed = format!("{}:1", proxy_host_internal());
+    let proxy = format!("http://proxyuser:{PROXY_PASSWORD}@{closed}");
     setup_proxy(LHVS_PROXY_ENV, &[("HTTP_PROXY", &proxy)], &[]);
     let resp = try_create_virtual_schema_with_password(
         &mut exa_conn(),
@@ -95,7 +98,7 @@ fn an_unreachable_proxy_fails_create_naming_the_proxy_without_its_password() {
         &local_stack_connection_password().via_proxy(),
     );
     let msg = error_text(&resp, "CREATE through an unreachable proxy");
-    assert!(msg.contains("10.84.0.12:1"), "{msg}");
+    assert!(msg.contains(&closed), "{msg}");
     assert!(
         !msg.contains(PROXY_PASSWORD),
         "proxy password leaked: {msg}"

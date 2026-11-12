@@ -2128,6 +2128,70 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
     .expect("high_card_probe RecordBatch construction is infallible")
 }
 
+/// `JSON_VALUE` parity fixture: one document per `id`, starting at 1.
+pub const E2E_JSON_TABLE: &str = "json_docs";
+
+pub const JSON_DOCS: [Option<&str>; 10] = [
+    Some(
+        r#"{"order":{"id":42,"price":1.50,"tags":["a","b"]},"locale":"de_DE","active":true,"note":"héllo €","day":"2024-01-02"}"#,
+    ),
+    Some(
+        r#"{"order":{"id":43.7,"price":1e2,"tags":[]},"locale":"en_US","active":"no","note":"","day":"02.01.2024"}"#,
+    ),
+    None,
+    Some(""),
+    Some(r#"{"order":[{"id":7},{"id":8}],"locale":null,"active":1,"note":[1]}"#),
+    Some(
+        r#"{"order":{"id":12345678901234567890123,"price":-0},"locale":"de_DE","locale":"fr_FR","active":" yes "}"#,
+    ),
+    Some(r#"{"order":{"id":44},"locale":"de_DE""#),
+    Some(r#"[{"locale":"it_IT","active":"001","order":{"id":"9"}}]"#),
+    Some(r#"{"locale":"é😀","active":false,"note":"x","order":{"id":-1.5E+3}}"#),
+    Some(r#"{"locale":"de_DE","active":"on","order":{"id":true}}"#),
+];
+
+pub async fn seed_json_docs(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-json").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for json_docs")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "doc", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build json_docs Iceberg schema")?;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("doc", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=JSON_DOCS.len() as i64)),
+            Arc::new(StringArray::from(JSON_DOCS.to_vec())),
+        ],
+    )
+    .context("build json_docs batch")?;
+    create_and_append(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_JSON_TABLE,
+        iceberg_schema,
+        [batch],
+    )
+    .await
+    .context("seed json_docs table")?;
+    Ok(())
+}
+
 // Typed COUNT(DISTINCT) probe: one column per reachable Exasol type across two data
 // files. Every column mixes in NULLs and repeats a value in both files, so a fan-out
 // that summed per-shard counts would overcount. Expected counts are computed from the

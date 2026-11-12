@@ -642,15 +642,17 @@ fn guard_dispatch_sql(
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
 ) -> String {
-    let result = guard_dispatch_result(
+    let result = dispatch_with(
         request,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         projection_widened,
+        &column_types(&guard_col_types()),
+        (None, None),
         limit,
         logical_schema,
+        &sample_scan_storage(),
     )
-    .expect("build_dispatch_sql must succeed for this declined-ORDER-BY fixture");
+    .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
         .as_str()
         .expect("pushdown response must carry a sql field")
@@ -675,7 +677,7 @@ fn dispatch_with(
         &PushdownRequest::parse(pushdown_req.clone())?,
         projection,
         projection_widened,
-        ScanTranslator::new(col_types),
+        scan_for(col_types, &pushdown_req),
         filter,
         declined_filter,
         limit,
@@ -714,31 +716,10 @@ fn dispatch_planned(
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
         col_types,
-        ScanTranslator::new(col_types).split_where(filter),
+        scan_for(col_types, &pushdown_req).split_where(filter),
         extract_limit(&pushdown_req),
         logical_schema,
         scan_storage,
-    )
-}
-
-/// An unrenderable pushed sort key is a `User` error, not SQL.
-fn guard_dispatch_result(
-    request: &Json,
-    proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<ExasolType>,
-    projection_widened: bool,
-    limit: Option<u64>,
-    logical_schema: Vec<LogicalField>,
-) -> Result<Json, UdfError> {
-    dispatch_with(
-        request,
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        &column_types(&guard_col_types()),
-        (None, None),
-        limit,
-        logical_schema,
-        &sample_scan_storage(),
     )
 }
 
@@ -750,38 +731,18 @@ fn declined_like_on_decimal() -> Json {
 /// The empty logical schema declines the bounded top-N unconditionally, so the
 /// decline route must win on its own.
 fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
-    let result =
-        dispatch_for_body(request).expect("build_dispatch_sql must succeed for this fixture");
-    result["sql"]
-        .as_str()
-        .expect("pushdown response must carry a sql field")
-        .to_string()
-}
-
-fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
     let (request, _) = request.build();
-    dispatch_planned(
+    let result = dispatch_planned(
         &request,
         &first_table_column_types(&request),
         Vec::new(),
         &sample_scan_storage(),
     )
-}
-
-#[test]
-fn grouped_request_with_an_invalid_cast_key_type_fails() {
-    let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
-    // The engine's `cast_to` takes an `ExasolType`, which cannot hold this invalid type.
-    let request = pushdown_request("T", &[("NAME", ExasolType::varchar(10))])
-        .group_by(vec![cast_json(invalid.clone(), col("NAME"))])
-        .count_star();
-
-    match dispatch_for_body(request) {
-        Err(UdfError::User(message)) => {
-            assert!(message.contains(&invalid.to_string()), "{message}")
-        }
-        other => panic!("the invalid key type must fail the query, got {other:?}"),
-    }
+    .expect("build_dispatch_sql must succeed for this fixture");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
 }
 
 #[test]
@@ -830,33 +791,6 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
                  declined predicate is applied exactly once: {sql}"
         );
     }
-}
-
-/// Scenario: A trivially-true filter is still omitted with no wrapper
-#[test]
-fn trivially_true_filter_omitted_without_wrapper() {
-    let trivially_true = bool_lit(true);
-    let (filter, declined) =
-        ScanTranslator::new(&column_types(&guard_col_types())).split_where(Some(&trivially_true));
-    assert!(
-        filter.is_none() && declined.is_none(),
-        "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
-    );
-
-    let sql = dispatch_sql_for_body(
-        guard_events()
-            .filter(trivially_true)
-            .column(table_col("EVENTS", "ID")),
-    );
-
-    assert!(
-        !sql.contains("LHS_T0"),
-        "a trivially-true filter must keep the wrapper-free fast scan: {sql}"
-    );
-    assert!(
-        !sql.contains(r#""filter""#),
-        "a trivially-true filter must not reach the scan spec: {sql}"
-    );
 }
 
 #[test]
@@ -964,8 +898,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    let (scan_filter, declined) =
-        ScanTranslator::new(&column_types(&col_types)).split_where(Some(&filter));
+    let (scan_filter, declined) = scan_over(&column_types(&col_types)).split_where(Some(&filter));
 
     assert!(
         scan_filter.is_none(),
@@ -1269,71 +1202,32 @@ fn declined_order_by_extension_runs_after_topn_detection() {
 
 /// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
-fn declined_order_by_renders_every_reachable_ordering_or_declines() {
-    let unrenderable_expression = order_by_element(
-        serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
-        true,
-        true,
-    );
-    let column_missing_nulls_last = serde_json::json!({
-        "type": "order_by_element",
-        "expression": col("ID"),
-        "isAscending": true
-    });
-    let renderable_expression = order_by_element(
-        scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
+fn declined_order_by_renders_every_ordering_in_full() {
+    let ordered = guard_events()
+        .order_by(serde_json::json!([
+            order_by_element(
+                scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
+                false,
+                true
+            ),
+            order_by_element(table_col("EVENTS", "NAME"), true, false),
+        ]))
+        .limit(7)
+        .column(col("NAME"))
+        .build()
+        .0;
+    let sql = guard_dispatch_sql(
+        &ordered,
+        vec![ProjectionItem::from("NAME")],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
-        true,
+        Some(7),
+        Vec::new(),
     );
-    let declining_shapes = [
-        (
-            "every element unrenderable",
-            serde_json::json!([unrenderable_expression, column_missing_nulls_last]),
-        ),
-        (
-            "renderable key first, unrenderable second",
-            serde_json::json!([renderable_expression, unrenderable_expression]),
-        ),
-        (
-            "unrenderable key first, renderable second",
-            serde_json::json!([unrenderable_expression, renderable_expression]),
-        ),
-    ];
-
-    for (facet, order_by) in declining_shapes {
-        let request = guard_events()
-            .order_by(order_by)
-            .limit(7)
-            .column(col("NAME"))
-            .build()
-            .0;
-        let err = guard_dispatch_result(
-            &request,
-            vec![ProjectionItem::from("NAME")],
-            vec![ExasolType::WIDEST_VARCHAR],
-            false,
-            Some(7),
-            Vec::new(),
-        )
-        .expect_err(&format!(
-            "{facet}: a pushed ordering the adapter cannot reproduce in full must \
-                 decline, never return SQL"
-        ));
-        match err {
-            UdfError::User(msg) => {
-                assert!(
-                    msg.contains("ORDER BY") && msg.contains("declined"),
-                    "{facet}: the decline must name the unrenderable ORDER BY key: {msg}"
-                );
-                assert!(
-                    msg.contains("not a native re-plan"),
-                    "{facet}: the decline is a HARD error — Exasol does not re-plan \
-                         natively, so the message must not imply a retry: {msg}"
-                );
-            }
-            other => panic!("{facet}: must be a User decline, got {other:?}"),
-        }
-    }
+    assert!(
+        sql.ends_with(r#" ORDER BY ABS("AMOUNT") DESC NULLS LAST, "NAME" ASC NULLS FIRST LIMIT 7"#),
+        "the wrapper must render every pushed sort key, then the window: {sql}"
+    );
 
     let unordered = guard_events().limit(7).column(col("NAME")).build().0;
     let sql = guard_dispatch_sql(
@@ -1820,7 +1714,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         widened,
-        ScanTranslator::new(&column_types(&guard_col_types())),
+        scan_for(&column_types(&guard_col_types()), &pushdown_req),
         None,
         None,
         None,
@@ -1862,7 +1756,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -1875,7 +1769,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: vec!["REGION".to_string()],
         total_bytes: 10,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     };
     let sides = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(

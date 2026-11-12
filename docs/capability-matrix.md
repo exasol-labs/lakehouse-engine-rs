@@ -15,6 +15,8 @@ SQL, and an aggregate runs as DataFusion partials that Exasol SQL merges. A ✓ 
 that the adapter receives the capability, not that DataFusion runs it.
 [Capabilities](capabilities.md) explains how each pushed-down capability is executed.
 
+A ✓ is the default. The virtual schema property `EXCLUDED_CAPABILITIES` withdraws a listed capability per schema, and Exasol then evaluates that capability itself. See [Excluding a capability](capabilities.md#excluding-a-capability).
+
 The capability names come from the Exasol
 [capabilities list](https://github.com/exasol/virtual-schema-common-java/blob/main/doc/development/api/capabilities_list.md).
 The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capabilities.rs`.
@@ -39,7 +41,7 @@ The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capa
 | `LIMIT` | ✓ | On a plain row scan each shard stops early. Exasol SQL re-applies the limit. |
 | `LIMIT_WITH_OFFSET` | ✓ | Exasol SQL applies the offset. A non-zero offset drops the per-shard limit. |
 | `ORDER_BY_COLUMN` | ✓ | DataFusion runs a per-shard top-N for `ORDER BY ... LIMIT n` on projected columns, without aggregation or offset. Otherwise Exasol SQL sorts. See [Capabilities](capabilities.md#filtering). |
-| `ORDER_BY_EXPRESSION` | ✓ | Always sorted in Exasol SQL, never as a per-shard top-N. A sort key the adapter cannot render fails the query. |
+| `ORDER_BY_EXPRESSION` | ✓ | Always sorted in Exasol SQL, never as a per-shard top-N. |
 | `SELECTLIST_EXPRESSIONS` | ✓ | DataFusion evaluates them when it can render every item. Otherwise Exasol SQL does. |
 | `SELECTLIST_PROJECTION` | ✓ |  |
 
@@ -134,7 +136,7 @@ sends the query to the adapter.
 | `DAYS_BETWEEN` | ✓ |  |
 | `DBTIMEZONE` |  | The scan sees neither the session nor the database time zone. |
 | `DEGREES` | ✓ |  |
-| `DIV` |  | Needs truncating division, and the request carries no operand types. |
+| `DIV` | ✓ | The scan computes integer operands. Exasol SQL computes decimal and DOUBLE operands. |
 | `DUMP` |  |  |
 | `EDIT_DISTANCE` |  |  |
 | `EXP` | ✓ |  |
@@ -164,7 +166,7 @@ sends the query to the adapter.
 | `IS_NUMBER` |  |  |
 | `IS_TIMESTAMP` |  |  |
 | `IS_YMINTERVAL` |  |  |
-| `JSON_VALUE` |  |  |
+| `JSON_VALUE` | ✓ | Runs in the scan for the forms [Capabilities](capabilities.md#scalar-functions) lists. Other forms run in Exasol SQL. |
 | `LAST_DAY` |  | Not translated. |
 | `LEAST` | ✓ |  |
 | `LEFT` | ✓ |  |

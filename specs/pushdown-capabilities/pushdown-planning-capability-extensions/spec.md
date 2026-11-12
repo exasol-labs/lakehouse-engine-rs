@@ -4,11 +4,10 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 
 ## Background
 
-* A scalar-function capability is advertised only when a `crates/vs-expression` arm renders it and the DataFusion result matches Exasol. `FN_NEG` and `FN_WEEK` meet this bar. `FN_CAST` meets it except for the text-target deviation that `sql-comprehension/vs-expression-translator-cast` records and (#587) removes. `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the divergent date functions, and the bitwise operator functions do not. Exasol never delegates an unadvertised capability and evaluates it over the returned rows, so advertising a capability the adapter cannot honour returns wrong rows.
-* The now-family (`CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP`) is unadvertised, because the scan UDF receives no time zone, clock, or statement anchor. It would read its own container clock in UTC once per shard, while Exasol's now-family is constant per statement and uses the session or database time zone.
-* A select-list item whose declared `selectListDataTypes` type is `TIMESTAMP WITH LOCAL TIME ZONE` cannot be a UDF EMITS type (`sqlCode 22002`). A full-base-row response to such a request fails Exasol's positional check with SQL state `04000` ("Expected number of columns is N but pushdown query has M"). The adapter routes the request to the qualified single-table wrapper instead: `SELECT <select list as Exasol SQL> FROM (<sharded raw fan-out narrowed to referenced columns>) AS "LHS_T0"`. The routing decision depends on the item's declared type, not on the `selectList` length, and an absent, `null`, empty, or non-array `selectList` receives the full base row.
-* The scan cannot substitute plain `TIMESTAMP` for `TIMESTAMP WITH LOCAL TIME ZONE`, because Exasol returns the latter in the session time zone and the former verbatim. The `vs-expression` literal arm renders the value as `CAST(CONVERT_TZ(TIMESTAMP '<utc value>', 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)`, so Exasol evaluates `SESSIONTIMEZONE` in the caller's session.
-* Exasol bit functions operate on unsigned 64-bit integers, while DataFusion's operators act on signed Arrow integers, and Iceberg has no unsigned integer type. DataFusion has no operator or function for `BIT_NOT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, or `BIT_TO_NUM`.
+* Exasol delegates an advertised capability fully and never re-checks it. It evaluates an unadvertised capability itself over the rows the scan returns.
+* The scan UDF receives no session time zone, clock, or statement anchor.
+* A scan UDF cannot emit a `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL`, `GEOMETRY`, or `HASHTYPE` column.
+* Exasol bit functions operate on unsigned 64-bit integers, DataFusion's integer operators are signed, and Iceberg has no unsigned integer type.
 
 ## Scenarios
 
@@ -16,7 +15,7 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 
 * *GIVEN* the adapter's advertised capability set
 * *WHEN* Exasol requests `getCapabilities`
-* *THEN* the response SHALL advertise the arithmetic binary-operator scalar-function capabilities for `+`, `-`, `*`, and `/` (the Exasol capability names `FN_ADD`, `FN_SUB`, `FN_MULT`, and `FN_FLOAT_DIV`), verified against the Exasol Virtual Schema capability vocabulary
+* *THEN* the response SHALL advertise the arithmetic scalar-function capabilities for `+`, `-`, `*`, `/`, integer division `DIV`, and unary `-` (the Exasol capability names `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, `FN_DIV`, and `FN_NEG`), verified against the Exasol Virtual Schema capability vocabulary
 * *AND* each advertised arithmetic operator SHALL be backed by a `crates/vs-expression` translator arm that renders it (so an advertised operator is never one the translator would decline), keeping the capability set coherent with the translator the same way GROUP BY tuple advertisement is gated on its backing path
 * *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `pushdown-joins/pushdown-planning-join`) SHALL be advertised, advertising arithmetic operators MUST NOT introduce any additional join or cross-join capability
 
@@ -49,7 +48,7 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 * *WHEN* Exasol requests `getCapabilities`
 * *THEN* the response SHALL NOT advertise `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, or `FN_SYSTIMESTAMP`
 * *AND* Exasol SHALL evaluate the now-family natively rather than pushing it to the node-local scan, because no time zone, clock, or statement anchor reaches the scan UDF, so the scan can only read its own container clock in UTC, independently per shard, see the Background and `sql-functions/vs-expression-translator-date-fns`
-* *AND* the four names SHALL be declined by the expression translator in BOTH dialects with the `unsupported scalar function: <name>` error, keeping the capability set and the translator coherent the same way the regexp, bitwise, and `ADD_*` date-arithmetic withdrawals do
+* *AND* the four names SHALL be declined by the DataFusion dialect with the `unsupported scalar function: <name>` error, keeping the capability set and the translator coherent the same way the regexp, bitwise, and `ADD_*` date-arithmetic withdrawals do
 * *AND* the withdrawal SHALL NOT alter any other advertised capability, `FN_DATE_TRUNC`, `FN_EXTRACT`, the field shortcuts (`FN_DAY`, `FN_HOUR`, `FN_MINUTE`, `FN_MONTH`, `FN_SECOND`, `FN_YEAR`, `FN_WEEK`), `FN_TO_DATE`, `FN_TO_TIMESTAMP`, and the `*_BETWEEN` family SHALL all remain advertised because each takes its datetime from its own arguments rather than from a clock, and Cartesian-product capabilities SHALL remain absent with only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`) advertised, so this withdrawal introduces no join or cross-join capability change
 * *AND* `docs/capabilities.md` SHALL NOT list the four withdrawn capabilities in its pushed-down scalar-function table, so the operator-facing documentation cannot claim a pushdown the adapter no longer advertises
 
@@ -63,7 +62,6 @@ The adapter advertises the arithmetic operator scalar functions and ISO week in 
 * *AND* the returned value SHALL equal the value Exasol computes natively for the same expression in the same session; the adapter MUST NOT substitute plain `TIMESTAMP` for a declared `TIMESTAMP WITH LOCAL TIME ZONE` EMITS type, which would surface the UTC wall clock where Exasol natively surfaces the session-local wall clock (at `SESSIONTIMEZONE = EUROPE/BERLIN`, native `CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` is `2024-03-01 10:00:00`, its UTC representation `2024-03-01 09:00:00`). This decline differs from the `scan-types/type-mapping` scenario "Iceberg timestamptz maps to plain Exasol TIMESTAMP": there the VS DECLARES the column plain `TIMESTAMP` at `createVirtualSchema`, so Exasol makes no localization promise, while here Exasol has already inferred the type for the select-list item independently of the adapter's schema, so a localization promise exists
 * *AND* the SAME classification SHALL route the ZERO-FILE path: when file resolution prunes every file the adapter short-circuits to the empty-result response BEFORE the dispatcher runs, so that path SHALL emit a zero-row result whose columns are typed from `selectListDataTypes` in select-list order (`CAST(NULL AS <declared type>)`) and MUST NOT emit the full-base-row empty projection, whose column count trips the same `04000`; `CAST(NULL AS TIMESTAMP WITH LOCAL TIME ZONE)` is valid Exasol SQL, so the routed empty shape is buildable for a declared-TSTZ item
 * *AND* the classification SHALL NOT fire where the full base row is the CORRECT response, an absent, `null`, empty, or non-array `selectList`, and SHALL ignore a bare `column` select-list item, whose EMITS type comes from `involvedTables` rather than from `selectListDataTypes`
-* *AND* an item the translator cannot render in the Exasol dialect at all SHALL remain a hard error from the wrapper's renderer, never a silent wrong value
 
 ### Scenario: Projected literal or constant select-list item is pushed down as a positional projection
 

@@ -2593,7 +2593,8 @@ fn create_proxy_virtual_schema() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         setup();
-        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let proxy_url = stack::proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         let mut conn = exa_conn();
         create_proxied_schema_and_scripts(
             &mut conn,

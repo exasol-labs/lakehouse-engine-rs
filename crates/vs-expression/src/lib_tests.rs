@@ -3,7 +3,7 @@ use crate::scalar_functions::{SCALAR_FUNCTIONS, ScalarFunction};
 use crate::test_support::*;
 use serde_json::json;
 
-fn scan_filter(filter: &Json) -> Result<Option<String>, UdfError> {
+fn scan_filter(filter: &Json) -> Result<String, UdfError> {
     render_scan_filter(filter, &typed_columns::<&str>(&[]))
 }
 
@@ -482,7 +482,7 @@ fn renders_cast_char_as_datafusion_varchar() {
 fn renders_cast_char_as_exasol_char() {
     let expr = cast(json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}));
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"CAST("X" AS CHAR(3) ASCII)"#
     );
 }
@@ -494,7 +494,7 @@ fn renders_cast_bool_to_varchar_as_plain_cast_in_exasol_dialect() {
         compare("predicate_greater", col("c_acctbal"), num_lit(0)),
     );
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"CAST(("C_ACCTBAL" > 0) AS VARCHAR(10))"#
     );
 }
@@ -526,7 +526,7 @@ fn renders_cast_timestamp_precision_per_dialect() {
             format!(r#"CAST("X" AS TIMESTAMP({p}))"#)
         };
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             expected,
             "Exasol dialect must render precision {p} as bare TIMESTAMP at 3, TIMESTAMP({p}) otherwise"
         );
@@ -560,7 +560,7 @@ fn renders_cast_timestamp_precision_per_dialect() {
             "DataFusion dialect: absent precision must render millisecond TIMESTAMP(3) for {data_type}"
         );
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             r#"CAST("X" AS TIMESTAMP)"#,
             "Exasol dialect: absent precision must render bare TIMESTAMP for {data_type}"
         );
@@ -600,14 +600,10 @@ fn cast_to_unsupported_target_declines() {
         let expr = cast(data_type.clone());
         assert!(
             render_expression(&expr).is_err(),
-            "CAST to {data_type} must raise in the DataFusion dialect's raising mode"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "CAST to {data_type} must be None in the DataFusion dialect's safe mode"
+            "CAST to {data_type} must raise in the DataFusion dialect"
         );
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"CAST("X" AS {exasol_target})"#),
             "the Exasol dialect must render CAST to {data_type}"
         );
@@ -618,7 +614,7 @@ fn cast_to_unsupported_target_declines() {
 fn exasol_dialect_renders_a_varchar_ascii_target() {
     let expr = cast(json!({"type": "VARCHAR", "size": 10, "characterSet": "ASCII"}));
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"CAST("X" AS VARCHAR(10) ASCII)"#
     );
 }
@@ -645,14 +641,9 @@ fn unsupported_node_returns_error() {
 }
 
 #[test]
-fn only_a_true_scan_filter_renders_as_no_filter() {
-    for (filter, expected) in [
-        (bool_lit(true), None),
-        (bool_lit(false), Some("FALSE")),
-        (null_lit(), Some("FALSE")),
-    ] {
-        assert_eq!(scan_filter(&filter).unwrap().as_deref(), expected);
-        assert_eq!(render_df_filter_exasol_safe(&filter).as_deref(), expected);
+fn a_null_scan_filter_renders_as_false() {
+    for filter in [bool_lit(false), null_lit()] {
+        assert_eq!(scan_filter(&filter).unwrap(), "FALSE");
     }
 }
 
@@ -662,15 +653,11 @@ fn conjoined_scan_filters_render_as_their_predicate_and() {
         predicate_equal(num_lit(1), num_lit(1)),
         predicate_equal(num_lit(2), num_lit(2)),
     ];
-    let one_by_one = conjuncts
-        .iter()
-        .map(|c| scan_filter(c).unwrap().unwrap())
-        .collect();
+    let one_by_one = conjuncts.iter().map(|c| scan_filter(c).unwrap()).collect();
     assert_eq!(
         conjoin_scan_filters(one_by_one),
-        scan_filter(&and(conjuncts)).unwrap()
+        scan_filter(&and(conjuncts)).ok()
     );
-    assert_eq!(conjoin_scan_filters(vec!["TRUE".into()]), None);
     assert_eq!(
         conjoin_scan_filters(vec!["NULL".into()]).as_deref(),
         Some("FALSE")
@@ -693,7 +680,7 @@ fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
     let ts = timestamp_lit("2024-01-15 12:00:00");
     let ts_utc = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
 
-    let ts_exasol = render_expression_exasol(&ts).unwrap();
+    let ts_exasol = render_expression_exasol(&ts);
     assert_eq!(ts_exasol, "TIMESTAMP '2024-01-15 12:00:00'");
     assert!(
         !ts_exasol.contains("arrow_cast"),
@@ -701,7 +688,7 @@ fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
     );
 
     assert_eq!(
-        render_expression_exasol(&timestamp_lit("2024-01-15 12:00:00' OR '1'='1")).unwrap(),
+        render_expression_exasol(&timestamp_lit("2024-01-15 12:00:00' OR '1'='1")),
         "TIMESTAMP '2024-01-15 12:00:00'' OR ''1''=''1'"
     );
 
@@ -720,7 +707,7 @@ fn renders_timestamp_utc_literal_via_convert_tz_in_exasol_dialect() {
     let value = "2024-03-01 10:00:00";
     let ts_utc = lit("literal_timestamp_utc", value);
 
-    let exasol = render_expression_exasol(&ts_utc).unwrap();
+    let exasol = render_expression_exasol(&ts_utc);
     assert_eq!(
         exasol,
         "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 10:00:00', 'UTC', SESSIONTIMEZONE) \
@@ -742,7 +729,7 @@ fn literal_timestamputc_wire_name_renders_exasol_only() {
     let value = "2024-03-01 09:00:00";
     let real_wire_name = lit("literal_timestamputc", value);
     assert_eq!(
-        render_expression_exasol(&real_wire_name).unwrap(),
+        render_expression_exasol(&real_wire_name),
         "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 09:00:00', 'UTC', SESSIONTIMEZONE) \
          AS TIMESTAMP WITH LOCAL TIME ZONE)"
     );
@@ -758,7 +745,7 @@ fn renders_null_valued_tstz_literal_bare_in_exasol_dialect() {
             json!({"type": node_type}),
         ] {
             assert_eq!(
-                render_expression_exasol(&node).unwrap(),
+                render_expression_exasol(&node),
                 "NULL",
                 "{node_type} with a null/absent value must render bare NULL"
             );
@@ -784,7 +771,7 @@ fn renders_null_valued_timestamp_literal_per_dialect() {
             ("with no value key at all", json!({"type": node_type})),
         ] {
             assert_eq!(
-                render_expression_exasol(&node).unwrap(),
+                render_expression_exasol(&node),
                 "NULL",
                 "{node_type} {variant}, Exasol dialect"
             );
@@ -851,7 +838,7 @@ fn renders_mod_as_operator() {
 #[test]
 fn renders_mod_as_function_call_in_exasol_dialect() {
     let expr = scalar_fn("MOD", [col("a"), num_lit(3)]);
-    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"MOD("A", 3)"#);
+    assert_eq!(render_expression_exasol(&expr), r#"MOD("A", 3)"#);
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
 }
 
@@ -928,20 +915,17 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
 #[test]
 fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
     let expr = scalar_fn("CONCAT", [col("s"), str_lit("")]);
-    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S" || '')"#);
+    assert_eq!(render_expression_exasol(&expr), r#"("S" || '')"#);
 
     let expr = scalar_fn("CONCAT", [col("a"), col("b"), col("c")]);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"("A" || "B" || "C")"#
-    );
+    assert_eq!(render_expression_exasol(&expr), r#"("A" || "B" || "C")"#);
 
     let expr = scalar_fn(
         "CONCAT",
         [predicate_equal(col("active"), bool_lit(true)), str_lit("")],
     );
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"(("ACTIVE" = TRUE) || '')"#
     );
 }
@@ -956,10 +940,7 @@ fn renders_nested_concat_wrapper_per_level() {
         render_expression(&expr).unwrap(),
         r#"nullif(concat(nullif(concat("A", "B"), ''), "C"), '')"#
     );
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"(("A" || "B") || "C")"#
-    );
+    assert_eq!(render_expression_exasol(&expr), r#"(("A" || "B") || "C")"#);
 }
 
 #[test]
@@ -969,46 +950,32 @@ fn renders_concat_single_argument() {
         render_expression(&expr).unwrap(),
         r#"nullif(concat("S"), '')"#
     );
-    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S")"#);
+    assert_eq!(render_expression_exasol(&expr), r#"("S")"#);
 }
 
 #[test]
-fn concat_empty_argument_list_errors_in_both_dialects() {
-    let expr = scalar_fn("CONCAT", []);
-    let expected = "function_scalar CONCAT requires at least 1 argument, got 0";
-    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap_err().to_string(),
-        expected
-    );
-    assert!(render_expression(&expr).is_err());
-    assert!(render_expression_exasol_safe(&expr).is_none());
-}
-
-#[test]
-fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
-    let expr = json!({
-        "type": "function_scalar",
-        "name": "CONCAT"
-    });
-    let expected = "function_scalar CONCAT missing 'arguments'";
-    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap_err().to_string(),
-        expected
-    );
-    assert!(render_expression(&expr).is_err());
-    assert!(render_expression_exasol_safe(&expr).is_none());
-
-    let expr = scalar_fn("CONCAT", [col("a"), Json::Null]);
-    let expected = "CONCAT argument rendered to null";
-    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap_err().to_string(),
-        expected
-    );
-    assert!(render_expression(&expr).is_err());
-    assert!(render_expression_exasol_safe(&expr).is_none());
+fn concat_without_a_renderable_argument_errors_in_the_datafusion_dialect() {
+    let cases = [
+        (
+            json!({"type": "function_scalar", "name": "CONCAT"}),
+            "function_scalar CONCAT missing 'arguments'",
+        ),
+        (
+            scalar_fn("CONCAT", []),
+            "function_scalar CONCAT requires at least 1 argument, got 0",
+        ),
+        (
+            scalar_fn("CONCAT", [col("a"), Json::Null]),
+            "CONCAT argument rendered to null",
+        ),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(
+            render_expression(&expr).unwrap_err().to_string(),
+            expected,
+            "{expr}"
+        );
+    }
 }
 
 #[test]
@@ -1108,10 +1075,6 @@ fn renders_greatest_least_empty_argument_list_errors() {
             render_expression(&expr).is_err(),
             "{name} empty args must raise"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} empty args must be None in safe mode"
-        );
     }
 }
 
@@ -1127,10 +1090,6 @@ fn greatest_least_without_arguments_key_errors() {
         assert!(
             err.to_string().contains("missing 'arguments'"),
             "{name} error should mention missing 'arguments', got: {err}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} without arguments key must be None in safe mode"
         );
     }
 }
@@ -1210,16 +1169,13 @@ fn renders_extract() {
 #[test]
 fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
     let expr = extract("DAY", col("ts"));
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"EXTRACT(DAY FROM "TS")"#
-    );
+    assert_eq!(render_expression_exasol(&expr), r#"EXTRACT(DAY FROM "TS")"#);
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"date_part('DAY', "TS")"#
     );
     assert_eq!(
-        render_expression_exasol(&extract("SECOND", col("ts"))).unwrap(),
+        render_expression_exasol(&extract("SECOND", col("ts"))),
         r#"EXTRACT(SECOND FROM "TS")"#
     );
 }
@@ -1260,29 +1216,12 @@ fn now_family_falls_through() {
         "SYSTIMESTAMP",
     ] {
         let expr = scalar_fn(name, []);
-        for (dialect, rendered) in [
-            ("DataFusion", render_expression(&expr)),
-            ("Exasol", render_expression_exasol(&expr)),
-        ] {
-            let err = rendered.unwrap_err().to_string();
-            assert!(
-                err.contains("unsupported scalar function"),
-                "{name} must fall through the generic unsupported-scalar-function \
-                 path in the {dialect} dialect: {err}"
-            );
-            assert!(
-                err.contains(name),
-                "the {dialect}-dialect error must name '{name}': {err}"
-            );
-        }
+        let err = render_expression(&expr).unwrap_err().to_string();
         assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
+            err.contains("unsupported scalar function"),
+            "{name} must fall through the generic unsupported-scalar-function path: {err}"
         );
-        assert!(
-            render_expression_exasol_safe(&expr).is_none(),
-            "{name} must be None in the Exasol safe variant"
-        );
+        assert!(err.contains(name), "the error must name '{name}': {err}");
     }
 }
 
@@ -1384,19 +1323,11 @@ fn between_fns_reject_wrong_arity() {
             render_expression(&one_arg).is_err(),
             "{name} 1-arg must raise"
         );
-        assert!(
-            render_expression(&one_arg).is_err(),
-            "{name} 1-arg must be None in safe mode"
-        );
 
         let three_args = scalar_fn(name, [col("a"), col("b"), col("c")]);
         assert!(
             render_expression(&three_args).is_err(),
             "{name} 3-arg must raise"
-        );
-        assert!(
-            render_expression(&three_args).is_err(),
-            "{name} 3-arg must be None in safe mode"
         );
     }
 }
@@ -1414,26 +1345,7 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
         render_scan_expression(&expr, &microsecond_ts()).is_err(),
         "SECOND(ts, 3) must decline even where the typed pass knows the argument's precision"
     );
-    assert!(
-        render_expression_exasol_safe(&expr).is_some(),
-        "SECOND(ts, 3) must still render under the Exasol dialect"
-    );
-}
-
-#[test]
-fn div_falls_through_as_unsupported() {
-    // DataFusion has no `div`, and a TRUNC(m/n) emulation diverges from Exasol on DOUBLE
-    // division by zero (22012 vs infinity); operand types are not carried in the node.
-    let expr = scalar_fn("DIV", [col("a"), col("b")]);
-    let err = render_expression(&expr).unwrap_err();
-    assert!(
-        err.to_string().contains("DIV"),
-        "error must name DIV as unsupported: {err}"
-    );
-    assert!(
-        render_expression(&expr).is_err(),
-        "DIV must be None in safe mode without panicking"
-    );
+    assert_eq!(render_expression_exasol(&expr), r#"SECOND("TS", 3)"#);
 }
 
 #[test]
@@ -1448,16 +1360,12 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
             err.to_string().contains(name),
             "error must name the unsupported function '{name}': {err}"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in safe mode without panicking"
-        );
     }
 }
 
 /// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
-fn regexp_scalar_functions_decline_in_both_dialects() {
+fn regexp_scalar_functions_decline_in_the_datafusion_dialect() {
     // DataFusion's regexp_like matches anywhere in the value, Exasol's PCRE only
     // when the match spans the whole value; `regex` also lacks look-around.
     let unsupported = [
@@ -1475,24 +1383,11 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
             expected,
             "the DataFusion dialect must decline {name}"
         );
-        assert_eq!(
-            render_expression_exasol(&expr).unwrap_err().to_string(),
-            expected,
-            "the Exasol dialect must decline {name}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
-        );
-        assert!(
-            render_expression_exasol_safe(&expr).is_none(),
-            "{name} must be None in the Exasol safe variant"
-        );
     }
 }
 
 #[test]
-fn regexp_like_predicate_declines_in_both_dialects() {
+fn regexp_like_predicate_declines_in_the_datafusion_dialect() {
     let expr = json!({
         "type": "predicate_like_regexp",
         "expression": col("name"),
@@ -1500,14 +1395,7 @@ fn regexp_like_predicate_declines_in_both_dialects() {
     });
     let expected = "unsupported expression node type: predicate_like_regexp";
     assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap_err().to_string(),
-        expected
-    );
-    assert!(render_expression(&expr).is_err());
     assert!(scan_filter(&expr).is_err());
-    assert!(render_expression_exasol_safe(&expr).is_none());
-    assert!(render_df_filter_exasol_safe(&expr).is_none());
 }
 #[test]
 fn bitwise_operator_functions_fall_through() {
@@ -1539,15 +1427,11 @@ fn bitwise_operator_functions_fall_through() {
             err_string.contains(name),
             "error must name the unsupported function '{name}': {err}"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in safe mode without panicking"
-        );
     }
 }
 
 #[test]
-fn undeclared_scalar_function_declines_in_both_dialects() {
+fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
     // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
     // declaration checked before `arguments`, and a missing `name`.
     let cases = [
@@ -1570,26 +1454,11 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
             expected,
             "DataFusion dialect must decline the undeclared node {expr}"
         );
-        assert_eq!(
-            render_expression_exasol(&expr).unwrap_err().to_string(),
-            expected,
-            "Exasol dialect must decline the undeclared node {expr}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "DataFusion safe variant must be None for {expr}"
-        );
-        assert!(
-            render_expression_exasol_safe(&expr).is_none(),
-            "Exasol safe variant must be None for {expr}"
-        );
     }
 }
 
 #[test]
-fn unsupported_date_functions_decline_in_both_dialects() {
-    // Every name exists in Exasol, so the Exasol-dialect assertion guards against the
-    // verbatim rule re-admitting them.
+fn unsupported_date_functions_decline_in_the_datafusion_dialect() {
     let unsupported = [
         "ADD_HOURS",
         "ADD_MINUTES",
@@ -1612,19 +1481,6 @@ fn unsupported_date_functions_decline_in_both_dialects() {
             render_expression(&expr).unwrap_err().to_string(),
             expected,
             "the DataFusion dialect must decline {name}"
-        );
-        assert_eq!(
-            render_expression_exasol(&expr).unwrap_err().to_string(),
-            expected,
-            "the Exasol dialect must decline {name}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
-        );
-        assert!(
-            render_expression_exasol_safe(&expr).is_none(),
-            "{name} must be None in the Exasol safe variant"
         );
     }
 }
@@ -1694,23 +1550,10 @@ fn render_expression_renders_scalar_wrapping_aggregates() {
 }
 
 #[test]
-fn aggregate_with_unrenderable_argument_declines() {
-    let bad = agg_item_expr("SUM", json!({"type": "totally_unknown_node"}), false);
-    assert!(
-        render_expression(&bad).is_err(),
-        "an unrenderable argument must raise in raising mode"
-    );
-    assert!(
-        render_expression(&bad).is_err(),
-        "an unrenderable argument must be None in safe mode"
-    );
-}
-
-#[test]
 fn renders_cast_varchar_exasol_dialect_includes_length() {
     let expr = cast(json!({"type": "VARCHAR", "size": 100}));
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"CAST("X" AS VARCHAR(100))"#
     );
 }
@@ -1726,28 +1569,22 @@ fn cast_char_target_diverges_between_dialects() {
         r#"CAST("C_VARCHAR" AS VARCHAR)"#
     );
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"CAST("C_VARCHAR" AS CHAR(20) ASCII)"#
     );
 }
 
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
-fn cast_to_an_incomplete_target_is_refused_in_both_dialects() {
+fn cast_to_an_incomplete_target_is_refused() {
     // exasol_type_tests pins which targets the parser refuses; this pins that CAST reaches it.
     let data_type = json!({"type": "VARCHAR"});
-    let expr = cast(data_type.clone());
-    for (dialect, rendered) in [
-        ("DataFusion", render_expression(&expr)),
-        ("Exasol", render_expression_exasol(&expr)),
-    ] {
-        match rendered {
-            Err(UdfError::User(message)) => assert!(
-                message.contains(&data_type.to_string()),
-                "the {dialect} refusal must name {data_type}: {message}"
-            ),
-            other => panic!("the {dialect} dialect must refuse CAST to {data_type}: {other:?}"),
-        }
+    match render_expression(&cast(data_type.clone())) {
+        Err(UdfError::User(message)) => assert!(
+            message.contains(&data_type.to_string()),
+            "the refusal must name {data_type}: {message}"
+        ),
+        other => panic!("CAST to {data_type} must be refused: {other:?}"),
     }
 }
 
@@ -1777,7 +1614,7 @@ fn renders_math_family_verbatim_in_exasol_dialect() {
     for (exasol_name, df_name) in one_arg {
         let expr = scalar_fn(exasol_name, [col("x")]);
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"{exasol_name}("X")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
@@ -1798,7 +1635,7 @@ fn renders_math_family_verbatim_in_exasol_dialect() {
     for (exasol_name, df_name) in two_arg {
         let expr = scalar_fn(exasol_name, [col("v"), num_lit(2)]);
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"{exasol_name}("V", 2)"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
@@ -1822,7 +1659,7 @@ fn renders_sign_as_native_sign_in_exasol_dialect() {
             ],
         )],
     );
-    let exasol = render_expression_exasol(&expr).unwrap();
+    let exasol = render_expression_exasol(&expr);
     assert_eq!(exasol, r#"SIGN((SUM("L_DISCOUNT") - 0.5))"#);
     assert!(
         !exasol.contains("signum"),
@@ -1861,7 +1698,7 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
     for (exasol_name, df_name) in one_arg {
         let expr = scalar_fn(exasol_name, [col("s")]);
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"{exasol_name}("S")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
@@ -1873,27 +1710,18 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
     }
 
     let substr = scalar_fn("SUBSTR", [col("s"), num_lit(1), num_lit(3)]);
-    assert_eq!(
-        render_expression_exasol(&substr).unwrap(),
-        r#"SUBSTR("S", 1, 3)"#
-    );
+    assert_eq!(render_expression_exasol(&substr), r#"SUBSTR("S", 1, 3)"#);
     assert_eq!(render_expression(&substr).unwrap(), r#"substr("S", 1, 3)"#);
 }
 
 #[test]
 fn instr_locate_with_start_arg_render_in_exasol_and_decline_in_datafusion() {
     let instr = scalar_fn("INSTR", [str_lit("hello"), str_lit("l"), num_lit(3)]);
-    assert_eq!(
-        render_expression_exasol(&instr).unwrap(),
-        "INSTR('hello', 'l', 3)"
-    );
+    assert_eq!(render_expression_exasol(&instr), "INSTR('hello', 'l', 3)");
     assert!(render_expression(&instr).is_err());
 
     let locate = scalar_fn("LOCATE", [str_lit("l"), str_lit("hello"), num_lit(3)]);
-    assert_eq!(
-        render_expression_exasol(&locate).unwrap(),
-        "LOCATE('l', 'hello', 3)"
-    );
+    assert_eq!(render_expression_exasol(&locate), "LOCATE('l', 'hello', 3)");
     assert!(render_expression(&locate).is_err());
 }
 
@@ -1901,7 +1729,7 @@ fn instr_locate_with_start_arg_render_in_exasol_and_decline_in_datafusion() {
 fn renders_greatest_least_verbatim_in_exasol_dialect() {
     let greatest = scalar_fn("GREATEST", [col("a"), col("b"), col("c")]);
     assert_eq!(
-        render_expression_exasol(&greatest).unwrap(),
+        render_expression_exasol(&greatest),
         r#"GREATEST("A", "B", "C")"#
     );
     assert_eq!(
@@ -1910,10 +1738,7 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
     );
 
     let least = scalar_fn("LEAST", [col("x"), num_lit(0)]);
-    assert_eq!(
-        render_expression_exasol(&least).unwrap(),
-        r#"LEAST("X", 0)"#
-    );
+    assert_eq!(render_expression_exasol(&least), r#"LEAST("X", 0)"#);
     assert_eq!(
         render_expression(&least).unwrap(),
         r#"CASE WHEN "X" IS NULL OR 0 IS NULL THEN NULL ELSE least("X", 0) END"#
@@ -1923,17 +1748,11 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
 #[test]
 fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
     let nullifzero = scalar_fn("NULLIFZERO", [col("v")]);
-    assert_eq!(
-        render_expression_exasol(&nullifzero).unwrap(),
-        r#"NULLIFZERO("V")"#
-    );
+    assert_eq!(render_expression_exasol(&nullifzero), r#"NULLIFZERO("V")"#);
     assert_eq!(render_expression(&nullifzero).unwrap(), r#"nullif("V", 0)"#);
 
     let zeroifnull = scalar_fn("ZEROIFNULL", [col("v")]);
-    assert_eq!(
-        render_expression_exasol(&zeroifnull).unwrap(),
-        r#"ZEROIFNULL("V")"#
-    );
+    assert_eq!(render_expression_exasol(&zeroifnull), r#"ZEROIFNULL("V")"#);
     assert_eq!(
         render_expression(&zeroifnull).unwrap(),
         r#"coalesce("V", 0)"#
@@ -1949,7 +1768,7 @@ fn renders_nullif_verbatim_in_exasol_dialect() {
         [scalar_fn("MOD", [col("id"), num_lit("5")]), num_lit("0")],
     );
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"NULLIF(MOD("ID", 5), 0)"#
     );
     assert_eq!(
@@ -1964,7 +1783,7 @@ fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
     for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
         let expr = scalar_fn(field, [col("ts")]);
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"{field}("TS")"#),
             "the Exasol dialect must render {field} verbatim"
         );
@@ -1981,7 +1800,7 @@ fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
 #[test]
 fn renders_week_as_native_week_in_exasol_dialect() {
     let expr = scalar_fn("WEEK", [col("d")]);
-    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"WEEK("D")"#);
+    assert_eq!(render_expression_exasol(&expr), r#"WEEK("D")"#);
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"date_part('week', "D")"#
@@ -1992,7 +1811,7 @@ fn renders_week_as_native_week_in_exasol_dialect() {
 fn renders_date_trunc_verbatim_in_exasol_dialect() {
     let expr = scalar_fn("DATE_TRUNC", [str_lit("month"), col("ts")]);
     assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
+        render_expression_exasol(&expr),
         r#"DATE_TRUNC('month', "TS")"#
     );
     assert_eq!(
@@ -2006,7 +1825,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
     for (exasol_name, df_name) in [("TO_DATE", "to_date"), ("TO_TIMESTAMP", "to_timestamp")] {
         let bare = scalar_fn(exasol_name, [col("s")]);
         assert_eq!(
-            render_expression_exasol(&bare).unwrap(),
+            render_expression_exasol(&bare),
             format!(r#"{exasol_name}("S")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
@@ -2017,7 +1836,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
 
         let formatted = scalar_fn(exasol_name, [col("s"), str_lit("YYYY-MM-DD")]);
         assert_eq!(
-            render_expression_exasol(&formatted).unwrap(),
+            render_expression_exasol(&formatted),
             format!(r#"{exasol_name}("S", 'YYYY-MM-DD')"#),
             "the Exasol dialect must forward {exasol_name}'s format model verbatim"
         );
@@ -2059,21 +1878,14 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
     for (name, arguments, exasol_sql) in cases {
         let expr = scalar_fn(name, arguments);
         assert!(render_expression(&expr).is_err(), "{exasol_sql} must err");
-        assert_eq!(render_expression(&expr).ok(), None, "{exasol_sql}");
-        assert_eq!(
-            render_expression_exasol(&expr).as_deref().ok(),
-            Some(exasol_sql)
-        );
+        assert_eq!(render_expression_exasol(&expr), exasol_sql);
     }
 }
 
 #[test]
 fn renders_days_between_verbatim_in_exasol_dialect() {
     let expr = scalar_fn("DAYS_BETWEEN", [col("a"), col("b")]);
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"DAYS_BETWEEN("A", "B")"#
-    );
+    assert_eq!(render_expression_exasol(&expr), r#"DAYS_BETWEEN("A", "B")"#);
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"(CAST("A" AS DATE) - CAST("B" AS DATE))"#
@@ -2091,7 +1903,7 @@ fn renders_between_family_verbatim_in_exasol_dialect() {
     for (name, df_expected) in cases {
         let expr = scalar_fn(name, [col("a"), col("b")]);
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             format!(r#"{name}("A", "B")"#),
             "the Exasol dialect must render {name} verbatim"
         );
@@ -2192,6 +2004,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     ] {
         fixtures.push(verbatim(name, vec![col("a"), col("b")]));
     }
+    fixtures.push(verbatim("DIV", vec![col("a"), col("b")]));
 
     fixtures.extend([
         shaped(
@@ -2303,8 +2116,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
                  the only assertion that catches it."
             );
         }
-        let rendered = render_expression_exasol(&fixture.node)
-            .unwrap_or_else(|err| panic!("{declared_name} failed to render: {err:?}"));
+        let rendered = render_expression_exasol(&fixture.node);
         match form {
             ExasolForm::VerbatimCall => {
                 assert!(
@@ -2324,7 +2136,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
                     .and_then(|a| a.as_array())
                     .expect("fixture node carries arguments")
                     .iter()
-                    .map(|arg| render_expression_exasol(arg).expect("argument renders"))
+                    .map(render_expression_exasol)
                     .collect();
                 assert_eq!(
                     rendered,
@@ -2377,8 +2189,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             .as_str()
             .expect("row carries a node type")
             .to_string();
-        let rendered = render_expression_exasol(&node)
-            .unwrap_or_else(|err| panic!("{node_type} failed to render: {err:?}"));
+        let rendered = render_expression_exasol(&node);
         assert_eq!(
             rendered, expected_exasol,
             "{node_type} in the Exasol dialect"
@@ -2406,6 +2217,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "nullif(",
             "coalesce(",
             CHECKED_FLOAT_DIV_FN,
+            CHECKED_INT_DIV_FN,
         ] {
             assert!(
                 !rendered.contains(token),
@@ -2428,7 +2240,7 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
             "{name} DataFusion dialect"
         );
         assert_eq!(
-            render_expression_exasol(&expr).unwrap(),
+            render_expression_exasol(&expr),
             expected,
             "{name} Exasol dialect"
         );
@@ -2442,7 +2254,7 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
         "NEG DataFusion dialect"
     );
     assert_eq!(
-        render_expression_exasol(&neg).unwrap(),
+        render_expression_exasol(&neg),
         expected_neg,
         "NEG Exasol dialect"
     );
@@ -2457,7 +2269,7 @@ fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
         "FLOAT_DIV DataFusion dialect"
     );
     assert_eq!(
-        render_expression_exasol(&float_div).unwrap(),
+        render_expression_exasol(&float_div),
         r#"("A" / 1)"#,
         "FLOAT_DIV Exasol dialect"
     );
@@ -2481,7 +2293,7 @@ fn non_timestamp_literals_render_identically_in_both_dialects() {
             "{node_type} DataFusion dialect"
         );
         assert_eq!(
-            render_expression_exasol(&node).unwrap(),
+            render_expression_exasol(&node),
             expected,
             "{node_type} Exasol dialect"
         );
@@ -2502,12 +2314,12 @@ fn literal_double_renders_as_a_double_cast_only_in_the_datafusion_dialect() {
     ] {
         let node = lit("literal_double", value);
         assert_eq!(render_expression(&node).unwrap(), datafusion);
-        assert_eq!(render_expression_exasol(&node).unwrap(), exasol);
+        assert_eq!(render_expression_exasol(&node), exasol);
     }
 }
 
 #[test]
-fn a_binary_literal_renders_for_datafusion_only_and_only_as_hex() {
+fn a_binary_literal_renders_only_as_hex() {
     let variable = binary_lit("0a1b");
     let fixed = fixed_binary_lit("0a1b", 2);
 
@@ -2516,6 +2328,5 @@ fn a_binary_literal_renders_for_datafusion_only_and_only_as_hex() {
         render_expression(&fixed).unwrap(),
         "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
     );
-    assert!(render_expression_exasol(&variable).is_err());
     assert!(render_expression(&binary_lit("0a'")).is_err());
 }

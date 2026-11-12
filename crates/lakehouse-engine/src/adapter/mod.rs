@@ -31,7 +31,7 @@ use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::{PermissionCheck, PermissionSettings};
 use crate::adapter::properties::{
     PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
-    resolve_allow_http,
+    resolve_allow_http, resolve_excluded_capabilities,
 };
 use crate::adapter::pushdown::{ConnectionStorage, ScanCatalog, declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
@@ -92,7 +92,12 @@ pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, 
 
 fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> {
     match request.get("type").and_then(|t| t.as_str()) {
-        Some("getCapabilities") => Ok(get_capabilities_response()),
+        Some("getCapabilities") => {
+            let props = get_properties(request);
+            Ok(get_capabilities_response(resolve_excluded_capabilities(
+                &props,
+            )))
+        }
         Some("createVirtualSchema") => handle_create_virtual_schema(ctx, request),
         Some("refresh") => {
             // Stateless: re-resolve the schema, same as create.
