@@ -1,13 +1,15 @@
 //! `JSON_VALUE` in the scan (#574): paths run in lax mode over item sequences, the result converts
 //! to the `RETURNING` type, and one read of a document serves every call of a plan node on it.
-//! A read stops once no path can select more, unless a call has a `DEFAULT ... ON ERROR`, which
-//! reads the whole document as Exasol does (docs/semantic-differences.md).
+//! A read stops once no path can select more, unless a call over the document anywhere in the
+//! query has a `DEFAULT ... ON ERROR`, which reads the whole document as Exasol does
+//! (docs/semantic-differences.md).
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanBuilder, StringBuilder, StructArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::ScalarValue;
 use datafusion::common::alias::AliasGenerator;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -17,13 +19,16 @@ use datafusion::logical_expr::{
     Aggregate, ColumnarValue, Expr, Filter, LogicalPlan, Projection, ScalarFunctionArgs, ScalarUDF,
     ScalarUDFImpl, Signature, Volatility, col, lit,
 };
-use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 use jiter::{Jiter, Peek};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use vs_expression::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 
+/// The twins of the rendered calls that read the whole document, set by [`StrictDocuments`].
+const JSON_VALUE_TEXT_STRICT_FN: &str = "lakehouse_json_value_text_strict";
+const JSON_VALUE_BOOLEAN_STRICT_FN: &str = "lakehouse_json_value_boolean_strict";
 /// The call that evaluates every `JSON_VALUE` of one plan node over one document.
 const JSON_VALUES_FN: &str = "lakehouse_json_values";
 /// One call's field of a [`JSON_VALUES_FN`] result.
@@ -329,15 +334,22 @@ enum Conversion {
 }
 
 /// One call's constants: `(path, max_chars, on_empty, on_error)` for text and
-/// `(path, on_empty, on_error)` for BOOLEAN.
+/// `(path, on_empty, on_error)` for BOOLEAN, and whether it reads the whole document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct JsonCall {
     path: Vec<JsonPathStep>,
     conversion: Conversion,
+    strict: bool,
 }
 
 impl JsonCall {
-    fn from_constants(returning: Returning, constants: &[&ScalarValue]) -> Result<Self> {
+    /// A `strict` function reads the whole document, as does a call with a `DEFAULT ... ON
+    /// ERROR`: Exasol sends `NULL ON ERROR` also without the clause, so only a `DEFAULT` asks.
+    fn from_constants(
+        returning: Returning,
+        strict: bool,
+        constants: &[&ScalarValue],
+    ) -> Result<Self> {
         let invalid = || {
             DataFusionError::Execution(format!("invalid JSON_VALUE scan arguments {constants:?}"))
         };
@@ -353,25 +365,28 @@ impl JsonCall {
             ScalarValue::Null => Ok(None),
             _ => Err(invalid()),
         };
-        let (path, conversion) = match (returning, constants) {
+        let (path, conversion, on_error) = match (returning, constants) {
             (Returning::Text, [path, max_chars, on_empty, on_error]) => {
                 let ScalarValue::UInt64(Some(max_chars)) = max_chars.cast_to(&DataType::UInt64)?
                 else {
                     return Err(invalid());
                 };
+                let on_error = text(on_error)?;
+                let has_default = on_error.is_some();
                 let conversion = Conversion::Text {
                     max_chars: max_chars as usize,
                     on_empty: text(on_empty)?,
-                    on_error: text(on_error)?,
+                    on_error,
                 };
-                (path, conversion)
+                (path, conversion, has_default)
             }
             (Returning::Boolean, [path, on_empty, on_error]) => {
+                let on_error = boolean(on_error)?;
                 let conversion = Conversion::Boolean {
                     on_empty: boolean(on_empty)?,
-                    on_error: boolean(on_error)?,
+                    on_error,
                 };
-                (path, conversion)
+                (path, conversion, on_error.is_some())
             }
             _ => return Err(invalid()),
         };
@@ -379,22 +394,24 @@ impl JsonCall {
             .as_deref()
             .and_then(parse_json_path)
             .ok_or_else(invalid)?;
-        Ok(Self { path, conversion })
+        Ok(Self {
+            path,
+            conversion,
+            strict: strict || on_error,
+        })
     }
 
-    fn data_type(&self) -> DataType {
+    fn returning(&self) -> Returning {
         match self.conversion {
-            Conversion::Text { .. } => DataType::Utf8,
-            Conversion::Boolean { .. } => DataType::Boolean,
+            Conversion::Text { .. } => Returning::Text,
+            Conversion::Boolean { .. } => Returning::Boolean,
         }
     }
 
-    /// Exasol sends `NULL ON ERROR` also without the clause, so only a `DEFAULT` asks for the
-    /// whole document to be checked.
-    fn strict(&self) -> bool {
-        match &self.conversion {
-            Conversion::Text { on_error, .. } => on_error.is_some(),
-            Conversion::Boolean { on_error, .. } => on_error.is_some(),
+    fn data_type(&self) -> DataType {
+        match self.returning() {
+            Returning::Text => DataType::Utf8,
+            Returning::Boolean => DataType::Boolean,
         }
     }
 }
@@ -488,7 +505,7 @@ fn for_each_document(documents: &ArrayRef, mut visit: impl FnMut(Option<&str>)) 
 fn evaluate(calls: &[JsonCall], documents: &ArrayRef) -> Result<Vec<ArrayRef>> {
     let mut columns: Vec<Column> = calls.iter().map(Column::new).collect();
     let paths: Vec<&[JsonPathStep]> = calls.iter().map(|call| call.path.as_slice()).collect();
-    let strict = calls.iter().any(JsonCall::strict);
+    let strict = calls.iter().any(|call| call.strict);
     for_each_document(documents, |document| {
         // Exasol reads the empty string as NULL.
         let items = document
@@ -513,11 +530,12 @@ fn constants(args: &ScalarFunctionArgs) -> Result<Vec<&ScalarValue>> {
         .collect()
 }
 
-/// One `JSON_VALUE` call, as the adapter renders it.
+/// One `JSON_VALUE` call, as the adapter renders it or as [`StrictDocuments`] makes it strict.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonUdf {
     name: &'static str,
     returning: Returning,
+    strict: bool,
     signature: Signature,
 }
 
@@ -538,7 +556,7 @@ impl ScalarUDFImpl for JsonUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let call = JsonCall::from_constants(self.returning, &constants(&args)?)?;
+        let call = JsonCall::from_constants(self.returning, self.strict, &constants(&args)?)?;
         let documents = args.args[0].to_array(args.number_rows)?;
         let [values] =
             <[ArrayRef; 1]>::try_from(evaluate(&[call], &documents)?).expect("one column per call");
@@ -637,9 +655,11 @@ fn json_call(expr: &Expr) -> Option<(&Expr, JsonCall)> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return None;
     };
-    let returning = match func.name() {
-        JSON_VALUE_TEXT_FN => Returning::Text,
-        JSON_VALUE_BOOLEAN_FN => Returning::Boolean,
+    let (returning, strict) = match func.name() {
+        JSON_VALUE_TEXT_FN => (Returning::Text, false),
+        JSON_VALUE_BOOLEAN_FN => (Returning::Boolean, false),
+        JSON_VALUE_TEXT_STRICT_FN => (Returning::Text, true),
+        JSON_VALUE_BOOLEAN_STRICT_FN => (Returning::Boolean, true),
         _ => return None,
     };
     let (document, constants) = args.split_first()?;
@@ -650,7 +670,7 @@ fn json_call(expr: &Expr) -> Option<(&Expr, JsonCall)> {
             _ => None,
         })
         .collect::<Option<_>>()?;
-    let call = JsonCall::from_constants(returning, &constants).ok()?;
+    let call = JsonCall::from_constants(returning, strict, &constants).ok()?;
     Some((document, call))
 }
 
@@ -767,17 +787,84 @@ impl OptimizerRule for ShareJsonDocuments {
     }
 }
 
-pub(super) fn register_json_value_udfs(ctx: &SessionContext) {
-    for (name, returning, arity) in [
-        (JSON_VALUE_TEXT_FN, Returning::Text, 5),
-        (JSON_VALUE_BOOLEAN_FN, Returning::Boolean, 4),
-    ] {
-        ctx.register_udf(ScalarUDF::from(JsonUdf {
-            name,
-            returning,
-            signature: Signature::any(arity, Volatility::Immutable),
-        }));
+fn json_udf(returning: Returning, strict: bool) -> ScalarUDF {
+    let (name, arity) = match (returning, strict) {
+        (Returning::Text, false) => (JSON_VALUE_TEXT_FN, 5),
+        (Returning::Boolean, false) => (JSON_VALUE_BOOLEAN_FN, 4),
+        (Returning::Text, true) => (JSON_VALUE_TEXT_STRICT_FN, 5),
+        (Returning::Boolean, true) => (JSON_VALUE_BOOLEAN_STRICT_FN, 4),
+    };
+    ScalarUDF::from(JsonUdf {
+        name,
+        returning,
+        strict,
+        signature: Signature::any(arity, Volatility::Immutable),
+    })
+}
+
+/// Makes every call over a document strict when one call over it anywhere in the plan is, before
+/// the optimizer moves calls between plan nodes, so a call's read does not depend on its node.
+#[derive(Debug)]
+struct StrictDocuments;
+
+impl AnalyzerRule for StrictDocuments {
+    fn name(&self) -> &str {
+        "lakehouse_strict_json_documents"
     }
+
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        let mut strict_documents: Vec<Expr> = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|node| {
+                    if let Some((document, call)) = json_call(node)
+                        && call.strict
+                        && !strict_documents.contains(document)
+                    {
+                        strict_documents.push(document.clone());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })?;
+        if strict_documents.is_empty() {
+            return Ok(plan);
+        }
+        let strict = |expr: Expr| -> Result<Transformed<Expr>> {
+            let Some((document, call)) = json_call(&expr) else {
+                return Ok(Transformed::no(expr));
+            };
+            if call.strict || !strict_documents.contains(document) {
+                return Ok(Transformed::no(expr));
+            }
+            let Expr::ScalarFunction(ScalarFunction { args, .. }) = expr else {
+                unreachable!("json_call matches only scalar functions");
+            };
+            let udf = Arc::new(json_udf(call.returning(), true));
+            Ok(Transformed::yes(Expr::ScalarFunction(
+                ScalarFunction::new_udf(udf, args),
+            )))
+        };
+        plan.transform_up_with_subqueries(|node| {
+            let names = NamePreserver::new(&node);
+            node.map_expressions(|expr| {
+                let name = names.save(&expr);
+                expr.transform_up(strict)?
+                    .map_data(|expr| Ok(name.restore(expr)))
+            })?
+            .map_data(LogicalPlan::recompute_schema)
+        })
+        .map(|transformed| transformed.data)
+    }
+}
+
+pub(super) fn register_json_value_udfs(ctx: &SessionContext) {
+    for returning in [Returning::Text, Returning::Boolean] {
+        for strict in [false, true] {
+            ctx.register_udf(json_udf(returning, strict));
+        }
+    }
+    ctx.add_analyzer_rule(Arc::new(StrictDocuments));
     ctx.add_optimizer_rule(Arc::new(ShareJsonDocuments));
 }
 

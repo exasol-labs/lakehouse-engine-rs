@@ -33,7 +33,7 @@ The adapter advertises `FN_JSON_VALUE`. The scan evaluates the `JSON_VALUE` form
 * *WHEN* the scan evaluates them on a document
 * *THEN* the scan SHALL stop reading the document once no call's path can select another item, and SHALL NOT check the rest of the document
 * *AND* in each object the scan SHALL take only the first member of a path step's name
-* *AND* a call with a `DEFAULT` `ON ERROR` behavior SHALL make the scan read and check the whole document for every call over it, because Exasol sends `NULL ON ERROR` also without the clause
+* *AND* a call with a `DEFAULT` `ON ERROR` behavior anywhere in the query SHALL make the scan read and check the whole document for every call over it, in the select list, the filter, the grouping, and the aggregates alike, because Exasol sends `NULL ON ERROR` also without the clause
 
 ### Scenario: Several JSON_VALUE calls on one document parse it once per row
 

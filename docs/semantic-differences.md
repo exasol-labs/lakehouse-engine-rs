@@ -121,10 +121,15 @@ A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer n
 
 The scan reads a document only until no `JSON_VALUE` path over it can select another item, and it takes only the first member of each name in an object. Native Exasol reads and checks the whole document, and reads repeated members as several items. So a document that is broken after the selected value, or that repeats a member the path selects, can give a value where Exasol takes the `ON ERROR` behavior, or the reverse.
 
-A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document makes the scan read and check the whole document, and the results match native Exasol. Exasol sends `NULL ON ERROR` also when the clause is absent, so `NULL ON ERROR` cannot ask for this.
+A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document, anywhere in the query, makes the scan read and check the whole document for every call over it, in the select list, the filter, the grouping, and the aggregates alike. The results then match native Exasol. Exasol sends `NULL ON ERROR` also when the clause is absent, and it sends `DEFAULT NULL ON ERROR` and `DEFAULT '' ON ERROR` as `NULL ON ERROR`, so none of these three asks for the whole read.
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
 | `JSON_VALUE('{"a":1} x', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
 | `JSON_VALUE('{"a":1,"a":2}', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
 | `JSON_VALUE('{"a":{"c":2},"a":{"b":1}}', '$.a.b')` | `NULL` (`ON EMPTY`) | `'1'` |
+| `JSON_VALUE('nul', '$.a' DEFAULT 'E' ON EMPTY)` | `'E'` (`ON EMPTY`) | `NULL` (`ON ERROR`) |
+
+## JSON_VALUE on deeply nested documents
+
+The scan reads a document nested at most about 200 levels deep, with or without a `DEFAULT ... ON ERROR`. A deeper document takes the `ON ERROR` behavior, while native Exasol reads it.

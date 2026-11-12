@@ -12,21 +12,13 @@ fn invoke(
     documents: Vec<Option<&str>>,
     constants: Vec<ScalarValue>,
 ) -> ArrayRef {
-    let name = match returning {
-        Returning::Text => JSON_VALUE_TEXT_FN,
-        Returning::Boolean => JSON_VALUE_BOOLEAN_FN,
-    };
-    let udf = JsonUdf {
-        name,
-        returning,
-        signature: Signature::any(constants.len() + 1, Volatility::Immutable),
-    };
+    let udf = json_udf(returning, false);
     let rows = documents.len();
     let documents: ArrayRef = Arc::new(StringArray::from(documents));
     let documents = cast(&documents, document_type).expect("a string type");
     let mut args = vec![ColumnarValue::Array(documents)];
     args.extend(constants.into_iter().map(ColumnarValue::Scalar));
-    invoke_scalar_udf(&udf, args, rows)
+    invoke_scalar_udf(udf.inner().as_ref(), args, rows)
         .and_then(|values| values.to_array(rows))
         .expect("constant arguments")
 }

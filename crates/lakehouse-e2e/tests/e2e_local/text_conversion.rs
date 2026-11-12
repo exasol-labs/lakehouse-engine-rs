@@ -552,6 +552,21 @@ const DOCUMENT_ONLY: &str = r#""projection":["ID","DOC"]"#;
 const JSON_VALUE_CASES: &[Case] = &[
     Case {
         setting: DEFAULT_SESSION,
+        query: "SELECT COUNT(JSON_VALUE(DOC, '$.locale')), MAX(JSON_VALUE(DOC, '$.locale')), COUNT(JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR)) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.locale'), JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, JSON_VALUE(DOC, '$.order.id' DEFAULT 'bad' ON ERROR) FROM {T} WHERE JSON_VALUE(DOC, '$.locale') = 'de_DE'",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, JSON_VALUE(DOC, '$.locale') FROM {T} WHERE ID NOT IN (6, 7)",
         path: Has(r#""projection":["ID",{"expr""#),
     },
@@ -689,6 +704,7 @@ const JSON_VALUE_ERROR_CASES: &[Case] = &[
 /// Scenario: JSON_VALUE in the scan reads the document and the path as Exasol does
 /// Scenario: JSON_VALUE in the scan converts the item as Exasol does
 /// Scenario: A JSON_VALUE the scan cannot compute runs in Exasol over the document column
+/// Scenario: A JSON_VALUE without a DEFAULT ON ERROR stops reading once no path can select more
 #[test]
 fn json_value_matches_native() {
     lakehouse_vs();
