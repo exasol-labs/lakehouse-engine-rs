@@ -78,8 +78,20 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Conversion | `FN_CAST` | `SELECT CAST(id AS VARCHAR(20))` |
 | Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
+| JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
+
+`JSON_VALUE` runs in the scan when all of these hold:
+
+- the document is text;
+- the path is `$` followed by `.name`, `."name"`, and `[n]` steps, with no whitespace;
+- there is no `RETURNING` clause, or it names `VARCHAR(n)` in UTF8 or `BOOLEAN`;
+- `ON EMPTY` and `ON ERROR` are `NULL`, or `DEFAULT` with a literal of the returning type that fits it.
+
+Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
+
+The scan reads a document nested at most about 200 levels deep. A deeper document takes the `ON ERROR` behavior.
 
 ### Text and session settings
 

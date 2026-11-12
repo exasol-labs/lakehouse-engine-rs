@@ -1,5 +1,6 @@
 //! Scan-side builders and runners: Parquet fixture files, minimal scan and join specs, inline
-//! and refusing storage backends, and a host runner that executes a scan into a sink context.
+//! and refusing storage backends, a host runner that executes a scan into a sink context, and a
+//! direct scalar UDF invocation.
 
 use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::raw_scan::{build_scan_sql, register_files};
@@ -10,12 +11,42 @@ use crate::scan::spec::{
 };
 use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage};
 use arrow::array::ArrayRef;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::common::config::ConfigOptions;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
 use parquet::arrow::ArrowWriter;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Drives `invoke_with_args` as DataFusion does for one batch of `rows` rows.
+pub(super) fn invoke_scalar_udf(
+    udf: &dyn ScalarUDFImpl,
+    args: Vec<ColumnarValue>,
+    rows: usize,
+) -> datafusion::error::Result<ColumnarValue> {
+    let arg_types: Vec<DataType> = args.iter().map(ColumnarValue::data_type).collect();
+    let arg_fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(position, data_type)| {
+            Arc::new(Field::new(
+                format!("arg{position}"),
+                data_type.clone(),
+                true,
+            ))
+        })
+        .collect();
+    let return_type = udf.return_type(&arg_types)?;
+    udf.invoke_with_args(ScalarFunctionArgs {
+        arg_fields,
+        args,
+        number_rows: rows,
+        return_field: Arc::new(Field::new(udf.name(), return_type, true)),
+        config_options: Arc::new(ConfigOptions::default()),
+    })
+}
 
 pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
     let schema = Arc::new(Schema::new(

@@ -164,7 +164,7 @@ sends the query to the adapter.
 | `IS_NUMBER` |  |  |
 | `IS_TIMESTAMP` |  |  |
 | `IS_YMINTERVAL` |  |  |
-| `JSON_VALUE` |  |  |
+| `JSON_VALUE` | ✓ | Runs in the scan for the forms [Capabilities](capabilities.md#scalar-functions) lists. Other forms run in Exasol SQL. |
 | `LAST_DAY` |  | Not translated. |
 | `LEAST` | ✓ |  |
 | `LEFT` | ✓ |  |

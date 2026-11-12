@@ -67,7 +67,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let keys = parse_order_by_keys(pushdown_req);
+        let mut keys = parse_order_by_keys(pushdown_req);
+        sort_by_select_items(&mut keys, pushdown_req, &projection);
         extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
@@ -355,6 +356,43 @@ fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
     assert!(
         !common.contains("order_by") && !common.contains("\"limit\""),
         "the per-shard common blob must stay clean (no sort keys, no limit): {common}"
+    );
+}
+
+/// Scenario: A declined ORDER BY on a selected expression sorts by its emitted column
+#[test]
+fn declined_order_by_on_a_selected_expression_sorts_by_its_column() {
+    let request = pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", "select")
+    .column(table_col("LINEITEM", "L_ORDERKEY"))
+    .item(abs_of("L_EXTENDEDPRICE"), ExasolType::decimal(18, 2))
+    .order_by(serde_json::json!([order_by_element(
+        abs_of("L_EXTENDEDPRICE"),
+        false,
+        true
+    )]))
+    .build()
+    .0;
+    let sql = plan_scan_sql(
+        &request,
+        vec![("s3://w/part-0.parquet".to_string(), 1000)],
+        1,
+    );
+
+    assert!(
+        sql.ends_with(r#"ORDER BY "_LH_PROJ_1" DESC NULLS LAST"#),
+        "the key must sort by the emitted select-list column: {sql}"
+    );
+    assert!(
+        !emits_clause(&sql).contains("\"L_EXTENDEDPRICE\""),
+        "the scan must not emit the expression's base column again: {}",
+        emits_clause(&sql)
     );
 }
 

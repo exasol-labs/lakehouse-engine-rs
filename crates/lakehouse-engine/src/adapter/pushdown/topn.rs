@@ -100,6 +100,46 @@ pub(super) fn parse_order_by_keys(pushdown_req: &Json) -> Vec<ParsedSortKey> {
         .unwrap_or_default()
 }
 
+/// A key equal to a select-list item sorts by the column the scan emits for it, so the wrapper
+/// needs none of the item's base columns and Exasol does not compute the item again.
+/// `projection` must hold one column per select-list item, as the row-scan path does.
+pub(super) fn sort_by_select_items(
+    keys: &mut [ParsedSortKey],
+    pushdown_req: &Json,
+    projection: &[ProjectedColumn],
+) {
+    let items = pushdown_req.get("selectList").and_then(Json::as_array);
+    let elements = pushdown_req.get("orderBy").and_then(Json::as_array);
+    let (Some(items), Some(elements)) = (items, elements) else {
+        return;
+    };
+    if items.len() != projection.len() {
+        return;
+    }
+    for (key, element) in keys.iter_mut().zip(elements) {
+        let ParsedSortKey::Expression {
+            ascending,
+            nulls_last,
+            ..
+        } = *key
+        else {
+            continue;
+        };
+        let Some(index) = items
+            .iter()
+            .position(|item| Some(item) == element.get("expression"))
+        else {
+            continue;
+        };
+        *key = ParsedSortKey::Expression {
+            rendered: emits_ident(&projection[index].item, index),
+            columns: Vec::new(),
+            ascending,
+            nulls_last,
+        };
+    }
+}
+
 /// Guards (any failure returns `None`):
 /// - a non-zero offset declines: a per-shard `LIMIT n OFFSET m` skips each shard's
 ///   own first m rows (#191). A zero offset matches, since Exasol normalises it away.

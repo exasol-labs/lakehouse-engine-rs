@@ -76,6 +76,13 @@ The adapter pushes an ordered top-N query (single table, no GROUP BY, no aggrega
 * *AND* an `orderBy` carrying two or more expression sort keys SHALL render EVERY key, in the pushed order, each with its own direction and NULL placement, and SHALL leak no column for any of them
 * *AND* the returned result SHALL equal the same query evaluated over all matching rows on a single node, in the requested sort-key order, direction, and NULL placement, EXCEPT for a referenced column requiring the JSON-fallback VARCHAR cast, which orders on the emitted JSON string rather than the native value
 
+### Scenario: A declined ORDER BY on a selected expression sorts by its emitted column
+
+* *GIVEN* a single-table row-scan `pushdown` request whose `orderBy` carries an expression sort key equal to an item of its select list (`SELECT JSON_VALUE(doc, '$.a') FROM t ORDER BY JSON_VALUE(doc, '$.a')`)
+* *WHEN* the bounded top-N path declines
+* *THEN* the wrapper's `ORDER BY` element SHALL name the column the scan emits for that select-list item
+* *AND* the adapter SHALL NOT append the expression's referenced base columns for that key, so Exasol does not compute the expression again
+
 ### Scenario: Generated SQL carries a credential reference, not a credential
 
 * *GIVEN* a pushdown request through this feature's path
