@@ -315,6 +315,16 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 | `LH_SEAWEEDFS_PORT` | `19000` | SeaweedFS S3 |
 | `LH_REST_PORT` | `18181` | Iceberg REST |
 
+A second stack beside a running one also needs its own Compose project, Docker network, and
+`/16` subnet, because Docker refuses two networks with overlapping subnets. Export the same
+values for `make <stack>-up` and `make test-e2e*`:
+
+| Env var | Default | Sets |
+|---|---|---|
+| `COMPOSE_PROJECT_NAME` | the checkout's directory name | Compose project, and so container and volume names |
+| `LH_NETWORK` | `lakehouse-engine` | Docker network name |
+| `LH_SUBNET_PREFIX` | `10.84` | First two octets of the network's `/16` and of every fixed service IP |
+
 ---
 
 ## Appendix: manual install checklist

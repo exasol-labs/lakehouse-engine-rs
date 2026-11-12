@@ -26,7 +26,7 @@ services:
       start_period: 10s
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.10
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.10
 
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.10.1
@@ -51,7 +51,7 @@ services:
       start_period: 20s
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.11
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.11
 
   # One-shot: Spark authors fixtures iceberg-rust cannot write (apache/iceberg-rust#340).
   spark-iceberg-fixtures:
@@ -81,11 +81,11 @@ services:
       - ./scripts/proxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
       - ./scripts/proxy/filter:/etc/tinyproxy/filter:ro
     extra_hosts:
-      - "seaweedfs-via-proxy:10.84.0.10"
-      - "iceberg-rest-via-proxy:10.84.0.11"
+      - "seaweedfs-via-proxy:${LH_SUBNET_PREFIX:-10.84}.0.10"
+      - "iceberg-rest-via-proxy:${LH_SUBNET_PREFIX:-10.84}.0.11"
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.12
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.12
 
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.1.16}"
@@ -104,15 +104,15 @@ services:
     # exaconf rewrites /etc/hosts and /etc/resolv.conf on startup, wiping
     # extra_hosts, so the entrypoint loop re-adds the static service entries.
     extra_hosts:
-      - "seaweedfs:10.84.0.10"
-      - "iceberg-rest:10.84.0.11"
+      - "seaweedfs:${LH_SUBNET_PREFIX:-10.84}.0.10"
+      - "iceberg-rest:${LH_SUBNET_PREFIX:-10.84}.0.11"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts; then
-              printf '10.84.0.10 seaweedfs\n10.84.0.11 iceberg-rest\n' >> /etc/hosts
+              printf '${LH_SUBNET_PREFIX:-10.84}.0.10 seaweedfs\n${LH_SUBNET_PREFIX:-10.84}.0.11 iceberg-rest\n' >> /etc/hosts
             fi
             sleep 2
           done ) &
@@ -125,7 +125,7 @@ services:
       start_period: 180s
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.20
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.20
 
 volumes:
   seaweedfs-data:
@@ -134,7 +134,7 @@ volumes:
 networks:
   lakehouse:
     # Unique name and subnet outside Docker's 172.x pool to avoid sibling-stack collisions.
-    name: lakehouse-engine
+    name: ${LH_NETWORK:-lakehouse-engine}
     ipam:
       config:
-        - subnet: 10.84.0.0/16
+        - subnet: ${LH_SUBNET_PREFIX:-10.84}.0.0/16
