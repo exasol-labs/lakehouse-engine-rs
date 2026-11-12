@@ -23,10 +23,10 @@ When plan-time file pruning eliminates every data file, the adapter returns a `p
 
 ### Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
 
-* *GIVEN* a query with an aggregate and no GROUP BY, whatever its select list holds: decomposable aggregates, `COUNT(DISTINCT ...)`, constants, aggregates the adapter does not decompose, no aggregate outside HAVING, or no aggregate at all because the outer query references none, e.g. `SELECT 'X', COUNT(*) FROM {vs_table} WHERE {prunes every file} HAVING COUNT(*) = 0`
+* *GIVEN* a query with an aggregate and no GROUP BY, whatever its select list holds, including no aggregate at all, e.g. `SELECT 'X', COUNT(*) FROM {vs_table} WHERE {prunes every file} HAVING COUNT(*) = 0`
 * *AND* the WHERE predicate prunes 100% of the table's data files during plan-time file pruning, or one side of an inner join has zero files
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL return the request's select list, HAVING, and LIMIT rendered over one zero-row relation per table, each typed like that table's columns, grouped by the empty grouping set `GROUP BY ()`, so Exasol evaluates the request over the empty set as one group
+* *THEN* the adapter SHALL return the request's select list, HAVING, and LIMIT rendered over one zero-row relation per table, each typed like that table's columns, so Exasol evaluates the request over the empty set as one group (`pushdown-aggregates/pushdown-planning-single-group-agg`)
 * *AND* the result SHALL equal native Exasol: exactly one row when HAVING is absent or true (`COUNT` yields `0`, every other aggregate `NULL`, and constants and scalar expressions are evaluated over those values), and no row when HAVING is false
 * *AND* the response MUST NOT invoke the scan fan-out UDF and MUST NOT reference any resolved data file
 

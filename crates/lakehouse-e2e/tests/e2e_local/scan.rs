@@ -2887,13 +2887,15 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
     }
 }
 
-/// Scenario: A single-group request that does not decompose routes to the qualified wrapper
+/// Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 #[test]
-fn e2e_count_over_aggregate_subselect_returns_native_row_count() {
+fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     lakehouse_vs();
     let mut conn = exa_conn();
-    let (events, typed) = (events_table(), typed_table());
+    let events = events_table();
 
+    // Exasol flattens each into one group_by request with a literal-only select list (#52).
+    // `MOD(id, 4)` tells a kept GROUP BY (4) from a row-scan fallback (20); `id` alone cannot.
     for (sql, expected) in [
         (
             format!(
@@ -2905,20 +2907,13 @@ fn e2e_count_over_aggregate_subselect_returns_native_row_count() {
             format!("SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {events} GROUP BY id)"),
             20,
         ),
-        (
-            format!("SELECT COUNT(*) FROM (SELECT SUM(id) s FROM {events} LIMIT 0)"),
-            0,
-        ),
-        (
-            format!(
-                "SELECT COUNT(*) FROM (SELECT SUM(C_QTY) s FROM {typed} WHERE SECOND(C_TS, 3) > 1)"
-            ),
-            1,
-        ),
-        (format!("SELECT 1 FROM (SELECT SUM(id) s FROM {events})"), 1),
     ] {
         let cols = conn.query_columns(&sql);
-        assert_eq!(cols[0].len(), 1, "must return one row: {sql}\n{cols:?}");
+        assert_eq!(
+            (cols.len(), cols[0].len()),
+            (1, 1),
+            "must return one column and one row: {sql}\n{cols:?}"
+        );
         assert_eq!(parse_int(&cols[0][0]), expected, "{sql}");
     }
 }

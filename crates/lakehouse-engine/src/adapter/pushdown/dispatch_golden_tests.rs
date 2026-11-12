@@ -72,6 +72,7 @@ fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
 
 pub(super) fn lone_count_distinct_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -81,6 +82,7 @@ pub(super) fn lone_count_distinct_request() -> (Json, Vec<ExasolType>) {
 
 fn multi_count_distinct_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -111,6 +113,7 @@ fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
 
 pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::decimal(36, 2),
@@ -121,6 +124,7 @@ pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
 /// An inner `DISTINCT` declines the decomposition, so the projection widens (#194).
 fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("SUM", Some("AMOUNT"), true), 2),
             ExasolType::decimal(36, 2),
@@ -130,6 +134,7 @@ fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
 
 fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("SUM", Some("AMOUNT"), false), 2),
             ExasolType::decimal(36, 2),
@@ -140,6 +145,7 @@ fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
 /// The nested `COUNT(*)` must dedup against the bare item's partial column.
 fn single_group_scalar_over_aggregate_dedup_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .count_star()
         .item(round_of_sum_over_count(), ExasolType::decimal(36, 2))
         .build()
@@ -155,6 +161,7 @@ fn round_of_sum_over_count() -> Json {
 
 fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::decimal(36, 2),
@@ -166,6 +173,7 @@ fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<Exasol
 
 fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("VARIANCE", Some("AMOUNT"), false), 4),
             ExasolType::decimal(36, 4),

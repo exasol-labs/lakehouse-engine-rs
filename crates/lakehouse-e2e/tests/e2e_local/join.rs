@@ -572,11 +572,9 @@ fn e2e_aggregate_over_join_result_correct() {
         );
 
         let nested = format!("SELECT COUNT(*) FROM ({})", aggregate_join_query(vs_name));
-        assert_eq!(
-            conn.query_columns(&nested),
-            vec![vec![serde_json::json!(1)]],
-            "{nested}"
-        );
+        let cols = conn.query_columns(&nested);
+        assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
+        assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
     }
 }
 

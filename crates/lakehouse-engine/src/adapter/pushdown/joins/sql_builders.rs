@@ -9,9 +9,10 @@ use vs_expression::SqlFragment;
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator, build_scan_driving_sql,
-    collect_all_column_names, extract_limit, extract_offset, output_select_list, project_columns,
-    projection_items, quote_ident, render_limit_offset, scan_storage_for, shard_count,
+    AggregationType, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
+    aggregation_type, build_scan_driving_sql, collect_all_column_names, extract_limit,
+    extract_offset, output_select_list, project_columns, projection_items, quote_ident,
+    render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
 use super::attribution::JoinLegs;
@@ -578,15 +579,13 @@ pub(in super::super) fn build_broadcast_join_sql(
 }
 
 fn qualified_join_group_by(pushdown_req: &Json, legs: &JoinLegs) -> Option<String> {
-    let Some(keys) = pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())
-    else {
+    let keys = match pushdown_req.get("groupBy").and_then(|v| v.as_array()) {
+        Some(keys) if !keys.is_empty() => keys,
         // Exasol may strip every aggregate from a single-group select list (#627).
-        return (pushdown_req.get("aggregationType").and_then(|v| v.as_str())
-            == Some("single_group"))
-        .then(|| "()".to_string());
+        _ if aggregation_type(pushdown_req) == Some(AggregationType::SingleGroup) => {
+            return Some("()".to_string());
+        }
+        _ => return None,
     };
     let parts: Vec<String> = keys
         .iter()
