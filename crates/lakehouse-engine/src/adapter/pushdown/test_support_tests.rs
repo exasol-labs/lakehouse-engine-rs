@@ -26,7 +26,7 @@ pub(crate) use vs_expression::test_support::{
     str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
 
-/// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
+/// The scan's typed filter SQL, `None` when it declines.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
     scan_over(col_types).split_where(Some(filter)).0
 }
@@ -1485,8 +1485,7 @@ pub(crate) fn pd(request: &Json) -> Json {
 }
 
 /// Panics unless `request` passes the planners' request check, so no fixture holds a request
-/// Exasol does not send.
-/// Exasol sends a request with no join for exactly one table.
+/// Exasol does not send. Exasol sends a request with no join for exactly one table.
 pub(crate) fn assert_exasol_sends(request: &Json) {
     let pushdown = &request["pushdownRequest"];
     let join = match detect_join(request, pushdown) {
@@ -1499,7 +1498,7 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
             );
             None
         }
-        Err(error) => panic!("a request Exasol does not send: {}", user_message(error)),
+        Err(error) => not_sent(error),
     };
     // Exasol drops a WHERE that folds to TRUE, though it sends FALSE, NULL, and TRUE conjuncts.
     assert_ne!(
@@ -1507,8 +1506,35 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
         serde_json::json!({"type": "literal_bool", "value": true}),
         "a request Exasol does not send: a TRUE filter"
     );
-    ensure_columns_declared(request, pushdown, join.as_ref())
-        .unwrap_or_else(|error| panic!("a request Exasol does not send: {}", user_message(error)));
+    fn not_sent<T>(error: UdfError) -> T {
+        panic!("a request Exasol does not send: {}", user_message(error))
+    }
+    let table_names: Vec<&str> = match &join {
+        Some(join) => join
+            .tables
+            .iter()
+            .map(|leaf| leaf.table_name.as_str())
+            .collect(),
+        None => vec![request["involvedTables"][0]["name"].as_str().unwrap_or("")],
+    };
+    let declared: Vec<_> = table_names
+        .into_iter()
+        .map(|name| {
+            support::involved_columns(request, |tables| {
+                tables
+                    .iter()
+                    .find(|table| table["name"].as_str() == Some(name))
+            })
+            .unwrap_or_else(not_sent)
+        })
+        .collect();
+    ensure_columns_declared(
+        request,
+        pushdown,
+        join.as_ref(),
+        &declared.iter().collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(not_sent);
 }
 
 /// A pushdown request as Exasol sends it, started by [`pushdown_request`]: each involved table with

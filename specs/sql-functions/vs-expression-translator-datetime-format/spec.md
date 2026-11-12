@@ -28,7 +28,7 @@ The inputs on which the scan and Exasol differ are documented in `docs/semantic-
 
 * *GIVEN* a `function_scalar` node named `TO_DATE` or `TO_TIMESTAMP` with more than two arguments, or a format that is not a supported format
 * *WHEN* the node is rendered in each dialect
-* *THEN* the DataFusion dialect SHALL return an error in raising mode and `None` in the safe variants
+* *THEN* the DataFusion dialect SHALL return an error
 * *AND* the Exasol dialect SHALL render the call verbatim, with the name, arguments, and format model Exasol sent
 * *AND* the caller SHALL treat that asymmetry as a decline to self-apply (`pushdown/pushdown-declined-filter-self-apply`), because `FN_TO_DATE` and `FN_TO_TIMESTAMP` stay advertised and Exasol delegates every pushed call
 

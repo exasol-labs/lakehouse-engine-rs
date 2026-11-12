@@ -2837,7 +2837,7 @@ fn cast_to_a_non_emittable_target_matches_native() {
     }
 }
 
-/// Scenario: Only a TRUE filter is suppressed, and a NULL filter keeps no row
+/// Scenario: A NULL filter keeps no row
 #[test]
 fn a_null_condition_keeps_no_row() {
     lakehouse_vs();

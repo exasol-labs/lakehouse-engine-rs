@@ -12,7 +12,7 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, PushdownRequest, SCAN_UDF_NAME, involved_columns,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
     project_columns, quote_ident,
 };
 
@@ -43,25 +43,20 @@ pub(super) use sql_builders::{
 };
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
-/// leg of `join` or the request's one table, and that table declares it (#615). Both planners run
-/// it before any catalog request.
+/// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
+/// each leg's columns in leg order, as the caller already read them from `involvedTables`. Both
+/// planners run it before any catalog request.
 pub(crate) fn ensure_columns_declared(
     request: &Json,
     pushdown: &Json,
     join: Option<&DetectedJoin>,
+    declared: &[&InvolvedColumns<'_>],
 ) -> Result<(), UdfError> {
-    let Some(join) = join else {
-        let involved = involved_columns(request, |tables| tables.first())?;
-        return attribution::JoinLegs::for_single_scan(request)
-            .ensure_columns_declared(pushdown, &[&involved]);
+    let legs = match join {
+        Some(join) => join.legs(),
+        None => attribution::JoinLegs::for_single_scan(request),
     };
-    let involved = join
-        .tables
-        .iter()
-        .map(|leaf| involved_table(request, &leaf.table_name))
-        .collect::<Result<Vec<_>, _>>()?;
-    join.legs()
-        .ensure_columns_declared(pushdown, &involved.iter().collect::<Vec<_>>())
+    legs.ensure_columns_declared(pushdown, declared)
 }
 
 /// The generated SQL runs outside the adapter script's schema, so an unqualified name would
@@ -151,7 +146,7 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
         .collect::<Result<Vec<_>, _>>()?;
-    ensure_columns_declared(request, pushdown_req, Some(join))?;
+    legs.ensure_columns_declared(pushdown_req, &involved.iter().collect::<Vec<_>>())?;
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())

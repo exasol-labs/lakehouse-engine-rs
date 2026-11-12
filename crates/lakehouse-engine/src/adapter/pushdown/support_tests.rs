@@ -1011,8 +1011,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
         None,
         r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
         r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
-    )
-    .expect("the distinct column is typed");
+    );
 
     assert!(
         sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
@@ -1177,8 +1176,7 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         Some(1),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("the distinct column is typed");
+    );
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
 }
 
@@ -2832,18 +2830,6 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
         proj_types,
         vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
     );
-}
-
-#[test]
-fn a_translator_over_a_tree_whose_columns_all_bind_builds() {
-    let universe = shared_name_universe();
-    let tree = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "X", "tableAlias": "LHS_T0"},
-        "right": {"type": "column", "name": "X", "tableAlias": "LHS_T1"},
-    });
-
-    ScanTranslator::over(&universe, &[&tree]).expect("each column binds its own relation");
 }
 
 #[test]

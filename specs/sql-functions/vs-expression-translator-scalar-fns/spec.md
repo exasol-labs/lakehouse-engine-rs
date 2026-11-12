@@ -29,7 +29,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SIGN`→`signum`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
-* *AND* a node whose argument count does not match the function arity SHALL return an error in raising mode and `None` in the safe variants
+* *AND* a node whose argument count does not match the function arity SHALL return an error
 
 ### Scenario: Math scalar functions render verbatim in the Exasol dialect
 
@@ -73,7 +73,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar_case` (the Exasol node type for both simple and searched CASE, including the expansion of `NULLIF(...)`) carrying `arguments` (the WHEN test conditions) and `results` (the THEN values, with the optional ELSE as the last element when `results` has one more entry than `arguments`)
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return a `CASE WHEN <cond1> THEN <res1> [WHEN <condN> THEN <resN>]... [ELSE <else>] END` expression with each condition and result rendered recursively
-* *AND* a `function_scalar_case` node with no WHEN branch SHALL return an error in raising mode and `None` in the safe variants
+* *AND* a `function_scalar_case` node with no WHEN branch SHALL return an error
 
 ### Scenario: NULLIFZERO and ZEROIFNULL translate to NULLIF and COALESCE
 
@@ -89,7 +89,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `nullif(<a>, <b>)` over the recursively rendered arguments
 * *AND* `render_expression_exasol` SHALL return `NULLIF(<a>, <b>)` under the same verbatim rule as the other Exasol scalar functions, because `NULLIF` is a native Exasol function and the lower-cased call is a DataFusion form
-* *AND* an argument count other than two SHALL return an error in raising mode and `None` in the safe variants in the DataFusion dialect
+* *AND* an argument count other than two SHALL return an error in the DataFusion dialect
 * *AND* the Exasol dialect SHALL NOT impose that arity check, for the reason given in the math-function scenario above: Exasol's compiler emitted a call its own engine accepts
 
 ### Scenario: Regexp scalar functions are deliberately not translated

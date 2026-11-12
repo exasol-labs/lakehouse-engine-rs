@@ -159,7 +159,7 @@ pub(crate) async fn handle_pushdown(
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
     let involved = involved_columns(request, |tables| tables.first())?;
-    ensure_columns_declared(request, pushdown_req, None)?;
+    ensure_columns_declared(request, pushdown_req, None, &[&involved])?;
 
     let limit = extract_limit(pushdown_req);
 
@@ -426,7 +426,7 @@ pub(crate) fn build_dispatch_sql(
                     limit,
                     udf_name,
                     distribute_udf_name,
-                )?;
+                );
                 return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
             }
             // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
@@ -501,7 +501,7 @@ pub(crate) fn build_dispatch_sql(
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(pushdown_req);
-        topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns())?;
+        topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
         Vec::new()

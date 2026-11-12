@@ -3,7 +3,7 @@ use crate::scalar_functions::{SCALAR_FUNCTIONS, ScalarFunction};
 use crate::test_support::*;
 use serde_json::json;
 
-fn scan_filter(filter: &Json) -> Result<Option<String>, UdfError> {
+fn scan_filter(filter: &Json) -> Result<String, UdfError> {
     render_scan_filter(filter, &typed_columns::<&str>(&[]))
 }
 
@@ -641,13 +641,9 @@ fn unsupported_node_returns_error() {
 }
 
 #[test]
-fn only_a_true_scan_filter_renders_as_no_filter() {
-    for (filter, expected) in [
-        (bool_lit(true), None),
-        (bool_lit(false), Some("FALSE")),
-        (null_lit(), Some("FALSE")),
-    ] {
-        assert_eq!(scan_filter(&filter).unwrap().as_deref(), expected);
+fn a_null_scan_filter_renders_as_false() {
+    for filter in [bool_lit(false), null_lit()] {
+        assert_eq!(scan_filter(&filter).unwrap(), "FALSE");
     }
 }
 
@@ -657,15 +653,11 @@ fn conjoined_scan_filters_render_as_their_predicate_and() {
         predicate_equal(num_lit(1), num_lit(1)),
         predicate_equal(num_lit(2), num_lit(2)),
     ];
-    let one_by_one = conjuncts
-        .iter()
-        .map(|c| scan_filter(c).unwrap().unwrap())
-        .collect();
+    let one_by_one = conjuncts.iter().map(|c| scan_filter(c).unwrap()).collect();
     assert_eq!(
         conjoin_scan_filters(one_by_one),
-        scan_filter(&and(conjuncts)).unwrap()
+        scan_filter(&and(conjuncts)).ok()
     );
-    assert_eq!(conjoin_scan_filters(vec!["TRUE".into()]), None);
     assert_eq!(
         conjoin_scan_filters(vec!["NULL".into()]).as_deref(),
         Some("FALSE")
@@ -1201,10 +1193,6 @@ fn now_family_falls_through() {
             "{name} must fall through the generic unsupported-scalar-function path: {err}"
         );
         assert!(err.contains(name), "the error must name '{name}': {err}");
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
-        );
     }
 }
 
@@ -1371,7 +1359,7 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
 
 /// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
-fn regexp_scalar_functions_decline_in_both_dialects() {
+fn regexp_scalar_functions_decline_in_the_datafusion_dialect() {
     // DataFusion's regexp_like matches anywhere in the value, Exasol's PCRE only
     // when the match spans the whole value; `regex` also lacks look-around.
     let unsupported = [
@@ -1389,15 +1377,11 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
             expected,
             "the DataFusion dialect must decline {name}"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
-        );
     }
 }
 
 #[test]
-fn regexp_like_predicate_declines_in_both_dialects() {
+fn regexp_like_predicate_declines_in_the_datafusion_dialect() {
     let expr = json!({
         "type": "predicate_like_regexp",
         "expression": col("name"),
@@ -1405,7 +1389,6 @@ fn regexp_like_predicate_declines_in_both_dialects() {
     });
     let expected = "unsupported expression node type: predicate_like_regexp";
     assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert!(render_expression(&expr).is_err());
     assert!(scan_filter(&expr).is_err());
 }
 #[test]
@@ -1446,7 +1429,7 @@ fn bitwise_operator_functions_fall_through() {
 }
 
 #[test]
-fn undeclared_scalar_function_declines_in_both_dialects() {
+fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
     // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
     // declaration checked before `arguments`, and a missing `name`.
     let cases = [
@@ -1469,15 +1452,11 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
             expected,
             "DataFusion dialect must decline the undeclared node {expr}"
         );
-        assert!(
-            render_expression(&expr).is_err(),
-            "DataFusion safe variant must be None for {expr}"
-        );
     }
 }
 
 #[test]
-fn unsupported_date_functions_decline_in_both_dialects() {
+fn unsupported_date_functions_decline_in_the_datafusion_dialect() {
     let unsupported = [
         "ADD_HOURS",
         "ADD_MINUTES",
@@ -1500,10 +1479,6 @@ fn unsupported_date_functions_decline_in_both_dialects() {
             render_expression(&expr).unwrap_err().to_string(),
             expected,
             "the DataFusion dialect must decline {name}"
-        );
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} must be None in the DataFusion safe variant"
         );
     }
 }
@@ -1898,7 +1873,6 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
     for (name, arguments, exasol_sql) in cases {
         let expr = scalar_fn(name, arguments);
         assert!(render_expression(&expr).is_err(), "{exasol_sql} must err");
-        assert_eq!(render_expression(&expr).ok(), None, "{exasol_sql}");
         assert_eq!(render_expression_exasol(&expr), exasol_sql);
     }
 }

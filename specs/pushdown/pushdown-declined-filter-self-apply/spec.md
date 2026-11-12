@@ -7,7 +7,7 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
 * Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers two outcomes: no filter and a declined filter. Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
 * A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
-* `render_scan_filter` returns `Err` only for a declined filter and `Ok(None)` for a trivially-true one. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
+* `render_scan_filter` returns `Err` only for a declined filter.
 * Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
 * The adapter self-applies a declined predicate through the non-suppressing Exasol render, which renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so a declined predicate is never applied nowhere.
 * `handle_pushdown` computes the decline classification once per path and passes it down.

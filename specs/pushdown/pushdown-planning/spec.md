@@ -104,7 +104,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *THEN* the adapter SHALL fail the query before any catalog request, with an error that names the column
 * *AND* a `column` node SHALL bind a table by its `tableName`, and by its `tableAlias` when that table occurs several times, so a node with no `tableName`, a `tableName` the query does not read, or a `tableAlias` that names no occurrence binds none
 * *AND* this state SHALL be unreachable for a request Exasol sends, because Exasol stamps a table of the query on every `column` node, single-table requests included, and declares every column a query reads in `involvedTables`
-* *AND* no later step SHALL handle a column that binds no table, because this check has already failed such a request
+* *AND* a later step that meets a column binding no table SHALL treat it as an adapter bug and fail the request, never decline or skip the column, because this check has already failed every such request Exasol sends
 
 ### Scenario: Every request of a supported Exasol version passes the strict type check
 

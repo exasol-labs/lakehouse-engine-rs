@@ -6,8 +6,8 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 
 * Exasol sends expression trees as serde_json `Value` objects: column references, literals, comparison predicates, logical operators, scalar functions, arithmetic operators, CAST, and aggregate function nodes (`function_aggregate`). The crate uses only serde_json as its IR.
 * An aggregate node is not a translated function. Its name is spliced verbatim and its arguments are rendered by recursion, so a scalar expression that wraps aggregates renders in full.
-* The crate's DataFusion entry points are `render_scan_expression`, which returns `Err` for an unsupported node and for one the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`), and `render_scan_filter`, which also returns `Ok(None)` for a trivially-true result. Their fragments are parsed by DataFusion inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_exasol_fragment`) always return a fragment, spliced into outer wrapper SQL that Exasol parses. Exasol pushes only the capabilities the adapter advertises, and the Exasol dialect renders every one of them, so these entry points panic on any other node rather than return an error no request can reach. An error that a scenario in this library states for a malformed or unsupported node is the DataFusion dialect's.
-* `render_scan_expression` does not suppress a trivially-true result, so its `Err` marks exactly the declined case.
+* The crate's DataFusion entry points are `render_scan_expression`, which returns `Err` for an unsupported node and for one the scan must not compute (`pushdown-types/pushdown-planning-scan-text-conversion`), and `render_scan_filter`, which also renders a `NULL` result as `FALSE`. Their fragments are parsed by DataFusion inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_exasol_fragment`) always return a fragment, spliced into outer wrapper SQL that Exasol parses. Exasol pushes only the capabilities the adapter advertises, and the Exasol dialect renders every one of them, so these entry points panic on any other node rather than return an error no request can reach. An error that a scenario in this library states for a malformed or unsupported node is the DataFusion dialect's.
+* `render_scan_expression` returns `Err` for exactly the declined case.
 * The dialect is threaded through every node, and a node branches on it where the two parsers disagree. The Exasol dialect renders what Exasol sent (verbatim name, argument order, and argument count). A construct that is not an Exasol call form has its own per-name arm: an operator wire name, `MOD`, `CONCAT`, a CAST target, and `CASE`.
 * An Exasol-dialect fragment reaches Exasol's parser as a select item, a GROUP BY key, a HAVING operand, an ORDER BY element, an N-scan cross-side residual, or a declined single-table WHERE predicate (rendered through `render_expression_qualified`). An acceptance test for Exasol-dialect rendering uses one of those positions.
 * Every translated `function_scalar` name is declared once in the crate, as `VerbatimCall` (`<NAME>(<rendered args>)`) or `Shaped` (rendered by its own per-name arm). The declaration gates dispatch, so the DataFusion dialect declines an undeclared name with `unsupported scalar function: <name>` before any per-name arm is reached.
@@ -20,7 +20,7 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *WHEN* the adapter renders that predicate for the qualified single-table wrapper's outer `WHERE`
 * *THEN* the Exasol pair SHALL be the renderer used, reached through `render_expression_qualified`, so the fragment is parsed by Exasol's core engine and carries length-qualified CAST targets
 * *AND* the recorded set of wrapper positions an Exasol-dialect node can reach SHALL include this one, so an acceptance test for Exasol-dialect rendering MAY use a declined single-table WHERE predicate
-* *AND* no translator entry point SHALL be added, because `render_scan_expression` already returns `Err` for exactly the declined case and the trivially-true rule stays owned by this crate
+* *AND* no translator entry point SHALL be added, because `render_scan_expression` already returns `Err` for exactly the declined case
 
 ### Scenario: Bare column reference translates to quoted identifier
 
@@ -49,7 +49,7 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *AND* a node carrying `distinct: true` SHALL render as `<NAME>(DISTINCT <rendered arg>)`
 * *AND* each argument SHALL be rendered recursively by the translator (so `CASE`, arithmetic, and column-reference arguments render correctly), and a column argument carrying a `tableAlias` SHALL render table-qualified as `"ALIAS"."COL"`
 * *AND* the translator MUST NOT fall through to the unsupported-node catch-all for a `function_aggregate` node (which would wrongly decline a scalar-over-aggregate select item)
-* *AND* an aggregate node whose argument cannot be rendered SHALL return an error in raising mode and `None` in the safe variants, consistent with every other node type
+* *AND* an aggregate node whose argument cannot be rendered SHALL return an error, consistent with every other node type
 
 ### Scenario: The Exasol dialect never contains a DataFusion-only function name
 

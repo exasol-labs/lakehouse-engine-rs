@@ -68,8 +68,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(pushdown_req);
-        extend_projection_with_sort_keys(&mut projection, &keys, scan.columns())
-            .expect("every fixture sort key names a declared column");
+        extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
         Vec::new()

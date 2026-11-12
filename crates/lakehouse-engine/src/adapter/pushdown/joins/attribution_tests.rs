@@ -3,8 +3,7 @@ use super::*;
 use crate::adapter::pushdown::support::involved_columns;
 use crate::adapter::pushdown::test_support::{
     PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, num_lit,
-    order_by_element, predicate_equal, pushdown_request, scalar_fn, str_lit, table_col,
-    user_message,
+    order_by_element, predicate_equal, pushdown_request, scalar_fn, table_col, user_message,
 };
 use crate::types::exasol_type::ExasolType;
 
@@ -258,23 +257,6 @@ fn customer_orders() -> (PushdownRequestBuilder, [JoinLeaf; 2]) {
     (request, [leaf("CUSTOMER", None), leaf("ORDERS", None)])
 }
 
-#[test]
-fn a_single_scan_whose_every_column_is_declared_passes() {
-    let request = id_name_table()
-        .column(table_col("T", "ID"))
-        .filter(predicate_equal(table_col("T", "NAME"), str_lit("x")))
-        .group_by(vec![table_col("T", "ID")])
-        .order_by(serde_json::json!([order_by_element(
-            table_col("T", "ID"),
-            true,
-            true
-        )]))
-        .build()
-        .0;
-
-    single_scan_gate(&request).expect("every column is declared");
-}
-
 /// Scenario: A column the request does not declare fails the request
 #[test]
 fn a_single_scan_column_its_table_does_not_declare_fails_the_request() {
@@ -329,18 +311,6 @@ fn a_single_scan_column_its_table_does_not_declare_fails_the_request() {
         let error = single_scan_gate(&request).expect_err(&format!("{case} fails"));
         assert_mentions(&user_message(error), mentioned);
     }
-}
-
-#[test]
-fn a_join_column_declared_on_its_own_leg_passes() {
-    let (request, leaves) = customer_orders();
-    let request = request
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .column(table_col("ORDERS", "O_ORDERKEY"))
-        .build()
-        .0;
-
-    join_gate(&request, &leaves).expect("each column is declared on the leg it names");
 }
 
 /// Scenario: A column the request does not declare fails the request

@@ -72,8 +72,7 @@ pub(crate) fn render_broadcast_join(
             .chain(rendered_clauses)
             .collect::<Vec<_>>(),
     )?;
-    // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
-    // loses broadcast eligibility and takes the N-scan fallback (#587).
+    // A declined condition loses broadcast eligibility and takes the N-scan fallback (#587).
     let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
         return Ok(None);
     };

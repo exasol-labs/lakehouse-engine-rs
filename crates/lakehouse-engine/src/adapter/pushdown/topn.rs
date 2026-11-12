@@ -1,11 +1,10 @@
 use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
-use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol;
 
 use super::support::{
-    ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref, emits_ident,
-    extract_limit, extract_offset, render_limit_offset,
+    BOUND_BY_TRANSLATOR, ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref,
+    emits_ident, extract_limit, extract_offset, render_limit_offset,
 };
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
@@ -175,7 +174,7 @@ pub(super) fn extend_projection_with_sort_keys(
     projection: &mut Vec<ProjectedColumn>,
     keys: &[ParsedSortKey],
     col_types: &ColumnTypes,
-) -> Result<(), UdfError> {
+) {
     for column in keys.iter().flat_map(ParsedSortKey::referenced_columns) {
         let already_emitted = projection.iter().any(|projected| {
             matches!(&projected.item, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column)
@@ -183,13 +182,14 @@ pub(super) fn extend_projection_with_sort_keys(
         if already_emitted {
             continue;
         }
-        let column_type = col_types.declared(&ColumnRef::from(column))?;
+        let column_type = col_types
+            .get(&ColumnRef::from(column))
+            .expect(BOUND_BY_TRANSLATOR);
         projection.push(ProjectedColumn {
             item: ProjectionItem::from(column),
             exa_type: column_type.exa_type,
         });
     }
-    Ok(())
 }
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the adapter must reproduce the

@@ -205,7 +205,7 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> Result<String, UdfError> {
+) -> String {
     let [SingleGroupItem::Distinct(dc)] = items else {
         unreachable!(
             "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
@@ -218,12 +218,12 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
         col_types,
         udf_name,
         distribute_udf_name,
-    )?;
+    );
     let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
-    Ok(sql)
+    sql
 }
 
 /// `"V"` carries the column's raw values, declared with its exact Exasol type, so
@@ -235,7 +235,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> Result<String, UdfError> {
+) -> String {
     let Some(col) = dc.column.as_deref() else {
         unreachable!(
             "build_distinct_fan_out is dispatched only for a lone bare-column \
@@ -243,7 +243,10 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
              single-table wrapper instead"
         )
     };
-    let value_type = col_types.declared(&ColumnRef::from(col))?.exa_type;
+    let value_type = col_types
+        .get(&ColumnRef::from(col))
+        .expect(BOUND_BY_TRANSLATOR)
+        .exa_type;
     let proj_item = ProjectionItem::from(col);
     let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
@@ -265,13 +268,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         files: base_spec.files.clone(),
     };
     let emits = format!(r#""V" {value_type}"#);
-    Ok(build_fan_out_inner(
-        &spec,
-        shards,
-        &emits,
-        udf_name,
-        distribute_udf_name,
-    ))
+    build_fan_out_inner(&spec, shards, &emits, udf_name, distribute_udf_name)
 }
 
 /// A nested distributor does the `GROUP BY shard_key` fan-out, wrapped by an outer
@@ -342,6 +339,11 @@ pub(super) fn undeclared_column_error(name: &str) -> UdfError {
         "the pushdown request names column {name}, which its involved table does not declare"
     ))
 }
+
+/// The invariant every type lookup of a request column relies on once [`ScanTranslator::over`]
+/// has built the translator over that request.
+pub(super) const BOUND_BY_TRANSLATOR: &str =
+    "ScanTranslator::over binds every column of the request it renders";
 
 /// Reads each column's name, Exasol type, and note in one pass. A column missing `name` is
 /// skipped. A missing or invalid `dataType` fails the request: the adapter declared every column
@@ -536,13 +538,6 @@ impl ColumnTypes {
         self.entry(column).map(|(_, column_type)| column_type)
     }
 
-    /// [`Self::get`] for a column the request names. A miss is an adapter bug, because
-    /// [`ensure_columns_declared`] already failed any request that names an undeclared column.
-    pub(super) fn declared(&self, column: &ColumnRef) -> Result<&ColumnType, UdfError> {
-        self.get(column)
-            .ok_or_else(|| undeclared_column_error(&column.name))
-    }
-
     pub(super) fn resolve(&self, node: &Json) -> Option<&(ColumnRef, ColumnType)> {
         self.entry(&column_node_ref(node)?)
     }
@@ -680,8 +675,8 @@ pub struct ScanTranslator<'a> {
 impl<'a> ScanTranslator<'a> {
     /// The translator of `trees`, every tree it will render. Every declared column has a type, so
     /// once each column of `trees` binds an entry, the typed pass declines only by a type rule.
-    /// A column that binds none is an adapter bug, such as a wrong leg qualification, and fails
-    /// the request instead of declining (#615).
+    /// The request check already failed every undeclared column, so a column that binds none is
+    /// an adapter bug, such as a wrong leg qualification, and fails the request loudly (#615).
     pub(super) fn over(columns: &'a ColumnTypes, trees: &[&Json]) -> Result<Self, UdfError> {
         for tree in trees {
             let mut unbound = None;
@@ -695,7 +690,9 @@ impl<'a> ScanTranslator<'a> {
                 }
             });
             if let Some(name) = unbound {
-                return Err(undeclared_column_error(&name));
+                return Err(UdfError::User(format!(
+                    "internal adapter error: column {name} binds no column of the scanned tables"
+                )));
             }
         }
         Ok(Self { columns })
@@ -723,7 +720,7 @@ impl<'a> ScanTranslator<'a> {
             return (None, None);
         };
         match render_scan_filter(&self.before_typing(raw), self.columns) {
-            Ok(sql) => (sql, None),
+            Ok(sql) => (Some(sql), None),
             Err(_) => (None, Some(raw)),
         }
     }
@@ -765,13 +762,7 @@ pub(super) fn project_columns(
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        let (column, column_type) = all_cols.resolve(e).ok_or_else(|| {
-                            undeclared_column_error(
-                                &ColumnNode::parse(e)
-                                    .map(|c| c.upper_name())
-                                    .unwrap_or_default(),
-                            )
-                        })?;
+                        let (column, column_type) = all_cols.resolve(e).expect(BOUND_BY_TRANSLATOR);
                         projected.push(ProjectedColumn {
                             item: ProjectionItem::Column(column.clone()),
                             exa_type: column_type.exa_type,
