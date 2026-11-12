@@ -167,8 +167,9 @@ pub fn detect_group_by_aggregates(
     })
 }
 
-/// A projected key takes its `selectListDataTypes` entry, an unprojected one its CAST's or column's
-/// type, a constant [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any other key (#476, #551).
+/// A projected key takes its `selectListDataTypes` entry, an unprojected one its exact type
+/// (`exact_expression_type`), a constant [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any other key
+/// (#476, #551).
 fn group_key_exasol_types(
     pushdown: &PushdownRequest,
     group_keys: &[SqlFragment],

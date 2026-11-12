@@ -6,6 +6,12 @@ fn columns() -> TypedColumns {
     typed_columns(&[
         ("D", ExasolType::Date),
         ("TS", ExasolType::timestamp(6)),
+        ("TS1", ExasolType::timestamp(1)),
+        ("TS7", ExasolType::timestamp(7)),
+        (
+            "TSLTZ",
+            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
+        ),
         ("B", ExasolType::Boolean),
         ("F", ExasolType::DoublePrecision),
         ("N", ExasolType::decimal(9, 2)),
@@ -258,10 +264,97 @@ fn a_computed_integer_converts_like_a_column() {
             scalar_fn("CONCAT", [extract("SECOND", col("TS")), str_lit("x")]),
             false,
         ),
+        (
+            "SECOND of a TIMESTAMP(0)",
+            scalar_fn("CONCAT", [second(timestamp_cast(0)), str_lit("x")]),
+            true,
+        ),
+        (
+            "SECOND of a DATE",
+            scalar_fn("CONCAT", [second(col("D")), str_lit("x")]),
+            false,
+        ),
     ];
     for (label, expr, pushed) in cases {
         let rendered = render(&expr);
         assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
+    }
+}
+
+fn second(argument: Json) -> Json {
+    scalar_fn("SECOND", [argument])
+}
+
+fn timestamp_cast(precision: u8) -> Json {
+    cast_to(ExasolType::timestamp(precision), col("TS"))
+}
+
+/// Scenario: SECOND keeps the fraction of its argument's declared precision
+#[test]
+fn second_renders_the_fraction_of_its_argument_precision() {
+    let cases = [
+        (
+            timestamp_cast(0),
+            r#"CAST(date_part('second', CAST("TS" AS TIMESTAMP(0))) AS DECIMAL(2,0))"#,
+            ExasolType::decimal(2, 0),
+        ),
+        (
+            timestamp_cast(3),
+            r#"CAST((CAST((date_part('microsecond', CAST("TS" AS TIMESTAMP(3))) / 1000) AS DECIMAL(5,0)) * CAST('0.001' AS DECIMAL(3,3))) AS DECIMAL(5,3))"#,
+            ExasolType::decimal(5, 3),
+        ),
+        (
+            col("TS"),
+            r#"CAST((CAST(date_part('microsecond', "TS") AS DECIMAL(8,0)) * CAST('0.000001' AS DECIMAL(6,6))) AS DECIMAL(8,6))"#,
+            ExasolType::decimal(8, 6),
+        ),
+        (
+            col("TS1"),
+            r#"CAST((CAST((date_part('microsecond', "TS1") / 100000) AS DECIMAL(3,0)) * CAST('0.1' AS DECIMAL(1,1))) AS DECIMAL(3,1))"#,
+            ExasolType::decimal(3, 1),
+        ),
+        (
+            col("TS7"),
+            r#"CAST((CAST((date_part('nanosecond', "TS7") / 100) AS DECIMAL(9,0)) * CAST('0.0000001' AS DECIMAL(7,7))) AS DECIMAL(9,7))"#,
+            ExasolType::decimal(9, 7),
+        ),
+        (
+            timestamp_cast(9),
+            r#"CAST((CAST(date_part('nanosecond', CAST("TS" AS TIMESTAMP(9))) AS DECIMAL(11,0)) * CAST('0.000000001' AS DECIMAL(9,9))) AS DECIMAL(11,9))"#,
+            ExasolType::decimal(11, 9),
+        ),
+    ];
+    for (argument, sql, ty) in cases {
+        for expr in [second(argument.clone()), extract("SECOND", argument)] {
+            assert_eq!(
+                render_scan_expression(&expr, &columns()).unwrap(),
+                SqlFragment::new(sql, Some(ty)),
+                "{expr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn second_of_a_date_is_zero_without_an_exact_type() {
+    assert_eq!(
+        render_scan_expression(&second(col("D")), &columns()).unwrap(),
+        SqlFragment::new(r#"CAST(date_part('second', "D") AS DECIMAL(2,0))"#, None)
+    );
+}
+
+#[test]
+fn second_over_any_other_argument_declines() {
+    let local_time_zone = ExasolType::TimestampWithLocalTimeZone { precision: 6 };
+    for expr in [
+        second(scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")])),
+        second(col("S")),
+        second(col("UNKNOWN")),
+        second(cast_to(local_time_zone, col("TS"))),
+        second(col("TSLTZ")),
+        extract("SECOND", col("D")),
+    ] {
+        assert!(render(&expr).is_err(), "{expr} must decline");
     }
 }
 
@@ -569,6 +662,22 @@ fn exact_expression_type_is_the_type_the_request_states() {
         ),
         ("column", col("N"), Some(ExasolType::decimal(9, 2))),
         ("other node", sum, None),
+        (
+            "SECOND of a TIMESTAMP(6)",
+            second(col("TS")),
+            Some(ExasolType::decimal(8, 6)),
+        ),
+        (
+            "EXTRACT SECOND of a TIMESTAMP(9)",
+            extract("SECOND", timestamp_cast(9)),
+            Some(ExasolType::decimal(11, 9)),
+        ),
+        ("SECOND of a DATE", second(col("D")), None),
+        (
+            "SECOND of a computed timestamp",
+            second(scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")])),
+            None,
+        ),
     ];
     for (label, node, expected) in cases {
         assert_eq!(

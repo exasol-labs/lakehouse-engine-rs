@@ -12,7 +12,10 @@ use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use scalar_functions::{ExasolForm, scalar_function};
-use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
+use scan_typing::{
+    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
+    seconds_type,
+};
 pub use scan_typing::{
     ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
 };
@@ -216,6 +219,42 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
             )));
         }
     })
+}
+
+/// Only the typed scan pass knows the fractional digits a one-argument SECOND keeps.
+const UNTYPED_SECOND: &str = "SECOND renders only as a one-argument call through the typed scan pass, which knows the argument's precision";
+
+/// The seconds of `arg` with their first `fraction` digits, cut beyond as Exasol does. An exact
+/// decimal product scales them, because Arrow's decimal quotient keeps only the scale s1 + 4.
+fn render_seconds(arg: &str, fraction: u8) -> Result<String, UdfError> {
+    let (unit, unit_digits) = match fraction {
+        0 => {
+            return Ok(format!(
+                "CAST(date_part('second', {arg}) AS {})",
+                seconds_type(0)
+            ));
+        }
+        1..=6 => ("microsecond", 6),
+        7..=9 => ("nanosecond", 9),
+        _ => {
+            return Err(UdfError::User(format!(
+                "SECOND cannot keep {fraction} fractional digits"
+            )));
+        }
+    };
+    let units = format!("date_part('{unit}', {arg})");
+    let cut = match 10u32.pow(u32::from(unit_digits - fraction)) {
+        1 => units,
+        divisor => format!("({units} / {divisor})"),
+    };
+    let whole = ExasolType::decimal(2 + fraction, 0);
+    let step = ExasolType::decimal(fraction, fraction);
+    let width = usize::from(fraction);
+    Ok(format!(
+        "CAST((CAST({cut} AS {whole}) * CAST('0.{:0>width$}' AS {step})) AS {})",
+        1,
+        seconds_type(fraction)
+    ))
 }
 
 /// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as, registered
@@ -477,6 +516,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
             Ok(Some(match dialect {
                 Dialect::Exasol => format!("EXTRACT({field} FROM {src})"),
+                Dialect::DataFusion if field == "SECOND" => {
+                    return Err(UdfError::User(UNTYPED_SECOND.into()));
+                }
                 // DataFusion has no EXTRACT(field FROM expr) planner by default.
                 Dialect::DataFusion => format!("date_part('{field}', {src})"),
             }))
@@ -531,7 +573,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             render_cast(args, value("dataType"), dialect)
         }
         // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE
+        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE | SECOND_NODE
             if dialect == Dialect::DataFusion =>
         {
             let arg = value("arguments")
@@ -543,6 +585,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(match kind {
                 INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
                 BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                SECOND_NODE => {
+                    let fraction = second_fraction(expr)
+                        .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;
+                    render_seconds(&inner, fraction)?
+                }
                 _ => format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)"),
             }))
         }
@@ -837,7 +884,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("NULLIF second argument is null".into()))?;
                     Ok(Some(format!("nullif({left}, {right})")))
                 }
-                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" => {
+                "SECOND" => Err(UdfError::User(UNTYPED_SECOND.into())),
+                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;

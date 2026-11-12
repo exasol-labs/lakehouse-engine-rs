@@ -3,7 +3,7 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::exasol_type::{ExasolType, exasol_type_from_json};
+use crate::exasol_type::{ExasolType, MAX_FRACTIONAL_DIGITS, exasol_type_from_json};
 use crate::scalar_functions::{ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
@@ -74,6 +74,85 @@ pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
 /// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
 /// (apache/datafusion#16797).
 pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
+/// Synthetic node: the seconds of its argument with `fraction` fractional digits, which only this
+/// pass knows.
+pub(crate) const SECOND_NODE: &str = "scan_second";
+
+/// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
+pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
+    ExasolType::decimal(2 + fraction, fraction)
+}
+
+/// What the scan computes for a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)`.
+#[derive(Clone, Copy)]
+enum Seconds {
+    /// The seconds of a `TIMESTAMP(p)` with its first p fractional digits.
+    OfTimestamp { fraction: u8 },
+    /// 0, which Exasol types `DECIMAL(2,0)` on 2025.1 and `DECIMAL(5,3)` on 8.29.
+    OfDate,
+}
+
+impl Seconds {
+    fn exact_type(self) -> Option<ExasolType> {
+        match self {
+            Self::OfTimestamp { fraction } => Some(seconds_type(fraction)),
+            Self::OfDate => None,
+        }
+    }
+
+    /// A DATE's seconds are no integer for the text rule: their text form differs by version.
+    fn class(self) -> TypeClass {
+        self.exact_type().map_or(TypeClass::Number, TypeClass::of)
+    }
+
+    fn node(self, argument: Json) -> Json {
+        let fraction = match self {
+            Self::OfTimestamp { fraction } => fraction,
+            Self::OfDate => 0,
+        };
+        serde_json::json!({"type": SECOND_NODE, SECOND_FRACTION: fraction, "arguments": [argument]})
+    }
+}
+
+const SECOND_FRACTION: &str = "fraction";
+
+/// The fractional digits a [`SECOND_NODE`] keeps.
+pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
+    let fraction = node.get(SECOND_FRACTION)?.as_u64()?;
+    u8::try_from(fraction).ok()
+}
+
+/// Classifies a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)` by the exact type of `x`.
+/// `None` for any other node, `SECOND(x, n)` included. Exasol itself fails `EXTRACT(SECOND)` of a
+/// DATE, so that declines.
+fn classify_second(
+    node: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Option<Result<Seconds, UdfError>> {
+    let (name, extract) = match kind(node) {
+        "function_scalar_extract" => (node.get("toExtract")?.as_str()?.to_uppercase(), true),
+        "function_scalar" => (upper_name(node), false),
+        _ => return None,
+    };
+    if name != "SECOND" {
+        return None;
+    }
+    let [argument] = node.get("arguments")?.as_array()?.as_slice() else {
+        return None;
+    };
+    Some(match exact_expression_type(argument, columns) {
+        Some(ExasolType::Timestamp { precision }) if precision <= MAX_FRACTIONAL_DIGITS => {
+            Ok(Seconds::OfTimestamp {
+                fraction: precision,
+            })
+        }
+        Some(ExasolType::Date) if !extract => Ok(Seconds::OfDate),
+        _ => Err(decline(format!(
+            "SECOND needs an argument declared TIMESTAMP(p), or DATE outside EXTRACT: {}",
+            short(node)
+        ))),
+    })
+}
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
 /// a `name` identifier to its visitor.
@@ -234,6 +313,10 @@ pub(crate) fn type_scan_tree(
         return Ok((node.clone(), class));
     }
     let (mut out, children) = type_children(node, columns)?;
+    if let Some(seconds) = classify_second(node, columns) {
+        let seconds = seconds?;
+        return Ok((seconds.node(out["arguments"][0].take()), seconds.class()));
+    }
     let class = node_class(node, &mut out, &children)?;
     Ok((out, class))
 }
@@ -423,11 +506,15 @@ fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfErro
     }
 }
 
-/// The type the request states for `node`: a CAST's `dataType` or a column's type. `None`
-/// otherwise, because Exasol's expression typing depends on values, session, and version (#476).
+/// The type the request states for `node`: a CAST's `dataType`, a column's type, or the type of
+/// `SECOND` over a `TIMESTAMP(p)`, which depends on p alone. `None` otherwise, because Exasol's
+/// expression typing depends on values, session, and version (#476).
 pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
     if let Some(data_type) = node.get("dataType") {
         return exasol_type_from_json(data_type).ok();
+    }
+    if let Some(seconds) = classify_second(node, columns) {
+        return seconds.ok()?.exact_type();
     }
     if kind(node) == "column" {
         columns.column_type(node)

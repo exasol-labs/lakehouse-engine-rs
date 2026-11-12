@@ -12,6 +12,10 @@ fn cast(data_type: Json) -> Json {
     cast_json(data_type, col("x"))
 }
 
+fn microsecond_ts() -> TypedColumns {
+    typed_columns(&[("ts", ExasolType::timestamp(6))])
+}
+
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
     let expr = col("region");
@@ -1183,6 +1187,8 @@ fn renders_case_without_else() {
     );
 }
 
+/// Scenario: EXTRACT translates to the DataFusion date_part call
+/// Scenario: The untyped DataFusion walker declines SECOND
 #[test]
 fn renders_extract() {
     let expr = extract("YEAR", col("ts"));
@@ -1196,8 +1202,11 @@ fn renders_extract() {
         render_expression(&expr2).unwrap(),
         r#"date_part('MONTH', "TS")"#
     );
+
+    assert!(render_expression(&extract("SECOND", col("ts"))).is_err());
 }
 
+/// Scenario: EXTRACT renders Exasol's EXTRACT FROM form in the Exasol dialect
 #[test]
 fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
     let expr = extract("DAY", col("ts"));
@@ -1209,11 +1218,17 @@ fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
         render_expression(&expr).unwrap(),
         r#"date_part('DAY', "TS")"#
     );
+    assert_eq!(
+        render_expression_exasol(&extract("SECOND", col("ts"))).unwrap(),
+        r#"EXTRACT(SECOND FROM "TS")"#
+    );
 }
 
+/// Scenario: Field-shortcut date functions translate to date_part of the matching field
+/// Scenario: The untyped DataFusion walker declines SECOND
 #[test]
 fn renders_year_month_day_extract() {
-    let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
+    let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE"];
     for field in shortcuts {
         let expr = scalar_fn(field, [col("ts")]);
         let sql = render_expression(&expr).unwrap();
@@ -1223,6 +1238,7 @@ fn renders_year_month_day_extract() {
             "failed for {field}"
         );
     }
+    assert!(render_expression(&scalar_fn("SECOND", [col("ts")])).is_err());
 }
 
 #[test]
@@ -1385,6 +1401,7 @@ fn between_fns_reject_wrong_arity() {
     }
 }
 
+/// Scenario: A refused argument count declines for DataFusion and renders for Exasol
 #[test]
 fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     let expr = scalar_fn("SECOND", [col("ts"), num_lit(3)]);
@@ -1392,6 +1409,10 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     assert!(
         render_expression(&expr).is_err(),
         "SECOND(ts, 3) must decline under the DataFusion dialect"
+    );
+    assert!(
+        render_scan_expression(&expr, &microsecond_ts()).is_err(),
+        "SECOND(ts, 3) must decline even where the typed pass knows the argument's precision"
     );
     assert!(
         render_expression_exasol_safe(&expr).is_some(),
@@ -1937,6 +1958,7 @@ fn renders_nullif_verbatim_in_exasol_dialect() {
     );
 }
 
+/// Scenario: Field-shortcut date functions render verbatim in the Exasol dialect
 #[test]
 fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
     for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
@@ -1946,8 +1968,10 @@ fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
             format!(r#"{field}("TS")"#),
             "the Exasol dialect must render {field} verbatim"
         );
+    }
+    for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE"] {
         assert_eq!(
-            render_expression(&expr).unwrap(),
+            render_expression(&scalar_fn(field, [col("ts")])).unwrap(),
             format!(r#"date_part('{field}', "TS")"#),
             "the DataFusion dialect must stay unchanged for {field}"
         );
@@ -2263,8 +2287,14 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             .find(|f| f.name == *declared_name)
             .expect("fixture completeness is asserted above");
         // The only call that reaches the per-name arms: Exasol `VerbatimCall`s return
-        // ahead of them.
-        if let Err(err) = render_expression(&fixture.node) {
+        // ahead of them. SECOND renders only from the typed scan pass, which knows its
+        // argument's precision.
+        let datafusion = if *declared_name == "SECOND" {
+            render_scan_expression(&fixture.node, &microsecond_ts()).map(|fragment| fragment.sql)
+        } else {
+            render_expression(&fixture.node)
+        };
+        if let Err(err) = datafusion {
             panic!(
                 "{declared_name} is declared in SCALAR_FUNCTIONS, which gates BOTH \
                  dialects from one lookup, so it MUST render in the DataFusion dialect too; \
