@@ -1,6 +1,6 @@
 use super::declared_columns_test_support::{declared, numeric, varchar};
 use super::*;
-use crate::scan::checked_div::CheckedDivError;
+use crate::scan::checked_div::CheckedFloatDivError;
 use crate::scan::scan_session_context;
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -279,16 +279,11 @@ async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
 
 #[test]
 fn classify_scan_error_names_a_checked_division_failure_without_the_storage_prefix() {
-    let zero_divisor = || CheckedDivError::ZeroDivisor {
+    let zero_divisor = || CheckedFloatDivError::ZeroDivisor {
         numerator: 7.0,
         divisor: 0.0,
     };
-    let integer_zero_divisor = || CheckedDivError::IntegerZeroDivisor { numerator: 7 };
     let nestings: Vec<(&str, DataFusionError)> = vec![
-        (
-            "integer zero divisor",
-            DataFusionError::External(Box::new(integer_zero_divisor())),
-        ),
         (
             "bare External",
             DataFusionError::External(Box::new(zero_divisor())),
@@ -325,7 +320,7 @@ fn classify_scan_error_names_a_checked_division_failure_without_the_storage_pref
 
 #[test]
 fn classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divisor() {
-    let overflow = DataFusionError::External(Box::new(CheckedDivError::NonFiniteResult {
+    let overflow = DataFusionError::External(Box::new(CheckedFloatDivError::NonFiniteResult {
         numerator: 1e300,
         divisor: 1e-300,
         quotient: f64::INFINITY,
@@ -350,7 +345,7 @@ fn classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divis
 #[test]
 fn classify_scan_error_redacts_secrets_from_a_checked_division_failure() {
     let secret = "AKIAIOSFODNN7EXAMPLE";
-    let wrapped = DataFusionError::External(Box::new(CheckedDivError::ZeroDivisor {
+    let wrapped = DataFusionError::External(Box::new(CheckedFloatDivError::ZeroDivisor {
         numerator: 7.0,
         divisor: 0.0,
     }))

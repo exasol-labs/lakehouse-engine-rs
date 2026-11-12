@@ -284,7 +284,7 @@ fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
 }
 
 #[test]
-fn build_session_context_registers_both_checked_division_functions() {
+fn build_session_context_registers_the_checked_float_div_function() {
     let spec = minimal_spec();
 
     let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
@@ -305,23 +305,6 @@ fn build_session_context_registers_both_checked_division_functions() {
         DataType::Float64,
         "the registered function must return DOUBLE, so the renderer needs no \
          CAST of its own around the call"
-    );
-
-    let integer = ctx
-        .state()
-        .udf(vs_expression::CHECKED_INT_DIV_FN)
-        .unwrap_or_else(|e| {
-            panic!(
-                "a session built for a spec must resolve {}: {e}",
-                vs_expression::CHECKED_INT_DIV_FN
-            )
-        });
-    assert_eq!(
-        integer
-            .return_type(&[DataType::Int64, DataType::Int64])
-            .expect("the checked integer division must declare a return type"),
-        DataType::Decimal128(19, 0),
-        "the registered function must return DECIMAL(<numerator precision>, 0)"
     );
 }
 

@@ -1,5 +1,5 @@
 //! Builders for Exasol pushdown-request JSON nodes: columns, literals, predicates, scalar
-//! functions, CAST, EXTRACT, CASE, and aggregates, plus the column types the typed renderers
+//! functions, CAST, EXTRACT, CASE, JSON_VALUE, and aggregates, plus the column types the typed renderers
 //! look up. Dependent crates enable `test-support`.
 
 use crate::exasol_type::{ExasolType, exasol_type_to_json};
@@ -248,6 +248,49 @@ fn aggregate(name: &str, argument: Option<Json>, distinct: bool) -> Json {
         aggregate["distinct"] = true.into();
     }
     aggregate
+}
+
+/// `JSON_VALUE(document, path)` as Exasol sends it without clauses: `RETURNING VARCHAR(2000000)`,
+/// `NULL ON EMPTY`, `NULL ON ERROR`.
+pub fn json_value(document: Json, path: &str) -> Json {
+    node(
+        "function_scalar_json_value",
+        [
+            ("name", "JSON_VALUE".into()),
+            ("arguments", array([document, str_lit(path)])),
+            (
+                "returningDataType",
+                exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
+            ),
+            ("emptyBehavior", json!({"type": "NULL"})),
+            ("errorBehavior", json!({"type": "NULL"})),
+        ],
+    )
+}
+
+/// [`json_value`] with `RETURNING returning` and the `ON EMPTY` and `ON ERROR` behaviors.
+pub fn json_value_as(
+    document: Json,
+    path: &str,
+    returning: ExasolType,
+    on_empty: Json,
+    on_error: Json,
+) -> Json {
+    let mut call = json_value(document, path);
+    call["returningDataType"] = exasol_type_to_json(&returning);
+    call["emptyBehavior"] = on_empty;
+    call["errorBehavior"] = on_error;
+    call
+}
+
+/// The `NULL` or `ERROR` behavior.
+pub fn json_behavior(kind: &str) -> Json {
+    json!({"type": kind})
+}
+
+/// `DEFAULT expression` as an `ON EMPTY` or `ON ERROR` behavior.
+pub fn json_default(expression: Json) -> Json {
+    json!({"type": "DEFAULT", "expression": expression})
 }
 
 /// Moves `fields` into a node of type `kind`. `json!` would clone every child it is handed,
