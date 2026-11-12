@@ -5,7 +5,7 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{SqlFragment, render_expression_exasol};
+use vs_expression::SqlFragment;
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
@@ -13,15 +13,15 @@ use super::super::support::{
     collect_all_column_names, extract_limit, extract_offset, output_select_list, project_columns,
     projection_items, quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
-use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
-use super::attribution::{JoinLegs, UnattributableColumn};
+use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
+use super::attribution::JoinLegs;
 use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
     conjoin_filters, cross_leg_residual_filter, leg_local_filter, projection_item_select_sql,
-    referenced_clause_values, referenced_leg_columns, render_df_filter_qualified,
-    render_expression_qualified, screen_leg_filter, select_item_type,
+    referenced_clause_values, referenced_leg_columns, render_expression_qualified,
+    screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -43,8 +43,7 @@ pub(crate) struct RenderedJoinPushdown {
 /// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, the
 /// projection widened to the full row (#196), a projected output name exceeds Exasol's
 /// identifier limit, or the WHERE filter declines through [`ScanTranslator::split_where`]: broadcast
-/// has no outer WHERE to apply a declined predicate. `Err` for a request with no column
-/// metadata at all, or with a column no single leg owns.
+/// has no outer WHERE to apply a declined predicate.
 ///
 /// Every column of the condition, filter, select list, and ORDER BY is qualified through
 /// [`JoinLegs`] with its leg's alias before anything reads it, and the column-type map is the
@@ -56,19 +55,24 @@ pub(crate) fn render_broadcast_join(
     sides: &[ResolvedJoinSide],
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let legs = join.legs();
-    let condition_tree = legs
-        .qualify_every_column(&join.conditions[0])
-        .map_err(unattributable_decline)?;
-    let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs)?);
+    let condition_tree = legs.qualify(&join.conditions[0]);
+    let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs));
     let col_types = ColumnTypes::per_relation(
         sides
             .iter()
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let scan = ScanTranslator::new(&col_types);
-    // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
-    // loses broadcast eligibility and takes the N-scan fallback (#587).
+    let rendered_clauses = BROADCAST_CLAUSES
+        .into_iter()
+        .filter_map(|clause| qualified.json().get(clause));
+    let scan = ScanTranslator::over(
+        &col_types,
+        &std::iter::once(&condition_tree)
+            .chain(rendered_clauses)
+            .collect::<Vec<_>>(),
+    )?;
+    // A declined condition loses broadcast eligibility and takes the N-scan fallback (#587).
     let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
         return Ok(None);
     };
@@ -97,18 +101,17 @@ pub(crate) fn render_broadcast_join(
     }))
 }
 
-/// Only the clauses the broadcast plan renders; a column no single leg owns has no correct
-/// qualified reference, so it fails with the fallback's own error.
-fn qualify_broadcast_clauses(pushdown_req: &Json, legs: &JoinLegs) -> Result<Json, UdfError> {
+/// The request clauses the broadcast plan renders, so the ones it qualifies and type-checks.
+const BROADCAST_CLAUSES: [&str; 3] = ["selectList", "filter", "orderBy"];
+
+fn qualify_broadcast_clauses(pushdown_req: &Json, legs: &JoinLegs) -> Json {
     let mut qualified = pushdown_req.clone();
-    for clause in ["selectList", "filter", "orderBy"] {
+    for clause in BROADCAST_CLAUSES {
         if let Some(value) = pushdown_req.get(clause) {
-            qualified[clause] = legs
-                .qualify_every_column(value)
-                .map_err(unattributable_decline)?;
+            qualified[clause] = legs.qualify(value);
         }
     }
-    Ok(qualified)
+    qualified
 }
 
 fn exceeds_identifier_limit(item: &ProjectionItem) -> bool {
@@ -122,26 +125,16 @@ fn exceeds_identifier_limit(item: &ProjectionItem) -> bool {
 
 /// Each condition attaches greedily to the earliest join point with every referenced leg
 /// in scope, as decided by [`JoinLegs::attachment_leg`] (never by table or column name). A
-/// join point with none renders `ON 1=1`. Unattachable conditions are returned as outer
-/// WHERE residuals, which for an inner join is result-equivalent to `ON`.
+/// join point with none renders `ON 1=1`.
 fn build_n_scan_join_from(
     fan_outs: &[String],
     legs: &JoinLegs,
     raw_conditions: &[Json],
     conditions: &[String],
-) -> (String, Vec<String>) {
-    let last_join_point = fan_outs.len().saturating_sub(1);
-
+) -> String {
     let mut on_at: Vec<Vec<String>> = vec![Vec::new(); fan_outs.len()];
-    let mut residual: Vec<String> = Vec::new();
     for (raw, rendered) in raw_conditions.iter().zip(conditions) {
-        // With a single leg there is no join point (and `clamp(1, 0)` would panic).
-        match legs.attachment_leg(raw) {
-            Some(m) if last_join_point >= 1 => {
-                on_at[m.clamp(1, last_join_point)].push(rendered.clone())
-            }
-            _ => residual.push(rendered.clone()),
-        }
+        on_at[legs.attachment_leg(raw)].push(rendered.clone());
     }
 
     let mut from = format!("({}) AS {}", fan_outs[0], quote_ident(&legs.leg_alias(0)));
@@ -160,7 +153,7 @@ fn build_n_scan_join_from(
             quote_ident(&legs.leg_alias(k))
         ));
     }
-    (from, residual)
+    from
 }
 
 fn n_full_row_qualified_items(
@@ -190,41 +183,10 @@ fn shard_side(side: &ResolvedJoinSide, inputs: &JoinScanRequestConfig<'_>) -> Ve
     relativize_shards_to_root(shards, &side.table_root)
 }
 
-/// Not merged with [`super::ineligible_join_decline`], whose sentence differs.
 fn join_render_decline(clause: &str) -> UdfError {
     UdfError::User(format!(
         "join pushdown declined: {clause}; this is a hard error, not a native re-plan"
     ))
-}
-
-/// Picking a leg arbitrarily instead would return silently wrong rows.
-fn unattributable_decline(column: UnattributableColumn) -> UdfError {
-    join_render_decline(&format!(
-        "{column} could not be attributed to a join leg, so no correct qualified \
-         reference exists"
-    ))
-}
-
-/// `Ok(None)` when trivially true; `Err` when neither dialect renders it (see
-/// `_decision/045`) or a reference cannot be placed on a leg.
-fn render_self_applied_where(
-    tree: &Json,
-    legs: &JoinLegs,
-    subject: &str,
-) -> Result<Option<String>, UdfError> {
-    if let Some(sql) = render_df_filter_qualified(tree, legs).map_err(unattributable_decline)? {
-        return Ok(Some(sql));
-    }
-    if render_expression_qualified(tree, legs)
-        .map_err(unattributable_decline)?
-        .is_some()
-    {
-        return Ok(None);
-    }
-    let tree_json = serde_json::to_string(tree).unwrap_or_default();
-    Err(join_render_decline(&format!(
-        "{subject} could be rendered by neither dialect, so it could be applied nowhere: {tree_json}"
-    )))
 }
 
 /// An absent/empty select list projects every column of every leg. An item without a stated type
@@ -238,7 +200,7 @@ fn n_scan_join_select_items(
         Some(Json::Array(list)) if !list.is_empty() => {
             let mut fragments = Vec::with_capacity(list.len());
             for item in list {
-                let sql = render_required_clause(item, legs, "a select-list item")?;
+                let sql = render_expression_qualified(item, legs);
                 fragments.push(SqlFragment::new(
                     sql,
                     select_item_type(item, legs, cols_per_leg),
@@ -257,9 +219,8 @@ fn n_scan_join_select_items(
     }
 }
 
-/// Shared by the N-scan wrapper and the grouped single-table fallback. Clauses are computed
-/// in SELECT, GROUP BY, HAVING, ORDER BY order so the first unrenderable one surfaces its
-/// error; the window renders last so it applies after the sort.
+/// Shared by the N-scan wrapper and the grouped single-table fallback. The window renders
+/// last so it applies after the sort.
 struct OuterWrapperClauses {
     select: String,
     trailing: String,
@@ -272,9 +233,9 @@ fn outer_wrapper_clauses(
 ) -> Result<OuterWrapperClauses, UdfError> {
     let pushdown_req = pushdown.json();
     let select_items = n_scan_join_select_items(pushdown, legs, cols_per_leg)?;
-    let group_by = qualified_join_group_by(pushdown_req, legs)?;
-    let having = qualified_join_having(pushdown_req, legs)?;
-    let order_by = qualified_join_order_by(pushdown_req, legs)?;
+    let group_by = qualified_join_group_by(pushdown_req, legs);
+    let having = qualified_join_having(pushdown_req, legs);
+    let order_by = qualified_join_order_by(pushdown_req, legs);
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     // Exasol withholds `limit` when it cannot delegate an ordering, so an offset never arrives
@@ -318,8 +279,6 @@ fn outer_wrapper_clauses(
 /// Each leg receives the leg-local conjuncts [`screen_leg_filter`] renders; every other conjunct,
 /// declined ones included, goes to the outer WHERE, so the fan-out loop runs first.
 ///
-/// `Err` (hard, no native re-plan) only when the wrapper cannot be built, including a
-/// residual neither dialect renders: a predicate applicable nowhere must fail the query.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_n_scan_join_sql(
     pushdown: &PushdownRequest,
@@ -330,36 +289,14 @@ pub(in super::super) fn build_n_scan_join_sql(
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let cols_per_side: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
-    if cols_per_side.iter().any(|c| c.is_empty()) {
-        return Err(join_render_decline(
-            "an involved table carries no column metadata, so the unaccelerated N-scan \
-             fallback cannot be built",
-        ));
-    }
 
     let legs = join.legs();
-    // A real guard, not a debug assertion: a mismatch would panic out of bounds in a release UDF.
-    if legs.leg_count() != sides.len() {
-        return Err(join_render_decline(&format!(
-            "leg count ({}) and resolved-side count ({}) disagree, so a leg index cannot \
-             index the resolved sides",
-            legs.leg_count(),
-            sides.len()
-        )));
-    }
 
-    // A condition has no lower fallback: if it cannot render qualified, no correct SQL exists.
-    let mut conditions = Vec::with_capacity(join.conditions.len());
-    for cond in &join.conditions {
-        let rendered = render_expression_qualified(cond, &legs)
-            .map_err(unattributable_decline)?
-            .ok_or_else(|| {
-                join_render_decline(
-                    "a join condition could not be rendered against the qualified N-scan schema",
-                )
-            })?;
-        conditions.push(rendered);
-    }
+    let conditions: Vec<String> = join
+        .conditions
+        .iter()
+        .map(|cond| render_expression_qualified(cond, &legs))
+        .collect();
 
     let pushdown_req = pushdown.json();
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
@@ -374,7 +311,7 @@ pub(in super::super) fn build_n_scan_join_sql(
             referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
         let (side_filter, side_declined) =
             match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
-                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i]),
+                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i])?,
                 None => (None, None),
             };
         // Disjoint by attribution, so no conjunct is double-applied.
@@ -394,28 +331,16 @@ pub(in super::super) fn build_n_scan_join_sql(
         where_filter.and_then(|f| cross_leg_residual_filter(f, &legs)),
         declined,
     );
-    let filter = match &residual {
-        None => None,
-        Some(tree) => render_self_applied_where(tree, &legs, "a residual WHERE conjunct")?,
-    };
+    let filter = residual.map(|tree| render_expression_qualified(&tree, &legs));
 
     let OuterWrapperClauses { select, trailing } =
         outer_wrapper_clauses(pushdown, &legs, &cols_per_side)?;
 
-    let (from, residual_conditions) =
-        build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
-
-    let mut where_parts: Vec<String> = residual_conditions
-        .iter()
-        .map(|c| format!("({c})"))
-        .collect();
-    if let Some(f) = &filter {
-        where_parts.push(format!("({f})"));
-    }
+    let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
     let mut sql = format!("SELECT {select} FROM {from}");
-    if !where_parts.is_empty() {
-        sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
+    if let Some(f) = &filter {
+        sql.push_str(&format!(" WHERE ({f})"));
     }
     sql.push_str(&trailing);
     Ok(sql)
@@ -642,89 +567,49 @@ pub(in super::super) fn build_broadcast_join_sql(
     let Some((keys, limit, offset)) = placement.wrapper else {
         return Ok(Some(fan_out));
     };
-    let wrapped = wrap_declined_order_by(
+    Ok(Some(wrap_declined_order_by(
         &fan_out,
         &spec.common.projection,
         spec.common.projection.len(),
         &keys,
         limit,
         offset,
-    );
-    // The wrapper returns its input unchanged when no key rendered; emitting the bare fan-out
-    // would answer an advertised ORDER_BY_COLUMN with unordered rows, so fall back instead.
-    debug_assert_ne!(
-        wrapped, fan_out,
-        "an Ordered window must render an ORDER BY"
-    );
-    Ok((wrapped != fan_out).then_some(wrapped))
+    )))
 }
 
-/// A group key that cannot be rendered is a hard error.
-fn qualified_join_group_by(
-    pushdown_req: &Json,
-    legs: &JoinLegs,
-) -> Result<Option<String>, UdfError> {
-    let keys = match pushdown_req
+fn qualified_join_group_by(pushdown_req: &Json, legs: &JoinLegs) -> Option<String> {
+    let keys = pushdown_req
         .get("groupBy")
         .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())
-    {
-        Some(keys) => keys,
-        None => return Ok(None),
-    };
-    let parts = keys
+        .filter(|a| !a.is_empty())?;
+    let parts: Vec<String> = keys
         .iter()
-        .map(|key| render_required_clause(key, legs, "a GROUP BY key"))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(parts.join(", ")))
+        .map(|key| render_expression_qualified(key, legs))
+        .collect();
+    Some(parts.join(", "))
 }
 
-/// Unrenderable is a hard error: dropping it would return wrong rows.
-fn qualified_join_having(pushdown_req: &Json, legs: &JoinLegs) -> Result<Option<String>, UdfError> {
+fn qualified_join_having(pushdown_req: &Json, legs: &JoinLegs) -> Option<String> {
     pushdown_req
         .get("having")
         .filter(|h| !h.is_null())
-        .map(|having| render_required_clause(having, legs, "HAVING"))
-        .transpose()
+        .map(|having| render_expression_qualified(having, legs))
 }
 
-/// The error names the render's reason, such as an invalid CAST `dataType`.
-fn render_required_clause(expr: &Json, legs: &JoinLegs, clause: &str) -> Result<String, UdfError> {
-    let qualified = legs.qualify(expr).map_err(unattributable_decline)?;
-    render_expression_exasol(&qualified).map_err(|err| {
-        join_render_decline(&format!(
-            "{clause} could not be rendered for the qualified N-scan join ({err})"
-        ))
-    })
-}
-
-/// An unrenderable element (or missing sort flags) is a hard error: Exasol does not
-/// re-sort a delegated ordering.
-fn qualified_join_order_by(
-    pushdown_req: &Json,
-    legs: &JoinLegs,
-) -> Result<Option<String>, UdfError> {
-    let elements = match pushdown_req
+fn qualified_join_order_by(pushdown_req: &Json, legs: &JoinLegs) -> Option<String> {
+    let elements = pushdown_req
         .get("orderBy")
         .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())
-    {
-        Some(elements) => elements,
-        None => return Ok(None),
-    };
-    let decline = || {
-        join_render_decline("an ORDER BY key could not be rendered for the qualified N-scan join")
-    };
-    let mut parts = Vec::with_capacity(elements.len());
-    for element in elements {
-        let (ascending, nulls_last) = parse_sort_flags(element).ok_or_else(decline)?;
-        let expr = element.get("expression").ok_or_else(decline)?;
-        let rendered = render_expression_qualified(expr, legs)
-            .map_err(unattributable_decline)?
-            .ok_or_else(decline)?;
-        parts.push(render_ordered(&rendered, ascending, nulls_last));
-    }
-    Ok(Some(parts.join(", ")))
+        .filter(|a| !a.is_empty())?;
+    let parts: Vec<String> = elements
+        .iter()
+        .map(|element| {
+            let (ascending, nulls_last) = sort_flags(element);
+            let rendered = render_expression_qualified(&element["expression"], legs);
+            render_ordered(&rendered, ascending, nulls_last)
+        })
+        .collect();
+    Some(parts.join(", "))
 }
 
 /// The shared inner-scan projection for both decline wrappers (#160).
@@ -812,10 +697,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         distribute_udf_name,
     );
 
-    let where_clause = match declined_filter {
-        None => None,
-        Some(tree) => render_self_applied_where(tree, &legs, "a declined WHERE predicate")?,
-    };
+    let where_clause = declined_filter.map(|tree| render_expression_qualified(tree, &legs));
 
     let mut sql = format!(
         "SELECT {select} FROM ({fan_out}) AS {}",

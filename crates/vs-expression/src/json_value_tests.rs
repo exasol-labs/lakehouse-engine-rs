@@ -170,7 +170,7 @@ fn exasol_dialect_reemits_every_clause() {
         json_behavior("ERROR"),
     );
     assert_eq!(
-        render_expression_exasol(&call).unwrap(),
+        render_expression_exasol(&call),
         "JSON_VALUE(\"DOC\", '$.a' RETURNING DECIMAL(18,0) DEFAULT 0 ON EMPTY ERROR ON ERROR)"
     );
 }

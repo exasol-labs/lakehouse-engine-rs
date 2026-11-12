@@ -4,7 +4,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_scan_expression`, `render_scan_filter`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
+The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_scan_expression`, `render_scan_filter`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_exasol_fragment`) feed outer wrapper SQL that Exasol's own engine parses.
 
 In the DataFusion dialect, most Exasol `FN_*` names lower-case to the DataFusion function of the same name. These need explicit aliasing: `SIGN`→`signum`, `LENGTH`→`character_length`, `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
@@ -29,7 +29,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SIGN`→`signum`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
-* *AND* a node whose argument count does not match the function arity SHALL return an error in raising mode and `None` in the safe variants
+* *AND* a node whose argument count does not match the function arity SHALL return an error
 
 ### Scenario: Math scalar functions render verbatim in the Exasol dialect
 
@@ -47,7 +47,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *THEN* the translator SHALL return `(<left> % <right>)`, because DataFusion exposes modulo as the `%` operator rather than a `mod()` function
 * *AND* both operands SHALL be rendered recursively
 * *AND* `render_expression_exasol` SHALL return `MOD(<left>, <right>)` instead, because Exasol's parser rejects `%`
-* *AND* a node whose argument count is not exactly two SHALL return an error in raising mode and `None` in the safe variants, in BOTH dialects
+* *AND* a node whose argument count is not exactly two SHALL return an error in the DataFusion dialect
 
 ### Scenario: String scalar functions translate to DataFusion string calls
 
@@ -73,7 +73,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar_case` (the Exasol node type for both simple and searched CASE, including the expansion of `NULLIF(...)`) carrying `arguments` (the WHEN test conditions) and `results` (the THEN values, with the optional ELSE as the last element when `results` has one more entry than `arguments`)
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return a `CASE WHEN <cond1> THEN <res1> [WHEN <condN> THEN <resN>]... [ELSE <else>] END` expression with each condition and result rendered recursively
-* *AND* a `function_scalar_case` node with no WHEN branch SHALL return an error in raising mode and `None` in the safe variants
+* *AND* a `function_scalar_case` node with no WHEN branch SHALL return an error
 
 ### Scenario: NULLIFZERO and ZEROIFNULL translate to NULLIF and COALESCE
 
@@ -89,13 +89,13 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `nullif(<a>, <b>)` over the recursively rendered arguments
 * *AND* `render_expression_exasol` SHALL return `NULLIF(<a>, <b>)` under the same verbatim rule as the other Exasol scalar functions, because `NULLIF` is a native Exasol function and the lower-cased call is a DataFusion form
-* *AND* an argument count other than two SHALL return an error in raising mode and `None` in the safe variants in the DataFusion dialect
+* *AND* an argument count other than two SHALL return an error in the DataFusion dialect
 * *AND* the Exasol dialect SHALL NOT impose that arity check, for the reason given in the math-function scenario above: Exasol's compiler emitted a call its own engine accepts
 
 ### Scenario: Regexp scalar functions are deliberately not translated
 
 * *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
-* *WHEN* `render_expression` processes the node in raising mode
+* *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
-* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking
 * *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

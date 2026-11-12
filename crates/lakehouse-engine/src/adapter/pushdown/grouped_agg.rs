@@ -12,7 +12,7 @@ use super::support::{
     ColumnTypes, PushdownRequest, ScanTranslator, build_fan_out_inner, output_select_list,
     quote_ident, render_limit_offset,
 };
-use super::topn::parse_sort_flags;
+use super::topn::sort_flags;
 
 /// Each variant carries its original `selectList` ordinal: Exasol validates the
 /// outer wrapper SELECT positionally against `selectListDataTypes`.
@@ -124,7 +124,7 @@ pub fn detect_group_by_aggregates(
             }
             // Exasol dialect: the constant is projected by the Exasol-parsed merge (#550).
             t if is_literal_selectlist_item(t) => {
-                let projection = render_exasol_fragment(item, scan.columns()).ok()?;
+                let projection = render_exasol_fragment(item, scan.columns());
                 select_items.push(GroupedSelectItem::Constant {
                     select_index,
                     projection,
@@ -235,13 +235,8 @@ pub(super) fn build_grouped_order_by_clause(
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
         // Flags only: an aggregate sort key yields no `SortKey`.
-        let Some((ascending, nulls_last)) = parse_sort_flags(element) else {
-            return Some(GroupedOrderBy::Unresolvable);
-        };
-        let Some(expr) = element.get("expression") else {
-            return Some(GroupedOrderBy::Unresolvable);
-        };
-        let Some(ordering) = render_merge_operand(Some(expr), scope, scan) else {
+        let (ascending, nulls_last) = sort_flags(element);
+        let Some(ordering) = render_merge_operand(Some(&element["expression"]), scope, scan) else {
             return Some(GroupedOrderBy::Unresolvable);
         };
         parts.push(render_ordered(&ordering, ascending, nulls_last));

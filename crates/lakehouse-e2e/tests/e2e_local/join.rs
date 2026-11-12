@@ -458,6 +458,7 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
 }
 
 /// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
+/// Scenario: A join outside the broadcast contract is declined safely
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();

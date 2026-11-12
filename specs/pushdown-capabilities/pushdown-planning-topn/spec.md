@@ -7,7 +7,7 @@ The adapter pushes an ordered top-N query (single table, no GROUP BY, no aggrega
 * The per-shard bounded top-N is carried once in the shard-invariant common spec. The merge `ORDER BY … LIMIT n` renders through the same order-by seam as the per-shard sort, so direction and NULL placement agree.
 * The bounded path applies only to a request with an `order_by` list and a `limit` with `numElements`, a single involved table, and no `having`, no aggregates, and no group keys.
 * A sort key is matched only when its `order_by` entry is a bare column reference that is also a projected output column. An expression or aggregate sort key never matches, because the per-shard sort key in the scan spec is a bare column.
-* Each `order_by` entry carries a direction (`isAscending`) and a NULL placement (`nullsLast`). The per-shard sort and the merge sort must use the same key order, direction, and NULL placement, or the merged top-N can differ from single-node evaluation.
+* Each `order_by` entry carries a direction (`isAscending`) and a NULL placement (`nullsLast`), and Exasol states both on every entry. The per-shard sort and the merge sort must use the same key order, direction, and NULL placement, or the merged top-N can differ from single-node evaluation.
 * A row in the global top-N cannot be outranked by `n` rows within its own shard, so it survives that shard's local `ORDER BY … LIMIT n`. The global top-N is therefore a subset of the union of the per-shard top-Ns.
 * A non-zero offset declines the bounded path, because each shard would skip its own first `m` rows and the union of the per-shard windows is not the global window. The declined wrapper renders `LIMIT n OFFSET m` on itself. `ScanSpec` has no offset field.
 * The offset guard tests for a non-zero offset, not for the key's presence. Exasol pushes no `offset` key for `OFFSET 0`, but a presence test would decline every ordered LIMIT query on a build that attached `offset: 0`.
@@ -82,16 +82,6 @@ The adapter pushes an ordered top-N query (single table, no GROUP BY, no aggrega
 * *WHEN* the bounded top-N path declines
 * *THEN* the wrapper's `ORDER BY` element SHALL name the column the scan emits for that select-list item
 * *AND* the adapter SHALL NOT append the expression's referenced base columns for that key, so Exasol does not compute the expression again
-
-### Scenario: An unrenderable expression sort key declines hard rather than silently dropping the ordering
-
-* *GIVEN* a `pushdown` request carrying a NON-EMPTY `orderBy` with at least one element the adapter cannot render, an expression sort key the Exasol-dialect expression renderer cannot render, or an element that omits its direction or NULL-placement flag
-* *WHEN* the adapter builds the scan-driving SQL on any path that renders a pushed ordering, the declined row-scan wrapper, the qualified single-table wrapper, or the N-scan join wrapper
-* *THEN* the adapter SHALL return a `User` decline naming the unrenderable `ORDER BY` key, and SHALL NOT claim a native re-plan
-* *AND* the adapter MUST NOT drop the sort key and return rows successfully in an arbitrary order, because Exasol delegates a pushed `orderBy` and does not re-sort the returned rows once a sort-key capability is advertised
-* *AND* a non-empty `orderBy` whose elements ALL fail to render SHALL take that SAME decline, and MUST NOT be treated as "no ordering was pushed" and returned as unwrapped scan-driving SQL, the two cases are one rule, not two, because dropping every key is the same silent-wrong-order outcome as dropping one (see the reconciled zero-parsed-keys clause in `pushdown-capabilities/pushdown-planning-order-by-capability`)
-* *AND* an ABSENT or EMPTY `orderBy` SHALL remain outside this scenario entirely: no ordering was pushed, so the adapter emits no wrapper and no `ORDER BY`
-* *AND* the decline SHALL be the ONLY alternative to a faithfully rendered ordering, so no reachable ordered shape can return a result that is both successful and silently unordered
 
 ### Scenario: Generated SQL carries a credential reference, not a credential
 

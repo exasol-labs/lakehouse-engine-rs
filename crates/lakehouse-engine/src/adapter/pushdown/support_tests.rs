@@ -381,8 +381,12 @@ fn projection_carried_in_common_literal_and_emits() {
 
 #[test]
 fn pushdown_translates_or_omits_predicate() {
-    let translatable = compare("predicate_greater", col("age"), num_lit(18));
-    let filter_rendered = untyped_scan_filter(&translatable);
+    let columns = column_types(&[
+        ("AGE", ExasolType::decimal(20, 0)),
+        ("PRICE", ExasolType::decimal(9, 2)),
+    ]);
+    let translatable = compare("predicate_greater", col("AGE"), num_lit(18));
+    let filter_rendered = scan_filter_sql(&translatable, &columns);
     assert!(
         filter_rendered.is_some(),
         "translatable predicate must produce a filter string"
@@ -399,8 +403,8 @@ fn pushdown_translates_or_omits_predicate() {
 
     // Kept out of the scan spec only; the adapter still self-applies it (see
     // `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`).
-    let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
-    let omitted = untyped_scan_filter(&untranslatable);
+    let untranslatable = like(col("PRICE"), "1%");
+    let omitted = scan_filter_sql(&untranslatable, &columns);
     assert!(
         omitted.is_none(),
         "untranslatable predicate must be omitted (None), not mistranslated"
@@ -499,10 +503,7 @@ fn project_columns_fallback_is_duplicate_free() {
                 ("name", ExasolType::WIDEST_VARCHAR),
             ],
         )
-        .item(
-            scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]),
-            ExasolType::decimal(20, 0),
-        )
+        .item(like(col("id"), "1%"), ExasolType::Boolean)
         .item(count_star(), ExasolType::decimal(20, 0)),
     );
 
@@ -532,7 +533,7 @@ fn aggregate_query_builds_partial_agg_spec() {
         cast_merge_items(
             &agg_plans,
             &[ExasolType::DoublePrecision, ExasolType::decimal(18, 0)],
-            &ColumnTypes::default(),
+            &column_types(NO_COLUMNS),
         ),
         None,
     )
@@ -707,7 +708,7 @@ fn build_agg_sql(
     let merge_select = cast_merge_items(
         &agg_plans,
         &vec![ExasolType::DoublePrecision; agg_plans.len()],
-        &ColumnTypes::default(),
+        &column_types(NO_COLUMNS),
     );
     let spec_template = CommonScanSpec {
         aggregates: Some(agg_plans),
@@ -738,7 +739,7 @@ fn aggregate_merge_renders_having_then_request_limit() {
     let merge_select = cast_merge_items(
         &plans,
         &[ExasolType::decimal(18, 0)],
-        &ColumnTypes::default(),
+        &column_types(NO_COLUMNS),
     );
     let spec_template = CommonScanSpec {
         aggregates: Some(plans),
@@ -1010,8 +1011,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
         None,
         r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
         r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
-    )
-    .expect("the distinct column is typed");
+    );
 
     assert!(
         sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
@@ -1058,7 +1058,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         .build();
     let pushdown = parsed_pushdown(&request);
 
-    let items = super::super::detect_aggregates(&pushdown, untyped_scan())
+    let items = super::super::detect_aggregates(&pushdown, scan_of(&request))
         .expect("two COUNT(DISTINCT) items are detected as distinct fan-out descriptors");
     assert!(
         has_distinct(&items),
@@ -1176,8 +1176,7 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         Some(1),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("the distinct column is typed");
+    );
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
 }
 
@@ -1717,7 +1716,10 @@ fn filter_in_common_arg() {
 
     let filter_json = predicate_equal(col("id"), num_lit(42));
 
-    let df_filter = untyped_scan_filter(&filter_json);
+    let df_filter = scan_filter_sql(
+        &filter_json,
+        &column_types(&[("ID", ExasolType::decimal(10, 0))]),
+    );
     assert!(
         df_filter.is_some(),
         "translatable filter must produce a DataFusion SQL string"
@@ -1744,53 +1746,24 @@ fn filter_in_common_arg() {
     );
 }
 
-/// Asserts the fixture genuinely declines, since a quietly rendering fixture would
-/// assert nothing.
-fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
-    let (scan_filter, declined) =
-        ScanTranslator::new(&column_types(col_types)).split_where(Some(filter));
-    assert!(
-        scan_filter.is_none(),
-        "fixture precondition: a declining filter must never reach the scan spec: \
-         {scan_filter:?}"
-    );
-    let declined = declined
-        .expect("fixture precondition: a declining filter must be handed back for self-applying");
-    let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
-    let pushdown = PushdownRequest::parse(
-        serde_json::json!({"filter": filter.clone(), "selectListDataTypes": []}),
-    )
-    .expect("a select-list-free request declares an empty selectListDataTypes");
-    let fan_out_spec = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
-    let type_map = column_types(col_types);
-    let fan_out = super::super::joins::FanOutProjection::new(fan_out_spec, &type_map);
-    super::super::joins::build_qualified_single_table_fallback_sql(
-        &request,
-        &pushdown,
-        &fan_out,
-        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        Some(declined),
-    )
-    .expect("the wrapper must render the declined predicate")
-}
-
 #[test]
 fn nested_like_decline_routes_to_wrapper_where() {
     let filter = and([
         string_equal("T", "STATUS", "OPEN"),
         like(table_col("T", "AMOUNT"), "9%"),
     ]);
-    let col_types = vec![
-        ("STATUS".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("AMOUNT".to_string(), ExasolType::decimal(9, 2)),
-    ];
+    let request = pushdown_request(
+        "T",
+        &[
+            ("STATUS", ExasolType::WIDEST_VARCHAR),
+            ("AMOUNT", ExasolType::decimal(9, 2)),
+        ],
+    )
+    .filter(filter)
+    .build()
+    .0;
 
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
+    let sql = declined_filter_wrapper_sql(&request);
 
     let where_at = sql
         .find(r#"AS "LHS_T0" WHERE "#)
@@ -1804,28 +1777,16 @@ fn nested_like_decline_routes_to_wrapper_where() {
 
 #[test]
 fn declined_like_on_date_column_routes_to_wrapper_where() {
-    let filter = like(table_col("T", "SHIPPED"), "2024%");
-    let col_types = vec![("SHIPPED".to_string(), ExasolType::Date)];
+    let request = pushdown_request("T", &[("SHIPPED", ExasolType::Date)])
+        .filter(like(table_col("T", "SHIPPED"), "2024%"))
+        .build()
+        .0;
 
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
+    let sql = declined_filter_wrapper_sql(&request);
 
     assert!(
         sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."SHIPPED" LIKE '2024%')"#),
         "the DATE-column LIKE must be applied in the wrapper WHERE: {sql}"
-    );
-}
-
-#[test]
-fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
-    let filter = like(table_col("T", "MYSTERY"), "A%");
-    let col_types = vec![("OTHER".to_string(), ExasolType::WIDEST_VARCHAR)];
-
-    let sql = declined_filter_wrapper_sql(&filter, &col_types);
-
-    assert!(
-        sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
-        "an unresolvable-subject decline must still be applied by the adapter, \
-         never omitted: {sql}"
     );
 }
 
@@ -2006,11 +1967,6 @@ fn selectlist_items_the_scan_declines_widen_to_the_full_base_row() {
         (
             "LIKE over TIMESTAMP",
             like(col("c_ts_a"), "1%"),
-            ExasolType::Boolean,
-        ),
-        (
-            "LIKE over an unresolvable column",
-            like(col("not_a_column"), "1%"),
             ExasolType::Boolean,
         ),
     ];
@@ -2449,48 +2405,6 @@ fn shared_name_universe() -> ColumnTypes {
 }
 
 #[test]
-fn qualified_universe_projects_each_column_with_its_relation_and_type() {
-    let universe = shared_name_universe();
-    let relations = pushdown_request("LHS_T0", &[("X", ExasolType::decimal(18, 0))])
-        .table("LHS_T1", &[("X", ExasolType::varchar(10))]);
-    let pushdown_req = relations
-        .clone()
-        .column(alias_col("LHS_T1", "X"))
-        .column(alias_col("LHS_T0", "X"))
-        .build_pushdown();
-    let (items, types, widened) = project_split(&pushdown_req, &universe).expect("projects");
-    assert!(!widened);
-    assert_eq!(
-        items,
-        vec![
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
-        ]
-    );
-    assert_eq!(
-        types,
-        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
-    );
-
-    let select_star = relations.build_pushdown();
-    let (projection, _) =
-        project_columns(&select_star, ScanTranslator::new(&universe)).expect("projects");
-    let (full_row, full_types) = split_projection(&projection);
-    assert_eq!(
-        full_row,
-        vec![
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
-        ],
-        "the full row lists the universe in leg order"
-    );
-    assert_eq!(
-        full_types,
-        vec![ExasolType::decimal(18, 0), ExasolType::varchar(10)]
-    );
-}
-
-#[test]
 fn only_a_plain_timestamp_declares_timestamp_digits() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
         let expected = match exa_type {
@@ -2836,8 +2750,8 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
-        untyped_scan_expression(&literal).is_some(),
-        "literal_timestamp_utc must render via untyped_scan_expression"
+        typed_scan(NO_COLUMNS).expression(&literal).is_some(),
+        "literal_timestamp_utc must render through the scan translator"
     );
     let (proj_cols, proj_types, widened) = projected(id_name_request().item(
         literal,
@@ -2866,7 +2780,7 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
 fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
     let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
-        untyped_scan_expression(&literal).is_none(),
+        typed_scan(NO_COLUMNS).expression(&literal).is_none(),
         "the DataFusion dialect must keep declining the real wire name (#242): \
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"
@@ -2891,4 +2805,17 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
         proj_types,
         vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
     );
+}
+
+#[test]
+fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
+    let universe = shared_name_universe();
+    let undeclared = alias_col("LHS_T0", "Y");
+    let wrong_relation = alias_col("LHS_T2", "X");
+
+    for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
+        let error = ScanTranslator::over(&universe, &[&tree])
+            .expect_err("a column no entry binds is an adapter bug, never a decline");
+        assert_mentions(&user_message(error), &[column]);
+    }
 }

@@ -182,22 +182,15 @@ pub(super) fn nq3_join_request() -> Json {
 /// `None` omits both the leaf's `alias` and the columns' `tableAlias`, as Exasol does for an
 /// unaliased occurrence (mirrors the live `EXPLAIN VIRTUAL` capture for #361).
 pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
-    fn leaf(alias: Option<&str>) -> Json {
-        let mut leaf = table_ref("FACT_ORDERS");
-        if let Some(alias) = alias {
-            leaf["alias"] = Json::String(alias.to_string());
-        }
-        leaf
-    }
     fn order_key(alias: Option<&str>) -> Json {
         table_column("FACT_ORDERS", alias, "O_ORDERKEY")
     }
 
-    let mut from = leaf(leg_aliases[0]);
+    let mut from = table_ref_as("FACT_ORDERS", leg_aliases[0]);
     for (left_leg, right_leg) in leg_aliases.iter().zip(leg_aliases.iter().skip(1)) {
         from = inner_join(
             from,
-            leaf(*right_leg),
+            table_ref_as("FACT_ORDERS", *right_leg),
             predicate_equal(order_key(*left_leg), order_key(*right_leg)),
         );
     }
@@ -227,14 +220,20 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
     }
 }
 
+/// The legs production binds for `request`: its join's legs, or its one table's.
+pub(super) fn request_legs(request: &Json) -> JoinLegs {
+    match detect_join(request, &pd(request)).expect("a plannable request") {
+        JoinShape::Join(join) => join.legs(),
+        JoinShape::NotAJoin => JoinLegs::for_single_scan(request),
+    }
+}
+
 /// The select list projected as `render_broadcast_join` projects it: every column qualified
 /// through the leg binding and typed by its own leg's universe, widened row included.
 pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
     let join = detected_join(request);
     let legs = join.legs();
-    let qualified = legs
-        .qualify(&pd(request))
-        .expect("every fixture column belongs to one leg");
+    let qualified = legs.qualify(&pd(request));
     let sides = request_sides(request, &join);
     let leg_types = ColumnTypes::per_relation(
         sides
@@ -283,7 +282,7 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             partition_columns: Vec::new(),
             refused_columns: Vec::new(),
         },
-        ColumnTypes::default(),
+        column_types(NO_COLUMNS),
     )
 }
 
@@ -307,24 +306,6 @@ fn qualify_udf_uses_schema_and_falls_back_when_empty() {
     assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
     assert_eq!(qualify_udf(Some(""), "UDF"), "UDF");
     assert_eq!(qualify_udf(None, "UDF"), "UDF");
-}
-
-#[test]
-fn golden_ineligible_decline_message_unchanged() {
-    let not_inner = user_message(ineligible_join_decline(
-        IneligibleJoinReason::NotInnerJoinType,
-    ));
-    let unsupported = user_message(ineligible_join_decline(
-        IneligibleJoinReason::UnsupportedShape,
-    ));
-    assert_eq!(
-        not_inner,
-        "join pushdown declined: the join is not an inner join; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
-    );
-    assert_eq!(
-        unsupported,
-        "join pushdown declined: the join `from` clause has an unsupported shape; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
-    );
 }
 
 const CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_name", "string")];
@@ -448,19 +429,6 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
     delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
         .expect("a select list naming only the mappable side's column must plan");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
-    let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_variant_col().await;
-    let request = delta_join_request(Some(vec![col("VARIANT_COL")]));
-
-    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
-        .await
-        .expect_err("a column reference naming no side must be charged to every side");
-
-    assert_refuses_variant_col(error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
