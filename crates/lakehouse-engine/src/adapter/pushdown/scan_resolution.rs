@@ -67,8 +67,12 @@ impl<'a> TableScanResolver<'a> {
     ) -> Result<(ResolvedScan, ColumnTypes), UdfError> {
         self.require_admitted(table_identifier)?;
         let declared = involved.notes.declared_schema()?;
-        let column_types =
-            ColumnTypes::of(involved, &declared.logical_schema, self.binary_as_string);
+        let column_types = ColumnTypes::of(
+            involved,
+            &declared.logical_schema,
+            &declared.refused_columns,
+            self.binary_as_string,
+        );
         // Retyped so every reader prunes binary comparisons on the raw bytes.
         let filter_json =
             filter_json.map(|filter| with_binary_literals(filter.clone(), &column_types));

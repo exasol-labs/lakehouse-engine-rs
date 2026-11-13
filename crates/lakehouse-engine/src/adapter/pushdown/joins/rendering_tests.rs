@@ -1,15 +1,16 @@
+use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
 use super::super::planning::{JoinLeaf, involved_table};
 use super::super::sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql,
-    render_broadcast_join,
+    JoinScanRequestConfig, build_broadcast_join_sql, build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
-    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    request_legs, resolved_side, two_scan_tuning,
+    broadcast_projection, customer_orders_sides, detected_join, equi_condition, join_request,
+    legs_from_leaves, resolved_side, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
+use crate::adapter::pushdown::support::RowProjection;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::ExasolType;
@@ -51,7 +52,12 @@ fn join_condition_renders_via_translator() {
     let request = join_request(Json::Null, equi_condition());
     let detected = detected_join(&request);
     let sides = request_sides(&request, &detected);
-    let both_legs = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
+    let both_legs: Vec<(String, ExasolType)> = sides
+        .iter()
+        .flat_map(|side| side.column_types.iter())
+        .map(|(column, column_type)| (column.name.clone(), column_type.exa_type))
+        .collect();
+    let both_legs = column_types(&both_legs);
     assert_eq!(
         scan_over(&both_legs)
             .expression(&equi_condition())
@@ -110,7 +116,8 @@ fn join_where_filter_spanning_both_sides_renders() {
 #[test]
 fn join_projection_emits_attribute_each_side_owning_type() {
     let request = join_request(Json::Null, equi_condition());
-    let (projection, types, _widened) = broadcast_projection(&request);
+    let projection = broadcast_projection(&request);
+    let (projection, types) = direct_columns(&projection);
 
     assert_eq!(
         projection,
@@ -160,8 +167,10 @@ fn a_shared_column_name_projects_with_each_leg_relation_and_type() {
         .column(table_col("A", "X"))
         .build()
         .0;
-    let (items, types, widened) = broadcast_projection(&selecting);
-    assert!(!widened);
+    let projection = broadcast_projection(&selecting);
+    let (items, types) = direct_columns(&projection);
+    let wrapped = projection == RowProjection::Wrapped;
+    assert!(!wrapped);
     assert_eq!(
         items,
         vec![
@@ -174,7 +183,8 @@ fn a_shared_column_name_projects_with_each_leg_relation_and_type() {
         vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
     );
 
-    let (full_row, full_types, _) = broadcast_projection(&shared_name_join().build().0);
+    let projection = broadcast_projection(&shared_name_join().build().0);
+    let (full_row, full_types) = direct_columns(&projection);
     assert_eq!(
         full_row,
         vec![
@@ -207,7 +217,8 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
         )],
     );
 
-    let (projection, _types, _widened) = broadcast_projection(&request);
+    let projection = broadcast_projection(&request);
+    let (projection, _types) = direct_columns(&projection);
 
     assert_eq!(
         projection.len(),
@@ -234,7 +245,8 @@ fn join_projection_string_fn_converts_integer_and_declines_unrenderable_arity() 
             ExasolType::WIDEST_VARCHAR,
         )],
     );
-    let (projection, _types, _widened) = broadcast_projection(&coerce_request);
+    let projection = broadcast_projection(&coerce_request);
+    let (projection, _types) = direct_columns(&projection);
     assert_eq!(
         projection.len(),
         1,
@@ -260,20 +272,13 @@ fn join_projection_string_fn_converts_integer_and_declines_unrenderable_arity() 
             ExasolType::decimal(18, 0),
         )],
     );
-    let (projection, _types, _widened) = broadcast_projection(&decline_request);
-    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER")
-        .unwrap()
-        .types
-        .len()
-        + involved_table(&decline_request, "ORDERS")
-            .unwrap()
-            .types
-            .len();
-    assert_eq!(
-        projection.len(),
-        expected_full_row_len,
-        "the arity-decline INSTR must fall back to the full projection over BOTH \
-         joined tables' columns, not a truncated strpos: {projection:?}"
+    let projection = broadcast_projection(&decline_request);
+    let wrapped = projection == RowProjection::Wrapped;
+    let (projection, _types) = direct_columns(&projection);
+    assert!(
+        wrapped,
+        "the arity-decline INSTR must decline the broadcast projection, not render a \
+         truncated strpos: {projection:?}"
     );
 }
 
@@ -289,10 +294,12 @@ fn join_projection_like_guard_reaches_join_select_list() {
             ExasolType::Boolean,
         )],
     );
-    let (projection, _types, widened) = broadcast_projection(&string_request);
+    let projection = broadcast_projection(&string_request);
+    let wrapped = projection == RowProjection::Wrapped;
+    let (projection, _types) = direct_columns(&projection);
     assert!(
-        !widened,
-        "a VARCHAR subject must keep the broadcast projection, not widen to the \
+        !wrapped,
+        "a VARCHAR subject must keep the broadcast projection, not wrap to the \
          full row: {projection:?}"
     );
     assert_eq!(
@@ -317,33 +324,14 @@ fn join_projection_like_guard_reaches_join_select_list() {
             ExasolType::Boolean,
         )],
     );
-    let (projection, _types, widened) = broadcast_projection(&decline_request);
+    let projection = broadcast_projection(&decline_request);
+    let wrapped = projection == RowProjection::Wrapped;
+    let (projection, _types) = direct_columns(&projection);
     assert!(
-        widened,
-        "the widening flag is what declines the broadcast join to the N-scan \
+        wrapped,
+        "the wrapping flag is what declines the broadcast join to the N-scan \
          fallback; a DATE-subject LIKE must set it: \
          {projection:?}"
-    );
-    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER")
-        .unwrap()
-        .types
-        .len()
-        + involved_table(&decline_request, "ORDERS")
-            .unwrap()
-            .types
-            .len();
-    assert_eq!(
-        projection.len(),
-        expected_full_row_len,
-        "a DECIMAL-subject LIKE must fall back to the full projection over BOTH \
-         joined tables' columns, not an unguarded LIKE: {projection:?}"
-    );
-    assert!(
-        projection
-            .iter()
-            .all(|item| matches!(item, ProjectionItem::Column(_))),
-        "the fallback projection must be bare columns, not a same-length vector \
-         of rendered Expr items: {projection:?}"
     );
 }
 
@@ -573,104 +561,247 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
     assert_eq!(numeric_declined, None);
 }
 
-#[test]
-fn referenced_leg_columns_narrows_to_used_columns() {
-    let full = [
-        ("C_CUSTKEY", ExasolType::decimal(20, 0)),
-        ("C_NAME", ExasolType::varchar(100)),
-        ("C_ADDRESS", ExasolType::varchar(100)),
-        ("C_PHONE", ExasolType::varchar(20)),
-    ];
-    let condition = predicate_equal(
-        table_col("CUSTOMER", "C_CUSTKEY"),
-        table_col("ORDERS", "O_CUSTKEY"),
-    );
-    let request = pushdown_request("CUSTOMER", &full)
-        .table("ORDERS", &[("O_CUSTKEY", ExasolType::decimal(20, 0))])
-        .field(
-            "from",
-            inner_join(
-                table_ref("CUSTOMER"),
-                table_ref("ORDERS"),
-                condition.clone(),
-            ),
-        )
-        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .build()
-        .0;
-    let narrowed = referenced_leg_columns(
-        &pd(&request),
-        &condition,
-        &request_legs(&request),
-        0,
-        &column_types(&full),
-    );
-    let names: Vec<&str> = narrowed
+const CUSTOMER_COLUMNS: [(&str, ExasolType); 4] = [
+    ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+    ("C_NAME", ExasolType::varchar(100)),
+    ("C_ADDRESS", ExasolType::varchar(100)),
+    ("C_PHONE", ExasolType::varchar(20)),
+];
+
+const ORDERS_COLUMNS: [(&str, ExasolType); 2] = [
+    ("O_ORDERKEY", ExasolType::decimal(20, 0)),
+    ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+];
+
+const REFUSAL_REASON: &str = "the reader cannot render this column";
+
+/// CUSTOMER's and ORDERS' columns, refusing each column `refused` names.
+fn customer_orders_columns(refused: &[&str]) -> [ColumnTypes; 2] {
+    let refused: Vec<RefusedColumn> = refused
         .iter()
-        .map(|(column, _)| column.name.as_str())
+        .map(|name| RefusedColumn {
+            column_name: name.to_string(),
+            reason: REFUSAL_REASON.to_string(),
+        })
         .collect();
-    assert_eq!(
-        names,
-        vec!["C_CUSTKEY", "C_NAME", "C_ADDRESS"],
-        "narrows to condition + select + filter columns, in full-column order, dropping C_PHONE"
-    );
-    assert_eq!(
-        narrowed
-            .iter()
-            .nth(1)
-            .map(|(column, column_type)| (column.name.as_str(), column_type.exa_type)),
-        Some(("C_NAME", ExasolType::varchar(100)))
-    );
+    [
+        refusing_column_types(&CUSTOMER_COLUMNS, &refused),
+        refusing_column_types(&ORDERS_COLUMNS, &refused),
+    ]
+}
+
+/// A [`leg_emission`] case: the contract, the clauses above the leg, the leg, the refused columns,
+/// and the emitted column names or a phrase of the error.
+type LegEmissionCase<'a> = (
+    &'a str,
+    OutputContract,
+    &'a [&'a Json],
+    usize,
+    &'a [&'a str],
+    Result<&'a [&'a str], &'a str>,
+);
+
+/// A [`fan_out_emission`] case: the clauses above the fan-out, the preferred and the refused
+/// columns, and the names each of the two legs emits.
+type FanOutEmissionCase<'a> = (
+    &'a str,
+    &'a [&'a Json],
+    &'a [&'a str],
+    &'a [&'a str],
+    [&'a [&'a str]; 2],
+);
+
+/// Each emission's column names, or the error message.
+fn emitted_names(emitted: Result<Vec<Emitted>, UdfError>) -> Result<Vec<Vec<String>>, String> {
+    emitted
+        .map(|legs| {
+            legs.iter()
+                .map(|leg| {
+                    leg.columns()
+                        .iter()
+                        .map(|(column, _)| column.name.clone())
+                        .collect()
+                })
+                .collect()
+        })
+        .map_err(user_message)
 }
 
 #[test]
-fn referenced_leg_columns_keeps_all_when_select_list_absent() {
+fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
     let condition = predicate_equal(
         table_col("CUSTOMER", "C_CUSTKEY"),
         table_col("ORDERS", "O_CUSTKEY"),
     );
-    let full = vec![
-        ("C_CUSTKEY".to_string(), ExasolType::decimal(20, 0)),
-        ("C_NAME".to_string(), ExasolType::varchar(100)),
+    let name = table_col("CUSTOMER", "C_NAME");
+    let address_filter = string_equal("CUSTOMER", "C_ADDRESS", "z");
+    let order_key = table_col("ORDERS", "O_ORDERKEY");
+    let legs = customer_orders_legs();
+    use OutputContract::{AnyOneColumn, Items, WholeRow};
+    let cases: [LegEmissionCase; 11] = [
+        (
+            "named columns keep the declaration order",
+            Items,
+            &[&name, &condition, &address_filter],
+            0,
+            &[],
+            Ok(&["C_CUSTKEY", "C_NAME", "C_ADDRESS"]),
+        ),
+        (
+            "a leg emits only its own columns",
+            Items,
+            &[&name, &condition],
+            1,
+            &[],
+            Ok(&["O_CUSTKEY"]),
+        ),
+        (
+            "SELECT * emits every declared column",
+            WholeRow,
+            &[&condition],
+            0,
+            &[],
+            Ok(&["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_PHONE"]),
+        ),
+        (
+            "SELECT * over a refused column the gate let through is an adapter error",
+            WholeRow,
+            &[&condition],
+            0,
+            &["C_ADDRESS"],
+            Err("internal adapter error"),
+        ),
+        (
+            "an empty select list still emits the named columns",
+            AnyOneColumn,
+            &[&condition],
+            0,
+            &["C_NAME"],
+            Ok(&["C_CUSTKEY"]),
+        ),
+        (
+            "an empty select list over an unnamed leg emits one column",
+            AnyOneColumn,
+            &[],
+            0,
+            &[],
+            Ok(&["C_CUSTKEY"]),
+        ),
+        (
+            "an unnamed leg skips a refused first column",
+            AnyOneColumn,
+            &[],
+            0,
+            &["C_CUSTKEY"],
+            Ok(&["C_NAME"]),
+        ),
+        (
+            "a leg only the other leg's clauses name emits one column, not its row",
+            Items,
+            &[&order_key],
+            0,
+            &["C_NAME"],
+            Ok(&["C_CUSTKEY"]),
+        ),
+        (
+            "an unnamed second leg skips a refused first column",
+            Items,
+            &[&name],
+            1,
+            &["O_ORDERKEY"],
+            Ok(&["O_CUSTKEY"]),
+        ),
+        (
+            "a named refused column is an adapter error",
+            Items,
+            &[&name],
+            0,
+            &["C_NAME"],
+            Err("internal adapter error"),
+        ),
+        (
+            "a leg with no readable column fails",
+            AnyOneColumn,
+            &[],
+            1,
+            &["O_ORDERKEY", "O_CUSTKEY"],
+            Err("no readable column"),
+        ),
     ];
-    let narrowed = referenced_leg_columns(
-        &serde_json::json!({}),
-        &condition,
-        &customer_orders_legs(),
-        0,
-        &column_types(&full),
-    );
-    assert_eq!(
-        narrowed,
-        column_types(&full),
-        "an absent select list ⇒ SELECT *, keep every column"
-    );
+    for (case, output, above, leg, refused, expected) in cases {
+        let columns = customer_orders_columns(refused);
+        let emitted = leg_emission(output, above, &legs, leg, &columns[leg]);
+        match (emitted_names(emitted.map(|leg| vec![leg])), expected) {
+            (Ok(names), Ok(expected)) => assert_eq!(names, [expected], "{case}"),
+            (Err(message), Err(fragment)) => {
+                assert!(message.contains(fragment), "{case}: {message}")
+            }
+            (actual, expected) => panic!("{case}: got {actual:?}, expected {expected:?}"),
+        }
+    }
 }
 
 #[test]
-fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
-    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .build_pushdown();
-    let condition = equi_condition();
-    let full = vec![
-        ("L_ORDERKEY".to_string(), ExasolType::decimal(20, 0)),
-        ("L_QUANTITY".to_string(), ExasolType::decimal(18, 2)),
+fn a_fan_out_over_several_legs_emits_one_placeholder_for_all_of_them() {
+    let name = table_col("CUSTOMER", "C_NAME");
+    let order_key = table_col("ORDERS", "O_ORDERKEY");
+    let legs = customer_orders_legs();
+    let cases: [FanOutEmissionCase; 5] = [
+        (
+            "a leg no clause names emits nothing beside a named leg",
+            &[&order_key],
+            &[],
+            &[],
+            [&[], &["O_ORDERKEY"]],
+        ),
+        (
+            "each leg emits its named columns",
+            &[&order_key, &name],
+            &[],
+            &[],
+            [&["C_NAME"], &["O_ORDERKEY"]],
+        ),
+        (
+            "no named column: the first leg emits a preferred column",
+            &[],
+            &["C_ADDRESS"],
+            &[],
+            [&["C_ADDRESS"], &[]],
+        ),
+        (
+            "no named and no preferred column: the first readable column",
+            &[],
+            &[],
+            &["C_CUSTKEY"],
+            [&["C_NAME"], &[]],
+        ),
+        (
+            "a refused preferred column is skipped",
+            &[],
+            &["C_CUSTKEY", "C_PHONE"],
+            &["C_CUSTKEY"],
+            [&["C_PHONE"], &[]],
+        ),
     ];
-    let narrowed = referenced_leg_columns(
-        pushdown_req.json(),
-        &condition,
-        &legs_of(&["CUSTOMER", "ORDERS", "LINEITEM"]),
-        2,
-        &column_types(&full),
-    );
-    assert_eq!(
-        narrowed,
-        column_types(&full),
-        "no clause references a LINEITEM column ⇒ keep every column rather than \
-         emit a zero-column leg"
-    );
+    for (case, above, prefer, refused, expected) in cases {
+        let columns = customer_orders_columns(refused);
+        let prefer = columns[0].narrowed(|column| prefer.contains(&column.name.as_str()));
+        let emitted = fan_out_emission(
+            OutputContract::Items,
+            above,
+            &legs,
+            &[(0, &columns[0]), (1, &columns[1])],
+            &prefer,
+        );
+        assert_eq!(
+            emitted_names(emitted),
+            Ok(expected
+                .iter()
+                .map(|leg| leg.iter().map(|name| name.to_string()).collect())
+                .collect()),
+            "{case}"
+        );
+    }
 }
 
 #[test]
@@ -705,7 +836,7 @@ fn side_fan_out_pushes_side_local_filter_into_common_blob() {
     let fan_out = |filter: Option<String>| {
         let sql = build_side_fan_out_sql(
             &side,
-            &column_types(&cols),
+            &emitting(&column_types(&cols)),
             filter,
             &two_scan_tuning(),
             "SCAN",
@@ -738,7 +869,7 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     };
     let sql = build_side_fan_out_sql(
         &side,
-        &column_types(&cols),
+        &emitting(&column_types(&cols)),
         None,
         &tuning,
         "SCAN",
@@ -878,7 +1009,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
 }
 
 #[test]
-fn unified_join_prunes_and_narrows_each_leg() {
+fn unified_join_pushes_each_leg_local_filter_into_its_fan_out() {
     let request = with_identifier_notes(
         pushdown_request(
             "CUSTOMER",
@@ -914,29 +1045,15 @@ fn unified_join_prunes_and_narrows_each_leg() {
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     );
 
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
+        &detected_join(&request),
+        &customer_orders_sides(&request, 10, 100),
         &two_scan_tuning(),
         "SCAN",
         "DISTRIBUTE",
     )
     .expect("unified wrapper must build");
-
-    assert!(
-        !sql.contains("C_ADDRESS"),
-        "an unreferenced CUSTOMER column must be narrowed out of the fan-out: {sql}"
-    );
-    assert!(
-        !sql.contains("O_TOTALPRICE"),
-        "an unreferenced ORDERS column must be narrowed out of the fan-out: {sql}"
-    );
 
     assert_eq!(
         sql.matches("\"filter\"").count(),
@@ -984,4 +1101,123 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
+}
+
+#[test]
+fn broadcast_width_is_bounded_by_fixed_width_types_or_a_literal_condition() {
+    let customer = |name: &str| table_col("CUSTOMER", name);
+    let text = [("C_NAME", ExasolType::WIDEST_VARCHAR)];
+    let fixed = [
+        ("C_KEY", ExasolType::decimal(18, 0)),
+        ("C_SCORE", ExasolType::DoublePrecision),
+        ("C_SINCE", ExasolType::Date),
+        ("C_SEEN", ExasolType::BARE_TIMESTAMP),
+        ("C_ACTIVE", ExasolType::Boolean),
+    ];
+    let named = string_equal("CUSTOMER", "C_NAME", "ACME");
+    let order_date = compare(
+        "predicate_greater",
+        table_col("ORDERS", "O_ORDERDATE"),
+        date_lit("1995-01-01"),
+    );
+    let cases = [
+        ("fixed-width types", column_types(&fixed), None, true),
+        ("no column read", column_types(NO_COLUMNS), None, true),
+        ("unfiltered VARCHAR", column_types(&text), None, false),
+        (
+            "unfiltered CHAR",
+            column_types(&[("C_NAME", ExasolType::char(10))]),
+            None,
+            false,
+        ),
+        (
+            "an interval",
+            column_types(&[("C_TERM", ExasolType::IntervalYearToMonth { precision: 2 })]),
+            None,
+            false,
+        ),
+        (
+            "col = literal",
+            column_types(&text),
+            Some(named.clone()),
+            true,
+        ),
+        (
+            "literal = col",
+            column_types(&text),
+            Some(predicate_equal(str_lit("ACME"), customer("C_NAME"))),
+            true,
+        ),
+        (
+            "IN literals",
+            column_types(&text),
+            Some(in_list(
+                customer("C_NAME"),
+                [str_lit("ACME"), str_lit("GLOBEX")],
+            )),
+            true,
+        ),
+        (
+            "a literal conjunct beside another",
+            column_types(&text),
+            Some(and([order_date, named.clone()])),
+            true,
+        ),
+        (
+            "an OR of literals",
+            column_types(&text),
+            Some(or([named, string_equal("CUSTOMER", "C_NAME", "GLOBEX")])),
+            false,
+        ),
+        (
+            "an IN list holding a column",
+            column_types(&text),
+            Some(in_list(
+                customer("C_NAME"),
+                [str_lit("ACME"), customer("C_CITY")],
+            )),
+            false,
+        ),
+        (
+            "a column on both sides",
+            column_types(&text),
+            Some(predicate_equal(
+                customer("C_NAME"),
+                table_col("ORDERS", "O_COMMENT"),
+            )),
+            false,
+        ),
+        (
+            "a range",
+            column_types(&text),
+            Some(compare("predicate_less", customer("C_NAME"), str_lit("B"))),
+            false,
+        ),
+        (
+            "a literal on another column",
+            column_types(&text),
+            Some(string_equal("CUSTOMER", "C_CITY", "BERLIN")),
+            false,
+        ),
+    ];
+    let legs = customer_orders_legs();
+    for (case, read, filter, bounded) in cases {
+        assert_eq!(
+            broadcast_width_bounded(filter.as_ref(), &legs, 0, &read),
+            bounded,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_condition_bounds_only_its_own_self_join_leg() {
+    let read = column_types(&[("O_COMMENT", ExasolType::WIDEST_VARCHAR)]);
+    let filter = predicate_equal(
+        aliased_col("FACT_ORDERS", "A", "O_COMMENT"),
+        str_lit("rush"),
+    );
+    let legs = self_join_legs();
+    assert!(broadcast_width_bounded(Some(&filter), &legs, 0, &read));
+    assert!(!broadcast_width_bounded(Some(&filter), &legs, 1, &read));
 }

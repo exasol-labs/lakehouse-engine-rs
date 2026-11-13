@@ -1,7 +1,5 @@
 use super::super::detect_aggregates;
-use super::super::joins::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
-};
+use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::merge_select_items;
 use super::super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, involved_columns, shard_count,
@@ -1523,16 +1521,15 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let all_cols = involved_columns(&request, |tables| tables.first())
         .unwrap()
         .types;
-    let referenced = referenced_columns(pushdown.json(), &column_types(&all_cols));
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
-    let fan_out = FanOutProjection::new(fan_out_spec, &referenced);
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown,
-        &fan_out,
+        fan_out_spec,
+        &emitting(&column_types(&all_cols)),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

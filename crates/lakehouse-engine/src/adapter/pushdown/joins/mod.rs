@@ -12,8 +12,9 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
-    project_columns, quote_ident,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, Emitted, InvolvedColumns, OutputContract,
+    PushdownRequest, SCAN_UDF_NAME, aggregation_type, project_columns, pushdown_response,
+    quote_ident,
 };
 
 mod attribution;
@@ -26,19 +27,20 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
-pub(super) use sql_builders::{EmptyRelation, qualified_single_table_fallback_pushdown};
+pub(super) use sql_builders::{
+    EmptyRelation, n_scan_emission, qualified_single_table_fallback_pushdown, single_table_emission,
+};
+// The dispatch-golden sibling module drives the broadcast and N-scan builders directly.
 #[cfg(test)]
 pub(super) use sql_builders::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
+    build_broadcast_join_sql, build_qualified_single_table_fallback_sql,
 };
 
 pub(super) use planning::{JoinWindowPlan, involved_table};
 use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
-use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
-// `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
-pub(super) use sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
-};
+use rendering::{leg_local_filter, possible_side_column_names};
+pub(super) use sql_builders::{JoinScanRequestConfig, build_n_scan_join_sql};
+use sql_builders::{build_broadcast_plan_sql, qualified_emission};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
 /// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
@@ -67,31 +69,52 @@ pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
 }
 
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
-/// the other side's same-named column. With no explicit select list, each side's whole
-/// declared row is charged.
-///
-/// Lives here rather than in `planning`, which must not depend on `rendering`.
+/// the other side's same-named column. `SELECT *` names no column, so it charges every one.
 fn ensure_no_side_refuses_a_referenced_column(
     request: &Json,
-    pushdown_req: &Json,
+    output: OutputContract,
     sides: &[ResolvedJoinSide],
 ) -> Result<(), UdfError> {
-    if sides.iter().all(|side| side.refused_columns.is_empty()) {
-        return Ok(());
-    }
-    let emits_unnamed_row = has_no_explicit_select_list(pushdown_req);
     for side in sides {
         let mut touched = possible_side_column_names(request, &side.table_name);
-        if emits_unnamed_row {
-            touched.extend(
-                side.column_types
+        match output {
+            OutputContract::WholeRow => touched.extend(
+                side.refused_columns
                     .iter()
-                    .map(|(column, _)| column.name.clone()),
-            );
+                    .map(|column| column.column_name.to_uppercase()),
+            ),
+            OutputContract::AnyOneColumn | OutputContract::Items => {}
         }
         ensure_no_touched_column_is_refused(&touched, &side.refused_columns)?;
     }
     Ok(())
+}
+
+/// The empty result of a join with a fileless side. Every column binds leg-qualified, so a name
+/// two legs share reads its own leg's type and refusal.
+fn empty_join_sql(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    emitted: Vec<Emitted>,
+) -> Result<Json, UdfError> {
+    let legs = join.legs();
+    let col_types = ColumnTypes::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
+    );
+    let bound = pushdown.with_json(legs.qualify(pushdown.json()));
+    let scan = ScanTranslator::over(&col_types, &[bound.json()])?;
+    let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
+    empty_result_sql(
+        pushdown,
+        &bound,
+        &projection,
+        scan,
+        &EmptyRelation::join(join, emitted),
+    )
 }
 
 /// Resolves each table once (never per shard), pruned by its leg-local WHERE conjuncts. Any
@@ -170,20 +193,13 @@ pub(super) async fn plan_join(
         ))
         .await?;
 
-    ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
+    // Both before the zero-files return: a refused column must error, never yield an empty
+    // result.
+    ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
+    let emitted = n_scan_emission(pushdown, join, &sides)?;
 
     if sides.iter().any(|s| s.files.is_empty()) {
-        let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let scan = ScanTranslator::over(&combined, &[pushdown_req])?;
-        let (projection, widened) = project_columns(pushdown, scan)?;
-        let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
-        return empty_result_sql(
-            pushdown,
-            &projection,
-            widened,
-            scan,
-            &EmptyRelation::join(join, cols_per_leg),
-        );
+        return empty_join_sql(pushdown, join, &sides, emitted);
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
@@ -201,26 +217,32 @@ pub(super) async fn plan_join(
         connection: statement.connection(),
     };
 
-    // The window is classified before sizing and rendering, so a request Exasol must
-    // post-process never reaches `render_broadcast_join`. A decline falls through to the N-scan
-    // fallback.
+    // Exasol renders an aggregating request's window over the broadcast fan-out. Any other window
+    // the broadcast path cannot serve skips it before sizing, falling through to the N-scan.
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
-    let window = classify_join_window(pushdown_req);
-    if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
+    if join.tables.len() == 2
+        && is_equi
+        && (aggregation_type(pushdown_req).is_some()
+            || !matches!(
+                classify_join_window(pushdown_req),
+                JoinWindowPlan::BroadcastUnservable
+            ))
+    {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
         if candidate.broadcast_eligible
-            && let Some(rendered) = render_broadcast_join(pushdown, join, &sides)?
-            && let Some(sql) = build_broadcast_join_sql(
+            && let Some(sql) = build_broadcast_plan_sql(
+                pushdown,
+                join,
+                &sides,
                 &candidate,
-                &rendered,
                 &inputs,
                 &udf_name,
                 &distribute_udf_name,
             )?
         {
-            return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+            return Ok(pushdown_response(sql));
         }
     }
 
@@ -228,11 +250,12 @@ pub(super) async fn plan_join(
         pushdown,
         join,
         &sides,
+        &emitted,
         &inputs,
         &udf_name,
         &distribute_udf_name,
     )?;
-    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+    Ok(pushdown_response(sql))
 }
 
 #[cfg(test)]

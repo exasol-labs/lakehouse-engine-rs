@@ -39,6 +39,19 @@ When a virtual schema is created, refreshed, or has its properties set, the adap
 * *AND* the request that reads `s` SHALL fail at plan time with that recorded reason, and `SELECT id` SHALL succeed
 * *AND* the pushdown SHALL omit a refused column from the scan's logical schema, so a gate miss fails with an unresolved column rather than a silent NULL column
 
+### Scenario: A request that reads no column never emits a refused column
+
+* *GIVEN* a virtual table whose first declared column is refused
+* *AND* a request that reads no column of it. `SELECT COUNT(*) FROM (SELECT SUM(x) FROM t)` is one, because Exasol strips its aggregates. `SELECT COUNT(*) FROM t WHERE RANDOM() >= 0` is another, because Exasol keeps the `COUNT(*)` and sends an empty select list
+* *AND* the request reads the table alone, beside a filter on another column that the scan declines, or joined to another table
+* *WHEN* the adapter plans the request
+* *THEN* the request SHALL succeed, and no scan SHALL emit a column the reader refuses
+* *AND* an empty select list SHALL NOT count as a `SELECT *`, which Exasol sends with no select list
+* *AND* the pushed query SHALL return exactly one column, because Exasol rejects any other width
+* *AND* each scan SHALL emit only columns that the request names, and one column the reader does not refuse when the SQL above the scan needs none
+* *AND* the same request SHALL succeed when its filter prunes every file
+* *AND* the query SHALL return the same rows as native Exasol
+
 ### Scenario: Pushdown takes the declared schema from the column notes for every kind
 
 * *GIVEN* a virtual table whose columns carry notes, under any catalog kind

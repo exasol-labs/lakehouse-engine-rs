@@ -85,10 +85,10 @@ The adapter maps each type a Delta table schema can declare onto an Arrow tag or
 * *WHEN* the adapter handles a pushdown request against that table
 * *THEN* the adapter SHALL plan the request normally when it reads and emits only mappable columns, and SHALL return a `UdfError` naming the refused column and its refusal reason when the request would read or emit `variant_col`
 * *AND* a request naming a `map` or nested `struct` column SHALL be planned normally, because neither type is refused
-* *AND* the refusal decision SHALL be taken from the pushdown request's OWN column references, collected by ONE recursive walk over the whole request JSON for every `column` node's name, UNIONED with the final projection the adapter renders, and MUST NOT be assembled from a per-clause enumeration
+* *AND* the refusal decision for a column an expression names SHALL be taken from the pushdown request's OWN column references, collected by ONE recursive walk over the whole request JSON for every `column` node's name, and MUST NOT be assembled from a per-clause enumeration
 * *AND* the request-JSON half SHALL cover a refused column reached through a WHERE filter, a GROUP BY key, an ORDER BY key, an aggregate argument, or a join condition
-* *AND* the projection half SHALL union in the full-base-row projection ONLY when the request's own select list is absent or empty, a genuine `SELECT *`, so `SELECT *` over a table carrying a refused column is refused rather than emitting a column the scan cannot bind
-* *AND* the projection half MUST NOT union in the full-base-row projection the adapter separately renders when a select-list item is an aggregate or otherwise untranslatable
+* *AND* a `SELECT *`, which Exasol sends with no select list, emits every declared column, so `SELECT *` over a table carrying a refused column SHALL be refused with that column's reason rather than emit a column the scan cannot bind
+* *AND* an empty select list, an aggregate, or an otherwise untranslatable select-list item MUST NOT refuse a column that no expression of the request names
 * *AND* the gate SHALL run BEFORE the zero-active-files early return, so a query naming a refused column against an EMPTY Delta table is refused rather than answered with an empty result
 * *AND* the gate SHALL run on the JOIN path for each resolved side as well as on the single-table path
 * *AND* a refused column SHALL be ABSENT from the logical schema the scan registers, so a gate miss fails with a DataFusion unresolved-column error rather than emitting a silently-NULLed `variant` column
