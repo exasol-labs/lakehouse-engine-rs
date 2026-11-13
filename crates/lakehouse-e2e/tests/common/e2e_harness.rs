@@ -161,7 +161,8 @@ pub fn create_proxied_schema_and_scripts(
     create_schema_and_scripts_with_env(conn, schema, adapter_env, scan_env);
 }
 
-/// Each `(name, value)` pair becomes one `%env` line of the adapter or the scan script.
+/// Each `(name, value)` pair becomes one `%env` line of the adapter or the scan script. The
+/// export script takes the adapter's lines, because it calls the catalog as the adapter does.
 pub fn create_schema_and_scripts_with_env(
     conn: &mut ExaConn,
     schema: &str,
@@ -196,7 +197,7 @@ RETURNS VARCHAR(100) AS
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {schema}.{EXPORT_SCRIPT_NAME}(...)
 RETURNS DECIMAL(18,0) AS
-%udf_object {SO_UDF_OBJECT_PATH}
+{adapter_env}%udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
@@ -1041,6 +1042,50 @@ pub fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect()
+}
+
+/// A namespace of this run, `e2e_export_<purpose>_<run id>`: the catalogs and the storage
+/// outlive a run, so each run exports into namespaces of its own.
+pub fn run_namespace(purpose: &str) -> String {
+    static RUN_ID: OnceLock<u128> = OnceLock::new();
+    let run_id = RUN_ID.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis()
+    });
+    format!("e2e_export_{purpose}_{run_id}")
+}
+
+/// The row count Exasol reports for the export `sql`.
+#[track_caller]
+pub fn exported_rows(conn: &mut ExaConn, sql: &str) -> i64 {
+    let resp = conn.execute(sql);
+    resp["responseData"]["results"][0]["rowCount"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("expected a rowCount from:\n{sql}\n\nResponse: {resp}"))
+}
+
+/// Asserts that `table` holds exactly the rows of `query`, each once. The source rows are
+/// distinct, so an equal count and an empty difference in both directions prove it.
+#[track_caller]
+pub fn assert_holds_rows(conn: &mut ExaConn, table: &str, query: &str, expected: i64) {
+    let mut count = |sql: String| conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM ({sql})"));
+    assert_eq!(
+        count(format!("SELECT * FROM {table}")),
+        expected,
+        "row count of {table}"
+    );
+    assert_eq!(
+        count(format!("SELECT * FROM {table} MINUS {query}")),
+        0,
+        "{table} holds rows that {query} does not return"
+    );
+    assert_eq!(
+        count(format!("{query} MINUS SELECT * FROM {table}")),
+        0,
+        "{table} misses rows that {query} returns"
+    );
 }
 
 #[track_caller]
