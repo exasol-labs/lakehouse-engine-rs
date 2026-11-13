@@ -245,7 +245,7 @@ pub(in super::super) enum JoinWindowPlan {
 /// absent column metadata.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     // The broadcast in-UDF join renders only projection, filter, and join condition, so
-    // Exasol aggregates over the materialized join instead.
+    // Exasol aggregates over its output.
     if aggregation_type(pushdown_req).is_some() {
         return JoinWindowPlan::ExasolPostProcessed;
     }

@@ -423,7 +423,7 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
 }
 
 #[test]
-fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
+fn e2e_join_offset_without_order_by_is_rejected() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -442,18 +442,6 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
         msg.contains("OFFSET") && msg.contains("ORDER BY"),
         "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \
          message, got: {msg}"
-    );
-
-    let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "an aggregate over a join must still fall back to the two-scan wrapper \
-         (LHS_T0/LHS_T1):\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate over a join must NOT carry a broadcast common-blob join \
-         block:\n{pushed}"
     );
 }
 
@@ -496,9 +484,6 @@ fn e2e_above_threshold_result_matches_broadcast() {
     );
 }
 
-// An aggregate over a join is served by the two-scan wrapper with Exasol aggregating
-// the materialized join, never by the broadcast in-UDF join.
-
 fn aggregate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM {} o \
@@ -508,26 +493,83 @@ fn aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 #[test]
-fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
+fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
     setup_e2e();
     let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
+    let self_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
+    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    let broadcast = [
+        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
+             '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_NAME HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, c.C_NAME LIMIT 2"
+        ),
+        format!(
+            "SELECT c.C_NAME, o.O_ORDERDATE, MAX(c.C_CUSTKEY), MIN(o.O_TOTALPRICE) \
+             FROM {orders} GROUP BY c.C_NAME, o.O_ORDERDATE"
+        ),
+        format!(
+            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE * c.C_CUSTKEY) FROM {orders} GROUP BY c.C_NAME"
+        ),
+        format!(
+            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME \
+             ORDER BY SUM(o.O_TOTALPRICE) DESC, c.C_NAME LIMIT 1"
+        ),
+        format!("SELECT COUNT(*), SUM(o.O_TOTALPRICE) FROM {orders}"),
+        format!(
+            "SELECT COUNT(*), MAX(c.C_NAME) FROM {orders} WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0"
+        ),
+        format!("SELECT COUNT(DISTINCT c.C_NAME) FROM {orders}"),
+        format!("SELECT COUNT(*) FROM (SELECT SUM(o.O_TOTALPRICE) FROM {orders})"),
+        format!(
+            "SELECT a.O_CUSTKEY, COUNT(*), SUM(b.O_TOTALPRICE) FROM {self_join} GROUP BY a.O_CUSTKEY"
+        ),
+        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
+        format!("SELECT e.ID, MIN(l.ID) FROM {events_labels} GROUP BY e.ID HAVING MIN(l.ID) > 3"),
+    ];
+    let n_scan = [
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} AND o.O_ORDERKEY > c.C_CUSTKEY \
+             GROUP BY c.C_NAME"
+        ),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE SECOND(o.O_ORDERDATE, 3) = 0 \
+             GROUP BY c.C_NAME"
+        ),
+    ];
 
-    let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "aggregate-over-join must emit the two-scan wrapper so Exasol aggregates \
-         over the join (LHS_T0/LHS_T1), even on the broadcast VS:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate cannot ride the broadcast in-UDF join — no common-blob join \
-         block may appear:\n{pushed}"
-    );
-    assert!(
-        pushed.contains("COUNT(*)"),
-        "the aggregate must be rendered as Exasol SQL over the join:\n{pushed}"
-    );
+    let mut failures = Vec::new();
+    for query in &broadcast {
+        for (vs_name, path) in [
+            (VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
+            (VS_NAME_LOW, PathCheck::NScan(2)),
+        ] {
+            failures.extend(native_copy_mismatch(
+                &mut conn,
+                vs_name,
+                JOIN_ORACLE,
+                query,
+                path,
+                Expect::Rows,
+            ));
+        }
+    }
+    for query in &n_scan {
+        failures.extend(native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            query,
+            PathCheck::NScan(2),
+            Expect::Rows,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Scenario: Aggregate over a join routes through the unified qualified wrapper
@@ -885,14 +927,8 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a scalar-over-aggregate grouped join must be served by the unified \
-         N-scan wrapper (N=2, LHS_T0/LHS_T1), not declined:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a grouped aggregate cannot ride the broadcast in-UDF join — no \
-         common-blob join block may appear:\n{pushed}"
+        has_broadcast_join_block(&pushed),
+        "a scalar-over-aggregate grouped join must aggregate over the broadcast fan-out:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);
@@ -2058,14 +2094,8 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_two_scan_wrapper(&pushed),
-        "an ungrouped scalar-over-aggregate join must be served by the N-scan \
-         wrapper (N=2, LHS_T0/LHS_T1) so Exasol aggregates over the join:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate — even one hidden inside a scalar function — cannot ride \
-         the broadcast in-UDF join, which renders projection only:\n{pushed}"
+        has_broadcast_join_block(&pushed),
+        "an ungrouped scalar-over-aggregate join must aggregate over the broadcast fan-out:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);

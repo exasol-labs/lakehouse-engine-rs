@@ -55,7 +55,7 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 
 ### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 
-* *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two legs, an equi-condition, no Exasol postprocessing, a byte size at or below the broadcast threshold
+* *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two legs, an equi-condition, a byte size at or below the broadcast threshold
 * *AND* the request carries a non-null `filter` whose DataFusion-bound render declines against the two legs' column metadata keyed by (relation alias, column)
 * *WHEN* the adapter renders the join pushdown
 * *THEN* the adapter SHALL decline the broadcast plan and fall through to the unified unaccelerated N-scan fallback, which applies the predicate itself, honouring the recorded broadcast contract that a filter the translator cannot render is served by the fallback

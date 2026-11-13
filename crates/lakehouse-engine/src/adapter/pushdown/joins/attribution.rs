@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
 use crate::adapter::pushdown::support::InvolvedColumns;
-use crate::scan::spec::relation_alias;
+use crate::scan::spec::{ColumnRef, relation_alias};
 use exasol_udf_sdk::error::UdfError;
-use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
+use vs_expression::{ColumnNode, rename_columns, rewrite_table_aliases, walk_column_nodes};
 
 /// The invariant every leg lookup after [`JoinLegs::ensure_columns_declared`] relies on.
 const BOUND: &str = "ensure_columns_declared binds every column of the request to one leg";
@@ -126,6 +126,14 @@ impl JoinLegs {
     /// qualify again.
     pub(super) fn qualify(&self, expr: &Json) -> Json {
         rewrite_table_aliases(expr, &mut |column| self.leg_alias(self.leg(column)))
+    }
+
+    /// Renames each `column` to the `LHS_T{leg}_{COLUMN}` column a broadcast fan-out emits it as.
+    pub(super) fn to_fan_out_output(&self, expr: &Json) -> Json {
+        rename_columns(expr, &mut |column| {
+            ColumnRef::qualified(self.leg_alias(self.leg(column)), column.upper_name())
+                .output_name()
+        })
     }
 
     /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`

@@ -13,7 +13,7 @@ use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
     ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
-    project_columns, quote_ident,
+    aggregation_type, project_columns, quote_ident,
 };
 
 mod attribution;
@@ -37,7 +37,8 @@ use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sid
 use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
+    JoinScanRequestConfig, build_aggregating_broadcast_join_sql, build_broadcast_join_sql,
+    build_n_scan_join_sql,
 };
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
@@ -201,25 +202,42 @@ pub(super) async fn plan_join(
         connection: statement.connection(),
     };
 
-    // The window is classified before sizing and rendering, so a request Exasol must
-    // post-process never reaches `render_broadcast_join`. A decline falls through to the N-scan
-    // fallback.
+    // Exasol aggregates over the broadcast fan-out. Any other window Exasol must post-process
+    // skips broadcast before sizing. A decline falls through to the N-scan fallback.
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
+    let aggregating = aggregation_type(pushdown_req).is_some();
     let window = classify_join_window(pushdown_req);
-    if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
+    if join.tables.len() == 2
+        && is_equi
+        && (aggregating || !matches!(window, JoinWindowPlan::ExasolPostProcessed))
+    {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
-        if candidate.broadcast_eligible
-            && let Some(rendered) = render_broadcast_join(pushdown, join, &sides)?
-            && let Some(sql) = build_broadcast_join_sql(
+        let sql = if !candidate.broadcast_eligible {
+            None
+        } else if aggregating {
+            build_aggregating_broadcast_join_sql(
+                pushdown,
+                join,
+                &sides,
+                &candidate,
+                &inputs,
+                &udf_name,
+                &distribute_udf_name,
+            )?
+        } else if let Some(rendered) = render_broadcast_join(pushdown, join, &sides)? {
+            build_broadcast_join_sql(
                 &candidate,
                 &rendered,
                 &inputs,
                 &udf_name,
                 &distribute_udf_name,
             )?
-        {
+        } else {
+            None
+        };
+        if let Some(sql) = sql {
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
     }

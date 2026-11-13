@@ -2144,7 +2144,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     let (pushdown_req, legs) = planned(&request);
     let leg = first_table_column_types(&request);
 
-    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[&leg])
+    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[&leg], LegColumns::Relations)
         .expect("a renderable expression sort key must render, not decline");
 
     assert!(
@@ -2178,8 +2178,13 @@ fn seam_trailing(request: &Json) -> Result<String, UdfError> {
         JoinShape::Join(join) => join.tables.len(),
         JoinShape::NotAJoin => 1,
     };
-    outer_wrapper_clauses(&pushdown, &legs, &vec![&events; leg_count])
-        .map(|clauses| clauses.trailing)
+    outer_wrapper_clauses(
+        &pushdown,
+        &legs,
+        &vec![&events; leg_count],
+        LegColumns::Relations,
+    )
+    .map(|clauses| clauses.trailing)
 }
 
 fn events_columns() -> [(&'static str, ExasolType); 3] {
@@ -2601,4 +2606,92 @@ fn join_block_names_the_dimension_legs_alias() {
         (serde_json::json!("LHS_T1"), serde_json::json!("LHS_T0")),
         "the smaller first leg is the dimension"
     );
+}
+
+fn aggregating_broadcast_sql(request: &Json) -> String {
+    let sides = request_typed(
+        request,
+        &[
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ],
+    );
+    let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
+    build_aggregating_broadcast_join_sql(
+        &parsed_pushdown(request),
+        &detected_join(request),
+        &sides,
+        &broadcast,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("the aggregating broadcast must build")
+    .expect("a renderable aggregating join must stay on the broadcast path")
+}
+
+#[test]
+fn aggregating_broadcast_aggregates_in_exasol_over_the_columns_it_reads() {
+    let mut request = selecting(
+        join_request(Json::Null, equi_condition()),
+        &[
+            (table_col("CUSTOMER", "C_NAME"), ExasolType::varchar(100)),
+            (
+                agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
+                ExasolType::Date,
+            ),
+        ],
+    );
+    let pushdown = &mut request["pushdownRequest"];
+    pushdown["aggregationType"] = serde_json::json!("group_by");
+    pushdown["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
+    pushdown["orderBy"] = serde_json::json!([order_by_element(
+        table_col("CUSTOMER", "C_NAME"),
+        false,
+        true
+    )]);
+    pushdown["limit"] = serde_json::json!({"numElements": 1});
+
+    let sql = aggregating_broadcast_sql(&request);
+
+    assert!(
+        sql.starts_with(
+            r#"SELECT "LHS_T0_C_NAME", CAST(MIN("LHS_T1_O_ORDERDATE") AS DATE) FROM (SELECT SCAN("#
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.ends_with(
+            r#") GROUP BY "LHS_T0_C_NAME" ORDER BY "LHS_T0_C_NAME" DESC NULLS LAST LIMIT 1"#
+        ),
+        "{sql}"
+    );
+    assert_eq!(
+        emits_clause(&sql),
+        r#""LHS_T0_C_NAME" VARCHAR(100), "LHS_T1_O_ORDERDATE" DATE"#
+    );
+    let common = broadcast_common_blob(&sql);
+    assert!(common["join"].get("post_join_limit").is_none(), "{common}");
+    assert!(
+        common["join"].get("post_join_order_by").is_none(),
+        "{common}"
+    );
+}
+
+#[test]
+fn aggregating_broadcast_reading_no_column_emits_one_column_per_joined_row() {
+    let mut request = selecting(
+        join_request(Json::Null, equi_condition()),
+        &[(count_star(), ExasolType::decimal(18, 0))],
+    );
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
+
+    let sql = aggregating_broadcast_sql(&request);
+
+    assert!(
+        sql.starts_with("SELECT CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN("),
+        "{sql}"
+    );
+    assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
+    assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
 }

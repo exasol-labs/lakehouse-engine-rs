@@ -78,3 +78,23 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
         "every tableAlias key must be gone at every depth, while name/tableName survive"
     );
 }
+
+#[test]
+fn rename_columns_replaces_each_column_node_with_an_unqualified_one() {
+    let expr = json!({
+        "type": "function_aggregate",
+        "name": "SUM",
+        "arguments": [{"type": "column", "name": "A", "tableName": "T", "tableAlias": "X"}]
+    });
+
+    let renamed = rename_columns(&expr, &mut |column| format!("R_{}", column.name));
+
+    assert_eq!(
+        renamed,
+        json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{"type": "column", "name": "R_A"}]
+        })
+    );
+}

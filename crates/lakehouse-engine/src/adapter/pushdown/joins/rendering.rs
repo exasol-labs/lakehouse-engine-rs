@@ -1,4 +1,4 @@
-use crate::scan::spec::ProjectionItem;
+use crate::scan::spec::{ColumnRef, ProjectionItem};
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -46,6 +46,32 @@ pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
 /// unlike the DataFusion-dialect broadcast render).
 pub(super) fn render_expression_qualified(expr: &Json, legs: &JoinLegs) -> String {
     render_expression_exasol(&legs.qualify(expr))
+}
+
+/// How an Exasol wrapper names a leg's column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegColumns {
+    /// `"LHS_T{leg}"."COLUMN"`: each leg is a relation of the wrapper's FROM.
+    Relations,
+    /// `"LHS_T{leg}_COLUMN"`: one broadcast fan-out emits every leg's columns.
+    FanOutOutput,
+}
+
+impl LegColumns {
+    pub(super) fn render(self, expr: &Json, legs: &JoinLegs) -> String {
+        match self {
+            Self::Relations => render_expression_qualified(expr, legs),
+            Self::FanOutOutput => render_expression_exasol(&legs.to_fan_out_output(expr)),
+        }
+    }
+
+    pub(super) fn column(self, legs: &JoinLegs, leg: usize, name: &str) -> String {
+        let alias = legs.leg_alias(leg);
+        match self {
+            Self::Relations => format!("{}.{}", quote_ident(&alias), quote_ident(name)),
+            Self::FanOutOutput => quote_ident(&ColumnRef::qualified(alias, name).output_name()),
+        }
+    }
 }
 
 /// An OR is never split, so an OR spanning legs stays withheld from every leg.
@@ -196,6 +222,28 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
     if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
         visit(h);
     }
+}
+
+/// Leg `leg`'s columns that an Exasol aggregation over a broadcast fan-out reads: those of the
+/// select list, GROUP BY, HAVING and ORDER BY, in declaration order. The scan applies the
+/// condition and WHERE itself.
+pub(super) fn aggregated_leg_columns(
+    pushdown_req: &Json,
+    legs: &JoinLegs,
+    leg: usize,
+    full_cols: &ColumnTypes,
+) -> ColumnTypes {
+    let mut names = std::collections::HashSet::new();
+    for clause in ["selectList", "groupBy", "having", "orderBy"] {
+        if let Some(value) = pushdown_req.get(clause) {
+            walk_column_nodes(value, &mut |column| {
+                if legs.leg(column) == leg {
+                    names.insert(column.upper_name());
+                }
+            });
+        }
+    }
+    full_cols.narrowed(|column| names.contains(&column.name))
 }
 
 /// Drops columns the N-scan wrapper never references so each leg ships narrow rows. Kept:

@@ -8,7 +8,9 @@ mod fragment;
 mod json_value;
 mod scalar_functions;
 mod scan_typing;
-pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
+pub use column_node::{
+    ColumnNode, rename_columns, rewrite_table_aliases, strip_table_alias, walk_column_nodes,
+};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;

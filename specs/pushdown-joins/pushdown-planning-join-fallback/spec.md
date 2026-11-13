@@ -10,7 +10,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * The adapter advertises `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` with no per-query opt-out, and Exasol never re-plans on an adapter error. Every advertised join shape must therefore render by broadcast or by this fallback. Exasol pushes only those inner equi-joins, and the Exasol dialect renders every condition and clause Exasol sends, so the fallback has no join shape to refuse.
 * The wrapper has four entry points: an inner equi-join of N >= 2 legs, a grouped request that did not decompose into the partial/merge shape (`GroupByWrapper`), a single-group request with more than one `COUNT(DISTINCT)` or a distinct mixed with an ordinary aggregate (`pushdown-aggregates/pushdown-planning-count-distinct`), and a row scan whose derived projection was widened. All four share one `ORDER BY` and window rendering site.
 * The wrapper resolves its own `LIMIT` and `OFFSET` and renders them on its outer SELECT over limit-free, sort-free fan-out legs. A row limit that leaked into a leg would cap that leg's pre-join input and return wrong rows. A non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`).
-* The broadcast path declines, and this wrapper serves: a non-zero offset without `orderBy`, a non-column sort key, a sort key absent from the broadcast projection, and every request that requires Exasol postprocessing (`pushdown-joins/pushdown-planning-join`).
+* The broadcast path declines, and this wrapper serves, for a request without Exasol postprocessing: a non-zero offset without `orderBy`, a non-column sort key, and a sort key absent from the broadcast projection (`pushdown-joins/pushdown-planning-join`).
 * A top-level WHERE conjunct reaches a leg only if it is local to that leg and the scan translator renders it against that leg's own column metadata (`pushdown-types/pushdown-planning-scan-text-conversion`). Every other conjunct is residual and lands in the outer wrapper's `WHERE`. The leg and residual sets are exact complements (`pushdown/pushdown-declined-filter-self-apply`).
 * The outer `WHERE` render has two outcomes. An absent residual set emits no clause. Any other residual set renders through the qualified Exasol-dialect render as it is.
 
@@ -28,7 +28,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 ### Scenario: A join outside the broadcast contract is declined safely
 
 * *GIVEN* a `pushdown` request whose `from` clause is a join
-* *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, carries a non-equi conjunct beside its equality, spans more than two legs, needs Exasol postprocessing, or carries a condition/filter/projection detail that keeps it off the broadcast path
+* *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, carries a non-equi conjunct beside its equality, spans more than two legs, or carries a condition/filter/projection detail that keeps it off the broadcast path
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
 * *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 legs, the two-leg case being N = 2), so Exasol's core engine produces the correct result
 * *AND* spanning more than two legs or needing Exasol postprocessing SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
@@ -67,9 +67,9 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 
 ### Scenario: Aggregate over a join routes through the unified qualified wrapper
 
-* *GIVEN* an inner equi-join `pushdown` request that requires Exasol postprocessing, or whose `ORDER BY`/`LIMIT` shape the broadcast path declines, per `pushdown-joins/pushdown-planning-join`
+* *GIVEN* an inner equi-join `pushdown` request outside the broadcast contract that requires Exasol postprocessing, or whose `ORDER BY`/`LIMIT` shape the broadcast path declines, per `pushdown-joins/pushdown-planning-join`
 * *WHEN* the adapter plans the request
-* *THEN* the adapter SHALL route the request to the unified qualified fallback path unconditionally, regardless of whether the join would otherwise be broadcast-eligible, because the broadcast in-UDF join renders only projection, filter, and join condition
+* *THEN* the adapter SHALL route the request to the unified qualified fallback path
 * *AND* a bare `LIMIT` alone, and a bare-projected-column `ORDER BY` alone, SHALL NOT force this route
 * *AND* the fallback wrapper SHALL render the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (side-0 fan-out) "LHS_T0", (side-1 fan-out) "LHS_T1", … WHERE <conditions> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), splicing Exasol's own aggregate function name verbatim while table-qualifying only its column argument(s)
 * *AND* a select-list item that is a SCALAR FUNCTION WRAPPING one or more aggregates (e.g. `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`) SHALL be rendered by recursing through the `crates/vs-expression` translator, which renders nested `function_aggregate` nodes by splicing the aggregate name verbatim and rendering the argument(s), NOT declined
@@ -87,7 +87,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 
 ### Scenario: A scalar function wrapping aggregates in a grouped join select list is rendered, not declined
 
-* *GIVEN* an inner equi-join `pushdown` request (two-table or three-or-more-table) whose grouped select list contains a select item that is a scalar function wrapping one or more aggregates, e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`, alongside plain aggregates such as `SUM(l_quantity)`, `SUM(CASE WHEN … END)`, and `AVG(l_extendedprice)`, with a GROUP BY, a HAVING, an ORDER BY, and a LIMIT
+* *GIVEN* an inner equi-join `pushdown` request outside the broadcast contract whose grouped select list contains a select item that is a scalar function wrapping one or more aggregates, e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`, alongside plain aggregates such as `SUM(l_quantity)`, `SUM(CASE WHEN … END)`, and `AVG(l_extendedprice)`, with a GROUP BY, a HAVING, an ORDER BY, and a LIMIT
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL NOT decline the request and SHALL NOT return an error for the scalar-over-aggregate select item
 * *AND* the adapter SHALL render each such select item by recursing through the `crates/vs-expression` translator, which renders the outer scalar function (`ROUND`, arithmetic, `CASE`, …) around nested `function_aggregate` nodes whose aggregate names (`SUM`, `COUNT`, `AVG`, …) are spliced verbatim and whose column arguments are table-qualified from their `tableName`

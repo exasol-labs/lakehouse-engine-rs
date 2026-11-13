@@ -4,8 +4,8 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 ## Background
 
-* The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, no Exasol postprocessing, and a condition, filter, and projection that `crates/vs-expression` can render. Any deviation takes the fallback.
-* Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it.
+* The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, and a condition, filter, and projection that `crates/vs-expression` can render. Any deviation takes the fallback.
+* Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it. Exasol postprocesses over the broadcast fan-out.
 * The dimension side rides in the shard-invariant common spec. Only the fact side's per-shard file subset flows through the `LAKEHOUSE_DISTRIBUTE_FILES` distributor.
 * A join leg is one occurrence of a table in the FROM tree. `pushdown-joins/pushdown-planning-join-fallback-self-join` owns the one binding that resolves a `column` node to its leg.
 * Exasol binds the pushdown result to the select list by position, so the column names the pushdown SQL emits stay inside it.
@@ -32,6 +32,14 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 * *AND* the generated scan-driving SQL SHALL drive the `LAKEHOUSE_SCAN` SCALAR EMIT UDF so that each shard invocation joins its fact-file subset against the full replicated dimension side node-locally, with no cross-shard exchange, and with NO `SELECT * FROM (...)` wrapper for an UNORDERED request; an ORDERED request carries the outer wrapper this feature's ordering scenario specifies
 * *AND* the adapter MUST NOT read either side's Parquet row data in the planning layer
 * *AND* a join whose two sides are DELTA tables reached through Unity Catalog SHALL take this same broadcast path with no Iceberg-specific step, because the side resolution and the broadcast decision read only format-neutral values
+
+### Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+
+* *GIVEN* a `pushdown` request that meets the broadcast contract and requires Exasol postprocessing
+* *WHEN* Exasol sends the `pushdown` request
+* *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, one column when they read none, and the full row of both legs when the select list is absent or empty
+* *AND* one outer Exasol `SELECT` SHALL render the select list, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` over the fan-out's `<alias>_<column>` output names, so no shard aggregates, sorts, or truncates
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
 ### Scenario: A bare LIMIT over a broadcast-eligible join is served by the broadcast path with a per-shard post-join cap
 
@@ -68,15 +76,14 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 ### Scenario: Ordering and window shapes the broadcast wrapper cannot serve decline to the unified fallback
 
-* *GIVEN* a `pushdown` request over a broadcast-eligible inner equi-join carrying one of: a `limit` with a NON-ZERO `limit.offset` and an absent or empty `orderBy`; an `orderBy` element that is an expression, an aggregate, or any non-`column` node; an `orderBy` element missing `isAscending` or `nullsLast`; or an `orderBy` element naming a column that is not a bare-column item of the broadcast projection
+* *GIVEN* a `pushdown` request over a broadcast-eligible inner equi-join that requires no Exasol postprocessing, carrying one of: a `limit` with a NON-ZERO `limit.offset` and an absent or empty `orderBy`; an `orderBy` element that is an expression, an aggregate, or any non-`column` node; an `orderBy` element missing `isAscending` or `nullsLast`; or an `orderBy` element naming a column that is not a bare-column item of the broadcast projection
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL decline the broadcast plan and route the request to the unified unaccelerated fallback, whose qualified wrapper renders the ordering and the window table-qualified over the materialized join
-* *AND* every arm EXCEPT projection membership SHALL be decided from the `pushdown` request ALONE, BEFORE either side is sized and before the broadcast render runs, so a request that requires Exasol postprocessing MUST NOT reach the broadcast renderer at all, and pays neither its condition, filter, and projection render nor its no-column-metadata error arm
+* *AND* every arm EXCEPT projection membership SHALL be decided from the `pushdown` request ALONE, BEFORE either side is sized and before the broadcast render runs
 * *AND* the projection-membership arm SHALL be decided LATER, at the broadcast construction site against the RENDERED broadcast projection, because that projection does not exist until the render has run, and a sort key naming a column that is not a bare-column item of it SHALL downgrade the request to the SAME unified unaccelerated fallback, by the same fall-through
 * *AND* that decline SHALL be a clean fall-through and MUST NOT be a hard client-facing `User` error, because, unlike the declined single-table row-scan path (`pushdown-capabilities/pushdown-planning-topn`), a renderer that CAN express the shape still exists
 * *AND* the adapter MUST NOT drop a sort key, a limit, or an offset it declined to serve on the broadcast path, so no reachable shape returns rows that are silently unordered, unwindowed, or wrongly truncated
 * *AND* the bare-`LIMIT`-with-non-zero-offset arm SHALL be a structural guard rather than a reachable branch, because a non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`)
-* *AND* a request that requires Exasol postprocessing SHALL force the unified unaccelerated fallback unconditionally
 
 ### Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 
