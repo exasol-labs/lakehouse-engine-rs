@@ -545,12 +545,6 @@ impl ColumnTypeLookup for ColumnTypes {
     }
 }
 
-/// The adapter's own rewrite of a tree the scan computes, the binary byte comparison. It needs the
-/// column types, so it runs here, once.
-fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
-    compare_binary_bytes(expr.clone(), col_types)
-}
-
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
 /// same column types, so every path runs the same typed checks (#587).
 #[derive(Debug, Clone, Copy)]
@@ -590,7 +584,11 @@ impl<'a> ScanTranslator<'a> {
 
     /// `None` declines: the caller applies the expression in Exasol or declines the shape.
     pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
-        render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
+        render_scan_expression(
+            &compare_binary_bytes(expr.clone(), self.columns),
+            self.columns,
+        )
+        .ok()
     }
 
     /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
@@ -599,7 +597,10 @@ impl<'a> ScanTranslator<'a> {
         let Some(raw) = filter else {
             return (None, None);
         };
-        match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
+        match render_scan_filter(
+            &compare_binary_bytes(raw.clone(), self.columns),
+            self.columns,
+        ) {
             Ok(sql) => (Some(sql), None),
             Err(_) => (None, Some(raw)),
         }

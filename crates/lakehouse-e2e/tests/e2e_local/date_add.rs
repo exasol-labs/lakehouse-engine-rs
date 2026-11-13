@@ -158,7 +158,7 @@ fn derived_argument_cases() -> Vec<DateAddCase> {
         "SELECT ID, ADD_DAYS(TO_DATE(CASE WHEN ID > 2 THEN '1960-02-29' ELSE '9999-12-30' END, 'YYYY-MM-DD'), 1) FROM {T}",
         "SELECT ID FROM {T} WHERE ADD_DAYS(COALESCE(C_DATE, DATE '1900-01-01'), 1) > DATE '2024-01-03'",
         "SELECT ID FROM {T} WHERE ADD_DAYS(DATE_TRUNC('month', C_TS), 1) > DATE '2024-01-02'",
-        // A literal finer than the unified TIMESTAMP(0) or the DATE result.
+        // A literal finer than the unified TIMESTAMP(0), and two against a DATE, which compare as written.
         "SELECT ID FROM {T} WHERE ADD_DAYS(CASE WHEN ID > 2 THEN ADD_HOURS(C_DATE, 1) ELSE ADD_MINUTES(C_DATE, 1) END, 1) >= TIMESTAMP '2024-01-04 01:00:00.5'",
         "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) < TIMESTAMP '2024-01-04 00:00:00.5'",
         "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) = TIMESTAMP '2024-01-04 00:00:00.5'",
@@ -220,7 +220,7 @@ fn mismatch(conn: &mut ExaConn, table: &str, case: &DateAddCase, expect: Expect)
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
 /// Scenario: The scan rounds a fractional count as Exasol does
 /// Scenario: A result outside Exasol's datetime range fails the query
-/// Scenario: A comparison with a TIMESTAMP literal finer than the call returns native rows
+/// Scenario: A timestamp filter compares at full precision
 /// Scenario: A form the scan cannot match runs in Exasol
 /// Scenario: The four functions render verbatim in the Exasol dialect
 #[test]

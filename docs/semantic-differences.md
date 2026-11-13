@@ -105,17 +105,22 @@ The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses 
 The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
 in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
 a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
-`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. `DATE_TRUNC` truncates any
-DATE or TIMESTAMP in nanoseconds, so it fails on a value outside the span. Native Exasol returns
-rows.
+`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. The scan also converts to
+nanoseconds a DATE it compares with a TIMESTAMP, a DATE that `DATE_TRUNC` truncates, and a
+TIMESTAMP that `DATE_TRUNC` truncates to `week`, `month`, `quarter`, or `year`, so each fails on
+a value outside the span. Native Exasol returns rows.
 
 | Query | Scan |
 |---|---|
 | `WHERE ts_ns < TIMESTAMP '9999-12-31 00:00:00'` | error `Cannot cast … to Timestamp(ns)` |
 | `SELECT ADD_DAYS(ts_ns, 100000)` | error `datetime field overflow` |
-| `SELECT DATE_TRUNC('month', d)` with `d` = 9999-12-31 | error `Cannot cast … to Timestamp(ns)` |
+| `WHERE d > TIMESTAMP '2024-01-01 00:00:00'` with `d` = 9999-12-31 | error `Cannot cast … to Timestamp(ns)` |
+| `SELECT DATE_TRUNC('day', d)` with `d` = 9999-12-31 | error `Cannot cast … to Timestamp(ns)` |
+| `SELECT DATE_TRUNC('month', ts)` with `ts` = 9999-12-31 10:00:00 | error `Timestamp … out of range` |
 
-Workaround: `CAST(ts_ns AS TIMESTAMP(6))`, which covers Exasol's whole range.
+Workaround: `CAST(ts_ns AS TIMESTAMP(6))` for a nanosecond column, which covers Exasol's whole
+range, and a DATE literal for a DATE, such as `WHERE d > DATE '2024-01-01'`. `DATE_TRUNC` has no
+workaround.
 
 ## JSON_VALUE without a DEFAULT ON ERROR
 

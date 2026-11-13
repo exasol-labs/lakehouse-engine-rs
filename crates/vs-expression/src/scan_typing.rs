@@ -36,6 +36,7 @@ pub(crate) enum Partial {
     Integer,
     /// DOUBLE or DECIMAL(p,s): a number not proven to be an integer.
     Number,
+    /// TIMESTAMP of a precision that differs by Exasol version.
     Timestamp,
 }
 
@@ -205,9 +206,7 @@ impl ScalarFunction {
             {
                 partial(Partial::Number)
             }
-            ResultRule::FirstArgument | ResultRule::Compared => {
-                args.first().copied().unwrap_or(Inferred::Unknown)
-            }
+            ResultRule::FirstArgument => args.first().copied().unwrap_or(Inferred::Unknown),
             ResultRule::Unified => args
                 .iter()
                 .copied()
@@ -444,19 +443,20 @@ fn upper_name(node: &Json) -> String {
         .to_uppercase()
 }
 
-/// An exact numeric literal is a DECIMAL(digits,0), a DOUBLE beyond 36 digits, or fractional.
+/// An exact numeric literal is a DECIMAL(digits,0) or fractional. Exasol sends an integer beyond
+/// 36 digits as `literal_double`.
 fn exact_numeric_type(node: &Json) -> Inferred {
     let text = match node.get("value") {
         Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
         Some(Json::String(s)) => Some(s.clone()),
         _ => None,
     };
-    match text.as_deref().and_then(integer_digits) {
-        Some(digits) => Inferred::Exact(
-            Decimal::new(digits, 0).map_or(ExasolType::DoublePrecision, ExasolType::Decimal),
-        ),
-        None => Inferred::Partial(Partial::Number),
-    }
+    text.as_deref()
+        .and_then(integer_digits)
+        .and_then(|digits| Decimal::new(digits, 0))
+        .map_or(Inferred::Partial(Partial::Number), |d| {
+            Inferred::Exact(ExasolType::Decimal(d))
+        })
 }
 
 fn timestamp_literal_type(node: &Json) -> Inferred {
@@ -496,30 +496,33 @@ fn scalar_function_type(
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
+    if function.result == ResultRule::Unified {
+        return unify_branches(node, out, "arguments", args);
+    }
+    if let ResultRule::DateAddition(_) = function.result {
+        check_date_addition(node, out, args)?;
+    } else {
+        let converted: Vec<Inferred> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
+            .map(|(_, ty)| *ty)
+            .collect();
+        refuse_implicit_text(node, &converted)?;
+    }
     match function.result {
-        ResultRule::Unified => return unify_branches(node, out, "arguments", args),
-        ResultRule::Compared => refuse_text_among_others(node, args)?,
-        ResultRule::DateAddition(_) => check_date_addition(node, out, args)?,
-        _ => {
-            let converted: Vec<Inferred> = args
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
-                .map(|(_, ty)| *ty)
-                .collect();
-            refuse_implicit_text(node, &converted)?;
+        ResultRule::IntegerOverIntegers if !args.iter().all(|ty| ty.is_integer()) => {
+            return Err(decline(format!(
+                "{} computes over integer operands only: {}",
+                function.name,
+                short(node)
+            )));
         }
-    }
-    if function.result == ResultRule::IntegerOverIntegers && !args.iter().all(|ty| ty.is_integer())
-    {
-        return Err(decline(format!(
-            "{} computes over integer operands only: {}",
-            function.name,
-            short(node)
-        )));
-    }
-    if function.result == ResultRule::Truncated && args.get(1) == Some(&DATE) {
-        truncate_date(out);
+        // DataFusion truncates a DATE to a timestamp, so the scan casts the result back to DATE.
+        ResultRule::Truncated if args.get(1) == Some(&DATE) => {
+            *out = cast_node(ExasolType::Date, out.take());
+        }
+        _ => {}
     }
     Ok(function.result_type(args))
 }
@@ -527,14 +530,10 @@ fn scalar_function_type(
 fn cast_node(target: ExasolType, argument: Json) -> Json {
     serde_json::json!({
         "type": "function_scalar_cast",
+        "name": "CAST",
         "dataType": exasol_type_to_json(&target),
         "arguments": [argument],
     })
-}
-
-/// DataFusion truncates a DATE to a timestamp, so the scan casts the result back to DATE.
-fn truncate_date(out: &mut Json) {
-    *out = cast_node(ExasolType::Date, out.take());
 }
 
 /// The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or a
@@ -549,19 +548,19 @@ fn check_date_addition(node: &Json, out: &mut Json, args: &[Inferred]) -> Result
         )));
     };
     refuse_implicit_text(node, args)?;
-    let cast_target = match first.timestamp_precision() {
-        _ if first == DATE => ExasolType::Date,
-        Some(precision) => ExasolType::timestamp(
+    let cast_target = if first == DATE {
+        ExasolType::Date
+    } else if let Some(precision) = first.timestamp_precision() {
+        ExasolType::timestamp(
             TimestampUnit::holding(precision)
                 .max(TimestampUnit::Microsecond)
                 .digits(),
-        ),
-        None => {
-            return Err(decline(format!(
-                "a date addition over a value that is not a DATE or TIMESTAMP: {}",
-                short(node)
-            )));
-        }
+        )
+    } else {
+        return Err(decline(format!(
+            "a date addition over a value that is not a DATE or TIMESTAMP: {}",
+            short(node)
+        )));
     };
     if count == BOOLEAN {
         out["arguments"][1] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][1].take());
@@ -764,18 +763,11 @@ fn compare_booleans_as_numbers(
     Ok(())
 }
 
-/// DataFusion truncates a timestamp literal to its operand's unit, while Exasol compares at full
-/// precision (#461, apache/datafusion#22142). The operand holds no digit beyond its precision, 0
-/// for a DATE, so the literal floored to that precision gives Exasol's answer.
+/// DataFusion truncates a timestamp literal to its TIMESTAMP operand's unit, while Exasol compares
+/// at full precision (#461, apache/datafusion#22142, fixed by apache/datafusion#22906). A DATE
+/// needs no floor, because DataFusion compares it with a timestamp in nanoseconds.
 fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
-    let precision = |field: &str| {
-        let ty = children.one(field)?;
-        if ty == DATE {
-            Some(0)
-        } else {
-            ty.timestamp_precision()
-        }
-    };
+    let precision = |field: &str| children.one(field)?.timestamp_precision();
     let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
     match kind(node) {
         "predicate_between" => {

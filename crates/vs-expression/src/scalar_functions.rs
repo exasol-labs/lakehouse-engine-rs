@@ -41,13 +41,12 @@ pub(crate) enum ResultRule {
     FirstArgument,
     /// Exasol brings every argument to one type, as for CASE branches.
     Unified,
-    /// `NULLIF`: compares its arguments and returns the first one's type.
-    Compared,
     /// `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, `ADD_MINUTES`: over a TIMESTAMP the result keeps
     /// its precision, over a DATE it is as given.
     DateAddition(DateResult),
     /// `DATE_TRUNC`: the type of the truncated DATE or TIMESTAMP.
     Truncated,
+    /// `TO_DATE`: a DATE in every Exasol version.
     Date,
     /// A TIMESTAMP whose precision differs by Exasol version.
     Timestamp,
@@ -233,7 +232,7 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("LOCATE").typed(T::FirstTwo, R::Integer),
         F::verbatim("GREATEST").typed(T::Never, R::Unified),
         F::verbatim("LEAST").typed(T::Never, R::Unified),
-        F::verbatim("NULLIF").typed(T::Never, R::Compared),
+        F::verbatim("NULLIF").typed(T::Never, R::Unified),
         F::verbatim("NULLIFZERO").typed(T::Never, R::FirstArgument),
         F::verbatim("ZEROIFNULL").typed(T::Never, R::FirstArgument),
         // DataFusion renders these as `date_part`, which Exasol lacks.

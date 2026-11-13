@@ -202,11 +202,9 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
         ExasolType::DoublePrecision => "DOUBLE".to_string(),
         // DataFusion parses only these four and reads a bare TIMESTAMP as nanoseconds, so the
         // rest decline rather than approximate.
-        ExasolType::Timestamp { precision }
-            if TimestampUnit::holding(precision).digits() == precision =>
-        {
-            format!("TIMESTAMP({precision})")
-        }
+        ExasolType::Timestamp {
+            precision: precision @ (0 | 3 | 6 | 9),
+        } => format!("TIMESTAMP({precision})"),
         // WLTZ carries session-time-zone semantics DataFusion's TIMESTAMP cannot reproduce, and
         // Arrow has no INTERVAL DAY(p) TO SECOND(f), GEOMETRY, or HASHTYPE equivalent.
         ExasolType::Timestamp { .. }

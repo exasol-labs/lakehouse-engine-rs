@@ -14,8 +14,6 @@ The typed pass kept its own coarse copy of the Exasol type, so each new rule mea
 
 The pass derives each node's type as an `ExasolType` when that type is known, as a kind with unknown parameters (text, integer, number, timestamp), as NULL, or as unknown. A rule returns an exact type only after a live Exasol check confirms it. Otherwise it returns a kind. Each scalar function has exactly one result rule.
 
-Timestamp precision has one home in vs-expression. `TimestampUnit` names the Arrow unit that holds a given number of fractional digits. `TimestampLiteral` gives a literal's type precision, its significant digits, and its floor.
-
 ### Consequences
 
 - Inferring a new type adds a rule, not a variant.
