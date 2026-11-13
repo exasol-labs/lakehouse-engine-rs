@@ -448,6 +448,39 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     assert_pushed_to_scan_udf(&mut conn, &distinct_sql, "the nanosecond distinct count");
 }
 
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
+#[test]
+fn iceberg_timestamp_literal_prunes_at_its_columns_unit() {
+    setup();
+    let mut conn = exa_conn();
+    // Exasol 8 rounds a TIMESTAMP literal to milliseconds before the pushdown, so no literal
+    // finer than a column's unit reaches the adapter there.
+    if !engine_honors_declared_precision(&mut conn) {
+        return;
+    }
+    let ts_ns_column = TSPRECISION_COL_TS_NS.to_uppercase();
+    let ts_column = TSPRECISION_COL_TS.to_uppercase();
+    for (column, literal, count, scanned) in [
+        (&ts_ns_column, "000000002", 0, false),
+        (&ts_ns_column, "000000001", 2, true),
+        (&ts_column, "123457", 0, false),
+        (&ts_column, "1234575", 0, true),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {column} > TIMESTAMP '2024-01-01 00:00:00.{literal}'",
+            qualified_probe()
+        );
+        assert_eq!(conn.query_scalar_i64(&sql), count, "{sql}");
+        let plan = isolated_pushdown_statement(&mut conn, &sql);
+        assert_eq!(
+            plan.contains(SCAN_SCRIPT_NAME),
+            scanned,
+            "a literal must prune the file exactly when its column's unit holds it and no \
+                 row matches: {plan}"
+        );
+    }
+}
+
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
 /// Scenario: A timestamp filter compares at full precision
 #[test]

@@ -1,8 +1,8 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null, like,
-    lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal, scalar_fn, str_lit,
-    timestamp_lit,
+    like_escape, lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal,
+    scalar_fn, str_lit, timestamp_lit,
 };
 use arrow::datatypes::TimeUnit;
 use serde_json::json;
@@ -156,6 +156,11 @@ fn range_and_between_nodes_evaluate_under_three_valued_logic() {
             not(between(sales_col("REGION"), str_lit("B"), str_lit("a"))),
             [false, false, true, false],
         ),
+        (
+            "BETWEEN with a numeric bound prunes by its string bound, which Exasol compares alone",
+            between(sales_col("REGION"), str_lit("a"), num_lit("5")),
+            [false, true, true, false],
+        ),
     ];
 
     for (label, filter, expected) in cases {
@@ -209,7 +214,7 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "an operator this module does not evaluate",
-            like(sales_col("YEAR"), "2025%"),
+            json!({"type": "predicate_is_json", "expression": sales_col("YEAR")}),
             [true, true, true],
         ),
         (
@@ -256,11 +261,6 @@ fn a_non_partition_node_never_prunes() {
         (
             "an IN list holding one empty string",
             in_list(sales_col("YEAR"), [str_lit("2024"), str_lit("")]),
-            [true, true, true],
-        ),
-        (
-            "a BETWEEN with one non-string bound",
-            between(sales_col("YEAR"), str_lit("2023"), num_lit("2024")),
             [true, true, true],
         ),
         (
@@ -331,6 +331,54 @@ fn two_files(key: &str, first: &str, second: &str) -> [FileValues; 2] {
     [file_with(key, Some(first)), file_with(key, Some(second))]
 }
 
+#[test]
+fn a_like_evaluates_exactly_against_each_partition_value() {
+    let files = year_files();
+    let cases = [
+        (
+            "a prefix",
+            like(sales_col("YEAR"), "2025%"),
+            [false, true, false],
+        ),
+        (
+            "a single-character wildcard",
+            like(sales_col("YEAR"), "202_"),
+            [true, true, false],
+        ),
+        (
+            "NOT over a pattern",
+            not(like(sales_col("YEAR"), "2025")),
+            [true, false, false],
+        ),
+        (
+            "an escaped wildcard",
+            like_escape(sales_col("YEAR"), "202!_", "!"),
+            [false, false, false],
+        ),
+        (
+            "a plain LIKE escaping with the default backslash",
+            like(sales_col("YEAR"), r"202\5"),
+            [false, true, false],
+        ),
+    ];
+    for (label, filter, expected) in cases {
+        assert_eq!(
+            kept(&filter, &files),
+            expected,
+            "{label}: kept per file [2026, 2025, NULL]"
+        );
+    }
+    assert_eq!(
+        kept_under(
+            &like(sales_col("YEAR"), "9%"),
+            &typed_columns(),
+            &two_files("year", "9", "10")
+        ),
+        [true, true],
+        "a LIKE on a column declared other than a string keeps every file"
+    );
+}
+
 /// Scenario: A partition value compares under its column's declared type
 #[test]
 fn partition_values_compare_under_their_declared_type() {
@@ -398,6 +446,11 @@ fn partition_values_compare_under_their_declared_type() {
             predicate_equal(sales_col("ACTIVE"), bool_lit(true)),
             two_files("active", "true", "false"),
         ),
+        (
+            "ratio > 1.0 on a double column",
+            compare("predicate_greater", sales_col("RATIO"), num_lit("1.0")),
+            two_files("ratio", "2.0", "0.5"),
+        ),
     ];
 
     for (label, filter, files) in cases {
@@ -416,6 +469,53 @@ fn partition_values_compare_under_their_declared_type() {
         [false],
         "a NULL value compares NULL under every declared type"
     );
+}
+
+/// SQL compares -0.0 equal to 0.0, while `ScalarValue` orders it below.
+#[test]
+fn a_negative_zero_float_partition_value_compares_equal_to_zero() {
+    let declared = [
+        ("pf".to_string(), DataType::Float32),
+        ("pd".to_string(), DataType::Float64),
+    ];
+    for key in ["pf", "pd"] {
+        let column = || sales_col(&key.to_uppercase());
+        let files = two_files(key, "-0.0", "0.5");
+        let cases = [
+            (
+                "= 0",
+                predicate_equal(column(), num_lit("0")),
+                [true, false],
+            ),
+            (
+                ">= 0",
+                compare("predicate_greaterequal", column(), num_lit("0")),
+                [true, true],
+            ),
+            (
+                "< 0",
+                compare("predicate_less", column(), num_lit("0")),
+                [false, false],
+            ),
+            (
+                "IN (0, 3)",
+                in_list(column(), [num_lit("0"), num_lit("3")]),
+                [true, false],
+            ),
+            (
+                "BETWEEN 0 AND 0.25",
+                between(column(), num_lit("0"), num_lit("0.25")),
+                [true, false],
+            ),
+        ];
+        for (label, filter, expected) in cases {
+            assert_eq!(
+                kept_under(&filter, &declared, &files),
+                expected,
+                "{key} {label}: kept per file [-0.0, 0.5]"
+            );
+        }
+    }
 }
 
 /// Scenario: A comparison the declared type cannot decide exactly keeps the file
@@ -453,11 +553,6 @@ fn an_undecidable_comparison_keeps_the_file() {
             two_files("ts_ms", "2024-03-01 00:00:00", "2024-03-01 00:00:00.001"),
         ),
         (
-            "a comparison on a float column",
-            compare("predicate_greater", sales_col("RATIO"), num_lit("1.0")),
-            two_files("ratio", "0.5", "2.0"),
-        ),
-        (
             "a double literal on an integer column",
             predicate_equal(sales_col("YEAR"), lit("literal_double", json!("2024"))),
             two_files("year", "2024", "2025"),
@@ -476,7 +571,7 @@ fn an_undecidable_comparison_keeps_the_file() {
             "a UTC timestamp literal on a timestamp column",
             predicate_equal(
                 sales_col("TS"),
-                lit("literal_timestamp_utc", json!("2024-03-01 00:00:00")),
+                lit("literal_timestamputc", json!("2024-03-01 00:00:00")),
             ),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
         ),

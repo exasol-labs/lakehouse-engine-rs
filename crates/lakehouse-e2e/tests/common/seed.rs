@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::pruning_fixture::{
-    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, iceberg_file_prefix,
-    pruning_batch, pruning_writer_properties,
+    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE,
+    PRUNING_TYPED_PARTITION_COLUMN, decimal_unscaled, iceberg_file_prefix, pruning_batch,
+    pruning_writer_properties,
 };
 use super::raw_parquet::{encode_parquet_message, write_parquet_column};
 
@@ -465,20 +466,24 @@ fn unpartitioned() -> UnboundPartitionSpec {
     UnboundPartitionSpec::builder().with_spec_id(0).build()
 }
 
-/// The partition field needs an explicit field-id (partition ids start at 1000): an
+/// Each partition field needs an explicit field-id (partition ids start at 1000): an
 /// unbound spec serializes `field-id: null`, which the REST catalog rejects.
-fn identity_partition_spec(source_id: i32, column: &str) -> Result<UnboundPartitionSpec> {
-    let field = UnboundPartitionField::builder()
-        .source_ids(vec![source_id])
-        .field_id(1000)
-        .name(column.to_string())
-        .transform(Transform::Identity)
-        .build()
-        .with_context(|| format!("build the {column} partition field"))?;
+fn identity_partition_spec(columns: &[(i32, &str)]) -> Result<UnboundPartitionSpec> {
+    let fields = (1000..)
+        .zip(columns)
+        .map(|(field_id, (source_id, column))| {
+            UnboundPartitionField::builder()
+                .source_ids(vec![*source_id])
+                .field_id(field_id)
+                .name(column.to_string())
+                .transform(Transform::Identity)
+                .build()
+                .with_context(|| format!("build the {column} partition field"))
+        });
     Ok(UnboundPartitionSpec::builder()
         .with_spec_id(1)
-        .add_partition_fields([field])
-        .with_context(|| format!("build the {column} partition spec"))?
+        .add_partition_fields(fields.collect::<Result<Vec<_>>>()?)
+        .context("build the identity partition spec")?
         .build())
 }
 
@@ -1273,7 +1278,7 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
         E2E_NAMESPACE,
         E2E_PART_TABLE,
         regions_iceberg_schema()?,
-        identity_partition_spec(2, PART_COL)?,
+        identity_partition_spec(&[(2, PART_COL)])?,
         HashMap::new(),
         files,
     )
@@ -1379,6 +1384,27 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
             NestedField::optional(4, "s", Type::Primitive(PrimitiveType::String)).into(),
             NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Double)).into(),
             NestedField::optional(6, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            NestedField::optional(
+                7,
+                PRUNING_TYPED_PARTITION_COLUMN,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 4,
+                    scale: 1,
+                }),
+            )
+            .into(),
+            NestedField::optional(
+                8,
+                "d",
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                }),
+            )
+            .into(),
+            NestedField::optional(9, "f", Type::Primitive(PrimitiveType::Float)).into(),
+            NestedField::optional(10, "dt", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::optional(11, "tz", Type::Primitive(PrimitiveType::Timestamptz)).into(),
         ])
         .build()
         .context("build pruning fixture Iceberg schema")?;
@@ -1387,7 +1413,10 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
         PRUNING_NAMESPACE,
         PRUNING_TABLE,
         iceberg_schema,
-        identity_partition_spec(2, PRUNING_PARTITION_COLUMN)?,
+        identity_partition_spec(&[
+            (2, PRUNING_PARTITION_COLUMN),
+            (7, PRUNING_TYPED_PARTITION_COLUMN),
+        ])?,
         HashMap::new(),
     )
     .await?
@@ -1401,7 +1430,11 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
             write_data_files(
                 &table,
                 &iceberg_file_prefix(file),
-                Struct::from_iter([file.partition.map(Literal::string)]),
+                Struct::from_iter([
+                    file.partition.map(Literal::string),
+                    file.typed_partition
+                        .map(|value| Literal::decimal(decimal_unscaled(value))),
+                ]),
                 pruning_writer_properties(),
                 [pruning_batch(file)],
             )

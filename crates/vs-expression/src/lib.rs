@@ -50,10 +50,6 @@ fn binary_op(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn is_empty_opt(value: Option<&str>) -> bool {
-    matches!(value, None | Some(""))
-}
-
 /// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
 /// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
@@ -66,6 +62,34 @@ fn quote_literal(value: Option<&Json>) -> String {
         Some(Json::String(s)) => format!("'{}'", sql_escape(s)),
         Some(other) => format!("'{}'", sql_escape(&json_scalar_to_string(other))),
     }
+}
+
+/// DataFusion's `LIKE` accepts only `\` as its escape (apache/datafusion#13291), so a pattern written
+/// with another escape is rewritten to it. `None` unless both are string literals and the escape is
+/// one character that never ends the pattern.
+fn backslash_escaped_pattern(pattern: &Json, escape: &Json) -> Option<String> {
+    fn string(node: &Json) -> Option<&str> {
+        (node.get("type")?.as_str()? == "literal_string").then_some(())?;
+        node.get("value")?.as_str()
+    }
+    let mut escape_chars = string(escape)?.chars();
+    let escape = escape_chars.next()?;
+    if escape_chars.next().is_some() {
+        return None;
+    }
+    let mut rewritten = String::new();
+    let mut chars = string(pattern)?.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c == escape => {
+                rewritten.push('\\');
+                rewritten.push(chars.next()?);
+            }
+            '\\' => rewritten.push_str("\\\\"),
+            c => rewritten.push(c),
+        }
+    }
+    Some(rewritten)
 }
 
 /// Shared by `literal_timestamp` and `literal_timestamp_utc` so they cannot drift.
@@ -507,25 +531,35 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }
         }
         "predicate_like" => {
+            let pattern = value("pattern").unwrap_or(&Json::Null);
             let left =
                 render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
-            let pattern =
-                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?;
-            match (left, pattern) {
-                (Some(l), Some(p)) => {
-                    let escape = value("escape_char").and_then(|e| e.as_str());
-                    if !is_empty_opt(escape) {
-                        Ok(Some(format!(
-                            "({l} LIKE {p} ESCAPE {})",
-                            quote_literal(value("escape_char"))
-                        )))
-                    } else {
-                        Ok(Some(format!("({l} LIKE {p})")))
-                    }
-                }
-                _ => Err(UdfError::User(
+            let (Some(l), Some(p)) = (left, render_expression_inner(pattern, dialect)?) else {
+                return Err(UdfError::User(
                     "predicate_like missing 'expression' or 'pattern'".into(),
-                )),
+                ));
+            };
+            match value("escapeChar") {
+                None => Ok(Some(format!("({l} LIKE {p})"))),
+                Some(escape) if dialect == Dialect::Exasol => {
+                    let escape = render_expression_inner(escape, dialect)?.ok_or_else(|| {
+                        UdfError::User("predicate_like with a null 'escapeChar'".into())
+                    })?;
+                    Ok(Some(format!("({l} LIKE {p} ESCAPE {escape})")))
+                }
+                Some(escape) => {
+                    let rewritten =
+                        backslash_escaped_pattern(pattern, escape).ok_or_else(|| {
+                            UdfError::User(
+                                "LIKE ESCAPE needs a string pattern and a one-character escape"
+                                    .into(),
+                            )
+                        })?;
+                    Ok(Some(format!(
+                        "({l} LIKE {})",
+                        quote_literal(Some(&Json::String(rewritten)))
+                    )))
+                }
             }
         }
         "function_scalar_extract" => {

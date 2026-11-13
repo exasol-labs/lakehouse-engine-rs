@@ -1,10 +1,11 @@
 //! One row set for the pruning case table. The Iceberg seed, the Hive and Delta copies, and the
 //! native oracle all read it, so every format answers the same predicate over the same rows.
 
-use super::raw_parquet::{encode_parquet_with, put_fixture_object};
+use super::raw_parquet::{delete_fixture_prefix, encode_parquet_with, put_fixture_object};
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 pub const PRUNING_NAMESPACE: &str = "e2e_pruning";
 pub const PRUNING_TABLE: &str = "pruning_cases";
 pub const PRUNING_PARTITION_COLUMN: &str = "p";
+pub const PRUNING_TYPED_PARTITION_COLUMN: &str = "q";
 pub const PRUNING_HIVE_BASE: &str = "s3://warehouse/direct_pruning/";
 const PRUNING_ORACLE_SCHEMA: &str = "PRUNING_ORACLE";
 pub const PRUNING_ORACLE_TABLE: &str = "PRUNING_ORACLE.CASES";
@@ -25,6 +27,8 @@ const ROWS_PER_PAGE: usize = 2;
 
 /// 2024-01-01T00:00:00 in microseconds since the epoch.
 const BASE_TS_MICROS: i64 = 1_704_067_200_000_000;
+/// 2024-01-01 in days since the epoch.
+const BASE_DAYS: i32 = 19_723;
 /// The Hive directory value of a NULL partition.
 const HIVE_NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -55,14 +59,9 @@ const fn row(
 pub struct PruningFile {
     pub label: &'static str,
     pub partition: Option<&'static str>,
+    /// The `decimal(4,1)` partition value, with one fraction digit.
+    pub typed_partition: Option<&'static str>,
     rows: &'static [PruningRow],
-}
-
-impl PruningFile {
-    /// Row by row, so a caller derives per-file statistics from the rows, not from a footer.
-    pub fn k_values(&self) -> Vec<Option<i64>> {
-        self.rows.iter().map(|row| row.k).collect()
-    }
 }
 
 /// The `k` boundary of the `NOT (k < 30 AND u)` cases.
@@ -79,6 +78,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "a1",
         partition: Some("a"),
+        typed_partition: Some("2.5"),
         rows: &[
             row(1, Some(10), Some("xa"), Some(0.5), Some(5_250)),
             row(2, Some(12), Some("ya"), Some(0.05), Some(500)),
@@ -89,6 +89,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "a2",
         partition: Some("a"),
+        typed_partition: Some("10.0"),
         rows: &[
             row(5, Some(15), Some("ya"), Some(0.05), Some(500)),
             row(6, Some(18), Some("xa"), Some(0.5), Some(5_250)),
@@ -101,6 +102,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "b1",
         partition: Some("b"),
+        typed_partition: Some("2.5"),
         rows: &[
             row(11, Some(5), Some("xa"), Some(0.5), Some(5_250)),
             row(12, Some(8), Some("yd"), Some(0.05), Some(500)),
@@ -115,6 +117,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "b2",
         partition: Some("b"),
+        typed_partition: None,
         rows: &[
             row(19, None, Some("xi"), Some(0.5), Some(5_250)),
             row(20, None, Some("yg"), Some(0.05), Some(500)),
@@ -124,6 +127,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "n1",
         partition: None,
+        typed_partition: Some("-1.5"),
         rows: &[
             row(22, Some(5), Some("yh"), Some(0.05), Some(500)),
             row(23, Some(7), Some("xj"), Some(0.5), Some(5_250)),
@@ -136,6 +140,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     PruningFile {
         label: "n2",
         partition: None,
+        typed_partition: Some("10.0"),
         rows: &[
             row(28, Some(45), Some("xm"), Some(0.5), Some(5_250)),
             row(29, Some(60), Some("yj"), Some(0.05), Some(500)),
@@ -156,9 +161,9 @@ pub fn pruning_writer_properties() -> WriterProperties {
         .build()
 }
 
-/// Holds the partition column `p`, as an Iceberg data file does.
 pub fn pruning_batch(file: &PruningFile) -> RecordBatch {
     let rows = file.rows;
+    let utc = Some(Arc::from("+00:00"));
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(PRUNING_PARTITION_COLUMN, DataType::Utf8, true),
@@ -166,7 +171,21 @@ pub fn pruning_batch(file: &PruningFile) -> RecordBatch {
         Field::new("s", DataType::Utf8, true),
         Field::new("x", DataType::Float64, true),
         Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new(
+            PRUNING_TYPED_PARTITION_COLUMN,
+            DataType::Decimal128(4, 1),
+            true,
+        ),
+        Field::new("d", DataType::Decimal128(9, 2), true),
+        Field::new("f", DataType::Float32, true),
+        Field::new("dt", DataType::Date32, true),
+        Field::new(
+            "tz",
+            DataType::Timestamp(TimeUnit::Microsecond, utc.clone()),
+            true,
+        ),
     ]));
+    let typed_partition = file.typed_partition.map(decimal_unscaled);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.id))),
         Arc::new(StringArray::from(vec![file.partition; rows.len()])),
@@ -176,8 +195,71 @@ pub fn pruning_batch(file: &PruningFile) -> RecordBatch {
         Arc::new(TimestampMicrosecondArray::from_iter(
             rows.iter().map(|r| r.ts_millis.map(ts_micros)),
         )),
+        Arc::new(
+            Decimal128Array::from(vec![typed_partition; rows.len()])
+                .with_precision_and_scale(4, 1)
+                .expect("decimal(4,1) partition"),
+        ),
+        Arc::new(
+            Decimal128Array::from_iter(derived(rows, d_unscaled))
+                .with_precision_and_scale(9, 2)
+                .expect("decimal(9,2) column"),
+        ),
+        Arc::new(Float32Array::from_iter(derived(rows, f_value))),
+        Arc::new(Date32Array::from_iter(derived(rows, dt_days))),
+        Arc::new(
+            TimestampMicrosecondArray::from_iter(derived(rows, tz_micros)).with_timezone_opt(utc),
+        ),
     ];
     RecordBatch::try_new(schema, columns).expect("pruning fixture batch construction")
+}
+
+/// `d`, `f`, `dt`, and `tz` rise with `k`, so their per-file bounds are those of `k`.
+fn derived<T: 'static>(
+    rows: &[PruningRow],
+    derive: fn(i64) -> T,
+) -> impl Iterator<Item = Option<T>> + '_ {
+    rows.iter().map(move |r| r.k.map(derive))
+}
+
+fn d_unscaled(k: i64) -> i128 {
+    i128::from(k) * 100 + 25
+}
+
+fn f_value(k: i64) -> f32 {
+    f32::from(i16::try_from(k).expect("fixture k fits i16")) / 100.0
+}
+
+fn dt_days(k: i64) -> i32 {
+    BASE_DAYS + i32::try_from(k).expect("fixture k fits i32")
+}
+
+fn tz_micros(k: i64) -> i64 {
+    BASE_TS_MICROS + k * 60_000_000
+}
+
+/// A scale-2 decimal as SQL and the Delta statistics write it.
+pub fn d_text(unscaled: i128) -> String {
+    let sign = if unscaled < 0 { "-" } else { "" };
+    let magnitude = unscaled.unsigned_abs();
+    format!("{sign}{}.{:02}", magnitude / 100, magnitude % 100)
+}
+
+pub fn day(days: i32) -> chrono::NaiveDate {
+    chrono::DateTime::UNIX_EPOCH
+        .date_naive()
+        .checked_add_signed(chrono::TimeDelta::days(days.into()))
+        .expect("fixture date is a valid day")
+}
+
+pub fn instant(micros: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(micros).expect("fixture timestamp is a valid instant")
+}
+
+pub fn decimal_unscaled(text: &str) -> i128 {
+    text.replace('.', "")
+        .parse()
+        .expect("fixture decimal text parses")
 }
 
 fn ts_micros(millis: i64) -> i64 {
@@ -189,13 +271,18 @@ pub fn iceberg_file_prefix(file: &PruningFile) -> String {
     format!("pc_{}", file.label)
 }
 
+/// Whether `text` names the Hive-style data file `<label>.parquet`, as a Hive or Delta key does.
+pub fn names_data_file(text: &str, label: &str) -> bool {
+    text.contains(&format!("/{label}.parquet"))
+}
+
 /// The Iceberg file name carries `<prefix>-`, and the Hive and Delta keys `/<label>.parquet`.
 pub fn labels_named(text: &str) -> BTreeSet<String> {
     PRUNING_FILES
         .iter()
         .filter(|file| {
             text.contains(&format!("{}-", iceberg_file_prefix(file)))
-                || text.contains(&format!("/{}.parquet", file.label))
+                || names_data_file(text, file.label)
         })
         .map(|file| file.label.to_string())
         .collect()
@@ -203,35 +290,38 @@ pub fn labels_named(text: &str) -> BTreeSet<String> {
 
 /// The Hive-style path below the table root, which the Hive and Delta copies share.
 pub fn pruning_relative_path(file: &PruningFile) -> String {
-    let segment = file.partition.unwrap_or(HIVE_NULL_PARTITION);
+    let segment = |value: Option<&str>| value.unwrap_or(HIVE_NULL_PARTITION).to_string();
     format!(
-        "{PRUNING_PARTITION_COLUMN}={segment}/{}.parquet",
+        "{PRUNING_PARTITION_COLUMN}={}/{PRUNING_TYPED_PARTITION_COLUMN}={}/{}.parquet",
+        segment(file.partition),
+        segment(file.typed_partition),
         file.label
     )
 }
 
-pub fn hive_object_uri(file: &PruningFile) -> String {
-    format!(
-        "{PRUNING_HIVE_BASE}{PRUNING_TABLE}/{}",
-        pruning_relative_path(file)
-    )
+pub fn hive_object_uri(base: &str, file: &PruningFile) -> String {
+    format!("{base}{PRUNING_TABLE}/{}", pruning_relative_path(file))
 }
 
-/// Omits `p`, whose value the Hive path and the Delta log carry, so both copies write these
-/// same bytes.
+/// Omits the partition columns, whose values the Hive path and the Delta log carry, so every
+/// copy writes these same bytes.
 pub fn pruning_data_file(file: &PruningFile) -> Bytes {
     let mut batch = pruning_batch(file);
-    let partition = batch
-        .schema()
-        .index_of(PRUNING_PARTITION_COLUMN)
-        .expect("the pruning batch holds the partition column");
-    batch.remove_column(partition);
+    for column in [PRUNING_PARTITION_COLUMN, PRUNING_TYPED_PARTITION_COLUMN] {
+        let index = batch
+            .schema()
+            .index_of(column)
+            .expect("the pruning batch holds the partition column");
+        batch.remove_column(index);
+    }
     encode_parquet_with(&batch, pruning_writer_properties())
 }
 
-pub fn write_pruning_hive_copy() {
+/// Drops the table root first, so no file of an earlier layout stays listed.
+pub fn write_pruning_hive_copy(base: &str) {
+    delete_fixture_prefix(&format!("{base}{PRUNING_TABLE}"));
     for file in &PRUNING_FILES {
-        put_fixture_object(&hive_object_uri(file), pruning_data_file(file));
+        put_fixture_object(&hive_object_uri(base, file), pruning_data_file(file));
     }
 }
 
@@ -245,29 +335,35 @@ pub fn oracle_statements() -> [String; 3] {
         format!("CREATE SCHEMA IF NOT EXISTS {PRUNING_ORACLE_SCHEMA}"),
         format!(
             "CREATE OR REPLACE TABLE {PRUNING_ORACLE_TABLE} (ID DECIMAL(20,0), P VARCHAR(2000000), \
-             K DECIMAL(20,0), S VARCHAR(2000000), X DOUBLE, TS TIMESTAMP, FILE_LABEL VARCHAR(10))"
+             K DECIMAL(20,0), S VARCHAR(2000000), X DOUBLE, TS TIMESTAMP, Q DECIMAL(4,1), \
+             D DECIMAL(9,2), F DOUBLE, DT DATE, TZ TIMESTAMP, FILE_LABEL VARCHAR(10))"
         ),
         format!(
-            "INSERT INTO {PRUNING_ORACLE_TABLE} (ID, P, K, S, X, TS, FILE_LABEL) VALUES {}",
+            "INSERT INTO {PRUNING_ORACLE_TABLE} (ID, P, K, S, X, TS, Q, D, F, DT, TZ, FILE_LABEL) \
+             VALUES {}",
             values.join(", ")
         ),
     ]
 }
 
 fn oracle_values(file: &PruningFile, r: &PruningRow) -> String {
-    let ts = r.ts_millis.map(|millis| {
-        chrono::DateTime::from_timestamp_micros(ts_micros(millis))
-            .expect("fixture timestamp is a valid instant")
+    let timestamp = |micros: i64| {
+        instant(micros)
             .format("TIMESTAMP '%Y-%m-%d %H:%M:%S%.3f'")
             .to_string()
-    });
+    };
     let values = [
         Some(r.id.to_string()),
         file.partition.map(sql_string),
         r.k.map(|k| k.to_string()),
         r.s.map(sql_string),
         r.x.map(|x| format!("{x:?}")),
-        ts,
+        r.ts_millis.map(|millis| timestamp(ts_micros(millis))),
+        file.typed_partition.map(str::to_string),
+        r.k.map(|k| d_text(d_unscaled(k))),
+        r.k.map(|k| format!("{:?}", f64::from(f_value(k)))),
+        r.k.map(|k| day(dt_days(k)).format("DATE '%Y-%m-%d'").to_string()),
+        r.k.map(|k| timestamp(tz_micros(k))),
         Some(sql_string(file.label)),
     ]
     .map(|value| value.unwrap_or_else(|| "NULL".to_string()));

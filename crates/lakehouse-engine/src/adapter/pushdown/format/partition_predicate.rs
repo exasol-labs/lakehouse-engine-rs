@@ -1,55 +1,44 @@
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
 use datafusion::scalar::ScalarValue;
 use serde_json::Value as Json;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::{non_null_partition_value, partition_scalar};
-use crate::types::mapping::timestamp_unit;
-use vs_expression::timestamp::TimestampLiteral;
 
-use super::filter_json::{
-    Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
-    subject_column,
-};
+use super::filter_json::Comparison;
+use super::pruning_filter::PruningFilter;
 
 /// A file is kept iff TRUE is reachable at the root; an untranslatable node reaches every truth
 /// value, so it can only widen the kept set. A value and a literal compare under the partition
 /// column's declared type, each converted as the scan converts a partition value.
 pub(super) struct PartitionPredicate {
-    root: Node,
+    root: PruningFilter<String>,
 }
 
 impl PartitionPredicate {
     /// `declared` types the partition columns (uppercase fold); an undeclared one compares as
     /// `utf8`, the type direct storage declares. `None` keeps every file.
     pub(super) fn from_filter(filter_json: Option<&Json>, declared: &[(String, DataType)]) -> Self {
-        let translator = Translator { declared };
+        let resolve = |column: &str| {
+            let column = column.to_uppercase();
+            let declared = declared
+                .iter()
+                .find(|(name, _)| folds_to(name, &column))
+                .map_or(DataType::Utf8, |(_, data_type)| data_type.clone());
+            Some((column, Some(declared)))
+        };
         Self {
-            root: filter_json.map_or(Node::Opaque, |node| translator.translate(node)),
+            root: filter_json.map_or(PruningFilter::Opaque, |node| {
+                PruningFilter::parse(node, &resolve)
+            }),
         }
     }
 
     /// Column names match partition keys case-insensitively (uppercase fold).
     pub(super) fn keeps(&self, partition_values: &BTreeMap<String, Option<String>>) -> bool {
-        self.root.reachable(partition_values).can_be_true
+        reachable(&self.root, partition_values).can_be_true
     }
-}
-
-enum Node {
-    Compare {
-        column: String,
-        comparison: Comparison,
-        literal: ScalarValue,
-    },
-    IsNull {
-        column: String,
-    },
-    And(Vec<Node>),
-    Or(Vec<Node>),
-    Not(Box<Node>),
-    Opaque,
 }
 
 /// The SQL truth values a node can reach across a file's rows; neither flag set means only NULL.
@@ -94,35 +83,51 @@ impl Reachable {
     }
 }
 
-impl Node {
-    fn reachable(&self, values: &BTreeMap<String, Option<String>>) -> Reachable {
-        match self {
-            Self::Compare {
-                column,
-                comparison,
-                literal,
-            } => partition_value(values, column).map_or(Reachable::ANY, |value| match value {
-                None => Reachable::exactly(None),
-                Some(value) => typed_ordering(value, literal).map_or(Reachable::ANY, |ordering| {
-                    Reachable::exactly(Some(comparison.holds(ordering)))
-                }),
+fn reachable(
+    filter: &PruningFilter<String>,
+    values: &BTreeMap<String, Option<String>>,
+) -> Reachable {
+    let of_value = |column: &str, truth: &dyn Fn(&str) -> Reachable| {
+        partition_value(values, column).map_or(Reachable::ANY, |value| {
+            value.map_or(Reachable::exactly(None), truth)
+        })
+    };
+    match filter {
+        PruningFilter::Compare {
+            column,
+            comparison,
+            literal,
+        } => of_value(column, &|value| compared(value, *comparison, literal)),
+        PruningFilter::InList { column, literals } => of_value(column, &|value| {
+            literals
+                .iter()
+                .map(|literal| compared(value, Comparison::Equal, literal))
+                .fold(Reachable::exactly(Some(false)), Reachable::or)
+        }),
+        PruningFilter::NullTest { column, is_null } => partition_value(values, column)
+            .map_or(Reachable::ANY, |value| {
+                Reachable::exactly(Some(value.is_none() == *is_null))
             }),
-            Self::IsNull { column } => partition_value(values, column)
-                .map_or(Reachable::ANY, |value| {
-                    Reachable::exactly(Some(value.is_none()))
-                }),
-            Self::And(operands) => operands
-                .iter()
-                .map(|operand| operand.reachable(values))
-                .fold(Reachable::exactly(Some(true)), Reachable::and),
-            Self::Or(operands) => operands
-                .iter()
-                .map(|operand| operand.reachable(values))
-                .fold(Reachable::exactly(Some(false)), Reachable::or),
-            Self::Not(operand) => operand.reachable(values).negated(),
-            Self::Opaque => Reachable::ANY,
-        }
+        PruningFilter::Like { column, pattern } => of_value(column, &|value| {
+            Reachable::exactly(Some(pattern.matches(value)))
+        }),
+        PruningFilter::And(operands) => operands
+            .iter()
+            .map(|operand| reachable(operand, values))
+            .fold(Reachable::exactly(Some(true)), Reachable::and),
+        PruningFilter::Or(operands) => operands
+            .iter()
+            .map(|operand| reachable(operand, values))
+            .fold(Reachable::exactly(Some(false)), Reachable::or),
+        PruningFilter::Not(operand) => reachable(operand, values).negated(),
+        PruningFilter::Opaque => Reachable::ANY,
     }
+}
+
+fn compared(value: &str, comparison: Comparison, literal: &ScalarValue) -> Reachable {
+    typed_ordering(value, literal).map_or(Reachable::ANY, |ordering| {
+        Reachable::exactly(Some(comparison.holds(ordering)))
+    })
 }
 
 /// `None` when `column` names no partition key; `Some(None)` when the file's value is NULL, which
@@ -157,166 +162,17 @@ fn typed_ordering(value: &str, literal: &ScalarValue) -> Option<Ordering> {
         return Some(value.as_bytes().cmp(literal.as_slice()));
     }
     let value = partition_scalar(value, &literal.data_type()).ok()?;
-    if value.is_null() {
-        return None;
-    }
-    value.partial_cmp(literal)
-}
-
-struct Translator<'a> {
-    declared: &'a [(String, DataType)],
-}
-
-impl Translator<'_> {
-    fn translate(&self, node: &Json) -> Node {
-        let Some(kind) = node.get("type").and_then(Json::as_str) else {
-            return Node::Opaque;
-        };
-        match kind {
-            "predicate_and" => self
-                .translate_operands(node)
-                .map_or(Node::Opaque, Node::And),
-            "predicate_or" => self.translate_operands(node).map_or(Node::Opaque, Node::Or),
-            "predicate_not" => node.get("expression").map_or(Node::Opaque, |operand| {
-                Node::Not(Box::new(self.translate(operand)))
-            }),
-            "predicate_is_null" => translate_is_null(node).unwrap_or(Node::Opaque),
-            "predicate_is_not_null" => {
-                translate_is_null(node).map_or(Node::Opaque, |is_null| Node::Not(Box::new(is_null)))
-            }
-            "predicate_in_constlist" => self.translate_in(node).unwrap_or(Node::Opaque),
-            "predicate_between" => self.translate_between(node).unwrap_or(Node::Opaque),
-            other => Comparison::from_node_type(other)
-                .and_then(|comparison| self.translate_comparison(node, comparison))
-                .unwrap_or(Node::Opaque),
+    // `ScalarValue` orders floats totally, which puts -0.0 below 0.0, but SQL compares them equal.
+    match (&value, literal) {
+        (_, _) if value.is_null() => None,
+        (ScalarValue::Float32(Some(value)), ScalarValue::Float32(Some(literal))) => {
+            value.partial_cmp(literal)
         }
-    }
-
-    fn translate_operands(&self, node: &Json) -> Option<Vec<Node>> {
-        Some(
-            operands(node)?
-                .iter()
-                .map(|operand| self.translate(operand))
-                .collect(),
-        )
-    }
-
-    fn translate_comparison(&self, node: &Json, comparison: Comparison) -> Option<Node> {
-        let (column, literal, comparison) = comparison_operands(node, comparison)?;
-        let column = column.to_uppercase();
-        Some(Node::Compare {
-            literal: self.typed_literal(&column, literal)?,
-            column,
-            comparison,
-        })
-    }
-
-    fn translate_in(&self, node: &Json) -> Option<Node> {
-        let (column, arguments) = in_operands(node)?;
-        let column = column.to_uppercase();
-        let equalities = arguments
-            .iter()
-            .map(|argument| {
-                Some(Node::Compare {
-                    column: column.clone(),
-                    comparison: Comparison::Equal,
-                    literal: self.typed_literal(&column, argument)?,
-                })
-            })
-            .collect::<Option<Vec<Node>>>()?;
-        Some(Node::Or(equalities))
-    }
-
-    fn translate_between(&self, node: &Json) -> Option<Node> {
-        let (column, low, high) = between_operands(node)?;
-        let column = column.to_uppercase();
-        let low = self.typed_literal(&column, low?)?;
-        let high = self.typed_literal(&column, high?)?;
-        Some(Node::And(vec![
-            Node::Compare {
-                column: column.clone(),
-                comparison: Comparison::GreaterEqual,
-                literal: low,
-            },
-            Node::Compare {
-                column,
-                comparison: Comparison::LessEqual,
-                literal: high,
-            },
-        ]))
-    }
-
-    fn typed_literal(&self, column: &str, literal: &Json) -> Option<ScalarValue> {
-        let declared = self
-            .declared
-            .iter()
-            .find(|(name, _)| folds_to(name, column))
-            .map_or(DataType::Utf8, |(_, data_type)| data_type.clone());
-        literal_under(literal, &declared)
-    }
-}
-
-fn translate_is_null(node: &Json) -> Option<Node> {
-    Some(Node::IsNull {
-        column: subject_column(node)?.to_uppercase(),
-    })
-}
-
-/// Converts only exactly, since a rounded literal could prune a file holding a matching row, and
-/// never an empty string literal, which Exasol reads as NULL.
-fn literal_under(literal: &Json, declared: &DataType) -> Option<ScalarValue> {
-    let kind = literal.get("type")?.as_str()?;
-    let value = literal.get("value")?;
-    let text = match (kind, declared) {
-        ("literal_string", DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
-            non_empty_str(value)?.to_string()
+        (ScalarValue::Float64(Some(value)), ScalarValue::Float64(Some(literal))) => {
+            value.partial_cmp(literal)
         }
-        ("literal_exactnumeric", integer) if integer.is_integer() => exact_numeral(value, 0)?,
-        (
-            "literal_exactnumeric",
-            DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale),
-        ) => exact_numeral(value, *scale)?,
-        ("literal_date", DataType::Date32 | DataType::Date64) => non_empty_str(value)?.to_string(),
-        ("literal_timestamp", DataType::Timestamp(unit, _)) => exact_timestamp(value, *unit)?,
-        ("literal_bool", DataType::Boolean) => value.as_bool()?.to_string(),
-        ("literal_binary", DataType::Binary) => {
-            return literal_binary_bytes(literal).map(|bytes| ScalarValue::Binary(Some(bytes)));
-        }
-        _ => return None,
-    };
-    ScalarValue::try_from_string(text, declared)
-        .ok()
-        .filter(|scalar| !scalar.is_null())
-}
-
-/// A plain `[+-]digits[.digits]` numeral with at most `scale` fraction digits; the string cast
-/// would round a finer one.
-fn exact_numeral(value: &Json, scale: i8) -> Option<String> {
-    let numeral = match value {
-        Json::String(numeral) => numeral.clone(),
-        Json::Number(number) => number.to_string(),
-        _ => return None,
-    };
-    let unsigned = numeral.strip_prefix(['+', '-']).unwrap_or(&numeral);
-    let (whole, fraction) = match unsigned.split_once('.') {
-        Some((whole, fraction)) => (whole, Some(fraction)),
-        None => (unsigned, None),
-    };
-    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-    let fraction_digits = match fraction {
-        None => 0,
-        Some(fraction) if is_digits(fraction) => fraction.len(),
-        Some(_) => return None,
-    };
-    (is_digits(whole) && fraction_digits <= usize::try_from(scale).ok()?).then_some(numeral)
-}
-
-/// The string cast truncates a fraction finer than `unit`, so such a literal does not convert.
-fn exact_timestamp(value: &Json, unit: TimeUnit) -> Option<String> {
-    let text = non_empty_str(value)?;
-    TimestampLiteral(text)
-        .fits(timestamp_unit(unit))
-        .then(|| text.to_string())
+        _ => value.partial_cmp(literal),
+    }
 }
 
 #[cfg(test)]

@@ -22,8 +22,8 @@ use tokio::net::TcpListener;
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
     cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
-    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
-    str_lit, string_equal, table_col, table_column, timestamp_lit,
+    is_null, like, like_escape, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
+    scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
 
 /// The scan's typed filter SQL, `None` when it declines.

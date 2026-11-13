@@ -1217,7 +1217,7 @@ fn an_or_with_an_untranslatable_branch_keeps_every_file() {
     let schema = open_fixture("multi-part-stats").schema();
     let node = or([
         compare("predicate_lessequal", col("ID"), num_lit(2)),
-        compare("predicate_notequal", col("ID"), num_lit(7)),
+        compare("predicate_equal", col("ID"), str_lit("seven")),
     ]);
 
     assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);

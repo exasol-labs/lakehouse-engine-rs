@@ -12,6 +12,7 @@ use super::pruning_fixture::{
 };
 use super::raw_parquet::get_fixture_object;
 
+use bytes::Bytes;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::reader::FileReader;
@@ -24,7 +25,9 @@ use Placement::{OuterWhere, Scan};
 
 pub const VS_ICEBERG: &str = "PRUNING_ICEBERG";
 pub const VS_HIVE: &str = "PRUNING_HIVE";
-pub const VS_DELTA: &str = "PRUNING_DELTA";
+pub const VS_UNITY: &str = "PRUNING_UNITY";
+/// The Hive copy as a Unity Catalog Parquet table, whose partition columns carry declared types.
+pub const PRUNING_PARQUET_TABLE: &str = "pruning_cases_parquet";
 
 #[derive(Clone, Copy, Debug)]
 enum Placement {
@@ -49,20 +52,22 @@ pub enum Format {
     Iceberg,
     Hive,
     Delta,
+    UnityParquet,
 }
 
 impl Format {
     fn table(self) -> String {
-        let vs = match self {
-            Format::Iceberg => VS_ICEBERG,
-            Format::Hive => VS_HIVE,
-            Format::Delta => VS_DELTA,
+        let (vs, table) = match self {
+            Format::Iceberg => (VS_ICEBERG, PRUNING_TABLE),
+            Format::Hive => (VS_HIVE, PRUNING_TABLE),
+            Format::Delta => (VS_UNITY, PRUNING_TABLE),
+            Format::UnityParquet => (VS_UNITY, PRUNING_PARQUET_TABLE),
         };
-        format!("{vs}.{}", PRUNING_TABLE.to_uppercase())
+        format!("{vs}.{}", table.to_uppercase())
     }
 }
 
-fn sorted_ids(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
+pub fn sorted_ids(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
     let mut ids: Vec<i64> = conn.query_columns(sql)[0].iter().map(parse_int).collect();
     ids.sort();
     ids
@@ -79,9 +84,14 @@ fn oracle_labels(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
 
 /// With its page index, so a caller can check the page layout.
 pub fn read_footer(uri: &str) -> ParquetMetaData {
+    parse_footer(get_fixture_object(uri), uri)
+}
+
+/// The footer of the Parquet bytes `name` holds, with its page index.
+pub fn parse_footer(parquet: Bytes, name: &str) -> ParquetMetaData {
     let options = ReadOptionsBuilder::new().with_page_index().build();
-    SerializedFileReader::new_with_options(get_fixture_object(uri), options)
-        .unwrap_or_else(|e| panic!("open the Parquet footer of {uri}: {e}"))
+    SerializedFileReader::new_with_options(parquet, options)
+        .unwrap_or_else(|e| panic!("open the Parquet footer of {name}: {e}"))
         .metadata()
         .clone()
 }
@@ -163,6 +173,8 @@ struct Case {
     predicate: &'static str,
     placement: Placement,
     counts: bool,
+    /// Direct storage declares every partition column a string, so it skips typed ones.
+    typed_partition: bool,
     iceberg: Option<&'static [&'static str]>,
     hive: Option<&'static [&'static str]>,
     delta: Option<&'static [&'static str]>,
@@ -174,6 +186,7 @@ impl Case {
             predicate,
             placement,
             counts: false,
+            typed_partition: false,
             iceberg: None,
             hive: None,
             delta: None,
@@ -183,6 +196,13 @@ impl Case {
     const fn counted(self) -> Self {
         Case {
             counts: true,
+            ..self
+        }
+    }
+
+    const fn typed_partition(self) -> Self {
+        Case {
+            typed_partition: true,
             ..self
         }
     }
@@ -208,10 +228,18 @@ impl Case {
         }
     }
 
+    const fn iceberg_and_delta(self, labels: &'static [&'static str]) -> Self {
+        self.iceberg(labels).delta(labels)
+    }
+
+    const fn every_format(self, labels: &'static [&'static str]) -> Self {
+        self.iceberg_and_delta(labels).hive(labels)
+    }
+
     fn expected(&self, format: Format) -> Option<BTreeSet<String>> {
         let labels = match format {
             Format::Iceberg => self.iceberg,
-            Format::Hive => self.hive,
+            Format::Hive | Format::UnityParquet => self.hive,
             Format::Delta => self.delta,
         }?;
         Some(labels.iter().map(ToString::to_string).collect())
@@ -219,29 +247,144 @@ impl Case {
 }
 
 const ALL_FILES: &[&str] = &["a1", "a2", "b1", "b2", "n1", "n2"];
+/// Every file but `b2`, whose statistics columns are NULL in every row.
+const NON_NULL_STATS: &[&str] = &["a1", "a2", "b1", "n1", "n2"];
 
 /// All-NULL columns fail comparisons. Iceberg: `!=`/`NOT IN` keep NULL partitions and all stats.
 /// Delta: NULL partitions fail every comparison; `!=`/`NOT IN` prune. Hive: three-valued logic.
+/// iceberg-rust keeps a file whose bounds lie between an `IN` list's values. A literal the
+/// column's type cannot hold exactly prunes nothing (`F` is `float`, `Q` and `D`
+/// have scale 1 and 2, `TZ` holds microseconds).
 const CASES: &[Case] = &[
-    Case::new("NOT (K < 30 AND S LIKE 'x%')", Scan).counted(),
-    Case::new("NOT (S LIKE 'x%' AND K < 30)", Scan).counted(),
+    Case::new("Q = 2.5", Scan)
+        .typed_partition()
+        .every_format(&["a1", "b1"]),
+    Case::new("Q = 2.50", Scan)
+        .typed_partition()
+        .every_format(&["a1", "b1"]),
+    Case::new("Q < 2.5", Scan)
+        .typed_partition()
+        .every_format(&["n1"]),
+    Case::new("Q <= 2.5", Scan)
+        .typed_partition()
+        .every_format(&["a1", "b1", "n1"]),
+    Case::new("Q > 2.5", Scan)
+        .typed_partition()
+        .every_format(&["a2", "n2"]),
+    Case::new("Q >= 10", Scan)
+        .typed_partition()
+        .every_format(&["a2", "n2"]),
+    Case::new("Q IN (-1.5, 10)", Scan)
+        .typed_partition()
+        .every_format(&["a2", "n1", "n2"]),
+    Case::new("Q BETWEEN 0 AND 5", Scan)
+        .typed_partition()
+        .every_format(&["a1", "b1"]),
+    Case::new("Q <> 2.5", Scan)
+        .typed_partition()
+        .iceberg(&["a2", "b2", "n1", "n2"])
+        .hive(&["a2", "n1", "n2"])
+        .delta(&["a2", "n1", "n2"]),
+    Case::new("Q = 2.55", Scan)
+        .typed_partition()
+        .every_format(ALL_FILES),
+    Case::new("Q < 2.55", Scan)
+        .typed_partition()
+        .every_format(ALL_FILES),
+    Case::new("D = 20.25", Scan).iceberg_and_delta(&["a1", "a2", "b1", "n1"]),
+    Case::new("D < 10.25", Scan).iceberg_and_delta(&["b1", "n1"]),
+    Case::new("D <= 10.25", Scan).iceberg_and_delta(&["a1", "b1", "n1"]),
+    Case::new("D > 40.25", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("D >= 40.25", Scan).iceberg_and_delta(&["a2", "b1", "n2"]),
+    Case::new("D IN (5.25, 60.25)", Scan)
+        .iceberg(NON_NULL_STATS)
+        .delta(&["b1", "n1", "n2"]),
+    Case::new("D BETWEEN 41 AND 44", Scan).iceberg_and_delta(&["b1"]),
+    Case::new("D <> 20.25", Scan)
+        .iceberg(ALL_FILES)
+        .delta(NON_NULL_STATS),
+    Case::new("D < 10.251", Scan).iceberg_and_delta(ALL_FILES),
+    Case::new("F > 0.2", Scan).iceberg_and_delta(ALL_FILES),
+    Case::new("F BETWEEN 0.1 AND 0.2", Scan).iceberg_and_delta(ALL_FILES),
+    Case::new("F < 0.5", Scan).iceberg_and_delta(NON_NULL_STATS),
+    Case::new("F >= 0.5", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("F <= 0.125", Scan).iceberg_and_delta(&["a1", "b1", "n1"]),
+    Case::new("F IN (0.5, 0.625)", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("F = CAST(0.5 AS DOUBLE)", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("F <> 0.5", Scan)
+        .iceberg(ALL_FILES)
+        .delta(NON_NULL_STATS),
+    Case::new("X > 0.5", Scan).iceberg_and_delta(&["a2"]),
+    Case::new("X < CAST(-0.25 AS DOUBLE)", Scan).iceberg_and_delta(&["a1", "n1"]),
+    Case::new("DT < DATE '2024-01-11'", Scan).iceberg_and_delta(&["b1", "n1"]),
+    Case::new("DT = TO_DATE('21.01.2024', 'DD.MM.YYYY')", Scan)
+        .iceberg_and_delta(&["a1", "a2", "b1", "n1"]),
+    Case::new("DT >= DATE '2024-02-15'", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("DT <> DATE '2024-01-21'", Scan)
+        .iceberg(ALL_FILES)
+        .delta(NON_NULL_STATS),
+    Case::new("TZ < TIMESTAMP '2024-01-01 00:10:00'", Scan).iceberg_and_delta(&["b1", "n1"]),
+    Case::new(
+        "TZ >= TO_TIMESTAMP('2024-01-01 00:45', 'YYYY-MM-DD HH24:MI')",
+        Scan,
+    )
+    .iceberg_and_delta(&["b1", "n2"]),
+    Case::new("TZ = TIMESTAMP '2024-01-01 00:20:00'", Scan)
+        .iceberg_and_delta(&["a1", "a2", "b1", "n1"]),
+    Case::new(
+        "TZ BETWEEN TIMESTAMP '2024-01-01 00:41:00' AND TIMESTAMP '2024-01-01 00:44:00'",
+        Scan,
+    )
+    .iceberg_and_delta(&["b1"]),
+    Case::new("K <> 10", Scan)
+        .iceberg(ALL_FILES)
+        .delta(NON_NULL_STATS),
+    Case::new("P <> 'a'", Scan)
+        .iceberg(&["b1", "b2", "n1", "n2"])
+        .hive(&["b1", "b2"])
+        .delta(&["b1", "b2"]),
+    Case::new("P LIKE 'a%'", Scan).every_format(&["a1", "a2"]),
+    Case::new("P LIKE 'a'", Scan).every_format(&["a1", "a2"]),
+    Case::new("P LIKE '_'", Scan)
+        .iceberg(ALL_FILES)
+        .hive(&["a1", "a2", "b1", "b2"])
+        .delta(ALL_FILES),
+    Case::new("NOT (P LIKE 'a%')", Scan)
+        .iceberg(&["b1", "b2", "n1", "n2"])
+        .hive(&["b1", "b2"])
+        .delta(&["b1", "b2"]),
+    Case::new("P LIKE '!_' ESCAPE '!'", Scan).every_format(&[]),
+    Case::new("S LIKE 'xa%'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
+    Case::new("S LIKE 'xa'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
+    Case::new("S LIKE 'z%'", Scan).iceberg_and_delta(&[]),
+    Case::new("S LIKE 'x!_%' ESCAPE '!'", Scan).iceberg_and_delta(&[]),
+    // An escaped ordinary character is itself, so these match rows only if the escape applies.
+    Case::new("S LIKE 'xaa' ESCAPE 'a'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
+    Case::new("P LIKE 'aa%' ESCAPE 'a'", Scan).every_format(&["a1", "a2"]),
+    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", OuterWhere)
+        .iceberg_and_delta(&["a1", "a2", "b1"]),
+    // A plain LIKE escapes with Exasol's default `\`, though Exasol sends no `escapeChar`.
+    Case::new(r"S LIKE 'x\a%'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
+    Case::new(r"P LIKE '\a'", Scan).every_format(&["a1", "a2"]),
+    Case::new("NOT (S LIKE 'x_')", Scan),
+    Case::new("NOT (K < 30 AND S LIKE 'x%')", Scan)
+        .counted()
+        .iceberg_and_delta(ALL_FILES),
+    Case::new("NOT (S LIKE 'x%' AND K < 30)", Scan)
+        .counted()
+        .iceberg_and_delta(ALL_FILES),
+    Case::new("NOT (K < 30 AND S LIKE '%a')", Scan).counted(),
+    Case::new("NOT (S LIKE '%a' AND K < 30)", Scan).counted(),
     Case::new("NOT (P = 'a' AND ABS(X) > 0.1)", Scan).counted(),
     Case::new("NOT (SECOND(TS, 3) > 1 AND P = 'b')", OuterWhere).counted(),
     Case::new("NOT (K < 30 AND SECOND(TS, 3) > 1)", OuterWhere).counted(),
-    Case::new("NOT ((K < 30 OR P = 'a') AND S LIKE 'x%')", Scan),
-    Case::new("NOT (K >= 10 AND K <= 20)", Scan)
-        .iceberg(&["a2", "b1", "n1", "n2"])
-        .delta(&["a2", "b1", "n1", "n2"]),
-    Case::new("NOT (K > 9 AND K < 21)", Scan)
-        .iceberg(&["a2", "b1", "n1", "n2"])
-        .delta(&["a2", "b1", "n1", "n2"]),
+    Case::new("NOT ((K < 30 OR P = 'a') AND S LIKE 'x%')", Scan).iceberg_and_delta(ALL_FILES),
+    Case::new("NOT (K >= 10 AND K <= 20)", Scan).iceberg_and_delta(&["a2", "b1", "n1", "n2"]),
+    Case::new("NOT (K > 9 AND K < 21)", Scan).iceberg_and_delta(&["a2", "b1", "n1", "n2"]),
     Case::new("NOT (K < 30 AND P = 'a')", Scan)
         .iceberg(ALL_FILES)
         .delta(&["a2", "b1", "b2", "n1", "n2"]),
-    Case::new("NOT (P > 'a' AND P < 'c')", Scan)
-        .iceberg(&["a1", "a2"])
-        .hive(&["a1", "a2"])
-        .delta(&["a1", "a2"]),
+    Case::new("NOT (P > 'a' AND P < 'c')", Scan).every_format(&["a1", "a2"]),
     Case::new("NOT (K < 10 OR S LIKE 'x%')", Scan),
     Case::new("NOT (P = 'b' OR ABS(X) > 0.1)", Scan),
     Case::new("NOT (SECOND(TS, 3) > 1 OR K > 40)", OuterWhere),
@@ -259,30 +402,14 @@ const CASES: &[Case] = &[
     Case::new("NOT (K IN (10, 20))", Scan)
         .iceberg(ALL_FILES)
         .delta(&["a1", "a2", "b1", "n1", "n2"]),
-    Case::new("NOT (P IN ('a', 'b') OR P IS NULL)", Scan)
-        .iceberg(&[])
-        .hive(&[])
-        .delta(&[]),
-    Case::new("NOT (P BETWEEN 'b' AND 'c')", Scan)
-        .iceberg(&["a1", "a2"])
-        .hive(&["a1", "a2"])
-        .delta(&["a1", "a2"]),
+    Case::new("NOT (P IN ('a', 'b') OR P IS NULL)", Scan).every_format(&[]),
+    Case::new("NOT (P BETWEEN 'b' AND 'c')", Scan).every_format(&["a1", "a2"]),
     Case::new("NOT (K BETWEEN 10 AND 20.5)", Scan),
-    Case::new("NOT (P IS NULL)", Scan)
-        .iceberg(&["a1", "a2", "b1", "b2"])
-        .hive(&["a1", "a2", "b1", "b2"])
-        .delta(&["a1", "a2", "b1", "b2"]),
-    Case::new("NOT (K IS NULL)", Scan)
-        .iceberg(&["a1", "a2", "b1", "n1", "n2"])
-        .delta(&["a1", "a2", "b1", "n1", "n2"]),
-    Case::new("NOT (P IS NOT NULL)", Scan)
-        .iceberg(&["n1", "n2"])
-        .hive(&["n1", "n2"])
-        .delta(&["n1", "n2"]),
-    Case::new("NOT (K IS NOT NULL)", Scan)
-        .iceberg(&["a2", "b2"])
-        .delta(&["a2", "b2"]),
-    Case::new("NOT (K <= 1000)", Scan).iceberg(&[]).delta(&[]),
+    Case::new("NOT (P IS NULL)", Scan).every_format(&["a1", "a2", "b1", "b2"]),
+    Case::new("NOT (K IS NULL)", Scan).iceberg_and_delta(&["a1", "a2", "b1", "n1", "n2"]),
+    Case::new("NOT (P IS NOT NULL)", Scan).every_format(&["n1", "n2"]),
+    Case::new("NOT (K IS NOT NULL)", Scan).iceberg_and_delta(&["a2", "b2"]),
+    Case::new("NOT (K <= 1000)", Scan).iceberg_and_delta(&[]),
 ];
 
 /// `None` when the case holds; otherwise every failed assertion, with the plan.
@@ -351,6 +478,7 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
 pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
     let failures: Vec<String> = CASES
         .iter()
+        .filter(|case| !(case.typed_partition && matches!(format, Format::Hive)))
         .filter_map(|case| case_failures(conn, format, case))
         .collect();
     assert!(
@@ -409,7 +537,7 @@ impl Format {
     fn prunes_every_file(self) -> &'static [&'static str] {
         match self {
             Format::Iceberg | Format::Delta => &["P = 'zz'", "K > 1000"],
-            Format::Hive => &["P = 'zz'"],
+            Format::Hive | Format::UnityParquet => &["P = 'zz'"],
         }
     }
 }
