@@ -1,6 +1,6 @@
 # Feature: Pushdown Planning, Timestamp Literal Precision
 
-A pushed-down filter that compares a timestamp column with a literal finer than the column's declared precision returns the rows native Exasol returns.
+A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal finer than the operand's precision returns the rows native Exasol returns.
 
 ## Background
 
@@ -13,9 +13,9 @@ A pushed-down filter that compares a timestamp column with a literal finer than 
 
 ### Scenario: A timestamp filter compares at full precision
 
-* *GIVEN* a timestamp column declared with the `p` fractional digits of its source unit, and a timestamp literal with more than `p` significant fractional digits
+* *GIVEN* an operand whose Exasol type the typed pass derives as `TIMESTAMP(p)` or as DATE, where `p` is 0: a column declared with the `p` fractional digits of its source unit, a CAST, a date addition, `DATE_TRUNC`, `NULLIF`, or a CASE, `COALESCE`, `GREATEST`, or `LEAST`, and a timestamp literal with more than `p` significant fractional digits
 * *WHEN* a filter compares the column with the literal through `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, or `IN`, with the literal on either side, under `NOT`, or inside `OR`
 * *THEN* the query SHALL return the rows native Exasol returns for the same values
-* *AND* the adapter SHALL rewrite each such comparison in the tree it renders for DataFusion: an ordering compares against the literal floored to `p` digits, an equality becomes `column <> column`, and an inequality becomes `column = column`, so a NULL column stays NULL
+* *AND* the typed pass SHALL rewrite each such comparison in the tree it renders for DataFusion: an ordering compares against the literal floored to `p` digits, an equality becomes `operand <> operand`, and an inequality becomes `operand = operand`, so a NULL operand stays NULL
 * *AND* the DataFusion dialect SHALL render a literal with more than 6 significant fractional digits at nanosecond precision
 * *AND* Iceberg and Delta file pruning SHALL derive no bound from a literal with more than 6 significant fractional digits

@@ -25,7 +25,7 @@ pub(crate) enum TextArgs {
     Pad,
 }
 
-/// How a function's result class follows from its arguments' classes.
+/// How a function's result type follows from its arguments' types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResultRule {
     Text,
@@ -41,9 +41,16 @@ pub(crate) enum ResultRule {
     FirstArgument,
     /// Exasol brings every argument to one type, as for CASE branches.
     Unified,
+    /// `NULLIF`: compares its arguments and returns the first one's type.
+    Compared,
     /// `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, `ADD_MINUTES`: over a TIMESTAMP the result keeps
     /// its precision, over a DATE it is as given.
     DateAddition(DateResult),
+    /// `DATE_TRUNC`: the type of the truncated DATE or TIMESTAMP.
+    Truncated,
+    Date,
+    /// A TIMESTAMP whose precision differs by Exasol version.
+    Timestamp,
     Other,
 }
 
@@ -226,7 +233,7 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("LOCATE").typed(T::FirstTwo, R::Integer),
         F::verbatim("GREATEST").typed(T::Never, R::Unified),
         F::verbatim("LEAST").typed(T::Never, R::Unified),
-        F::verbatim("NULLIF").typed(T::Never, R::Unified),
+        F::verbatim("NULLIF").typed(T::Never, R::Compared),
         F::verbatim("NULLIFZERO").typed(T::Never, R::FirstArgument),
         F::verbatim("ZEROIFNULL").typed(T::Never, R::FirstArgument),
         // DataFusion renders these as `date_part`, which Exasol lacks.
@@ -237,12 +244,14 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("MINUTE").typed(T::Never, R::Integer),
         F::verbatim("SECOND").typed(T::Never, R::Number),
         F::verbatim("WEEK").typed(T::Never, R::Integer),
-        F::verbatim("DATE_TRUNC").parameters(&[0]),
+        F::verbatim("DATE_TRUNC")
+            .typed(T::Never, R::Truncated)
+            .parameters(&[0]),
         F::verbatim("TO_DATE")
-            .typed(T::First, R::Other)
+            .typed(T::First, R::Date)
             .parameters(&[1]),
         F::verbatim("TO_TIMESTAMP")
-            .typed(T::First, R::Other)
+            .typed(T::First, R::Timestamp)
             .parameters(&[1]),
         // DataFusion emulates these via `date_part`, which Exasol lacks.
         F::verbatim("DAYS_BETWEEN").typed(T::Never, R::Number),

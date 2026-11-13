@@ -8,6 +8,7 @@ mod fragment;
 mod json_value;
 mod scalar_functions;
 mod scan_typing;
+pub mod timestamp;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
@@ -16,10 +17,8 @@ use json_value::{Fallback, JsonValueCall, Returning};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
-pub use scan_typing::{
-    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, date_addition_scan_digits,
-    exact_expression_type,
-};
+pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
+use timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -80,9 +79,8 @@ fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
 }
 
 fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
-    let fraction = value.and_then(Json::as_str).and_then(|v| v.split_once('.'));
-    match fraction {
-        Some((_, digits)) if digits.trim_end_matches('0').len() > 6 => "Nanosecond",
+    match value.and_then(Json::as_str).map(TimestampLiteral) {
+        Some(literal) if !literal.fits(TimestampUnit::Microsecond) => "Nanosecond",
         _ => "Microsecond",
     }
 }
@@ -204,9 +202,11 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
         ExasolType::DoublePrecision => "DOUBLE".to_string(),
         // DataFusion parses only these four and reads a bare TIMESTAMP as nanoseconds, so the
         // rest decline rather than approximate.
-        ExasolType::Timestamp {
-            precision: precision @ (0 | 3 | 6 | 9),
-        } => format!("TIMESTAMP({precision})"),
+        ExasolType::Timestamp { precision }
+            if TimestampUnit::holding(precision).digits() == precision =>
+        {
+            format!("TIMESTAMP({precision})")
+        }
         // WLTZ carries session-time-zone semantics DataFusion's TIMESTAMP cannot reproduce, and
         // Arrow has no INTERVAL DAY(p) TO SECOND(f), GEOMETRY, or HASHTYPE equivalent.
         ExasolType::Timestamp { .. }

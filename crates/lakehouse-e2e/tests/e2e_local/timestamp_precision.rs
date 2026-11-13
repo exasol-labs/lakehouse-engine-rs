@@ -449,7 +449,7 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
 }
 
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
-/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+/// Scenario: A comparison with a TIMESTAMP literal finer than the call returns native rows
 #[test]
 fn date_addition_over_a_nanosecond_timestamp_runs_in_the_scan() {
     setup();
@@ -518,6 +518,10 @@ fn a_nanosecond_date_addition_outside_the_arrow_range_fails_in_the_scan() {
         ),
         (
             "SELECT ID FROM {T} WHERE ADD_DAYS(TS_NS, 1) < TIMESTAMP '9999-12-31 00:00:00'",
+            "to Timestamp(ns)",
+        ),
+        (
+            "SELECT ID, DATE_TRUNC('month', CASE WHEN ID > 0 THEN DATE '9999-12-31' END) FROM {T}",
             "to Timestamp(ns)",
         ),
     ];

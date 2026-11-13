@@ -3,84 +3,123 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::exasol_type::{ExasolType, exasol_type_from_json, exasol_type_to_json};
+use crate::exasol_type::{Decimal, ExasolType, exasol_type_from_json, exasol_type_to_json};
 use crate::json_value::{JsonValueCall, Returning};
 use crate::scalar_functions::{
     DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
+use crate::timestamp::{TimestampLiteral, TimestampUnit};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
     fn column_type(&self, column: &Json) -> Option<ExasolType>;
 }
 
-/// The part of a node's Exasol type that decides whether the scan may convert it to text.
+/// What the typed pass knows of a node's Exasol type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeClass {
-    /// CHAR or VARCHAR.
-    Text,
-    /// DECIMAL(p,0). Its text form is the same in every session.
-    Integer { precision: Option<u8> },
-    /// `TRUE` or `FALSE` in every session.
-    Boolean,
+pub(crate) enum Inferred {
+    /// The type Exasol gives the node. Each rule that derives one is checked against a live
+    /// Exasol.
+    Exact(ExasolType),
+    /// The kind is proven, its parameters are not.
+    Partial(Partial),
     /// A NULL literal, NULL in every type.
     Null,
-    /// DOUBLE, DECIMAL(p,s>0), or a number of unproven scale. Its text form follows
-    /// `NLS_NUMERIC_CHARACTERS`.
-    Number,
-    /// DATE. Its text form follows `NLS_DATE_FORMAT`.
-    Date,
-    /// `TIMESTAMP(precision)`, `precision` counting fractional-second digits. Its text form
-    /// follows `NLS_TIMESTAMP_FORMAT`.
-    Timestamp { precision: u8 },
-    /// `TIMESTAMP WITH LOCAL TIME ZONE`, or a type this pass does not derive.
-    Other,
+    Unknown,
 }
 
-impl TypeClass {
-    fn of(ty: ExasolType) -> Self {
-        match ty {
-            ty if ty.is_character() => Self::Text,
-            ExasolType::Decimal(d) if d.scale() == 0 => Self::Integer {
-                precision: Some(d.precision()),
-            },
-            ExasolType::Decimal(_) | ExasolType::DoublePrecision => Self::Number,
-            ExasolType::Boolean => Self::Boolean,
-            ExasolType::Date => Self::Date,
-            ExasolType::Timestamp { precision } => Self::Timestamp { precision },
-            _ => Self::Other,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Partial {
+    /// CHAR or VARCHAR.
+    Text,
+    /// DECIMAL(p,0).
+    Integer,
+    /// DOUBLE or DECIMAL(p,s): a number not proven to be an integer.
+    Number,
+    Timestamp,
+}
+
+const BOOLEAN: Inferred = Inferred::Exact(ExasolType::Boolean);
+const DATE: Inferred = Inferred::Exact(ExasolType::Date);
+
+impl Inferred {
+    fn is_text(self) -> bool {
+        match self {
+            Self::Exact(ty) => ty.is_character(),
+            other => other == Self::Partial(Partial::Text),
         }
     }
 
-    const INTEGER: Self = Self::Integer { precision: None };
+    /// NULL counts, as it does for [`Self::is_numeric`].
+    fn is_integer(self) -> bool {
+        match self {
+            Self::Exact(ExasolType::Decimal(d)) => d.scale() == 0,
+            other => matches!(other, Self::Partial(Partial::Integer) | Self::Null),
+        }
+    }
 
     fn is_numeric(self) -> bool {
-        matches!(self, Self::Integer { .. } | Self::Number | Self::Null)
+        match self {
+            Self::Exact(ty) => matches!(ty, ExasolType::Decimal(_) | ExasolType::DoublePrecision),
+            other => other.is_integer() || other == Self::Partial(Partial::Number),
+        }
     }
 
-    fn is_integer(self) -> bool {
-        matches!(self, Self::Integer { .. } | Self::Null)
+    fn is_timestamp(self) -> bool {
+        self == Self::Partial(Partial::Timestamp) || self.timestamp_precision().is_some()
     }
 
-    /// The class Exasol gives a CASE, GREATEST, or LEAST over these branches.
+    fn integer_precision(self) -> Option<u8> {
+        match self {
+            Self::Exact(ExasolType::Decimal(d)) if d.scale() == 0 => Some(d.precision()),
+            _ => None,
+        }
+    }
+
+    fn timestamp_precision(self) -> Option<u8> {
+        match self {
+            Self::Exact(ExasolType::Timestamp { precision }) => Some(precision),
+            _ => None,
+        }
+    }
+
+    /// The type of a CASE, `GREATEST`, or `LEAST` over these branches.
     fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Null, c) | (c, Self::Null) => c,
-            (Self::Text, Self::Text) => Self::Text,
-            (Self::Integer { .. }, Self::Integer { .. }) => Self::INTEGER,
-            (Self::Integer { .. } | Self::Number, Self::Integer { .. } | Self::Number) => {
-                Self::Number
+        let exact = match (self, other) {
+            (Self::Null, ty) | (ty, Self::Null) => return ty,
+            (Self::Exact(a), Self::Exact(b)) => unified_type(a, b),
+            _ => None,
+        };
+        match exact {
+            Some(ty) => Self::Exact(ty),
+            None if self.is_text() && other.is_text() => Self::Partial(Partial::Text),
+            None if self.is_integer() && other.is_integer() => Self::Partial(Partial::Integer),
+            None if self.is_numeric() && other.is_numeric() => Self::Partial(Partial::Number),
+            None if self.is_timestamp() && other.is_timestamp() => {
+                Self::Partial(Partial::Timestamp)
             }
-            (Self::Boolean, Self::Boolean) => Self::Boolean,
-            _ => Self::Other,
+            None => Self::Unknown,
         }
     }
 }
 
-/// The fractional digits of the Arrow microsecond and nanosecond timestamps a date addition
-/// computes in.
-const MICROSECOND_DIGITS: u8 = 6;
-const NANOSECOND_DIGITS: u8 = 9;
+/// Exasol's type for two branches brought to one type, where a live check proved it. A DATE with
+/// a TIMESTAMP has none: Exasol 2025 gives the TIMESTAMP's type, Exasol 8 the first branch's.
+fn unified_type(a: ExasolType, b: ExasolType) -> Option<ExasolType> {
+    match (a, b) {
+        (ExasolType::Boolean, ExasolType::Boolean) | (ExasolType::Date, ExasolType::Date) => {
+            Some(a)
+        }
+        (ExasolType::Decimal(x), ExasolType::Decimal(y)) if x.scale() == 0 && y.scale() == 0 => {
+            Some(ExasolType::decimal(x.precision().max(y.precision()), 0))
+        }
+        (ExasolType::Timestamp { precision: p }, ExasolType::Timestamp { precision: q }) => {
+            Some(ExasolType::timestamp(p.max(q)))
+        }
+        _ => None,
+    }
+}
+
 /// Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits
 /// before it reads a row, while the scan fails only per non-NULL row. No count above 1e10 yields a
 /// result inside 0001-01-01 to 9999-12-31 in any unit (the range spans 5,258,964,960 minutes), so
@@ -97,9 +136,9 @@ pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
 /// a `name` identifier to its visitor.
-pub const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
+const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
 /// See [`EXPR_ARRAY_FIELDS`].
-pub const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
+const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
 pub(crate) fn decline(reason: String) -> UdfError {
     UdfError::User(format!("the scan cannot compute this expression: {reason}"))
@@ -115,17 +154,18 @@ fn wrap(node_type: &str, arg: Json) -> Json {
 
 /// `node` converted to text implicitly, as a LIKE operand, a `||` operand, or a string-function
 /// argument.
-fn to_text(node: Json, class: TypeClass) -> Result<Json, UdfError> {
-    match class {
-        TypeClass::Text | TypeClass::Null => Ok(node),
-        TypeClass::Integer { .. } => Ok(wrap(INTEGER_TEXT_NODE, node)),
-        TypeClass::Boolean => Ok(wrap(BOOLEAN_TEXT_NODE, node)),
-        TypeClass::Number | TypeClass::Date | TypeClass::Timestamp { .. } | TypeClass::Other => {
-            Err(decline(format!(
-                "converting {} to text depends on the session's NLS settings",
-                short(&node)
-            )))
-        }
+fn to_text(node: Json, ty: Inferred) -> Result<Json, UdfError> {
+    if ty.is_text() || ty == Inferred::Null {
+        Ok(node)
+    } else if ty.is_integer() {
+        Ok(wrap(INTEGER_TEXT_NODE, node))
+    } else if ty == BOOLEAN {
+        Ok(wrap(BOOLEAN_TEXT_NODE, node))
+    } else {
+        Err(decline(format!(
+            "converting {} to text depends on the session's NLS settings",
+            short(&node)
+        )))
     }
 }
 
@@ -151,27 +191,45 @@ impl ScalarFunction {
         positions.into_iter().filter(|i| *i < arg_count).collect()
     }
 
-    fn class(self, args: &[TypeClass]) -> TypeClass {
+    fn result_type(self, args: &[Inferred]) -> Inferred {
+        let partial = Inferred::Partial;
         match self.result {
-            ResultRule::Text => TypeClass::Text,
-            ResultRule::Integer | ResultRule::IntegerOverIntegers => TypeClass::INTEGER,
-            ResultRule::Number => TypeClass::Number,
-            ResultRule::Arithmetic if args.iter().all(|c| c.is_integer()) => TypeClass::INTEGER,
-            ResultRule::Arithmetic | ResultRule::NumberOverNumbers
-                if args.iter().all(|c| c.is_numeric()) =>
-            {
-                TypeClass::Number
+            ResultRule::Text => partial(Partial::Text),
+            ResultRule::Integer | ResultRule::IntegerOverIntegers => partial(Partial::Integer),
+            ResultRule::Number => partial(Partial::Number),
+            ResultRule::Arithmetic if args.iter().all(|ty| ty.is_integer()) => {
+                partial(Partial::Integer)
             }
-            ResultRule::FirstArgument => args.first().copied().unwrap_or(TypeClass::Other),
+            ResultRule::Arithmetic | ResultRule::NumberOverNumbers
+                if args.iter().all(|ty| ty.is_numeric()) =>
+            {
+                partial(Partial::Number)
+            }
+            ResultRule::FirstArgument | ResultRule::Compared => {
+                args.first().copied().unwrap_or(Inferred::Unknown)
+            }
             ResultRule::Unified => args
                 .iter()
                 .copied()
-                .reduce(TypeClass::union)
-                .unwrap_or(TypeClass::Other),
-            ResultRule::Arithmetic
-            | ResultRule::NumberOverNumbers
-            | ResultRule::DateAddition(_)
-            | ResultRule::Other => TypeClass::Other,
+                .reduce(Inferred::union)
+                .unwrap_or(Inferred::Unknown),
+            ResultRule::DateAddition(date_result) => match args.first() {
+                Some(&DATE) => match date_result {
+                    DateResult::Date => DATE,
+                    DateResult::Timestamp => Inferred::Exact(ExasolType::timestamp(0)),
+                },
+                Some(&first) if first.timestamp_precision().is_some() => first,
+                _ => Inferred::Unknown,
+            },
+            ResultRule::Truncated => match args.get(1) {
+                Some(&source) if source == DATE || source.is_timestamp() => source,
+                _ => Inferred::Unknown,
+            },
+            ResultRule::Date => DATE,
+            ResultRule::Timestamp => partial(Partial::Timestamp),
+            ResultRule::Arithmetic | ResultRule::NumberOverNumbers | ResultRule::Other => {
+                Inferred::Unknown
+            }
         }
     }
 }
@@ -189,7 +247,7 @@ fn integer_text_width(precision: Option<u8>) -> u32 {
 /// (`docs/semantic-differences.md`); CHAR declines, because the scan does not blank-pad.
 fn cast_to_text(
     source: Json,
-    class: TypeClass,
+    ty: Inferred,
     target: ExasolType,
     size: u32,
     is_char: bool,
@@ -200,32 +258,29 @@ fn cast_to_text(
             short(&source)
         )))
     };
-    if is_char && class != TypeClass::Null {
+    if is_char && ty != Inferred::Null {
         return refuse("blank-pads, which the scan does not reproduce");
     }
-    match class {
-        TypeClass::Null | TypeClass::Text => Ok(source),
-        TypeClass::Integer { precision } => {
-            if integer_text_width(precision) > size {
-                return refuse("may not fit the integer's text");
-            }
-            Ok(wrap(INTEGER_TEXT_NODE, source))
+    if ty == Inferred::Null || ty.is_text() {
+        Ok(source)
+    } else if ty.is_integer() {
+        if integer_text_width(ty.integer_precision()) > size {
+            return refuse("may not fit the integer's text");
         }
-        TypeClass::Boolean => {
-            if size < 5 {
-                return refuse("may not fit FALSE");
-            }
-            Ok(wrap(BOOLEAN_TEXT_NODE, source))
+        Ok(wrap(INTEGER_TEXT_NODE, source))
+    } else if ty == BOOLEAN {
+        if size < 5 {
+            return refuse("may not fit FALSE");
         }
-        TypeClass::Number | TypeClass::Date | TypeClass::Timestamp { .. } | TypeClass::Other => {
-            refuse("depends on the session's NLS settings")
-        }
+        Ok(wrap(BOOLEAN_TEXT_NODE, source))
+    } else {
+        refuse("depends on the session's NLS settings")
     }
 }
 
 /// A CAST from text to a type Exasol parses by session settings (`NLS_DATE_FORMAT`,
 /// `NLS_TIMESTAMP_FORMAT`, `NLS_NUMERIC_CHARACTERS`).
-fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result<(), UdfError> {
+fn cast_from_text(source: &Json, ty: Inferred, target: ExasolType) -> Result<(), UdfError> {
     let session_parsed = match target {
         ExasolType::Date
         | ExasolType::Timestamp { .. }
@@ -234,7 +289,7 @@ fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result
         ExasolType::Decimal(d) => d.scale() > 0,
         _ => false,
     };
-    if session_parsed && matches!(class, TypeClass::Text) {
+    if session_parsed && ty.is_text() {
         return Err(decline(format!(
             "CAST of text {} to {target} parses by the session's NLS settings",
             short(source)
@@ -243,35 +298,35 @@ fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result
     Ok(())
 }
 
-/// Rewrites `node` for the DataFusion dialect and derives its class, post-order. Text passes only
+/// Rewrites `node` for the DataFusion dialect and derives its type, post-order. Text passes only
 /// where Exasol takes text; elsewhere Exasol converts it by the session's NLS settings.
 pub(crate) fn type_scan_tree(
     node: &Json,
     columns: &dyn ColumnTypeLookup,
-) -> Result<(Json, TypeClass), UdfError> {
+) -> Result<(Json, Inferred), UdfError> {
     if !node.is_object() {
-        return Ok((node.clone(), TypeClass::Other));
+        return Ok((node.clone(), Inferred::Unknown));
     }
     if kind(node) == "column" {
-        let class = columns
+        let ty = columns
             .column_type(node)
-            .map_or(TypeClass::Other, TypeClass::of);
-        return Ok((node.clone(), class));
+            .map_or(Inferred::Unknown, Inferred::Exact);
+        return Ok((node.clone(), ty));
     }
     let (mut out, children) = type_children(node, columns)?;
-    let class = node_class(node, &mut out, &children)?;
-    Ok((out, class))
+    let ty = node_type(node, &mut out, &children)?;
+    Ok((out, ty))
 }
 
-/// The classes of a node's typed child expressions, by field.
+/// The types of a node's typed child expressions, by field.
 #[derive(Default)]
-struct ChildClasses {
-    arrays: Vec<(&'static str, Vec<TypeClass>)>,
-    singles: Vec<(&'static str, TypeClass)>,
+struct ChildTypes {
+    arrays: Vec<(&'static str, Vec<Inferred>)>,
+    singles: Vec<(&'static str, Inferred)>,
 }
 
-impl ChildClasses {
-    fn of(&self, field: &str) -> Vec<TypeClass> {
+impl ChildTypes {
+    fn of(&self, field: &str) -> Vec<Inferred> {
         self.arrays
             .iter()
             .find(|(f, _)| *f == field)
@@ -279,14 +334,14 @@ impl ChildClasses {
             .unwrap_or_default()
     }
 
-    fn one(&self, field: &str) -> Option<TypeClass> {
+    fn one(&self, field: &str) -> Option<Inferred> {
         self.singles
             .iter()
             .find(|(f, _)| *f == field)
             .map(|(_, c)| *c)
     }
 
-    fn all(&self) -> Vec<TypeClass> {
+    fn all(&self) -> Vec<Inferred> {
         self.arrays
             .iter()
             .flat_map(|(_, c)| c.iter().copied())
@@ -299,52 +354,50 @@ impl ChildClasses {
 fn type_children(
     node: &Json,
     columns: &dyn ColumnTypeLookup,
-) -> Result<(Json, ChildClasses), UdfError> {
+) -> Result<(Json, ChildTypes), UdfError> {
     let mut out = node.clone();
-    let mut children = ChildClasses::default();
+    let mut children = ChildTypes::default();
     for field in EXPR_ARRAY_FIELDS {
         if let Some(Json::Array(items)) = node.get(field) {
-            let (rewritten, classes): (Vec<Json>, Vec<TypeClass>) = items
+            let (rewritten, types): (Vec<Json>, Vec<Inferred>) = items
                 .iter()
                 .map(|item| type_scan_tree(item, columns))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .unzip();
             out[field] = Json::Array(rewritten);
-            children.arrays.push((field, classes));
+            children.arrays.push((field, types));
         }
     }
     for field in EXPR_SINGLE_FIELDS {
         if let Some(child) = node.get(field)
             && child.is_object()
         {
-            let (rewritten, class) = type_scan_tree(child, columns)?;
+            let (rewritten, ty) = type_scan_tree(child, columns)?;
             out[field] = rewritten;
-            children.singles.push((field, class));
+            children.singles.push((field, ty));
         }
     }
     Ok((out, children))
 }
 
-/// The class of a non-column `node` whose children are typed, rewriting `out` where needed.
-fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
-    let class = match kind(node) {
-        "literal_null" => TypeClass::Null,
-        "literal_bool" => TypeClass::Boolean,
-        "literal_string" => TypeClass::Text,
-        "literal_double" => TypeClass::Number,
-        "literal_exactnumeric" => exact_numeric_class(node),
-        "literal_date" => TypeClass::Date,
-        "literal_timestamp" => TypeClass::Timestamp {
-            precision: fractional_digits(node),
-        },
+/// The type of a non-column `node` whose children are typed, rewriting `out` where needed.
+fn node_type(node: &Json, out: &mut Json, children: &ChildTypes) -> Result<Inferred, UdfError> {
+    let ty = match kind(node) {
+        "literal_null" => Inferred::Null,
+        "literal_bool" => BOOLEAN,
+        "literal_string" => Inferred::Partial(Partial::Text),
+        "literal_double" => Inferred::Exact(ExasolType::DoublePrecision),
+        "literal_exactnumeric" => exact_numeric_type(node),
+        "literal_date" => DATE,
+        "literal_timestamp" => timestamp_literal_type(node),
         "predicate_like" => {
             for field in ["expression", "pattern"] {
-                if let Some(class) = children.one(field) {
-                    out[field] = to_text(out[field].take(), class)?;
+                if let Some(ty) = children.one(field) {
+                    out[field] = to_text(out[field].take(), ty)?;
                 }
             }
-            TypeClass::Boolean
+            BOOLEAN
         }
         "predicate_equal"
         | "predicate_notequal"
@@ -355,30 +408,33 @@ fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
         | "predicate_between"
         | "predicate_in_constlist" => {
             type_comparison(node, out, children)?;
-            TypeClass::Boolean
+            floor_timestamp_literals(node, out, children);
+            BOOLEAN
         }
-        "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
+        "predicate_is_null" | "predicate_is_not_null" => BOOLEAN,
         k if k.starts_with("predicate_") => {
             refuse_implicit_text(node, &children.all())?;
-            TypeClass::Boolean
+            BOOLEAN
         }
         "function_scalar_extract" => {
             refuse_implicit_text(node, &children.all())?;
             node.get("toExtract")
                 .and_then(Json::as_str)
-                .map_or(TypeClass::Other, |field| typed_function(field).class(&[]))
+                .map_or(Inferred::Unknown, |field| {
+                    typed_function(field).result_type(&[])
+                })
         }
-        "function_scalar_case" => case_class(node, out, children)?,
-        "function_scalar_json_value" => json_value_class(node, &children.of("arguments"))?,
-        "function_scalar_cast" => cast_class(out, &children.of("arguments"))?,
-        "function_scalar" => scalar_function_class(node, out, &children.of("arguments"))?,
-        "function_aggregate" => aggregate_class(node, &children.of("arguments"))?,
+        "function_scalar_case" => case_type(node, out, children)?,
+        "function_scalar_json_value" => json_value_type(node, &children.of("arguments"))?,
+        "function_scalar_cast" => cast_type(out, &children.of("arguments"))?,
+        "function_scalar" => scalar_function_type(node, out, &children.of("arguments"))?,
+        "function_aggregate" => aggregate_type(node, &children.of("arguments"))?,
         _ => {
             refuse_implicit_text(node, &children.all())?;
-            TypeClass::Other
+            Inferred::Unknown
         }
     };
-    Ok(class)
+    Ok(ty)
 }
 
 fn upper_name(node: &Json) -> String {
@@ -388,115 +444,103 @@ fn upper_name(node: &Json) -> String {
         .to_uppercase()
 }
 
-/// An exact numeric literal is an integer of its digit count, or a fractional number.
-fn exact_numeric_class(node: &Json) -> TypeClass {
+/// An exact numeric literal is a DECIMAL(digits,0), a DOUBLE beyond 36 digits, or fractional.
+fn exact_numeric_type(node: &Json) -> Inferred {
     let text = match node.get("value") {
         Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
         Some(Json::String(s)) => Some(s.clone()),
         _ => None,
     };
-    text.as_deref()
-        .and_then(integer_digits)
-        .map_or(TypeClass::Number, |digits| TypeClass::Integer {
-            precision: Some(digits),
-        })
+    match text.as_deref().and_then(integer_digits) {
+        Some(digits) => Inferred::Exact(
+            Decimal::new(digits, 0).map_or(ExasolType::DoublePrecision, ExasolType::Decimal),
+        ),
+        None => Inferred::Partial(Partial::Number),
+    }
 }
 
-/// The count of fractional-second digits in a timestamp literal's value.
-fn fractional_digits(node: &Json) -> u8 {
-    node.get("value")
+fn timestamp_literal_type(node: &Json) -> Inferred {
+    let precision = node
+        .get("value")
         .and_then(Json::as_str)
-        .and_then(|value| value.split_once('.'))
-        .map_or(0, |(_, digits)| {
-            u8::try_from(digits.len()).unwrap_or(u8::MAX)
-        })
+        .and_then(|value| u8::try_from(TimestampLiteral(value).type_precision()).ok());
+    match precision {
+        Some(p) if p <= TimestampUnit::Nanosecond.digits() => {
+            Inferred::Exact(ExasolType::timestamp(p))
+        }
+        _ => Inferred::Partial(Partial::Timestamp),
+    }
 }
 
-fn case_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
+fn case_type(node: &Json, out: &mut Json, children: &ChildTypes) -> Result<Inferred, UdfError> {
     // A simple CASE compares its basis with each WHEN value.
     if children.one("basis").is_some() {
         type_comparison(node, out, children)?;
     } else {
         refuse_implicit_text(node, &children.of("arguments"))?;
     }
-    unify_branches(node, &children.of("results"))
+    unify_branches(node, out, "results", &children.of("results"))
 }
 
-fn scalar_function_class(
+fn scalar_function_type(
     node: &Json,
     out: &mut Json,
-    args: &[TypeClass],
-) -> Result<TypeClass, UdfError> {
+    args: &[Inferred],
+) -> Result<Inferred, UdfError> {
     let fn_name = upper_name(node);
     if fn_name == "CAST" {
-        return cast_class(out, args);
+        return cast_type(out, args);
     }
     let function = typed_function(&fn_name);
     let text_positions = function.string_positions(args.len());
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
-    if function.result == ResultRule::Unified {
-        return unify_branches(node, args);
+    match function.result {
+        ResultRule::Unified => return unify_branches(node, out, "arguments", args),
+        ResultRule::Compared => refuse_text_among_others(node, args)?,
+        ResultRule::DateAddition(_) => check_date_addition(node, out, args)?,
+        _ => {
+            let converted: Vec<Inferred> = args
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
+                .map(|(_, ty)| *ty)
+                .collect();
+            refuse_implicit_text(node, &converted)?;
+        }
     }
-    if let ResultRule::DateAddition(date_result) = function.result {
-        return date_addition_class(node, out, args, date_result);
-    }
-    let converted: Vec<TypeClass> = args
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
-        .map(|(_, c)| *c)
-        .collect();
-    refuse_implicit_text(node, &converted)?;
-    if function.result == ResultRule::IntegerOverIntegers && !args.iter().all(|c| c.is_integer()) {
+    if function.result == ResultRule::IntegerOverIntegers && !args.iter().all(|ty| ty.is_integer())
+    {
         return Err(decline(format!(
             "{} computes over integer operands only: {}",
             function.name,
             short(node)
         )));
     }
-    Ok(function.class(args))
+    if function.result == ResultRule::Truncated && args.get(1) == Some(&DATE) {
+        truncate_date(out);
+    }
+    Ok(function.result_type(args))
 }
 
-/// The fractional digits of the Arrow timestamp a date addition over a `TIMESTAMP(precision)`
-/// computes in. Nanoseconds end at 2262-04-11 (`docs/semantic-differences.md`).
-fn scan_timestamp_digits(precision: u8) -> u8 {
-    if precision <= MICROSECOND_DIGITS {
-        MICROSECOND_DIGITS
-    } else {
-        NANOSECOND_DIGITS
-    }
+fn cast_node(target: ExasolType, argument: Json) -> Json {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "dataType": exasol_type_to_json(&target),
+        "arguments": [argument],
+    })
 }
 
-/// The fractional digits the scan result of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or
-/// `ADD_MINUTES` call holds. `None` for another node, or for a call the scan does not compute.
-pub fn date_addition_scan_digits(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<u8> {
-    if kind(node) != "function_scalar"
-        || !matches!(
-            typed_function(&upper_name(node)).result,
-            ResultRule::DateAddition(_)
-        )
-    {
-        return None;
-    }
-    match type_scan_tree(node, columns).ok()?.1 {
-        TypeClass::Date => Some(MICROSECOND_DIGITS),
-        TypeClass::Timestamp { precision } => Some(scan_timestamp_digits(precision)),
-        _ => None,
-    }
+/// DataFusion truncates a DATE to a timestamp, so the scan casts the result back to DATE.
+fn truncate_date(out: &mut Json) {
+    *out = cast_node(ExasolType::Date, out.take());
 }
 
 /// The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or a
-/// TIMESTAMP. The first argument gets a CAST to the Arrow type the scan computes in, so the scan
-/// function sees `Date32`, or a microsecond or nanosecond timestamp, whatever Arrow type holds the
-/// column.
-fn date_addition_class(
-    node: &Json,
-    out: &mut Json,
-    args: &[TypeClass],
-    date_result: DateResult,
-) -> Result<TypeClass, UdfError> {
+/// TIMESTAMP, in `Date32` or a microsecond or nanosecond timestamp. The first argument gets a
+/// CAST to that type, whatever Arrow type holds it.
+fn check_date_addition(node: &Json, out: &mut Json, args: &[Inferred]) -> Result<(), UdfError> {
     let &[first, count] = args else {
         return Err(decline(format!(
             "a date addition takes 2 arguments, got {}: {}",
@@ -505,44 +549,31 @@ fn date_addition_class(
         )));
     };
     refuse_implicit_text(node, args)?;
-    let (cast_target, result) = match first {
-        TypeClass::Date => (
-            ExasolType::Date,
-            match date_result {
-                DateResult::Date => TypeClass::Date,
-                DateResult::Timestamp => TypeClass::Timestamp { precision: 0 },
-            },
+    let cast_target = match first.timestamp_precision() {
+        _ if first == DATE => ExasolType::Date,
+        Some(precision) => ExasolType::timestamp(
+            TimestampUnit::holding(precision)
+                .max(TimestampUnit::Microsecond)
+                .digits(),
         ),
-        TypeClass::Timestamp { precision } => (
-            ExasolType::timestamp(scan_timestamp_digits(precision)),
-            first,
-        ),
-        _ => {
+        None => {
             return Err(decline(format!(
                 "a date addition over a value that is not a DATE or TIMESTAMP: {}",
                 short(node)
             )));
         }
     };
-    match count {
-        TypeClass::Integer { .. } | TypeClass::Number | TypeClass::Null => {}
-        TypeClass::Boolean => {
-            out["arguments"][1] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][1].take());
-        }
-        _ => {
-            return Err(decline(format!(
-                "a date addition count that is not a number: {}",
-                short(node)
-            )));
-        }
+    if count == BOOLEAN {
+        out["arguments"][1] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][1].take());
+    } else if !count.is_numeric() {
+        return Err(decline(format!(
+            "a date addition count that is not a number: {}",
+            short(node)
+        )));
     }
     refuse_constant_count_beyond_scan_limit(node)?;
-    out["arguments"][0] = serde_json::json!({
-        "type": "function_scalar_cast",
-        "dataType": exasol_type_to_json(&cast_target),
-        "arguments": [out["arguments"][0].take()],
-    });
-    Ok(result)
+    out["arguments"][0] = cast_node(cast_target, out["arguments"][0].take());
+    Ok(())
 }
 
 fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> {
@@ -568,30 +599,30 @@ fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> 
     )))
 }
 
-fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+fn aggregate_type(node: &Json, args: &[Inferred]) -> Result<Inferred, UdfError> {
     let name = upper_name(node);
     match name.as_str() {
-        "COUNT" => Ok(TypeClass::INTEGER),
-        "MIN" | "MAX" => Ok(args.first().copied().unwrap_or(TypeClass::Other)),
+        "COUNT" => Ok(Inferred::Partial(Partial::Integer)),
+        "MIN" | "MAX" => Ok(args.first().copied().unwrap_or(Inferred::Unknown)),
         "SUM" | "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
         | "VAR_SAMP" => numeric_aggregate(node, &name, args),
         _ => {
             refuse_implicit_text(node, args)?;
-            Ok(TypeClass::Other)
+            Ok(Inferred::Unknown)
         }
     }
 }
 
-fn json_value_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
-    if args.first() != Some(&TypeClass::Text) {
+fn json_value_type(node: &Json, args: &[Inferred]) -> Result<Inferred, UdfError> {
+    if !args.first().is_some_and(|ty| ty.is_text()) {
         return Err(decline(format!(
             "JSON_VALUE over a document that is not text: {}",
             short(node)
         )));
     }
     Ok(match JsonValueCall::parse(node)?.returning {
-        Returning::Text { .. } => TypeClass::Text,
-        Returning::Boolean => TypeClass::Boolean,
+        Returning::Text { .. } => Inferred::Partial(Partial::Text),
+        Returning::Boolean => BOOLEAN,
     })
 }
 
@@ -637,8 +668,8 @@ fn is_session_free_integer_text(node: &Json, max_digits: u8) -> bool {
 const COMPARED_FIELDS: [&str; 4] = ["expression", "left", "right", "basis"];
 
 /// Types the operands that a predicate or a simple CASE compares with each other.
-fn type_comparison(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<(), UdfError> {
-    let mut operands: Vec<(&Json, TypeClass)> = COMPARED_FIELDS
+fn type_comparison(node: &Json, out: &mut Json, children: &ChildTypes) -> Result<(), UdfError> {
+    let mut operands: Vec<(&Json, Inferred)> = COMPARED_FIELDS
         .iter()
         .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
         .collect();
@@ -654,26 +685,26 @@ fn type_comparison(node: &Json, out: &mut Json, children: &ChildClasses) -> Resu
 fn compare_without_session_parse(
     node: &Json,
     out: &mut Json,
-    operands: &[(&Json, TypeClass)],
+    operands: &[(&Json, Inferred)],
 ) -> Result<(), UdfError> {
     let text: Vec<&Json> = operands
         .iter()
-        .filter(|(_, c)| matches!(c, TypeClass::Text))
+        .filter(|(_, ty)| ty.is_text())
         .map(|(n, _)| *n)
         .collect();
-    let non_text: Vec<TypeClass> = operands
+    let non_text: Vec<Inferred> = operands
         .iter()
-        .map(|(_, c)| *c)
-        .filter(|c| !matches!(c, TypeClass::Text | TypeClass::Null))
+        .map(|(_, ty)| *ty)
+        .filter(|ty| !ty.is_text() && *ty != Inferred::Null)
         .collect();
     if text.is_empty() || non_text.is_empty() {
         return Ok(());
     }
     // A multi-value IN converts the text to the integer's type, which fails natively on a literal
     // wider than its precision, so only a literal that fits reaches the scan.
-    let max_digits = non_text.iter().try_fold(18, |max, c| match c {
-        TypeClass::Integer { precision } => Some(precision.map_or(max, |p| max.min(p))),
-        _ => None,
+    let max_digits = non_text.iter().try_fold(18, |max, ty| {
+        ty.is_integer()
+            .then(|| ty.integer_precision().map_or(max, |p| max.min(p)))
     });
     let integer_against_digits =
         max_digits.is_some_and(|max| text.iter().all(|n| is_session_free_integer_text(n, max)));
@@ -704,35 +735,124 @@ fn compare_without_session_parse(
 fn compare_booleans_as_numbers(
     node: &Json,
     out: &mut Json,
-    children: &ChildClasses,
-    operands: &[(&Json, TypeClass)],
+    children: &ChildTypes,
+    operands: &[(&Json, Inferred)],
 ) -> Result<(), UdfError> {
     let has_number = operands
         .iter()
-        .any(|(_, c)| matches!(c, TypeClass::Integer { .. } | TypeClass::Number));
-    let has_boolean = operands.iter().any(|(_, c)| *c == TypeClass::Boolean);
+        .any(|(_, ty)| ty.is_numeric() && *ty != Inferred::Null);
+    let has_boolean = operands.iter().any(|(_, ty)| *ty == BOOLEAN);
     if !has_number || !has_boolean {
         return Ok(());
     }
-    if kind(node) == "predicate_in_constlist"
-        && children.one("expression") == Some(TypeClass::Boolean)
-    {
+    if kind(node) == "predicate_in_constlist" && children.one("expression") == Some(BOOLEAN) {
         return Err(decline(format!(
             "an IN list converts its numbers to the BOOLEAN it tests: {}",
             short(node)
         )));
     }
     for field in COMPARED_FIELDS {
-        if children.one(field) == Some(TypeClass::Boolean) {
+        if children.one(field) == Some(BOOLEAN) {
             out[field] = wrap(BOOLEAN_NUMBER_NODE, out[field].take());
         }
     }
-    for (i, class) in children.of("arguments").into_iter().enumerate() {
-        if class == TypeClass::Boolean {
+    for (i, ty) in children.of("arguments").into_iter().enumerate() {
+        if ty == BOOLEAN {
             out["arguments"][i] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][i].take());
         }
     }
     Ok(())
+}
+
+/// DataFusion truncates a timestamp literal to its operand's unit, while Exasol compares at full
+/// precision (#461, apache/datafusion#22142). The operand holds no digit beyond its precision, 0
+/// for a DATE, so the literal floored to that precision gives Exasol's answer.
+fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
+    let precision = |field: &str| {
+        let ty = children.one(field)?;
+        if ty == DATE {
+            Some(0)
+        } else {
+            ty.timestamp_precision()
+        }
+    };
+    let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
+    match kind(node) {
+        "predicate_between" => {
+            let Some(p) = precision("expression") else {
+                return;
+            };
+            if !finer(&out["left"], p) && !finer(&out["right"], p) {
+                return;
+            }
+            let operand = &out["expression"];
+            *out = serde_json::json!({"type": "predicate_and", "expressions": [
+                floored_comparison("predicate_greaterequal", operand, &out["left"], p),
+                floored_comparison("predicate_lessequal", operand, &out["right"], p),
+            ]});
+        }
+        "predicate_in_constlist" => {
+            let Some(p) = precision("expression") else {
+                return;
+            };
+            let Some(Json::Array(values)) = out.get("arguments") else {
+                return;
+            };
+            if !values.iter().any(|value| finer(value, p)) {
+                return;
+            }
+            let operand = &out["expression"];
+            let expressions: Vec<Json> = values
+                .iter()
+                .map(|value| floored_comparison("predicate_equal", operand, value, p))
+                .collect();
+            *out = serde_json::json!({"type": "predicate_or", "expressions": expressions});
+        }
+        op => {
+            if let Some(p) = precision("left")
+                && finer(&out["right"], p)
+            {
+                *out = floored_comparison(op, &out["left"], &out["right"], p);
+            } else if let Some(p) = precision("right")
+                && finer(&out["left"], p)
+            {
+                *out = floored_comparison(mirrored(op), &out["right"], &out["left"], p);
+            }
+        }
+    }
+}
+
+fn mirrored(op: &str) -> &str {
+    match op {
+        "predicate_less" => "predicate_greater",
+        "predicate_lessequal" => "predicate_greaterequal",
+        "predicate_greater" => "predicate_less",
+        "predicate_greaterequal" => "predicate_lessequal",
+        op => op,
+    }
+}
+
+fn floored_literal(node: &Json, precision: u8) -> Option<Json> {
+    if kind(node) != "literal_timestamp" {
+        return None;
+    }
+    let floor = TimestampLiteral(node.get("value")?.as_str()?).floor(precision)?;
+    Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
+}
+
+/// `operand <op> literal`, with a literal finer than `precision` floored. `x <> x` and `x = x`
+/// keep a NULL operand NULL, so an enclosing NOT stays exact.
+fn floored_comparison(op: &str, operand: &Json, literal: &Json, precision: u8) -> Json {
+    let Some(floor) = floored_literal(literal, precision) else {
+        return serde_json::json!({"type": op, "left": operand, "right": literal});
+    };
+    let (op, right) = match op {
+        "predicate_equal" => ("predicate_notequal", operand.clone()),
+        "predicate_notequal" => ("predicate_equal", operand.clone()),
+        "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
+        _ => ("predicate_greater", floor),
+    };
+    serde_json::json!({"type": op, "left": operand, "right": right})
 }
 
 fn integer_literal(digits: &str) -> Json {
@@ -749,8 +869,8 @@ fn integer_literal(digits: &str) -> Json {
 
 /// Text in a position that expects a date, timestamp, number, or boolean: Exasol converts it by
 /// the session's NLS settings, and DataFusion parses ISO dates and a `.` or fails to plan.
-fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfError> {
-    if operands.iter().any(|c| matches!(c, TypeClass::Text)) {
+fn refuse_implicit_text(node: &Json, operands: &[Inferred]) -> Result<(), UdfError> {
+    if operands.iter().any(|ty| ty.is_text()) {
         return Err(decline(format!(
             "converting a text operand to another type parses it by the session's NLS settings: {}",
             short(node)
@@ -761,64 +881,87 @@ fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfEr
 
 /// DataFusion aggregates only numbers here. Exasol also converts text by the session's NLS
 /// settings and BOOLEAN to 1 or 0, so those run in Exasol.
-fn numeric_aggregate(node: &Json, name: &str, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+fn numeric_aggregate(node: &Json, name: &str, args: &[Inferred]) -> Result<Inferred, UdfError> {
     refuse_implicit_text(node, args)?;
-    if !args.iter().all(|c| c.is_numeric()) {
+    if !args.iter().all(|ty| ty.is_numeric()) {
         return Err(decline(format!(
             "{name} over a value that is not a number: {}",
             short(node)
         )));
     }
     // DataFusion cannot sum an untyped NULL, and Exasol folds a CAST of NULL to a bare NULL.
-    if args.contains(&TypeClass::Null) {
+    if args.contains(&Inferred::Null) {
         return Err(decline(format!("{name} over a bare NULL: {}", short(node))));
     }
-    Ok(if name == "SUM" && args.iter().all(|c| c.is_integer()) {
-        TypeClass::INTEGER
-    } else {
-        TypeClass::Number
-    })
+    Ok(Inferred::Partial(
+        if name == "SUM" && args.iter().all(|ty| ty.is_integer()) {
+            Partial::Integer
+        } else {
+            Partial::Number
+        },
+    ))
 }
 
-/// The class of values Exasol brings to one type (CASE results, GREATEST, LEAST, NULLIF). Text
-/// among other types converts by the session's NLS settings.
-fn unify_branches(node: &Json, branches: &[TypeClass]) -> Result<TypeClass, UdfError> {
-    let has_text = branches.iter().any(|c| matches!(c, TypeClass::Text));
-    let has_other = branches
+/// Text among other types converts by the session's NLS settings.
+fn refuse_text_among_others(node: &Json, types: &[Inferred]) -> Result<(), UdfError> {
+    let has_text = types.iter().any(|ty| ty.is_text());
+    let has_other = types
         .iter()
-        .any(|c| !matches!(c, TypeClass::Text | TypeClass::Null));
+        .any(|ty| !ty.is_text() && *ty != Inferred::Null);
     if has_text && has_other {
         return Err(decline(format!(
             "bringing text and another type to one type parses the text by the session's NLS settings: {}",
             short(node)
         )));
     }
-    Ok(branches
-        .iter()
-        .copied()
-        .reduce(TypeClass::union)
-        .unwrap_or(TypeClass::Other))
+    Ok(())
 }
 
-fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+/// The type Exasol brings the values in `field` to (CASE results, `GREATEST`, `LEAST`).
+/// DataFusion brings timestamps to the finest unit among them, so each branch gets a CAST to the
+/// unit that holds Exasol's precision.
+fn unify_branches(
+    node: &Json,
+    out: &mut Json,
+    field: &str,
+    branches: &[Inferred],
+) -> Result<Inferred, UdfError> {
+    refuse_text_among_others(node, branches)?;
+    let unified = branches
+        .iter()
+        .copied()
+        .reduce(Inferred::union)
+        .unwrap_or(Inferred::Unknown);
+    if let Some(precision) = unified.timestamp_precision() {
+        let target = ExasolType::timestamp(TimestampUnit::holding(precision).digits());
+        for (i, branch) in branches.iter().enumerate() {
+            if *branch != Inferred::Null {
+                out[field][i] = cast_node(target, out[field][i].take());
+            }
+        }
+    }
+    Ok(unified)
+}
+
+fn cast_type(out: &mut Json, args: &[Inferred]) -> Result<Inferred, UdfError> {
     let target = out
         .get("dataType")
         .map(exasol_type_from_json)
         .transpose()?
         .ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
-    let source_class = args.first().copied().unwrap_or(TypeClass::Other);
+    let source_type = args.first().copied().unwrap_or(Inferred::Unknown);
     let source = out
         .get_mut("arguments")
         .and_then(|args| args.get_mut(0))
         .ok_or_else(|| UdfError::User("CAST missing its argument".into()))?;
     match target {
         ExasolType::Char { size, .. } => {
-            *source = cast_to_text(source.take(), source_class, target, size, true)?;
+            *source = cast_to_text(source.take(), source_type, target, size, true)?;
         }
         ExasolType::Varchar { size, .. } => {
-            *source = cast_to_text(source.take(), source_class, target, size, false)?;
+            *source = cast_to_text(source.take(), source_type, target, size, false)?;
         }
-        ExasolType::Decimal(d) if source_class == TypeClass::Boolean => {
+        ExasolType::Decimal(d) if source_type == BOOLEAN => {
             if d.precision() == d.scale() {
                 return Err(decline(format!(
                     "CAST of {} to {target} cannot hold 1",
@@ -827,9 +970,9 @@ fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError>
             }
             *source = wrap(BOOLEAN_NUMBER_NODE, source.take());
         }
-        _ => cast_from_text(source, source_class, target)?,
+        _ => cast_from_text(source, source_type, target)?,
     }
-    Ok(TypeClass::of(target))
+    Ok(Inferred::Exact(target))
 }
 
 #[cfg(test)]

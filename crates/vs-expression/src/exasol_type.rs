@@ -136,14 +136,6 @@ impl ExasolType {
         matches!(self, Self::Char { .. } | Self::Varchar { .. })
     }
 
-    /// The fractional-second digits a plain `TIMESTAMP` holds.
-    pub fn fractional_digits(&self) -> Option<u8> {
-        match self {
-            Self::Timestamp { precision } => Some(*precision),
-            _ => None,
-        }
-    }
-
     /// Whether a scan UDF can declare this type in `EMITS`. Exasol rejects `TIMESTAMP WITH
     /// LOCAL TIME ZONE` there (`sqlCode 22002`), and no Arrow type maps to the other three.
     pub fn is_udf_emittable(&self) -> bool {

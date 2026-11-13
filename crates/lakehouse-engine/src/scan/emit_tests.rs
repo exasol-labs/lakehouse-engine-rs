@@ -3,7 +3,7 @@ use super::*;
 use crate::scan::checked_div::CheckedFloatDivError;
 use crate::scan::scan_session_context;
 use arrow::array::Int32Array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -1125,4 +1125,27 @@ async fn coerce_fails_when_a_value_does_not_fit_its_declared_target() {
         ctx.batches.is_empty(),
         "no batch may be emitted, and no NULL may be substituted for the value"
     );
+}
+
+#[test]
+fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
+    let cases = [
+        (0, TimeUnit::Millisecond),
+        (1, TimeUnit::Millisecond),
+        (2, TimeUnit::Millisecond),
+        (3, TimeUnit::Millisecond),
+        (4, TimeUnit::Microsecond),
+        (5, TimeUnit::Microsecond),
+        (6, TimeUnit::Microsecond),
+        (7, TimeUnit::Nanosecond),
+        (8, TimeUnit::Nanosecond),
+        (9, TimeUnit::Nanosecond),
+    ];
+    for (digits, expected_unit) in cases {
+        assert_eq!(
+            arrow_time_unit(emitted_unit(TimestampUnit::holding(digits))),
+            expected_unit,
+            "declared precision={digits}"
+        );
+    }
 }

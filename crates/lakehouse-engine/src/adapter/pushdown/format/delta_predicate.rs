@@ -4,7 +4,7 @@ use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
 use crate::adapter::pushdown::literal_binary_bytes;
-use crate::types::mapping::timestamp_literal_digits;
+use vs_expression::timestamp::{TimestampLiteral, TimestampUnit};
 
 use super::filter_json::{
     Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
@@ -179,7 +179,9 @@ fn literal_to_scalar(lit: &Json, prim: &PrimitiveType) -> Option<Scalar> {
         | ("literal_timestamp_utc", PrimitiveType::Timestamp) => {
             let text = non_empty_str(value)?;
             // Delta timestamps hold microseconds; a truncated finer literal would prune matching files.
-            (timestamp_literal_digits(text) <= 6).then(|| prim.parse_scalar(text).ok())?
+            TimestampLiteral(text)
+                .fits(TimestampUnit::Microsecond)
+                .then(|| prim.parse_scalar(text).ok())?
         }
 
         ("literal_binary", PrimitiveType::Binary) => literal_binary_bytes(lit).map(Scalar::Binary),

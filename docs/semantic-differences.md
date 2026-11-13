@@ -105,12 +105,15 @@ The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses 
 The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
 in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
 a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
-`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. Native Exasol returns rows.
+`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. `DATE_TRUNC` truncates any
+DATE or TIMESTAMP in nanoseconds, so it fails on a value outside the span. Native Exasol returns
+rows.
 
 | Query | Scan |
 |---|---|
 | `WHERE ts_ns < TIMESTAMP '9999-12-31 00:00:00'` | error `Cannot cast … to Timestamp(ns)` |
 | `SELECT ADD_DAYS(ts_ns, 100000)` | error `datetime field overflow` |
+| `SELECT DATE_TRUNC('month', d)` with `d` = 9999-12-31 | error `Cannot cast … to Timestamp(ns)` |
 
 Workaround: `CAST(ts_ns AS TIMESTAMP(6))`, which covers Exasol's whole range.
 
