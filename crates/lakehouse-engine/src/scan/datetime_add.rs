@@ -7,14 +7,15 @@ use super::exasol_numeric::numeric_overflow;
 use super::raised_failure::RaisedFailure;
 use crate::types::mapping::predates_calendar_versions;
 use arrow::array::{
-    Array, ArrayRef, AsArray, Decimal128Array, Float64Array, TimestampMicrosecondBuilder,
+    Array, ArrayRef, AsArray, Decimal128Array, Float64Array, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{
     DECIMAL128_MAX_PRECISION, DataType, Date32Type, Decimal128Type, Float64Type, TimeUnit,
-    TimestampMicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
 };
-use arrow::temporal_conversions::timestamp_us_to_datetime;
+use arrow::temporal_conversions::{timestamp_ns_to_datetime, timestamp_us_to_datetime};
 use datafusion::common::{Result, exec_err, plan_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -26,17 +27,18 @@ use std::sync::Arc;
 use vs_expression::{ADD_DAYS_FN, ADD_HOURS_FN, ADD_MINUTES_FN, ADD_WEEKS_FN};
 
 const TIMESTAMP_MICROS: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
-const MICROS_PER_MINUTE: i128 = 60_000_000;
-const MICROS_PER_HOUR: i128 = 60 * MICROS_PER_MINUTE;
-const MICROS_PER_DAY: i128 = 24 * MICROS_PER_HOUR;
-/// Exasol's range as microseconds from 1970-01-01. A whole-day result lies inside it exactly when
-/// its date lies inside Exasol's DATE range, so one check serves both result types.
-const EXASOL_MIN_MICROS: i128 = EXASOL_DATE_MIN_DAYS as i128 * MICROS_PER_DAY;
-const EXASOL_MAX_MICROS: i128 = (EXASOL_DATE_MAX_DAYS as i128 + 1) * MICROS_PER_DAY - 1;
+const TIMESTAMP_NANOS: DataType = DataType::Timestamp(TimeUnit::Nanosecond, None);
+const NANOS_PER_MICRO: i128 = 1_000;
+const NANOS_PER_MILLI: i128 = 1_000_000;
+const NANOS_PER_MINUTE: i128 = 60_000_000_000;
+const NANOS_PER_HOUR: i128 = 60 * NANOS_PER_MINUTE;
+const NANOS_PER_DAY: i128 = 24 * NANOS_PER_HOUR;
+/// Exasol's range as nanoseconds from 1970-01-01. A whole-day result lies inside it exactly when
+/// its date lies inside Exasol's DATE range, so one check serves every result type.
+const EXASOL_MIN_NANOS: i128 = EXASOL_DATE_MIN_DAYS as i128 * NANOS_PER_DAY;
+const EXASOL_MAX_NANOS: i128 = (EXASOL_DATE_MAX_DAYS as i128 + 1) * NANOS_PER_DAY - 1;
 /// Exasol refuses an `ADD_DAYS` or `ADD_WEEKS` count of a larger magnitude.
 const DAY_AND_WEEK_COUNT_LIMIT: u32 = 999_999_999;
-const NANOS_PER_MICRO: i128 = 1_000;
-const MICROS_PER_MILLI: i128 = 1_000;
 /// Exasol 8 holds the milliseconds of an `ADD_HOURS` or `ADD_MINUTES` count in 18 digits.
 const EXASOL_8_MILLIS_LIMIT: u128 = 999_999_999_999_999_999;
 const NUMERIC_OUT_OF_RANGE: &str = "data exception - numeric value out of range";
@@ -63,15 +65,13 @@ impl CountArithmetic {
         }
     }
 
-    /// The largest whole count of `micros_per_count` microseconds the arithmetic holds.
-    fn count_limit(self, micros_per_count: i128) -> u128 {
+    /// The largest whole count of `nanos_per_count` nanoseconds the arithmetic holds.
+    fn count_limit(self, nanos_per_count: i128) -> u128 {
         match self {
             Self::Milliseconds => {
-                EXASOL_8_MILLIS_LIMIT / (micros_per_count / MICROS_PER_MILLI).unsigned_abs()
+                EXASOL_8_MILLIS_LIMIT / (nanos_per_count / NANOS_PER_MILLI).unsigned_abs()
             }
-            Self::Nanoseconds => {
-                i128::MAX.unsigned_abs() / (micros_per_count * NANOS_PER_MICRO).unsigned_abs()
-            }
+            Self::Nanoseconds => i128::MAX.unsigned_abs() / nanos_per_count.unsigned_abs(),
         }
     }
 
@@ -113,12 +113,12 @@ impl Unit {
         }
     }
 
-    fn micros_per_count(self) -> i128 {
+    fn nanos_per_count(self) -> i128 {
         match self {
-            Self::Days => MICROS_PER_DAY,
-            Self::Weeks => 7 * MICROS_PER_DAY,
-            Self::Hours => MICROS_PER_HOUR,
-            Self::Minutes => MICROS_PER_MINUTE,
+            Self::Days => NANOS_PER_DAY,
+            Self::Weeks => 7 * NANOS_PER_DAY,
+            Self::Hours => NANOS_PER_HOUR,
+            Self::Minutes => NANOS_PER_MINUTE,
         }
     }
 
@@ -134,7 +134,7 @@ impl Unit {
 
     /// The largest whole hour or minute count that `arithmetic` holds.
     fn arithmetic_count_limit(self, arithmetic: CountArithmetic) -> Option<u128> {
-        (!self.keeps_a_date()).then(|| arithmetic.count_limit(self.micros_per_count()))
+        (!self.keeps_a_date()).then(|| arithmetic.count_limit(self.nanos_per_count()))
     }
 
     fn result_type(self, arg_types: &[DataType]) -> Result<DataType> {
@@ -153,8 +153,10 @@ impl Unit {
             DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 Ok(TIMESTAMP_MICROS)
             }
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(TIMESTAMP_NANOS),
             other => plan_err!(
-                "{} takes a Date32 or {TIMESTAMP_MICROS} first argument, got {other}",
+                "{} takes a Date32, {TIMESTAMP_MICROS}, or {TIMESTAMP_NANOS} first argument, \
+                 got {other}",
                 self.scan_name()
             ),
         }
@@ -217,29 +219,60 @@ impl Unit {
         ))
     }
 
-    /// `micros` plus `count` units, as microseconds from 1970-01-01 inside Exasol's range.
-    fn add(self, micros: i128, count: i128) -> std::result::Result<i64, String> {
+    /// `nanos` plus `count` units, as nanoseconds from 1970-01-01 inside Exasol's range.
+    fn add(self, nanos: i128, count: i128) -> std::result::Result<i128, String> {
         let shifted = count
-            .checked_mul(self.micros_per_count())
-            .and_then(|offset| micros.checked_add(offset));
+            .checked_mul(self.nanos_per_count())
+            .and_then(|offset| nanos.checked_add(offset));
         let after_the_range = match shifted {
-            Some(result @ EXASOL_MIN_MICROS..=EXASOL_MAX_MICROS) => return Ok(result as i64),
-            Some(result) => result > EXASOL_MAX_MICROS,
+            Some(result @ EXASOL_MIN_NANOS..=EXASOL_MAX_NANOS) => return Ok(result),
+            Some(result) => result > EXASOL_MAX_NANOS,
             None => count > 0,
         };
-        let argument = i64::try_from(micros)
-            .ok()
-            .and_then(timestamp_us_to_datetime)
-            .map_or_else(
-                || format!("{micros} microseconds from 1970-01-01"),
-                |at| at.to_string(),
-            );
-        let call = format!("{}({argument}, {count})", self.exasol_name());
+        let call = self.call(nanos, count);
         Err(if after_the_range {
             format!("{DATETIME_OVERFLOW}; {call} lies after 9999-12-31")
         } else {
             format!("{DATETIME_UNDERFLOW}; {call} lies before 0001-01-01")
         })
+    }
+
+    /// A result over a `TIMESTAMP(7..=9)` as an Arrow nanosecond timestamp, which ends before
+    /// Exasol's range does (`docs/semantic-differences.md`).
+    fn nanosecond_result(
+        self,
+        nanos: i128,
+        count: i128,
+        result: i128,
+    ) -> std::result::Result<i64, String> {
+        i64::try_from(result).map_err(|_| {
+            let (class, bound) = if result > 0 {
+                (DATETIME_OVERFLOW, "after 2262-04-11 23:47:16.854775807")
+            } else {
+                (DATETIME_UNDERFLOW, "before 1677-09-21 00:12:43.145224192")
+            };
+            format!(
+                "{class}; {} lies {bound}, outside the nanosecond timestamps the scan computes \
+                 a TIMESTAMP(7) to TIMESTAMP(9) in",
+                self.call(nanos, count)
+            )
+        })
+    }
+
+    fn call(self, nanos: i128, count: i128) -> String {
+        let argument = i64::try_from(nanos)
+            .ok()
+            .and_then(timestamp_ns_to_datetime)
+            .or_else(|| {
+                i64::try_from(nanos.div_euclid(NANOS_PER_MICRO))
+                    .ok()
+                    .and_then(timestamp_us_to_datetime)
+            })
+            .map_or_else(
+                || format!("{nanos} nanoseconds from 1970-01-01"),
+                |at| at.to_string(),
+            );
+        format!("{}({argument}, {count})", self.exasol_name())
     }
 }
 
@@ -339,23 +372,35 @@ impl DatetimeAddUdf {
         }
     }
 
-    /// NULL in either argument returns NULL before the count is checked.
+    /// `arguments` are nanoseconds from 1970-01-01. NULL in either argument returns NULL before
+    /// the count is checked.
     fn shift(
         &self,
         arguments: impl Iterator<Item = Option<i128>>,
         counts: &Counts,
+        result_unit: TimeUnit,
     ) -> std::result::Result<ArrayRef, String> {
-        let mut shifted = TimestampMicrosecondBuilder::with_capacity(arguments.size_hint().0);
+        let mut shifted = Vec::with_capacity(arguments.size_hint().0);
         for (row, argument) in arguments.enumerate() {
-            match argument.zip(counts.at(row)) {
-                Some((micros, count)) => {
+            shifted.push(match argument.zip(counts.at(row)) {
+                Some((nanos, count)) => {
                     let count = self.unit.whole_count(count, self.arithmetic)?;
-                    shifted.append_value(self.unit.add(micros, count)?);
+                    let result = self.unit.add(nanos, count)?;
+                    Some(match result_unit {
+                        TimeUnit::Nanosecond => {
+                            self.unit.nanosecond_result(nanos, count, result)?
+                        }
+                        // Exact: the argument holds whole microseconds, and a count whole minutes.
+                        _ => (result / NANOS_PER_MICRO) as i64,
+                    })
                 }
-                None => shifted.append_null(),
-            }
+                None => None,
+            });
         }
-        Ok(Arc::new(shifted.finish()))
+        Ok(match result_unit {
+            TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(shifted)),
+            _ => Arc::new(TimestampMicrosecondArray::from(shifted)),
+        })
     }
 }
 
@@ -404,21 +449,30 @@ impl ScalarUDFImpl for DatetimeAddUdf {
             argument.to_array(rows)?,
             Counts::of(&count.to_array(rows)?)?,
         );
-        // Widened before scaling: a Date32 far outside Exasol's range overflows i64 microseconds.
-        let shifted = match argument.as_primitive_opt::<Date32Type>() {
-            Some(dates) => self.shift(
+        // Widened before scaling: a Date32 far outside Exasol's range overflows i64 nanoseconds.
+        let shifted = if let Some(dates) = argument.as_primitive_opt::<Date32Type>() {
+            self.shift(
                 dates
                     .iter()
-                    .map(|days| days.map(|days| i128::from(days) * MICROS_PER_DAY)),
+                    .map(|days| days.map(|days| i128::from(days) * NANOS_PER_DAY)),
                 &counts,
-            ),
-            None => self.shift(
+                TimeUnit::Microsecond,
+            )
+        } else if let Some(nanos) = argument.as_primitive_opt::<TimestampNanosecondType>() {
+            self.shift(
+                nanos.iter().map(|nanos| nanos.map(i128::from)),
+                &counts,
+                TimeUnit::Nanosecond,
+            )
+        } else {
+            self.shift(
                 cast(&argument, &TIMESTAMP_MICROS)?
                     .as_primitive::<TimestampMicrosecondType>()
                     .iter()
-                    .map(|micros| micros.map(i128::from)),
+                    .map(|micros| micros.map(|micros| i128::from(micros) * NANOS_PER_MICRO)),
                 &counts,
-            ),
+                TimeUnit::Microsecond,
+            )
         }
         .map_err(|failure| {
             self.raised.record(failure.clone());

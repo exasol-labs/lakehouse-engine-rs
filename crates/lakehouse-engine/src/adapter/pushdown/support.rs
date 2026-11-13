@@ -14,8 +14,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, DATE_ADDITION_FUNCTIONS, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS,
-    SqlFragment, render_scan_expression, render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
+    date_addition_scan_digits, render_scan_expression, render_scan_filter, walk_column_nodes,
 };
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
@@ -615,7 +615,7 @@ fn rewrite_timestamp_comparison(node: &Json, col_types: &ColumnTypes) -> Option<
 }
 
 /// `literal` floored to the fractional digits `operand` holds in the scan: a column's declared
-/// digits, or 6 for a date addition, whose scan result holds whole microseconds. `None` when the
+/// digits, or the digits of the Arrow timestamp a date addition computes in. `None` when the
 /// literal fits those digits, or when `operand` is neither.
 fn timestamp_literal_floor(
     operand: &Json,
@@ -638,22 +638,14 @@ fn timestamp_literal_floor(
     Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
 }
 
-const MICROSECOND_DIGITS: usize = 6;
-
 /// `None` for an operand whose scan value the floor does not cover.
 fn scan_fractional_digits(operand: &Json, col_types: &ColumnTypes) -> Option<usize> {
-    match operand.get("type")?.as_str()? {
-        "column" => Some(usize::from(
-            column_exa_type(operand, col_types)?.fractional_digits()?,
-        )),
-        "function_scalar" => {
-            let name = operand.get("name")?.as_str()?.to_ascii_uppercase();
-            DATE_ADDITION_FUNCTIONS
-                .contains(&name.as_str())
-                .then_some(MICROSECOND_DIGITS)
-        }
-        _ => None,
-    }
+    let digits = match operand.get("type")?.as_str()? {
+        "column" => column_exa_type(operand, col_types)?.fractional_digits()?,
+        "function_scalar" => date_addition_scan_digits(operand, col_types)?,
+        _ => return None,
+    };
+    Some(usize::from(digits))
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps

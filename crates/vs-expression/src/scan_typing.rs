@@ -77,8 +77,10 @@ impl TypeClass {
     }
 }
 
-/// The widest timestamp the scan holds as an Arrow microsecond timestamp without losing digits.
-const MAX_SCAN_TIMESTAMP_PRECISION: u8 = 6;
+/// The fractional digits of the Arrow microsecond and nanosecond timestamps a date addition
+/// computes in.
+const MICROSECOND_DIGITS: u8 = 6;
+const NANOSECOND_DIGITS: u8 = 9;
 /// Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits
 /// before it reads a row, while the scan fails only per non-NULL row. No count above 1e10 yields a
 /// result inside 0001-01-01 to 9999-12-31 in any unit (the range spans 5,258,964,960 minutes), so
@@ -457,9 +459,38 @@ fn scalar_function_class(
     Ok(function.class(args))
 }
 
+/// The fractional digits of the Arrow timestamp a date addition over a `TIMESTAMP(precision)`
+/// computes in. Nanoseconds end at 2262-04-11 (`docs/semantic-differences.md`).
+fn scan_timestamp_digits(precision: u8) -> u8 {
+    if precision <= MICROSECOND_DIGITS {
+        MICROSECOND_DIGITS
+    } else {
+        NANOSECOND_DIGITS
+    }
+}
+
+/// The fractional digits the scan result of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or
+/// `ADD_MINUTES` call holds. `None` for another node, or for a call the scan does not compute.
+pub fn date_addition_scan_digits(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<u8> {
+    if kind(node) != "function_scalar"
+        || !matches!(
+            typed_function(&upper_name(node)).result,
+            ResultRule::DateAddition(_)
+        )
+    {
+        return None;
+    }
+    match type_scan_tree(node, columns).ok()?.1 {
+        TypeClass::Date => Some(MICROSECOND_DIGITS),
+        TypeClass::Timestamp { precision } => Some(scan_timestamp_digits(precision)),
+        _ => None,
+    }
+}
+
 /// The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or a
-/// `TIMESTAMP(0..=6)`. The first argument gets a CAST to the class's Arrow-backed type, so the scan
-/// function sees `Date32` or a microsecond timestamp whatever Arrow type holds the column.
+/// TIMESTAMP. The first argument gets a CAST to the Arrow type the scan computes in, so the scan
+/// function sees `Date32`, or a microsecond or nanosecond timestamp, whatever Arrow type holds the
+/// column.
 fn date_addition_class(
     node: &Json,
     out: &mut Json,
@@ -482,15 +513,10 @@ fn date_addition_class(
                 DateResult::Timestamp => TypeClass::Timestamp { precision: 0 },
             },
         ),
-        TypeClass::Timestamp { precision } if precision <= MAX_SCAN_TIMESTAMP_PRECISION => {
-            (ExasolType::timestamp(6), first)
-        }
-        TypeClass::Timestamp { precision } => {
-            return Err(decline(format!(
-                "a TIMESTAMP({precision}) holds nanoseconds, and an Arrow nanosecond timestamp ends at 2262-04-11: {}",
-                short(node)
-            )));
-        }
+        TypeClass::Timestamp { precision } => (
+            ExasolType::timestamp(scan_timestamp_digits(precision)),
+            first,
+        ),
         _ => {
             return Err(decline(format!(
                 "a date addition over a value that is not a DATE or TIMESTAMP: {}",

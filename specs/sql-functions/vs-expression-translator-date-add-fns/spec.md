@@ -1,13 +1,13 @@
 # Feature: VS Expression Translator, Date-Addition Functions
 
-The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and returns what native Exasol returns, except for a date before 1582-10-15, where the scan follows the proleptic Gregorian calendar and Exasol the Julian calendar. Exasol computes every other form of these functions itself.
+The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or TIMESTAMP argument and returns what native Exasol returns, except for a date before 1582-10-15, where the scan follows the proleptic Gregorian calendar and Exasol the Julian calendar, and for a result over a `TIMESTAMP(7)` to `TIMESTAMP(9)` outside 1677-09-21 to 2262-04-11, which fails in the scan. Exasol computes every other form of these functions itself.
 
 ## Background
 
 * Exasol returns a DATE from `ADD_DAYS` and `ADD_WEEKS` over a DATE, a `TIMESTAMP(0)` from `ADD_HOURS` and `ADD_MINUTES` over a DATE, and a `TIMESTAMP(p)` from all four over a `TIMESTAMP(p)`.
 * Exasol rounds a fractional count half away from zero before it adds the count, and fails a result outside its DATE and TIMESTAMP range of 0001-01-01 to 9999-12-31.
 * The scan declares each computed output column with the type Exasol states in `selectListDataTypes` and casts the computed value to it (`datafusion-scan/scan-execution-value-conversion`).
-* The scan holds a `TIMESTAMP(7)` to `TIMESTAMP(9)` value as an Arrow nanosecond timestamp, whose range ends at 2262-04-11. A microsecond timestamp drops its digits below a microsecond.
+* The scan holds a `TIMESTAMP(7)` to `TIMESTAMP(9)` value as an Arrow nanosecond timestamp, whose range spans 1677-09-21 00:12:43.145224192 to 2262-04-11 23:47:16.854775807. A microsecond timestamp drops its digits below a microsecond, and spans Exasol's whole range.
 * A declined expression takes its path's fallback (`pushdown-types/pushdown-planning-scan-text-conversion`), so Exasol computes it.
 
 ## Scenarios
@@ -42,9 +42,10 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument has the TIMESTAMP class with a precision from 0 to 6
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument has the TIMESTAMP class
 * *WHEN* `render_scan_expression` processes the node
-* *THEN* the translator SHALL render the function's `vs_add_*` call with the first argument as `CAST(<arg_sql> AS TIMESTAMP(6))`, so the scan function receives a microsecond timestamp without a time zone, which holds every fractional-second digit of a `TIMESTAMP(0)` to `TIMESTAMP(6)` value
+* *THEN* the translator SHALL render the function's `vs_add_*` call with the first argument as `CAST(<arg_sql> AS TIMESTAMP(6))` for a precision from 0 to 6 and `CAST(<arg_sql> AS TIMESTAMP(9))` for a precision from 7 to 9, so the scan function receives a microsecond or nanosecond timestamp without a time zone, which holds every fractional-second digit of the argument
+* *AND* the scan SHALL return a microsecond timestamp over a microsecond argument and a nanosecond timestamp over a nanosecond argument
 * *AND* the scan SHALL return the timestamp plus the rounded count of days, weeks, hours, or minutes, with every fractional-second digit of the argument kept
 * *AND* a result that crosses a month end, a leap day, or a year end SHALL be the date and time native Exasol returns
 * *AND* a query that uses the function in a select list, a WHERE filter, a GROUP BY key, or an aggregate argument SHALL return the rows native Exasol returns
@@ -71,12 +72,21 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *AND* a NULL argument SHALL return NULL whatever the count, as native Exasol does
 * *AND* the scan MUST NOT return a row, a NULL, or a clamped value in place of the failure
 
+### Scenario: A result outside the nanosecond range fails the query
+
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call over a `TIMESTAMP(7)` to `TIMESTAMP(9)` argument, whose result for a row lies after 2262-04-11 23:47:16.854775807 or before 1677-09-21 00:12:43.145224192 but inside Exasol's range
+* *WHEN* the scan computes the call
+* *THEN* the query SHALL fail with an error whose message starts with `data exception - datetime field overflow` for a result after the nanosecond range and `data exception - datetime field underflow` for a result before it, and names the `TIMESTAMP(7)` to `TIMESTAMP(9)` limit
+* *AND* the scan MUST NOT return a row, a NULL, or a wrapped value in place of the failure
+* *AND* `docs/semantic-differences.md` SHALL list this difference from native Exasol, which returns the timestamp, together with a comparison of such a call or a `TIMESTAMP(9)` column with a timestamp literal outside the nanosecond range, such as a 9999-12-31 sentinel, which fails in the scan
+
 ### Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
 
-* *GIVEN* a comparison, `BETWEEN`, or `IN` of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call with a TIMESTAMP literal of more than 6 significant fractional digits, with the literal on either side
+* *GIVEN* a comparison, `BETWEEN`, or `IN` of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call over a DATE or a `TIMESTAMP(0)` to `TIMESTAMP(6)` with a TIMESTAMP literal of more than 6 significant fractional digits, with the literal on either side
 * *WHEN* the scan computes the filter
 * *THEN* the query SHALL return the rows native Exasol returns
 * *AND* the adapter SHALL rewrite each such comparison in the tree it renders for DataFusion as it rewrites a comparison with a column of 6 fractional digits (`pushdown-types/pushdown-planning-timestamp-literal-precision`), because the scan's result holds whole microseconds and DataFusion truncates the literal to microseconds before it compares
+* *AND* the adapter MUST NOT rewrite a comparison with a call over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, whose scan result holds nanoseconds, so a literal of up to 9 digits compares as written
 * *AND* a call that the typed pass declines SHALL take its path's fallback, which applies the comparison as Exasol received it, without the rewrite
 
 ### Scenario: A date before 1582-10-15 follows the proleptic Gregorian calendar in the scan
@@ -89,11 +99,11 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: A form the scan cannot match runs in Exasol
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP(7)` to `TIMESTAMP(9)` value, a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a DATE or TIMESTAMP class, such as a CASE over two dates, `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP`, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a DATE or TIMESTAMP class, such as a CASE over two dates, `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP`, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* `render_scan_expression` SHALL return `Err`, and the expression SHALL take its path's fallback, so Exasol computes the function
 * *AND* the query SHALL return the rows native Exasol returns
-* *AND* a `TIMESTAMP(7)` to `TIMESTAMP(9)` argument SHALL decline, because the scan can neither keep its nanosecond digits in microseconds nor return a nanosecond result after 2262-04-11, which native Exasol returns, and a text argument or count SHALL decline, because Exasol reads text by the session's NLS settings
+* *AND* a text argument or count SHALL decline, because Exasol reads text by the session's NLS settings
 * *AND* a numeric literal count with a magnitude above 1e10 SHALL decline, because Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits before it reads a row
 * *AND* `docs/capabilities.md` SHALL list the argument forms that run in Exasol
 * *AND* the adapter SHALL still advertise the four capabilities, because the fallback computes each declined form in Exasol SQL

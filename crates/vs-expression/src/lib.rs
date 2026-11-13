@@ -17,7 +17,8 @@ pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, pa
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{
-    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
+    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, date_addition_scan_digits,
+    exact_expression_type,
 };
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
@@ -233,8 +234,9 @@ pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
 
 /// The scalar UDFs the DataFusion dialect renders `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and
-/// `ADD_MINUTES` as, registered by `lakehouse-engine`. Each MUST take a first argument of `Date32`
-/// or `Timestamp(Microsecond, None)`, which the typed pass casts to, and a number as its second.
+/// `ADD_MINUTES` as, registered by `lakehouse-engine`. Each MUST take a first argument of `Date32`,
+/// `Timestamp(Microsecond, None)`, or `Timestamp(Nanosecond, None)`, which the typed pass casts
+/// to, and a number as its second.
 pub const ADD_DAYS_FN: &str = "vs_add_days";
 /// See [`ADD_DAYS_FN`].
 pub const ADD_WEEKS_FN: &str = "vs_add_weeks";
@@ -242,10 +244,6 @@ pub const ADD_WEEKS_FN: &str = "vs_add_weeks";
 pub const ADD_HOURS_FN: &str = "vs_add_hours";
 /// See [`ADD_DAYS_FN`].
 pub const ADD_MINUTES_FN: &str = "vs_add_minutes";
-/// The Exasol functions the DataFusion dialect renders as `vs_add_*`. Each scan result holds
-/// whole microseconds, so the adapter floors a finer timestamp literal compared with one.
-pub const DATE_ADDITION_FUNCTIONS: [&str; 4] =
-    ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"];
 
 fn render_cast(
     args: Option<&Vec<Json>>,

@@ -2812,6 +2812,18 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored() {
     }
 }
 
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn a_date_addition_over_a_nanosecond_timestamp_keeps_a_nanosecond_literal() {
+    let col_types = vec![("TS9".to_string(), ExasolType::timestamp(9))];
+    let call = scalar_fn("ADD_DAYS", [col("ts9"), num_lit(1)]);
+    let filter = predicate_equal(call, timestamp_lit("2024-01-02 00:00:00.000000001"));
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+        filter
+    );
+}
+
 #[test]
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");

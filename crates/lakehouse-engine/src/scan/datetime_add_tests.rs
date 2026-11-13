@@ -4,7 +4,7 @@ use crate::scan::scan_session_context;
 use crate::scan::test_support::invoke_scalar_udf;
 use arrow::array::{
     ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    NullArray, RecordBatch, TimestampMicrosecondArray, UInt64Array,
+    NullArray, RecordBatch, TimestampMicrosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, ScalarBuffer};
 use arrow::datatypes::{Date32Type, Field};
@@ -80,6 +80,18 @@ fn rendered(array: &ArrayRef) -> Vec<Option<String>> {
             .as_primitive::<Date32Type>()
             .iter()
             .map(|value| value.map(|d| Date32Type::to_naive_date_opt(d).unwrap().to_string()))
+            .collect(),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => array
+            .as_primitive::<TimestampNanosecondType>()
+            .iter()
+            .map(|value| {
+                value.map(|n| {
+                    timestamp_ns_to_datetime(n)
+                        .unwrap()
+                        .format("%Y-%m-%d %H:%M:%S%.9f")
+                        .to_string()
+                })
+            })
             .collect(),
         _ => array
             .as_primitive::<TimestampMicrosecondType>()
@@ -722,7 +734,80 @@ fn result_types_follow_the_argument_and_the_unit() {
             timestamp_type,
             "{unit:?} over a timestamp"
         );
+        assert_eq!(
+            udf.return_type(&[TIMESTAMP_NANOS, DataType::Int64])
+                .unwrap(),
+            TIMESTAMP_NANOS,
+            "{unit:?} over a nanosecond timestamp"
+        );
     }
+}
+
+fn nanosecond_timestamp(text: &str) -> ArrayRef {
+    let nanos = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .unwrap_or_else(|e| panic!("{text} must be a timestamp: {e}"))
+        .and_utc()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| panic!("{text} must fit nanoseconds"));
+    Arc::new(TimestampNanosecondArray::from(vec![nanos]))
+}
+
+/// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
+#[test]
+fn a_nanosecond_timestamp_keeps_its_nanoseconds() {
+    let cases = [
+        (Unit::Days, 1.0, "2024-01-02 00:00:00.123456789"),
+        (Unit::Weeks, -1.0, "2023-12-25 00:00:00.123456789"),
+        (Unit::Hours, 1.5, "2024-01-01 02:00:00.123456789"),
+        (Unit::Minutes, -0.5, "2023-12-31 23:59:00.123456789"),
+    ];
+    for (unit, count, expected) in cases {
+        let argument = nanosecond_timestamp("2024-01-01 00:00:00.123456789");
+        let result = add(unit, argument.clone(), double(count))
+            .unwrap_or_else(|e| panic!("{unit:?} must return a value, got: {e}"));
+        assert_eq!(result.data_type(), &TIMESTAMP_NANOS, "{unit:?}");
+        assert_eq!(
+            added(unit, argument, double(count)),
+            expected,
+            "{unit:?} by {count}"
+        );
+    }
+}
+
+/// Scenario: A result outside the nanosecond range fails the query
+#[test]
+fn a_nanosecond_result_outside_the_arrow_range_fails() {
+    let cases = [
+        (
+            Unit::Days,
+            nanosecond_timestamp("2262-04-11 00:00:00.000000001"),
+            integer(1),
+            "data exception - datetime field overflow",
+        ),
+        (
+            Unit::Hours,
+            nanosecond_timestamp("1677-09-21 01:00:00.000000001"),
+            integer(-1),
+            "data exception - datetime field underflow",
+        ),
+    ];
+    for (unit, argument, count, expected) in cases {
+        let message = failure(unit, argument, count);
+        assert_eq!(class(&message), expected, "{message}");
+        assert!(
+            message.contains("TIMESTAMP(7) to TIMESTAMP(9)"),
+            "{message}"
+        );
+    }
+    assert_eq!(
+        added(
+            Unit::Days,
+            nanosecond_timestamp("2262-04-10 00:00:00.000000001"),
+            integer(1)
+        ),
+        "2262-04-11 00:00:00.000000001",
+        "the last whole day of the range still computes"
+    );
 }
 
 #[test]
@@ -731,7 +816,11 @@ fn other_argument_and_count_types_fail_planning() {
     let rejected = [
         vec![DataType::Utf8, DataType::Int64],
         vec![
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Int64,
+        ],
+        vec![
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
             DataType::Int64,
         ],
         vec![
@@ -824,6 +913,23 @@ async fn the_scan_session_computes_each_rendered_call() {
             Some("2024-01-01 02:00:00.000000".to_string()),
             Some("2025-01-01 00:00:30.123456".to_string()),
         ]
+    );
+}
+
+/// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
+#[tokio::test]
+async fn the_scan_session_computes_a_nanosecond_call() {
+    let sql = format!(
+        "SELECT {ADD_HOURS_FN}(CAST(arrow_cast('2024-12-31 23:30:00.123456789', \
+         'Timestamp(Nanosecond, None)') AS TIMESTAMP(9)), 1)"
+    );
+    let batch = collect(&scan_session(), &sql)
+        .await
+        .unwrap_or_else(|e| panic!("the rendered call must run, got: {e}"));
+    assert_eq!(batch.column(0).data_type(), &TIMESTAMP_NANOS);
+    assert_eq!(
+        rendered(batch.column(0)),
+        [Some("2025-01-01 00:30:00.123456789".to_string())]
     );
 }
 

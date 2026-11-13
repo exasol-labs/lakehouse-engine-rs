@@ -806,6 +806,11 @@ fn date_and_timestamp_classes_follow_their_source() {
             timestamp(0),
         ),
         (
+            "ADD_MINUTES over a TIMESTAMP(9)",
+            scalar_fn("ADD_MINUTES", [col("TS9"), num_lit(1)]),
+            timestamp(9),
+        ),
+        (
             "ADD_DAYS over ADD_HOURS over a DATE",
             scalar_fn(
                 "ADD_DAYS",
@@ -893,11 +898,6 @@ fn unmatched_date_addition_forms_decline() {
     let mut cases = Vec::new();
     for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"] {
         let first_arguments = [
-            ("TIMESTAMP(9)", col("TS9")),
-            (
-                "TIMESTAMP(7) literal",
-                timestamp_lit("2024-01-01 00:00:00.1234567"),
-            ),
             ("TIMESTAMP WITH LOCAL TIME ZONE", col("LTZ")),
             ("text", col("S")),
             ("text literal", str_lit("2024-01-01")),
@@ -964,11 +964,48 @@ fn unmatched_date_addition_forms_decline() {
             render(&expr)
         );
     }
-    let nanoseconds = render(&scalar_fn("ADD_DAYS", [col("TS9"), num_lit(1)])).unwrap_err();
-    assert!(
-        nanoseconds.to_string().contains("2262-04-11"),
-        "a TIMESTAMP(9) names the nanosecond range: {nanoseconds}"
-    );
+}
+
+/// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
+#[test]
+fn a_date_addition_computes_in_the_unit_that_holds_its_argument() {
+    let cases = [
+        (col("TS0"), r#"vs_add_days(CAST("TS0" AS TIMESTAMP(6)), 1)"#),
+        (col("TS"), r#"vs_add_days(CAST("TS" AS TIMESTAMP(6)), 1)"#),
+        (col("TS9"), r#"vs_add_days(CAST("TS9" AS TIMESTAMP(9)), 1)"#),
+        (
+            timestamp_lit("2024-01-01 00:00:00.1000000"),
+            "vs_add_days(CAST(arrow_cast('2024-01-01 00:00:00.1000000', 'Timestamp(Microsecond, None)') AS TIMESTAMP(9)), 1)",
+        ),
+    ];
+    for (argument, expected) in cases {
+        assert_eq!(
+            render(&scalar_fn("ADD_DAYS", [argument, num_lit(1)])).unwrap(),
+            expected
+        );
+    }
+}
+
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn date_addition_scan_digits_follow_the_computing_unit() {
+    let cases = [
+        (scalar_fn("ADD_DAYS", [col("D"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_DAYS", [col("TS0"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_WEEKS", [col("TS"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_MINUTES", [col("TS9"), num_lit(1)]), Some(9)),
+        (scalar_fn("ADD_DAYS", [col("S"), num_lit(1)]), None),
+        (scalar_fn("UPPER", [col("S")]), None),
+        (col("TS"), None),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(
+            date_addition_scan_digits(&expr, &columns()),
+            expected,
+            "{expr}"
+        );
+    }
 }
 
 #[test]

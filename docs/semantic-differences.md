@@ -100,6 +100,20 @@ The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses 
 | `ADD_DAYS(d, -1)` with `d` = 1582-10-15 | `1582-10-04` | `1582-10-14` |
 | `ADD_DAYS(d, -200000)` with `d` = 2024-01-01 | `1476-05-24` | `1476-06-02` |
 
+## Nanosecond timestamps outside 1677 to 2262
+
+The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
+in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
+a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
+`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. Native Exasol returns rows.
+
+| Query | Scan |
+|---|---|
+| `WHERE ts_ns < TIMESTAMP '9999-12-31 00:00:00'` | error `Cannot cast … to Timestamp(ns)` |
+| `SELECT ADD_DAYS(ts_ns, 100000)` | error `datetime field overflow` |
+
+Workaround: `CAST(ts_ns AS TIMESTAMP(6))`, which covers Exasol's whole range.
+
 ## JSON_VALUE without a DEFAULT ON ERROR
 
 The scan reads a document only until no `JSON_VALUE` path over it can select another item, and it takes only the first member of each name in an object. Native Exasol reads and checks the whole document, and reads repeated members as several items. So a document that is broken after the selected value, or that repeats a member the path selects, can give a value where Exasol takes the `ON ERROR` behavior, or the reverse.
