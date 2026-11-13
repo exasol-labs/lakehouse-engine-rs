@@ -19,7 +19,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: SECOND keeps the fraction of its argument's declared precision
 
-* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` is a column or a `CAST` with the declared type `TIMESTAMP(p)`
+* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` is a column with the declared type `TIMESTAMP(p)`, or a `CAST` to `TIMESTAMP(p)` with p of 0, 3, 6, or 9, the only CAST precisions the DataFusion dialect renders
 * *WHEN* `render_scan_expression` renders it
 * *THEN* the fragment SHALL compute the seconds of `x` with their first p fractional digits, and SHALL carry the type `DECIMAL(2+p, p)`
 * *AND* it SHALL read `date_part('second', …)` when p is 0, `date_part('microsecond', …)` when p is 1 to 6, and `date_part('nanosecond', …)` when p is 7 to 9
@@ -35,7 +35,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: SECOND over any other argument, or EXTRACT(SECOND) over a DATE, runs in Exasol
 
-* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has neither the declared type `TIMESTAMP(p)` nor `DATE`, such as `SECOND(DATE_TRUNC('minute', ts))`, `SECOND` of a `VARCHAR` column, or `SECOND(CAST(ts AS TIMESTAMP(6) WITH LOCAL TIME ZONE))`, or `EXTRACT(SECOND FROM x)` over a DATE `x`
+* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has neither the declared type `TIMESTAMP(p)` nor `DATE`, such as `SECOND(DATE_TRUNC('minute', ts))`, `SECOND` of a `VARCHAR` column, `SECOND(CAST(ts AS TIMESTAMP(7)))` (a CAST precision the DataFusion dialect cannot render), or `SECOND(CAST(ts AS TIMESTAMP(6) WITH LOCAL TIME ZONE))`, or `EXTRACT(SECOND FROM x)` over a DATE `x`
 * *WHEN* `render_scan_expression` renders it
 * *THEN* the DataFusion dialect SHALL decline the node, so Exasol computes the function in the wrapper
 * *AND* `EXTRACT(SECOND FROM <date>)` SHALL therefore fail with Exasol's own `Feature not supported` error, as it does over a native table

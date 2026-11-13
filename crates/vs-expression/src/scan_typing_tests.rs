@@ -340,6 +340,7 @@ fn second_over_any_other_argument_declines() {
         second(col("UNKNOWN")),
         second(cast_to(local_time_zone, col("TS"))),
         second(col("TSLTZ")),
+        second(timestamp_cast(7)),
         extract("SECOND", col("D")),
     ] {
         assert!(render(&expr).is_err(), "{expr} must decline");

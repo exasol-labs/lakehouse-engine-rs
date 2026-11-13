@@ -554,6 +554,14 @@ fn second_and_extract_second_match_a_native_copy() {
             Expect::Rows,
         ),
     ]);
+    if engine_honors_declared_precision(&mut conn) {
+        // DataFusion parses only TIMESTAMP(0|3|6|9), so a CAST to any other precision runs in Exasol.
+        cases.push((
+            "SELECT ID, SECOND(CAST(TS AS TIMESTAMP(7))) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Lacks("date_part("),
+            Expect::Rows,
+        ));
+    }
     let probe = qualified_probe();
     create_native_copy(&mut conn, &probe, "TS, TSTZ, TS_NS");
     let mut failures = native_copy_mismatches(&mut conn, &probe, &cases);
