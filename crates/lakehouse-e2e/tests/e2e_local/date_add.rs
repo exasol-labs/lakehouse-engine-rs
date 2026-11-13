@@ -139,11 +139,40 @@ fn finer_literal_cases() -> Vec<DateAddCase> {
     .into()
 }
 
+/// Arguments whose type the typed pass derives from unified branches or a date function, with
+/// values before 1970 and near 9999-12-31.
+fn derived_argument_cases() -> Vec<DateAddCase> {
+    [
+        "SELECT ID, ADD_DAYS(CASE WHEN ID > 2 THEN C_DATE ELSE DATE '1900-03-01' END, 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(COALESCE(C_TS, TIMESTAMP '9999-12-30 10:00:00.5'), 1) FROM {T}",
+        "SELECT ID, ADD_MINUTES(COALESCE(C_DATE, DATE '1950-06-15'), 30) FROM {T}",
+        "SELECT ID, ADD_WEEKS(GREATEST(C_TS, ADD_HOURS(C_DATE, 1)), 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(LEAST(C_TS, TIMESTAMP '1960-01-01 00:00:00.12'), 1) FROM {T}",
+        "SELECT ID, ADD_DAYS(NULLIF(C_DATE, DATE '2024-01-01'), 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(NULLIF(C_DATE, C_TS), 1) FROM {T}",
+        "SELECT ID, ADD_DAYS(DATE_TRUNC('month', C_DATE), 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(DATE_TRUNC('month', C_DATE), 1) FROM {T}",
+        "SELECT ID, ADD_DAYS(DATE_TRUNC('month', COALESCE(C_DATE, DATE '2262-03-31')), -1) FROM {T}",
+        "SELECT ID, ADD_DAYS(DATE_TRUNC('year', COALESCE(C_DATE, DATE '1700-07-15')), 1) FROM {T}",
+        "SELECT ID, ADD_MINUTES(DATE_TRUNC('hour', C_TS), 5) FROM {T}",
+        "SELECT ID, ADD_DAYS(TO_DATE(CASE WHEN ID > 2 THEN '1960-02-29' ELSE '9999-12-30' END, 'YYYY-MM-DD'), 1) FROM {T}",
+        "SELECT ID FROM {T} WHERE ADD_DAYS(COALESCE(C_DATE, DATE '1900-01-01'), 1) > DATE '2024-01-03'",
+        "SELECT ID FROM {T} WHERE ADD_DAYS(DATE_TRUNC('month', C_TS), 1) > DATE '2024-01-02'",
+        // A literal finer than the unified TIMESTAMP(0), and two against a DATE, which compare as written.
+        "SELECT ID FROM {T} WHERE ADD_DAYS(CASE WHEN ID > 2 THEN ADD_HOURS(C_DATE, 1) ELSE ADD_MINUTES(C_DATE, 1) END, 1) >= TIMESTAMP '2024-01-04 01:00:00.5'",
+        "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) < TIMESTAMP '2024-01-04 00:00:00.5'",
+        "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) = TIMESTAMP '2024-01-04 00:00:00.5'",
+    ]
+    .map(|query| DateAddCase::new(query, Has(SCAN_FUNCTION)))
+    .into()
+}
+
 fn declined_cases() -> Vec<DateAddCase> {
     [
-        "SELECT ID, ADD_DAYS(CASE WHEN ID > 2 THEN C_DATE ELSE DATE '2024-03-01' END, 1) FROM {T}",
-        "SELECT ID, ADD_HOURS(DATE_TRUNC('month', C_DATE), 1) FROM {T}",
-        "SELECT ID FROM {T} WHERE ADD_DAYS(DATE_TRUNC('month', C_TS), 1) > DATE '2024-01-02'",
+        // Exasol 2025 brings a DATE and a TIMESTAMP to the TIMESTAMP, Exasol 8 to the first branch.
+        "SELECT ID, ADD_DAYS(CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END, 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(LEAST(C_DATE, C_TS), 1) FROM {T}",
+        "SELECT ID, ADD_HOURS(TO_TIMESTAMP(CASE WHEN ID > 2 THEN '2024-01-01 10:00:00' ELSE '1960-01-01 00:00:00' END, 'YYYY-MM-DD HH24:MI:SS'), 1) FROM {T}",
     ]
     .map(|query| DateAddCase::new(query, Lacks(SCAN_FUNCTION)))
     .into()
@@ -191,7 +220,7 @@ fn mismatch(conn: &mut ExaConn, table: &str, case: &DateAddCase, expect: Expect)
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
 /// Scenario: The scan rounds a fractional count as Exasol does
 /// Scenario: A result outside Exasol's datetime range fails the query
-/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+/// Scenario: A timestamp filter compares at full precision
 /// Scenario: A form the scan cannot match runs in Exasol
 /// Scenario: The four functions render verbatim in the Exasol dialect
 #[test]
@@ -204,6 +233,7 @@ fn date_add_functions_match_native() {
     let rows = row_cases()
         .into_iter()
         .chain(finer_literal_cases())
+        .chain(derived_argument_cases())
         .chain(declined_cases())
         .map(|case| (case, Expect::Rows));
     let errors = error_cases().into_iter().map(|case| (case, Expect::Error));

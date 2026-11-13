@@ -8,7 +8,7 @@ use vs_expression::ColumnNode;
 
 use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::spec::LogicalField;
-use crate::types::mapping::timestamp_literal_digits;
+use vs_expression::timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Resolves a filter column through its declared field id to the field the scanned schema carries
 /// under that id: bounds are stored by field id, so a rename must not prune by another's bounds.
@@ -76,12 +76,16 @@ fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
         // `Datum` parses at most microseconds; a truncated finer literal would prune matching files.
         ("literal_timestamp", PrimitiveType::Timestamp | PrimitiveType::TimestampNs) => {
             let s = lit.get("value")?.as_str()?;
-            (timestamp_literal_digits(s) <= 6).then(|| parse_timestamp_no_tz(s, prim))?
+            TimestampLiteral(s)
+                .fits(TimestampUnit::Microsecond)
+                .then(|| parse_timestamp_no_tz(s, prim))?
         }
 
         ("literal_timestamp_utc", PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs) => {
             let s = lit.get("value")?.as_str()?;
-            (timestamp_literal_digits(s) <= 6).then(|| parse_timestamptz(s, prim))?
+            TimestampLiteral(s)
+                .fits(TimestampUnit::Microsecond)
+                .then(|| parse_timestamptz(s, prim))?
         }
 
         ("literal_binary", PrimitiveType::Binary) => literal_binary_bytes(lit).map(Datum::binary),

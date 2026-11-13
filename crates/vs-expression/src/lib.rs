@@ -8,6 +8,7 @@ mod fragment;
 mod json_value;
 mod scalar_functions;
 mod scan_typing;
+pub mod timestamp;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
@@ -19,10 +20,8 @@ use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
     seconds_type,
 };
-pub use scan_typing::{
-    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, date_addition_scan_digits,
-    exact_expression_type,
-};
+pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
+use timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -83,9 +82,8 @@ fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
 }
 
 fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
-    let fraction = value.and_then(Json::as_str).and_then(|v| v.split_once('.'));
-    match fraction {
-        Some((_, digits)) if digits.trim_end_matches('0').len() > 6 => "Nanosecond",
+    match value.and_then(Json::as_str).map(TimestampLiteral) {
+        Some(literal) if !literal.fits(TimestampUnit::Microsecond) => "Nanosecond",
         _ => "Microsecond",
     }
 }

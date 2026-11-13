@@ -1,8 +1,8 @@
 //! `EXPORT ... INTO SCRIPT` through the export script into the local Iceberg REST catalog. The
 //! local stack has one node, so the writer count is `WRITERS_PER_NODE`, capped at 300.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
 use futures::TryStreamExt;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
@@ -10,9 +10,10 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
 
 use crate::common::e2e_harness::{
-    DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_holds_rows,
-    create_virtual_schema, declared_types, error_text, exa_conn, exported_rows,
-    local_stack_s3_store, run_namespace, runtime,
+    DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
+    VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
+    declared_types, exa_conn, export_error, exported_rows, failing_source, local_stack_s3_store,
+    run_namespace, runtime,
 };
 use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
@@ -38,10 +39,7 @@ const ROLE_EXPORTER: &str = "EXPORT_E2E_ROLE_EXPORTER";
 const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
 const WAREHOUSE_BUCKET: &str = "warehouse";
 
-/// Every row raises when read, so an error without the read error proves the export
-/// failed before reading the source.
-const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.SRC_ROWS)";
-const SOURCE_READ_ERROR: &str = "division by zero";
+static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
 const AZURE_ACCOUNT_KEY: &str = "ZXhwb3J0LWUyZS1henVyZS1rZXk=";
 
@@ -121,45 +119,17 @@ fn new_table() -> String {
     )
 }
 
-/// The export script and the CONNECTION a statement goes through.
-#[derive(Clone, Copy)]
-struct Route {
-    script_schema: &'static str,
-    connection: &'static str,
-}
-
-const DIRECT: Route = Route {
+const DIRECT: ExportRoute = ExportRoute {
     script_schema: SCHEMA_NAME,
     connection: DEFAULT_CATALOG_CONN_NAME,
 };
 
 /// The proxy-only scripts and CONNECTION of `proxy_virtual_schemas`, so a `scripts/proxy/filter`
 /// line can inject a catalog or storage fault.
-const PROXIED: Route = Route {
+const PROXIED: ExportRoute = ExportRoute {
     script_schema: PROXY_ADAPTER_SCHEMA,
     connection: PROXY_ICEBERG_CREDS,
 };
-
-impl Route {
-    fn export_into(self, source: &str, tail: &str) -> String {
-        format!(
-            "EXPORT {source} INTO SCRIPT {}.{EXPORT_SCRIPT_NAME} {tail}",
-            self.script_schema
-        )
-    }
-
-    /// A valid export of `source` into `table` with `options`. The local stack serves plain
-    /// HTTP, so it sets `ALLOW_HTTP = 'true'`.
-    fn export(self, source: &str, table: &str, options: &str) -> String {
-        self.export_into(
-            source,
-            &format!(
-                "WITH CATALOG_CONNECTION = '{}' TABLE_NAME = '{table}' ALLOW_HTTP = 'true' {options}",
-                self.connection
-            ),
-        )
-    }
-}
 
 fn export_into(source: &str, tail: &str) -> String {
     DIRECT.export_into(source, tail)
@@ -177,34 +147,10 @@ fn profiled_export(source: &str, options: &str) -> (i64, i64) {
     profiled_export_counts(&mut exa_conn(), &export_sql(source, options))
 }
 
-/// The error text of a failing export, checked to carry no value of the CONNECTION.
-#[track_caller]
-fn export_error(conn: &mut ExaConn, sql: &str) -> String {
-    let error = error_text(&conn.try_execute(sql), sql);
+/// The CONNECTION values no export error may carry.
+fn connection_secrets() -> [String; 2] {
     let password = local_stack_connection_password();
-    for secret in [&password.access_key, &password.secret_key] {
-        assert!(
-            !error.contains(secret.as_str()),
-            "a CONNECTION value leaked: {error}"
-        );
-    }
-    error
-}
-
-#[track_caller]
-fn assert_refused_before_reading(
-    label: &str,
-    conn: &mut ExaConn,
-    sql: &str,
-    fragments: &[&str],
-) -> String {
-    let error = export_error(conn, sql);
-    assert!(
-        fragments.iter().all(|fragment| error.contains(fragment))
-            && !error.contains(SOURCE_READ_ERROR),
-        "{label}: {sql} must fail before reading the source, naming {fragments:?}: {error}"
-    );
-    error
+    [password.access_key, password.secret_key]
 }
 
 fn table_exists(table: &str) -> bool {
@@ -387,14 +333,14 @@ fn export_refuses_invalid_statements_before_reading() {
         (
             "WRITERS_PER_NODE with SINGLE_COMMIT",
             export_sql(
-                FAILING_SOURCE,
+                &FAILING_SOURCE,
                 "WRITERS_PER_NODE = '2' SINGLE_COMMIT = 'true'",
             ),
             vec!["WRITERS_PER_NODE cannot be combined with SINGLE_COMMIT = 'true'".to_string()],
         ),
         (
             "unknown option",
-            export_sql(FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
+            export_sql(&FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
             vec![
                 "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, and ALLOW_HTTP"
                     .to_string(),
@@ -402,7 +348,7 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "WRITERS_PER_NODE of 0",
-            export_sql(FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
+            export_sql(&FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
             vec![
                 "WRITERS_PER_NODE = '0' is not a whole number from 1 to".to_string(),
                 "WRITERS_PER_NODE = '4'".to_string(),
@@ -411,7 +357,7 @@ fn export_refuses_invalid_statements_before_reading() {
         (
             "ALLOW_HTTP of yes",
             export_into(
-                FAILING_SOURCE,
+                &FAILING_SOURCE,
                 &format!(
                     "WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t' \
                      ALLOW_HTTP = 'yes'"
@@ -421,12 +367,12 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "no CATALOG_CONNECTION",
-            export_into(FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
+            export_into(&FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
             vec!["option CATALOG_CONNECTION is required".to_string()],
         ),
         (
             "named AT clause",
-            export_into(FAILING_SOURCE, &named_at),
+            export_into(&FAILING_SOURCE, &named_at),
             vec![
                 "the AT clause is not supported".to_string(),
                 use_option.to_string(),
@@ -434,7 +380,7 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "inline AT clause",
-            export_into(FAILING_SOURCE, &inline),
+            export_into(&FAILING_SOURCE, &inline),
             vec![
                 "the AT clause is not supported".to_string(),
                 use_option.to_string(),
@@ -442,30 +388,40 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "TRUNCATE",
-            export_sql(FAILING_SOURCE, "TRUNCATE"),
+            export_sql(&FAILING_SOURCE, "TRUNCATE"),
             vec![never_rewrites("TRUNCATE")],
         ),
         (
             "REPLACE",
-            export_sql(FAILING_SOURCE, "REPLACE"),
+            export_sql(&FAILING_SOURCE, "REPLACE"),
             vec![never_rewrites("REPLACE")],
         ),
         (
             "CREATED BY",
-            export_sql(FAILING_SOURCE, "CREATED BY 'CREATE TABLE ns.t (x INT)'"),
+            export_sql(&FAILING_SOURCE, "CREATED BY 'CREATE TABLE ns.t (x INT)'"),
             vec![never_rewrites("CREATED BY")],
         ),
     ];
 
     for (case, sql, fragments) in cases {
         let fragments: Vec<&str> = fragments.iter().map(String::as_str).collect();
-        let error = assert_refused_before_reading(case, &mut exa_conn(), &sql, &fragments);
+        let error = assert_refused_before_reading(
+            case,
+            &mut exa_conn(),
+            &sql,
+            &fragments,
+            &connection_secrets(),
+        );
         assert!(
             !error.contains(INLINE_PASSWORD),
             "{case}: the inline password leaked: {error}"
         );
     }
-    let read_error = export_error(&mut exa_conn(), &export_sql(FAILING_SOURCE, ""));
+    let read_error = export_error(
+        &mut exa_conn(),
+        &export_sql(&FAILING_SOURCE, ""),
+        &connection_secrets(),
+    );
     assert!(
         read_error.contains(SOURCE_READ_ERROR),
         "with valid options the export reads the failing source: {read_error}"
@@ -479,7 +435,7 @@ fn export_plain_http_needs_allow_http() {
     setup();
     let conn = DEFAULT_CATALOG_CONN_NAME;
     let without_allow_http = export_into(
-        FAILING_SOURCE,
+        &FAILING_SOURCE,
         &format!(
             "WITH CATALOG_CONNECTION = '{conn}' TABLE_NAME = '{}'",
             new_table()
@@ -494,6 +450,7 @@ fn export_plain_http_needs_allow_http() {
             &format!("field address of CONNECTION '{conn}' names a plain HTTP address"),
             "ALLOW_HTTP = 'true'",
         ],
+        &connection_secrets(),
     );
     assert_eq!(
         exported_rows(
@@ -538,11 +495,11 @@ fn export_refuses_unwritable_connections_and_column_names() {
     ));
     let through = |connection: &'static str, options: &str| {
         let table = new_table();
-        let route = Route {
+        let route = ExportRoute {
             connection,
             ..DIRECT
         };
-        (route.export(FAILING_SOURCE, &table, options), table)
+        (route.export(&FAILING_SOURCE, &table, options), table)
     };
     let azure_refusal = "supplies Azure storage field(s) account_name, account_key, but the export writes only to S3-compatible storage";
     let sigv4_refusal =
@@ -585,7 +542,8 @@ fn export_refuses_unwritable_connections_and_column_names() {
     ];
 
     for (case, (sql, table), refusal) in cases {
-        let error = assert_refused_before_reading(case, &mut sys, &sql, &[refusal]);
+        let error =
+            assert_refused_before_reading(case, &mut sys, &sql, &[refusal], &connection_secrets());
         assert!(
             !error.contains(AZURE_ACCOUNT_KEY),
             "{case}: the account key leaked: {error}"
@@ -606,6 +564,7 @@ fn export_single_commit_on_catalog_refusing_stage_create_fails() {
     let error = export_error(
         &mut exa_conn(),
         &PROXIED.export(SOURCE_TABLE, refused_table, "SINGLE_COMMIT = 'true'"),
+        &connection_secrets(),
     );
 
     // The proxy resets the connection after its 403, so the answer's body breaks off.
@@ -636,9 +595,10 @@ fn export_failed_single_commit_leaves_no_table() {
             &format!("{source_error}.t"),
             "SINGLE_COMMIT = 'true'",
         ),
+        &connection_secrets(),
     );
     assert!(
-        error.contains("data exception - division by zero"),
+        error.contains(SOURCE_READ_ERROR),
         "a source error at row 500 fails the statement: {error}"
     );
     // The `scripts/proxy/filter` line answers HTTP 403 under `<namespace>/t/metadata/`, so the
@@ -653,6 +613,7 @@ fn export_failed_single_commit_leaves_no_table() {
                 &format!("{manifest_fault}.t"),
                 "SINGLE_COMMIT = 'true'",
             ),
+            &connection_secrets(),
         );
     });
     assert!(
@@ -704,8 +665,9 @@ fn export_missing_script_grant_fails_named() {
     assert_refused_before_reading(
         "no script grant",
         &mut exporter_conn(NO_ACCESS_EXPORTER),
-        &export_sql(FAILING_SOURCE, ""),
+        &export_sql(&FAILING_SOURCE, ""),
         &[&missing_grant_error(NO_ACCESS_EXPORTER)],
+        &connection_secrets(),
     );
 }
 
@@ -727,7 +689,11 @@ fn export_errors_carry_no_connection_password() {
     let forged_writer_call =
         format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");
 
-    let error = export_error(&mut exporter_conn(NO_ACCESS_EXPORTER), &forged_writer_call);
+    let error = export_error(
+        &mut exporter_conn(NO_ACCESS_EXPORTER),
+        &forged_writer_call,
+        &connection_secrets(),
+    );
 
     assert!(
         error.contains(&missing_grant_error(NO_ACCESS_EXPORTER)),

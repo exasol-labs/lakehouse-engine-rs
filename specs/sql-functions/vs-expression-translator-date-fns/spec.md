@@ -59,6 +59,9 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `date_trunc(<unit_sql>, <source_sql>)` with both arguments rendered recursively
 * *AND* the unit literal MUST be passed through as a string argument DataFusion's `date_trunc` accepts (e.g. `'year'`, `'month'`, `'day'`, `'hour'`)
+* *AND* over a DATE the translator SHALL return `CAST(date_trunc(<unit_sql>, <source_sql>) AS DATE)`, because Exasol returns a DATE and DataFusion a timestamp
+* *AND* the scan SHALL fail on a source outside 1677-09-21 to 2262-04-11 that is a DATE, or a TIMESTAMP truncated to `week`, `month`, `quarter`, or `year`, because DataFusion converts it to nanoseconds, and `docs/semantic-differences.md` SHALL list this difference
+* *AND* a TIMESTAMP truncated to `second`, `minute`, `hour`, or `day` SHALL return native Exasol's value across Exasol's whole range
 * *AND* `render_expression_exasol` SHALL return `DATE_TRUNC(<unit_sql>, <source_sql>)`, Exasol's own PostgreSQL-compatible `DATE_TRUNC` takes the same argument order, so the unit literal Exasol sent is forwarded unchanged and Exasol applies its own `NLS_FIRST_DAY_OF_WEEK` for the `'week'` unit
 
 ### Scenario: The now-family is not translated

@@ -80,7 +80,7 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 | JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
-`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or `TIMESTAMP` argument and a numeric count. Over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, the scan computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)). Any other argument form (`TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over two date values, another date function, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
+`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or `TIMESTAMP` argument and a numeric count. Over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, the scan computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)). The argument can also be a `CASE`, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps, `NULLIF`, `DATE_TRUNC`, or `TO_DATE`. Any other argument form (`TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over a date and a timestamp, `TO_TIMESTAMP`, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
 
 `DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
 
