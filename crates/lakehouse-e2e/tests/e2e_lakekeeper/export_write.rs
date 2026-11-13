@@ -2,14 +2,16 @@
 //! namespaces of its own and reads the new tables back through a virtual schema over them.
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use serde_json::Value;
 
 use super::{CONN_STATIC, CONN_VENDED, LAKEKEEPER_CATALOG_URI_INTERNAL, setup};
 use crate::common::e2e_harness::{
-    EXPORT_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_holds_rows, create_proxied_schema_and_scripts,
-    create_virtual_schema_with_password, error_text, exa_conn, exported_rows, run_namespace,
+    ExportRoute, NO_SECRETS, SCHEMA_NAME, VsProps, assert_holds_rows,
+    assert_refused_before_reading, create_proxied_schema_and_scripts,
+    create_virtual_schema_with_password, error_text, exa_conn, export_error, exported_rows,
+    failing_source, run_namespace,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::lakekeeper::{
@@ -26,10 +28,7 @@ const SOURCE_ROWS: i64 = 1_000;
 const TYPES_TABLE: &str = "LK_EXPORT_E2E.ALL_TYPES";
 const ROWS_16K: &str = "LK_EXPORT_E2E.ROWS_16K";
 const CROSS_JOIN_SIDE: &str = "LK_EXPORT_E2E.SIDE_20K";
-/// Every row raises when read, so an error without the read error proves the export
-/// failed before reading the source.
-const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM LK_EXPORT_E2E.SRC_ROWS)";
-const SOURCE_READ_ERROR: &str = "division by zero";
+static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
 const ALREADY_EXISTS: &str = "already exists; the export only creates new tables";
 const PROXIED_CONN: &str = "LK_EXPORT_PROXY_CREDS";
 
@@ -82,40 +81,39 @@ fn sources() {
 struct Target {
     warehouse: &'static str,
     vended: bool,
-    script_schema: &'static str,
-    connection: &'static str,
+    route: ExportRoute,
 }
 
 const STATIC: Target = Target {
     warehouse: WAREHOUSE_STATIC,
     vended: false,
-    script_schema: SCHEMA_NAME,
-    connection: CONN_STATIC,
+    route: ExportRoute {
+        script_schema: SCHEMA_NAME,
+        connection: CONN_STATIC,
+    },
 };
 
 const VENDED: Target = Target {
     warehouse: WAREHOUSE_VENDED,
     vended: true,
-    script_schema: SCHEMA_NAME,
-    connection: CONN_VENDED,
+    route: ExportRoute {
+        script_schema: SCHEMA_NAME,
+        connection: CONN_VENDED,
+    },
 };
 
 /// The static warehouse through the proxy-only scripts, so the proxy log shows each request.
 const PROXIED_STATIC: Target = Target {
-    script_schema: PROXY_ADAPTER_SCHEMA,
-    connection: PROXIED_CONN,
+    route: ExportRoute {
+        script_schema: PROXY_ADAPTER_SCHEMA,
+        connection: PROXIED_CONN,
+    },
     ..STATIC
 };
 
 impl Target {
-    /// An export of `source` into `table` with `options`. The stack serves plain HTTP, so it
-    /// sets `ALLOW_HTTP = 'true'`.
     fn export(self, source: &str, table: &str, options: &str) -> String {
-        format!(
-            "EXPORT {source} INTO SCRIPT {}.{EXPORT_SCRIPT_NAME} WITH CATALOG_CONNECTION = '{}' \
-             TABLE_NAME = '{table}' ALLOW_HTTP = 'true' {options}",
-            self.script_schema, self.connection
-        )
+        self.route.export(source, table, options)
     }
 
     /// The same target through a CONNECTION named `connection` with `password`.
@@ -125,7 +123,13 @@ impl Target {
             LAKEKEEPER_CATALOG_URI_INTERNAL,
             password,
         ));
-        Self { connection, ..self }
+        Self {
+            route: ExportRoute {
+                connection,
+                ..self.route
+            },
+            ..self
+        }
     }
 
     fn password(self) -> CatalogConnectionPassword {
@@ -136,7 +140,7 @@ impl Target {
     fn read_back(self, vs: &str, namespace: &str) {
         create_virtual_schema_with_password(
             &mut exa_conn(),
-            &VsProps::new(vs, namespace).with_catalog_conn_name(self.connection),
+            &VsProps::new(vs, namespace).with_catalog_conn_name(self.route.connection),
             LAKEKEEPER_CATALOG_URI_INTERNAL,
             &self.password(),
         );
@@ -186,22 +190,32 @@ fn proxied_static() -> Target {
     PROXIED_STATIC
 }
 
-/// The error text of a failing export, checked to carry none of `secrets`.
-#[track_caller]
-fn export_error(sql: &str, secrets: &[&str]) -> String {
-    let error = error_text(&exa_conn().try_execute(sql), sql);
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        assert!(!error.contains(secret), "a secret leaked: {error}");
-    }
-    error
-}
-
 #[track_caller]
 fn assert_names(case: &str, error: &str, fragments: &[&str]) {
     assert!(
         fragments.iter().all(|fragment| error.contains(fragment)),
         "{case}: the error must name {fragments:?}: {error}"
     );
+}
+
+/// The name and Iceberg type of each column of `metadata`'s current schema.
+fn iceberg_columns(metadata: &Value) -> Vec<(&str, &str)> {
+    let schema_id = &metadata["current-schema-id"];
+    let schema = metadata["schemas"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find(|s| &s["schema-id"] == schema_id))
+        .unwrap_or_else(|| panic!("no current schema: {metadata}"));
+    schema["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| {
+            (
+                field["name"].as_str().unwrap(),
+                field["type"].as_str().unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn snapshots(metadata: &Value) -> &[Value] {
@@ -236,23 +250,10 @@ fn export_creates_missing_namespace_and_table() {
     let metadata = STATIC
         .metadata(&table)
         .unwrap_or_else(|| panic!("the catalog must hold {table}"));
-    let schema_id = &metadata["current-schema-id"];
-    let schema = metadata["schemas"]
-        .as_array()
-        .and_then(|schemas| schemas.iter().find(|s| &s["schema-id"] == schema_id))
-        .unwrap_or_else(|| panic!("{table} has no current schema: {metadata}"));
-    let columns: Vec<(&str, &str)> = schema["fields"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|field| {
-            (
-                field["name"].as_str().unwrap(),
-                field["type"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(columns, [("ID", "decimal(9,0)"), ("LABEL", "string")]);
+    assert_eq!(
+        iceberg_columns(&metadata),
+        [("ID", "decimal(9,0)"), ("LABEL", "string")]
+    );
     let vs = "LK_EXPORT_TWO_LEVELS";
     STATIC.read_back(vs, &namespace);
     assert_holds_rows(
@@ -279,12 +280,37 @@ fn export_round_trips_every_supported_type() {
         (STATIC, "LK_EXPORT_TYPES_STATIC"),
     ] {
         let namespace = run_namespace(&vs.to_lowercase());
-        let sql = target.export(TYPES_TABLE, &format!("{namespace}.all_types"), "");
+        let table = format!("{namespace}.all_types");
+        let sql = target.export(TYPES_TABLE, &table, "");
         assert_eq!(exported_rows(&mut exa_conn(), &sql), 4, "{vs}");
+        // A round trip alone reads a wider decimal or a `timestamptz` back as equal values.
+        assert_eq!(
+            iceberg_columns(&target.metadata(&table).unwrap()),
+            TYPES_ICEBERG_COLUMNS,
+            "{vs}"
+        );
         target.read_back(vs, &namespace);
         assert_types_read_back(&mut exa_conn(), &format!("{vs}.ALL_TYPES"));
     }
 }
+
+/// The Iceberg column of each `TYPES_TABLE` column, as the export maps its Exasol type.
+const TYPES_ICEBERG_COLUMNS: [(&str, &str); 14] = [
+    ("ID", "decimal(9,0)"),
+    ("D9_0", "decimal(9,0)"),
+    ("D12_0", "decimal(12,0)"),
+    ("D18_0", "decimal(18,0)"),
+    ("D9_2", "decimal(9,2)"),
+    ("D18_2", "decimal(18,2)"),
+    ("D36_6", "decimal(36,6)"),
+    ("DBL", "double"),
+    ("FLAG", "boolean"),
+    ("TXT", "string"),
+    ("CHR", "string"),
+    ("DT", "date"),
+    ("TS", "timestamp"),
+    ("TS6", "timestamp"),
+];
 
 /// Asserts that `table` holds the rows of `TYPES_TABLE`, each matched by its ID with equal
 /// values. A MINUS would push a GROUP BY over `table`, whose DOUBLE keys travel as text that
@@ -354,7 +380,11 @@ fn export_refuses_unsupported_column_types() {
     for (index, (expression, spelling)) in cases.into_iter().enumerate() {
         let table = format!("{namespace}.t{index}");
         let source = format!("(SELECT {expression} AS C FROM DUAL)");
-        let error = export_error(&STATIC.export(&source, &table, ""), &[]);
+        let error = export_error(
+            &mut exa_conn(),
+            &STATIC.export(&source, &table, ""),
+            NO_SECRETS,
+        );
         assert!(
             refusals("C", spelling)
                 .iter()
@@ -366,7 +396,11 @@ fn export_refuses_unsupported_column_types() {
     let table = format!("{namespace}.timestamp_9");
     let source = "(SELECT CAST(TIMESTAMP '2024-01-01 00:00:00.123456789' AS TIMESTAMP(9)) AS TS9 \
                   FROM DUAL)";
-    let error = export_error(&STATIC.export(source, &table, ""), &[]);
+    let error = export_error(
+        &mut exa_conn(),
+        &STATIC.export(source, &table, ""),
+        NO_SECRETS,
+    );
     assert_names(
         "TIMESTAMP(9)",
         &error,
@@ -392,18 +426,15 @@ fn export_refuses_an_existing_table() {
     let mut error = String::new();
 
     let log = stack::proxy_log_during(|| {
-        error = export_error(&target.export(FAILING_SOURCE, &existing, ""), &[]);
+        error = assert_refused_before_reading(
+            "existing table",
+            &mut exa_conn(),
+            &target.export(&FAILING_SOURCE, &existing, ""),
+            &[&format!("table {existing} {ALREADY_EXISTS}")],
+            NO_SECRETS,
+        );
     });
 
-    assert_names(
-        "existing table",
-        &error,
-        &[&format!("table {existing} {ALREADY_EXISTS}")],
-    );
-    assert!(
-        !error.contains(SOURCE_READ_ERROR),
-        "read the source: {error}"
-    );
     assert_eq!(snapshot_ids(), before, "the table keeps its snapshots");
     let table_head = format!("/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE} HTTP");
     let requests: Vec<&str> = log
@@ -544,7 +575,10 @@ fn export_bad_catalog_connection_fails_before_reading() {
         (
             "unreachable catalog",
             Target {
-                connection: "LK_EXPORT_UNREACHABLE",
+                route: ExportRoute {
+                    connection: "LK_EXPORT_UNREACHABLE",
+                    ..STATIC.route
+                },
                 ..STATIC
             },
             unreachable.to_string(),
@@ -564,14 +598,12 @@ fn export_bad_catalog_connection_fails_before_reading() {
 
     for (case, target, address) in cases {
         let table = format!("{namespace}.t");
-        let error = export_error(
-            &target.export(FAILING_SOURCE, &table, ""),
+        assert_refused_before_reading(
+            case,
+            &mut exa_conn(),
+            &target.export(&FAILING_SOURCE, &table, ""),
+            &[&format!("the catalog {address}")],
             &[wrong_secret, &password.secret_key, &password.access_key],
-        );
-        assert_names(case, &error, &[&format!("the catalog {address}")]);
-        assert!(
-            !error.contains(SOURCE_READ_ERROR),
-            "{case}: read the source: {error}"
         );
         STATIC.assert_no_table(case, &table);
     }
@@ -591,12 +623,14 @@ fn export_wrong_storage_secret_fails_at_the_writer() {
         },
     );
 
-    for (case, options) in [
-        ("parallel", ""),
-        ("single_commit", "SINGLE_COMMIT = 'true'"),
+    // Without SINGLE_COMMIT the export creates the table before any writer runs.
+    for (case, options, snapshot_count) in [
+        ("parallel", "", Some(0)),
+        ("single_commit", "SINGLE_COMMIT = 'true'", None),
     ] {
         let table = format!("{namespace}.{case}");
         let error = export_error(
+            &mut exa_conn(),
             &target.export(SOURCE_TABLE, &table, options),
             &[wrong_key, &STATIC.password().access_key],
         );
@@ -607,16 +641,11 @@ fn export_wrong_storage_secret_fails_at_the_writer() {
                 "writing the data files of table {table} to storage failed"
             )],
         );
-        match (options.is_empty(), target.metadata(&table)) {
-            (_, None) => {}
-            (true, Some(metadata)) => {
-                assert!(
-                    snapshots(&metadata).is_empty(),
-                    "{case}: {table} holds no rows"
-                )
-            }
-            (false, Some(_)) => panic!("{case}: SINGLE_COMMIT must not create {table}"),
-        }
+        assert_eq!(
+            target.metadata(&table).map(|m| snapshots(&m).len()),
+            snapshot_count,
+            "{case}: the snapshot count of {table}, None when it does not exist"
+        );
     }
 }
 

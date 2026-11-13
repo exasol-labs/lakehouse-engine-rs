@@ -130,9 +130,8 @@ The virtual schema's owner holds both, and so does every member of a role that o
 
 A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, `SINGLE_COMMIT`, and the check for an existing table. The writer therefore treats its writer spec as untrusted input. Such a call can:
 
-- create a table anywhere the CONNECTION's catalog identity may create one,
 - carry its own `allow_http`, so it can send requests over plain HTTP without the statement's `ALLOW_HTTP`,
-- append rows to a table an export created, when its forged `export_id` equals the table's `lakehouse.export-id`.
+- append rows to any table that an earlier export created.
 
 Grant the export role only to users who may export any rows through the CONNECTION.
 

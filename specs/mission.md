@@ -57,7 +57,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 
 ### Export
 
-14. **Export into a new Iceberg table**: `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT` writes source rows into a new Iceberg table through the Iceberg REST catalog (#566).
+14. **Export into a new Iceberg table**: `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT` writes source rows into a new Iceberg table through the Iceberg REST catalog.
 
 ## Out of Scope
 

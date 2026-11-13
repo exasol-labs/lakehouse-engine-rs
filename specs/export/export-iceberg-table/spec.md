@@ -115,7 +115,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *GIVEN* a CONNECTION whose static storage keys cannot write to the catalog's storage, and a source of 1,000 rows
 * *WHEN* a user exports it
 * *THEN* the export SHALL fail with an error that names the storage as the failing side and contains no storage credential
-* *AND* with `SINGLE_COMMIT = 'true'` the export SHALL NOT create the table, and without it the table, if it exists, SHALL hold no rows
+* *AND* with `SINGLE_COMMIT = 'true'` the export SHALL NOT create the table, and without it the table SHALL exist and have no snapshots
 
 ### Scenario: A CONNECTION the export does not support is refused before any data is read
 
