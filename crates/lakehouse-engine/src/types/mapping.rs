@@ -6,7 +6,6 @@ use lakehouse_catalog::ColumnSourceType;
 
 use super::exasol_type::{Decimal, ExasolType, MAX_VARCHAR_SIZE};
 use super::hive_type::parse_hive_type;
-use crate::scan::emit::emitted_unit;
 use vs_expression::timestamp::TimestampUnit;
 
 /// Returns `VARCHAR(2000000)` for every incompatible Arrow type rather than erroring;
@@ -103,6 +102,11 @@ pub(crate) fn arrow_time_unit(unit: TimestampUnit) -> TimeUnit {
         TimestampUnit::Microsecond => TimeUnit::Microsecond,
         TimestampUnit::Nanosecond => TimeUnit::Nanosecond,
     }
+}
+
+/// No emit path feeds Arrow's `Second` unit, so a timestamp held in seconds emits in milliseconds.
+pub(crate) fn emitted_unit(unit: TimestampUnit) -> TimestampUnit {
+    unit.max(TimestampUnit::Millisecond)
 }
 
 pub(crate) fn timestamp_unit(unit: TimeUnit) -> TimestampUnit {

@@ -535,3 +535,33 @@ fn a_nanosecond_date_addition_outside_the_arrow_range_fails_in_the_scan() {
         );
     }
 }
+
+/// Scenario: A timestamp filter compares at full precision
+#[test]
+fn a_derived_timestamp_operand_compares_with_a_finer_literal_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = qualified_probe();
+
+    // Every literal spells more digits than its operand's precision, so each case is floored.
+    let filters = [
+        "COALESCE(TS, TIMESTAMP '2000-01-01 00:00:00') < TIMESTAMP '2024-01-01 00:00:00.1234565'",
+        "GREATEST(TS, TIMESTAMP '2000-01-01 00:00:00.1') = TIMESTAMP '2024-01-01 00:00:00.1234561'",
+        "LEAST(TS, TIMESTAMP '2099-01-01 00:00:00') BETWEEN TIMESTAMP '2024-01-01 00:00:00.0000015' AND TIMESTAMP '2024-01-01 00:00:00.1234565'",
+        "CASE WHEN ID > 0 THEN TS END >= TIMESTAMP '2024-01-01 00:00:00.0000015'",
+        "NULLIF(TS, TIMESTAMP '2024-01-01 00:00:00.000001') > TIMESTAMP '2024-01-01 00:00:00.0000015'",
+        "DATE_TRUNC('second', TS) <> TIMESTAMP '2024-01-01 00:00:00.0000005'",
+        "CAST(TS AS DATE) < TIMESTAMP '2024-01-01 00:00:00.5'",
+    ];
+    assert_filters_match_native_copy(&mut conn, &table, "TS", &filters);
+    for filter in filters {
+        let pushed = isolated_pushdown_statement(
+            &mut conn,
+            &format!("SELECT ID FROM {table} WHERE {filter}"),
+        );
+        assert!(
+            pushed.contains(SCAN_SCRIPT_NAME) && pushed.contains("\"filter\":\""),
+            "{filter} must stay in the scan's WHERE clause: {pushed}"
+        );
+    }
+}

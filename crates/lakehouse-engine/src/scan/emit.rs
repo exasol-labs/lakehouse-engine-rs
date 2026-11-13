@@ -4,7 +4,7 @@ use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
 use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
-use crate::types::mapping::arrow_time_unit;
+use crate::types::mapping::{arrow_time_unit, emitted_unit};
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
@@ -215,11 +215,6 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
         ),
         _ => DataType::Utf8,
     })
-}
-
-/// No emit path feeds Arrow's `Second` unit, so a timestamp held in seconds emits in milliseconds.
-pub(crate) fn emitted_unit(unit: TimestampUnit) -> TimestampUnit {
-    unit.max(TimestampUnit::Millisecond)
 }
 
 /// A pair outside Exasol's DECIMAL domain is drift: fail rather than put text into a numeric column.
