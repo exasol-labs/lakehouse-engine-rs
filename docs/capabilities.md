@@ -36,6 +36,8 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 
 A filter prunes files at plan time only where it compares a bare column with a literal: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS [NOT] NULL`, and `LIKE` with a literal prefix, combined by `AND`, `OR`, and `NOT`. Exasol folds constant expressions such as `TO_DATE('01.11.2026', 'DD.MM.YYYY')` into literals first. A function over the column (`YEAR(d) = 2026`, `CAST(d AS VARCHAR) LIKE '2026%'`) or a comparison of two columns prunes nothing, so write a range instead: `d >= DATE '2026-01-01' AND d < DATE '2027-01-01'`.
 
+A `LIKE` without `ESCAPE` prunes with `\` as its escape character, Exasol's default `DEFAULT_LIKE_ESCAPE_CHARACTER`, so `name LIKE 'x\_%'` prunes by the prefix `x_`. A session that sets another default gets different rows, see [Semantic differences](semantic-differences.md#like-under-a-changed-default_like_escape_character).
+
 A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32-bit `float` column, `amount = 1.555` on a `decimal(10,2)` column, and a timestamp literal finer than the column's unit prune nothing, and still return the correct rows.
 
 | Format | Prunes by |

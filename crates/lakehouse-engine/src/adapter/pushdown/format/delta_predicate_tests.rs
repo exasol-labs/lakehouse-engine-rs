@@ -69,7 +69,6 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
     }
 }
 
-/// Scenario: A not-equal comparison prunes
 #[test]
 fn notequal_translates() {
     let node = compare("predicate_notequal", col("ID"), num_lit(5));
@@ -328,30 +327,6 @@ fn or_over_an_empty_expression_list_returns_none() {
 }
 
 #[test]
-fn empty_and_fold_returns_none_rather_than_the_kernel_true_identity() {
-    assert_eq!(Predicate::and_from([]), Predicate::literal(true));
-
-    assert_eq!(fold_and(std::iter::empty(), Predicate::and_from), None);
-}
-
-#[test]
-fn empty_or_fold_returns_none_rather_than_the_kernel_false_identity() {
-    assert_eq!(Predicate::or_from([]), Predicate::literal(false));
-
-    assert_eq!(fold_or(std::iter::empty(), Predicate::or_from), None);
-}
-
-#[test]
-fn fold_and_over_only_untranslatable_children_returns_none() {
-    assert_eq!(fold_and([None, None], Predicate::and_from), None);
-}
-
-#[test]
-fn fold_or_over_only_untranslatable_children_returns_none() {
-    assert_eq!(fold_or([None, None], Predicate::or_from), None);
-}
-
-#[test]
 fn in_list_translates_to_an_or_chain_of_equalities() {
     let node = in_list(col("ID"), [num_lit(1), num_lit(2), num_lit(3)]);
     let pred = translate(&node).expect("an IN list of translatable literals must translate");
@@ -468,7 +443,6 @@ fn on_s(compare: fn(Expression, Expression) -> Predicate, value: &str) -> Predic
     )
 }
 
-/// Scenario: A LIKE pattern prunes by its literal prefix
 #[test]
 fn a_like_prefix_prunes_as_the_range_up_to_its_successor() {
     let range = Predicate::and_from([on_s(Predicate::ge, "ab"), on_s(Predicate::lt, "ac")]);
@@ -486,9 +460,14 @@ fn a_like_prefix_prunes_as_the_range_up_to_its_successor() {
         translate_on_text(&like(col("S"), "abc")),
         Some(on_s(Predicate::eq, "abc"))
     );
+    let last = "\u{10FFFF}";
+    assert_eq!(
+        translate_on_text(&not(like(col("S"), &format!("{last}%")))),
+        Some(Predicate::not(on_s(Predicate::ge, last))),
+        "a prefix without a successor is the exact lower bound alone"
+    );
 }
 
-/// Scenario: A LIKE pattern prunes by its literal prefix
 #[test]
 fn a_like_with_a_wildcard_after_its_prefix_never_prunes_by_its_negation() {
     let range = Predicate::and_from([on_s(Predicate::ge, "ab"), on_s(Predicate::lt, "ac")]);

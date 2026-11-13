@@ -5,11 +5,9 @@ use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField};
 use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
-use super::filter_json::{
-    Comparison, LikeBound, Translated, between_operands, comparison_operands, fold_and, fold_or,
-    in_operands, like_operands, operands, subject_column,
-};
-use super::literal::exact_literal;
+use super::filter_json::Comparison;
+use super::literal::{UTC, exact_literal};
+use super::pruning_translation::{PruningTarget, translate};
 
 /// Each declared column's name paired with the current snapshot field its binding key names.
 type FilterColumns<'s> = [(&'s str, &'s StructField)];
@@ -19,48 +17,94 @@ type FilterColumns<'s> = [(&'s str, &'s StructField)];
 /// its declared name and emitted under its field's current name; one missing from `columns`
 /// constrains nothing.
 pub(crate) fn to_delta_predicate(filter_json: &Json, columns: &FilterColumns) -> Option<Predicate> {
-    translate_node(filter_json, columns).map(|translated| translated.predicate)
+    translate(filter_json, &DeltaTarget { columns }).map(|translated| translated.predicate)
 }
 
-fn translate_node(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
-    let kind = node.get("type")?.as_str()?;
-    if let Some(comparison) = Comparison::from_node_type(kind) {
-        return translate_comparison(node, comparison, columns);
+struct DeltaTarget<'c, 's> {
+    columns: &'c FilterColumns<'s>,
+}
+
+impl<'s> PruningTarget for DeltaTarget<'_, 's> {
+    type Predicate = Predicate;
+    type Column = (&'s str, &'s PrimitiveType);
+    type Literal = Scalar;
+
+    fn resolve(&self, column: &str) -> Option<Self::Column> {
+        resolve_column(column, self.columns)
     }
 
-    match kind {
-        "predicate_in_constlist" => translate_in(node, columns),
-        "predicate_is_null" => {
-            let (field_name, _) = resolve_column(subject_column(node)?, columns)?;
-            Some(Translated::exact(Predicate::is_null(Expression::column([
-                field_name,
-            ]))))
+    fn literal(&self, (_, primitive): Self::Column, literal: &Json) -> Option<Scalar> {
+        literal_to_scalar(literal, primitive)
+    }
+
+    fn is_string(&self, (_, primitive): Self::Column) -> bool {
+        *primitive == PrimitiveType::String
+    }
+
+    fn string(&self, value: String) -> Scalar {
+        Scalar::String(value)
+    }
+
+    fn compare(
+        &self,
+        (name, _): Self::Column,
+        comparison: Comparison,
+        scalar: Scalar,
+    ) -> Predicate {
+        let compare: fn(Expression, Expression) -> Predicate = match comparison {
+            Comparison::Equal => Predicate::eq,
+            Comparison::NotEqual => Predicate::ne,
+            Comparison::Less => Predicate::lt,
+            Comparison::LessEqual => Predicate::le,
+            Comparison::Greater => Predicate::gt,
+            Comparison::GreaterEqual => Predicate::ge,
+        };
+        compare(Expression::column([name]), Expression::literal(scalar))
+    }
+
+    fn null_test(&self, (name, _): Self::Column, is_null: bool) -> Predicate {
+        let column = Expression::column([name]);
+        if is_null {
+            Predicate::is_null(column)
+        } else {
+            Predicate::is_not_null(column)
         }
-        "predicate_is_not_null" => {
-            let (field_name, _) = resolve_column(subject_column(node)?, columns)?;
-            Some(Translated::exact(Predicate::is_not_null(
-                Expression::column([field_name]),
-            )))
+    }
+
+    /// Desugared into ORed equalities because the kernel prunes nothing for a native IN.
+    fn in_list(&self, column: Self::Column, scalars: Vec<Scalar>) -> Predicate {
+        Predicate::or_from(
+            scalars
+                .into_iter()
+                .map(|scalar| self.compare(column, Comparison::Equal, scalar)),
+        )
+    }
+
+    /// The kernel has no prefix predicate, so a prefix becomes the range from it to its successor.
+    /// A prefix of only the last code point has none, and every string above it starts with it.
+    fn starts_with(&self, column: Self::Column, prefix: String) -> Predicate {
+        let upper = successor(&prefix);
+        let lower = self.compare(column, Comparison::GreaterEqual, Scalar::String(prefix));
+        match upper {
+            Some(upper) => Predicate::and_from([
+                lower,
+                self.compare(column, Comparison::Less, Scalar::String(upper)),
+            ]),
+            None => lower,
         }
-        // An empty junction is never built: `and_from([])` is `true` and `or_from([])` is `false`.
-        "predicate_and" => fold_and(
-            operands(node)?
-                .iter()
-                .map(|expr| translate_node(expr, columns)),
-            Predicate::and_from,
-        ),
-        "predicate_or" => fold_or(
-            operands(node)?
-                .iter()
-                .map(|expr| translate_node(expr, columns)),
-            Predicate::or_from,
-        ),
-        "predicate_not" => {
-            translate_node(node.get("expression")?, columns)?.negated(Predicate::not)
-        }
-        "predicate_between" => translate_between(node, columns),
-        "predicate_like" => translate_like(node, columns),
-        _ => None,
+    }
+
+    // The walk never builds an empty junction: `and_from([])` is `true`, `or_from([])` `false`.
+    fn and(predicates: Vec<Predicate>) -> Predicate {
+        Predicate::and_from(predicates)
+    }
+
+    fn or(predicates: Vec<Predicate>) -> Predicate {
+        Predicate::or_from(predicates)
+    }
+
+    fn not(predicate: Predicate) -> Predicate {
+        Predicate::not(predicate)
     }
 }
 
@@ -93,7 +137,7 @@ fn arrow_type(primitive: &PrimitiveType) -> Option<ArrowType> {
         PrimitiveType::String => ArrowType::Utf8,
         PrimitiveType::Binary => ArrowType::Binary,
         PrimitiveType::Date => ArrowType::Date32,
-        PrimitiveType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        PrimitiveType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
         PrimitiveType::TimestampNtz => ArrowType::Timestamp(TimeUnit::Microsecond, None),
         _ => return None,
     })
@@ -119,92 +163,6 @@ fn literal_to_scalar(literal: &Json, primitive: &PrimitiveType) -> Option<Scalar
         ScalarValue::TimestampMicrosecond(Some(micros), None) => Scalar::TimestampNtz(micros),
         _ => return None,
     })
-}
-
-fn translate_comparison(
-    node: &Json,
-    comparison: Comparison,
-    columns: &FilterColumns,
-) -> Option<Translated<Predicate>> {
-    let (col_name, lit_node, comparison) = comparison_operands(node, comparison)?;
-    let (field_name, prim) = resolve_column(col_name, columns)?;
-    let scalar = literal_to_scalar(lit_node, prim)?;
-    let column = Expression::column([field_name]);
-    let literal = Expression::literal(scalar);
-
-    let predicate = match comparison {
-        Comparison::Equal => Predicate::eq(column, literal),
-        Comparison::NotEqual => Predicate::ne(column, literal),
-        Comparison::Less => Predicate::lt(column, literal),
-        Comparison::LessEqual => Predicate::le(column, literal),
-        Comparison::Greater => Predicate::gt(column, literal),
-        Comparison::GreaterEqual => Predicate::ge(column, literal),
-    };
-    Some(Translated::exact(predicate))
-}
-
-/// Desugared into ORed equalities because the kernel prunes nothing for a native IN.
-fn translate_in(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
-    let (col_name, args) = in_operands(node)?;
-    let (field_name, prim) = resolve_column(col_name, columns)?;
-    fold_or(
-        args.iter().map(|arg| {
-            let scalar = literal_to_scalar(arg, prim)?;
-            Some(Translated::exact(Predicate::eq(
-                Expression::column([field_name]),
-                Expression::literal(scalar),
-            )))
-        }),
-        Predicate::or_from,
-    )
-}
-
-/// Either bound alone is implied by BETWEEN, so an untranslatable bound is dropped.
-fn translate_between(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
-    let (col_name, low, high) = between_operands(node)?;
-    let (field_name, prim) = resolve_column(col_name, columns)?;
-    let bound = |literal: Option<&Json>, compare: fn(Expression, Expression) -> Predicate| {
-        let scalar = literal_to_scalar(literal?, prim)?;
-        Some(Translated::exact(compare(
-            Expression::column([field_name]),
-            Expression::literal(scalar),
-        )))
-    };
-    fold_and(
-        [bound(low, Predicate::ge), bound(high, Predicate::le)],
-        Predicate::and_from,
-    )
-}
-
-/// The kernel has no prefix predicate, so a prefix becomes the range from it to its successor.
-fn translate_like(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
-    let (col_name, pattern) = like_operands(node)?;
-    let (field_name, prim) = resolve_column(col_name, columns)?;
-    (*prim == PrimitiveType::String).then_some(())?;
-    let compare = |compare: fn(Expression, Expression) -> Predicate, value: String| {
-        compare(
-            Expression::column([field_name]),
-            Expression::literal(Scalar::String(value)),
-        )
-    };
-    match pattern.bound()? {
-        LikeBound::Equal(value) => Some(Translated::exact(compare(Predicate::eq, value))),
-        LikeBound::Prefix { prefix, exact } => {
-            let upper = successor(&prefix);
-            let below = upper.map(|upper| Translated::exact(compare(Predicate::lt, upper)));
-            let range = fold_and(
-                [
-                    Some(Translated::exact(compare(Predicate::ge, prefix))),
-                    below,
-                ],
-                Predicate::and_from,
-            )?;
-            Some(Translated {
-                exact: exact && range.exact,
-                ..range
-            })
-        }
-    }
 }
 
 /// The least string above every string starting with `prefix`, in code point order.

@@ -80,7 +80,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 ### Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 
 * *GIVEN* a virtual schema over a partitioned Iceberg table whose files hold rows on both sides of the comparison `k < 30`
-* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE 'x%')`, with the conjuncts in either order
+* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE '%a')`, with the conjuncts in either order
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter MUST NOT prune by the negation of the partly translated conjunction, and every file that holds a row the `NOT` matches SHALL be scanned
 * *AND* the query SHALL return the rows and the `COUNT(*)` that native Exasol returns for the same predicate over the same rows, and MUST NOT answer with the empty result
@@ -95,7 +95,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 ### Scenario: Pruning keeps every file with a matching row for every filter shape
 
 * *GIVEN* a partitioned Iceberg table whose files differ in partition value, per-file bounds, per-row-group bounds, per-page bounds, and NULL content, and a native Exasol table that holds the same rows
-* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on a partition column, a statistics-only column, and both, with a `LIKE`, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
+* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on a partition column, a statistics-only column, and both, with a `LIKE` that starts with a wildcard, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
 * *THEN* each query SHALL return the native table's rows, and the scanned files SHALL include every file that holds a matching row
 * *AND* for a fully translated predicate, the scanned files SHALL be exactly the files Iceberg's inclusive evaluation keeps, so a change that turns pruning off fails, while a partly translated predicate SHALL be held only to keeping every file with a matching row
 * *AND* a query that scans no file SHALL take the empty-result route, and every other query SHALL apply its predicate in the scan or in the adapter's outer `WHERE`, never drop it

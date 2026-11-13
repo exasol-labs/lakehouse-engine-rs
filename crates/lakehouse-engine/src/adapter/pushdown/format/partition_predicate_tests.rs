@@ -1,8 +1,8 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null, like,
-    lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal, scalar_fn, str_lit,
-    timestamp_lit,
+    like_escape, lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal,
+    scalar_fn, str_lit, timestamp_lit,
 };
 use arrow::datatypes::TimeUnit;
 use serde_json::json;
@@ -331,15 +331,9 @@ fn two_files(key: &str, first: &str, second: &str) -> [FileValues; 2] {
     [file_with(key, Some(first)), file_with(key, Some(second))]
 }
 
-/// Scenario: A LIKE pattern prunes by its literal prefix
 #[test]
 fn a_like_evaluates_exactly_against_each_partition_value() {
     let files = year_files();
-    let escaped = |pattern: &str| {
-        let mut node = like(sales_col("YEAR"), pattern);
-        node["escapeChar"] = str_lit("!");
-        node
-    };
     let cases = [
         (
             "a prefix",
@@ -358,8 +352,13 @@ fn a_like_evaluates_exactly_against_each_partition_value() {
         ),
         (
             "an escaped wildcard",
-            escaped("202!_"),
+            like_escape(sales_col("YEAR"), "202!_", "!"),
             [false, false, false],
+        ),
+        (
+            "a plain LIKE escaping with the default backslash",
+            like(sales_col("YEAR"), r"202\5"),
+            [false, true, false],
         ),
     ];
     for (label, filter, expected) in cases {

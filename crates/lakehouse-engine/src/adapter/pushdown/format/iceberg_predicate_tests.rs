@@ -326,7 +326,6 @@ fn type_mismatch_returns_none() {
     assert!(translate(&node).is_none(), "type mismatch must be None");
 }
 
-/// Scenario: A not-equal comparison prunes
 #[test]
 fn notequal_translates() {
     let node = compare("predicate_notequal", col("ID"), num_lit(5));
@@ -336,7 +335,6 @@ fn notequal_translates() {
     );
 }
 
-/// Scenario: A LIKE pattern prunes by its literal prefix
 #[test]
 fn a_like_prefix_prunes_with_starts_with_and_negates_only_when_exact() {
     let starts_with = Reference::new("name").starts_with(Datum::string("ab"));

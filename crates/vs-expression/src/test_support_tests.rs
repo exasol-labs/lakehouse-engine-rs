@@ -154,6 +154,13 @@ pub fn like(expression: Json, pattern: &str) -> Json {
     )
 }
 
+/// A `LIKE ... ESCAPE`, whose escape Exasol sends as a string literal under `escapeChar`.
+pub fn like_escape(expression: Json, pattern: &str, escape: &str) -> Json {
+    let mut node = like(expression, pattern);
+    node["escapeChar"] = str_lit(escape);
+    node
+}
+
 pub fn scalar_fn(name: &str, arguments: impl IntoIterator<Item = Json>) -> Json {
     node(
         "function_scalar",

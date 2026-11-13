@@ -189,6 +189,10 @@ pub(super) enum LikeBound {
     Prefix { prefix: String, exact: bool },
 }
 
+/// Exasol sends `escapeChar` only for an explicit `ESCAPE`. A plain `LIKE` takes the session's
+/// `DEFAULT_LIKE_ESCAPE_CHARACTER`, which the adapter cannot read, so it assumes the default.
+const DEFAULT_LIKE_ESCAPE: char = '\\';
+
 /// The column and pattern of a `LIKE` over a bare column and a string pattern.
 pub(super) fn like_operands(node: &Json) -> Option<(&str, LikePattern)> {
     fn string(literal: &Json) -> Option<&str> {
@@ -196,11 +200,11 @@ pub(super) fn like_operands(node: &Json) -> Option<(&str, LikePattern)> {
         literal.get("value")?.as_str()
     }
     let escape = match node.get("escapeChar") {
-        None => None,
+        None => DEFAULT_LIKE_ESCAPE,
         Some(escape) => {
             let mut chars = string(escape)?.chars();
             let escape = chars.next()?;
-            chars.next().is_none().then_some(Some(escape))?
+            chars.next().is_none().then_some(escape)?
         }
     };
     let pattern = LikePattern::parse(string(node.get("pattern")?)?, escape)?;
@@ -208,12 +212,12 @@ pub(super) fn like_operands(node: &Json) -> Option<(&str, LikePattern)> {
 }
 
 impl LikePattern {
-    fn parse(pattern: &str, escape: Option<char>) -> Option<Self> {
+    fn parse(pattern: &str, escape: char) -> Option<Self> {
         let mut chars = pattern.chars();
         let mut tokens = Vec::new();
         while let Some(c) = chars.next() {
             tokens.push(match c {
-                c if Some(c) == escape => LikeToken::Char(chars.next()?),
+                c if c == escape => LikeToken::Char(chars.next()?),
                 '%' => LikeToken::AnyMany,
                 '_' => LikeToken::AnyOne,
                 c => LikeToken::Char(c),

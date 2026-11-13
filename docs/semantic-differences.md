@@ -144,3 +144,9 @@ When `EXCLUDED_CAPABILITIES` lists `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDE
 ```sql
 ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'LIMIT, LIMIT_WITH_OFFSET, ORDER_BY_COLUMN, ORDER_BY_EXPRESSION';
 ```
+
+## LIKE under a changed DEFAULT_LIKE_ESCAPE_CHARACTER
+
+A `LIKE` without `ESCAPE` uses the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, which is `\` unless `ALTER SESSION` or `ALTER SYSTEM` changes it. Exasol does not send that setting to the adapter, so the scan and file pruning always escape with `\`. After `ALTER SESSION SET DEFAULT_LIKE_ESCAPE_CHARACTER = '!'`, `WHERE name LIKE 'x!_%'` matches `x_1` natively but not through the virtual schema.
+
+**Workaround:** write the escape explicitly. `WHERE name LIKE 'x!_%' ESCAPE '!'` returns the native rows under any session default.

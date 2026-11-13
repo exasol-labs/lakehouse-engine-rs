@@ -13,7 +13,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * `stats` is optional per file (Delta protocol "Add File and Remove File"), so a file without statistics is always kept.
 * `delta_kernel` cannot prune on `BinaryPredicateOp::In`, because `eval_pred_in` returns `None`. An IN list becomes an OR-chain of equalities. `Predicate::or_from([])` returns `false`, which would prune every file, so an IN list with no translatable element produces no constraint.
 * `delta_kernel::Predicate` has no `negate()`. Negation is `Predicate::not(pred)`.
-* `Scalar::Timestamp` and `Scalar::TimestampNtz` hold microseconds since the epoch and `Scalar::Date` holds days. A `Scalar::String` compares against no timestamp bound and prunes nothing.
+* `Scalar::Timestamp` and `Scalar::TimestampNtz` hold microseconds since the epoch and `Scalar::Date` holds days.
 * `Expression::column` takes a path iterator, so a flat column is `Expression::column(["NAME"])`.
 * Exasol delivers upper-cased column names and Delta's `StructType::field` is case-sensitive. The translator resolves a request column through its declared binding key, recorded at `createVirtualSchema` in the column notes (`vs-adapter/column-source-notes`). It finds the note by the uppercase fold, then the current snapshot field with the note's physical name (`name` mode) or field id (`id` mode), and emits that field's current logical name. Under `none` mode it resolves the declared name case-insensitively. A column whose key the snapshot no longer carries yields no constraint.
 * Under column mapping (`name` or `id` mode) the kernel maps the logical column name to the physical statistics path itself, so the translator emits logical names as `snapshot.schema()` reports them.
@@ -82,7 +82,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * *WHEN* the translator converts each request literal against the resolved column's own Delta type
 * *THEN* each literal SHALL become the `Scalar` variant matching that column's type, and a literal whose request type cannot represent that column's type SHALL yield NO predicate for its node rather than a coerced or reinterpreted value
 * *AND* a timestamp literal SHALL be parsed into MICROSECONDS since the epoch and a date literal into DAYS, through the shared converter of `file-planning/pruning-predicate-translation`, and MUST NOT be handed to the kernel as a string scalar, which compares against no timestamp bound and silently prunes nothing
-* *AND* an empty-string literal SHALL yield no predicate for its node, because the kernel's parser answers a null scalar for it and a null is not a constraint
+* *AND* an empty-string literal SHALL yield no predicate for its node, because Exasol reads `''` as NULL and a null is not a constraint
 * *AND* a column the table's schema does not declare SHALL yield no predicate for its node, resolved case-insensitively against the schema so an Exasol-upper-cased name still reaches its declared field
 * *AND* a column whose Delta type is not a primitive SHALL yield no predicate for its node
 
@@ -125,7 +125,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 ### Scenario: Delta pruning keeps every file with a matching row for every filter shape
 
 * *GIVEN* a virtual schema over a partitioned Delta table whose files differ in partition value, per-file statistics, per-row-group bounds, per-page bounds, and NULL content, including a NULL partition value and a file whose statistics-only column is NULL in every row, and a native Exasol table that holds the same rows
-* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on the partition column, the statistics-only column, and both, with a `LIKE`, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
+* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on the partition column, the statistics-only column, and both, with a `LIKE` that starts with a wildcard, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
 * *THEN* each query SHALL return the native table's rows, and the scanned files SHALL include every file that holds a matching row
 * *AND* a `NOT` over a partly translated predicate (`file-planning/pushdown-file-pruning`) MUST NOT prune by its negation, while for a fully translated predicate the scanned files SHALL be exactly the files the kernel's partition and statistics evaluation keeps, so a change that turns pruning off fails
 * *AND* a query that scans no file SHALL take the empty-result route, and every other query SHALL apply its predicate in the scan or in the adapter's outer `WHERE`, never drop it

@@ -230,17 +230,43 @@ fn renders_like_without_escape() {
 }
 
 #[test]
-fn renders_like_with_escape() {
-    let expr = json!({
-        "type": "predicate_like",
-        "expression": col("name"),
-        "pattern": str_lit("A!%"),
-        "escape_char": "!"
-    });
-    let sql = render_expression(&expr).unwrap();
-    assert!(sql.contains("LIKE"), "LIKE not found: {sql}");
-    assert!(sql.contains("ESCAPE"), "ESCAPE not found: {sql}");
-    assert!(sql.contains("'!'"), "escape char not found: {sql}");
+fn renders_like_escape_in_the_exasol_dialect_as_sent() {
+    assert_eq!(
+        render_expression_exasol(&like_escape(col("name"), "A!%", "!")),
+        r#"("NAME" LIKE 'A!%' ESCAPE '!')"#
+    );
+}
+
+/// DataFusion's LIKE takes only `\` as its escape, so another escape is rewritten to it.
+#[test]
+fn renders_like_escape_in_the_datafusion_dialect_as_a_backslash_pattern() {
+    let cases = [
+        ("A!%", "!", r"A\%"),
+        ("A!_b%", "!", r"A\_b%"),
+        ("xaa", "a", r"x\a"),
+        (r"a\b!%", "!", r"a\\b\%"),
+        (r"a\%", r"\", r"a\%"),
+    ];
+    for (pattern, escape, rewritten) in cases {
+        assert_eq!(
+            render_expression(&like_escape(col("name"), pattern, escape)).unwrap(),
+            format!(r#"("NAME" LIKE '{rewritten}')"#),
+            "{pattern} ESCAPE {escape}"
+        );
+    }
+}
+
+#[test]
+fn a_like_escape_the_datafusion_dialect_cannot_rewrite_declines() {
+    for (pattern, escape) in [("A!", "!"), ("A%", "!!")] {
+        assert!(
+            render_expression(&like_escape(col("name"), pattern, escape)).is_err(),
+            "{pattern} ESCAPE {escape}"
+        );
+    }
+    let mut column_pattern = like_escape(col("name"), "A%", "!");
+    column_pattern["pattern"] = col("other");
+    assert!(render_expression(&column_pattern).is_err());
 }
 
 #[test]

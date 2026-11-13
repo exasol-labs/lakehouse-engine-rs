@@ -419,13 +419,42 @@ const CASES: &[Case] = &[
     Case::new("S LIKE 'x!_%' ESCAPE '!'", Scan)
         .iceberg(&[])
         .delta(&[]),
+    // An escaped ordinary character is itself, so these match rows only if the escape applies.
+    Case::new("S LIKE 'xaa' ESCAPE 'a'", Scan)
+        .iceberg(&["a1", "a2", "b1"])
+        .delta(&["a1", "a2", "b1"]),
+    Case::new("P LIKE 'aa%' ESCAPE 'a'", Scan)
+        .iceberg(&["a1", "a2"])
+        .hive(&["a1", "a2"])
+        .delta(&["a1", "a2"]),
+    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", OuterWhere)
+        .iceberg(&["a1", "a2", "b1"])
+        .delta(&["a1", "a2", "b1"]),
+    // A plain LIKE escapes with Exasol's default `\`, though Exasol sends no `escapeChar`.
+    Case::new(r"S LIKE 'x\a%'", Scan)
+        .iceberg(&["a1", "a2", "b1"])
+        .delta(&["a1", "a2", "b1"]),
+    Case::new(r"P LIKE '\a'", Scan)
+        .iceberg(&["a1", "a2"])
+        .hive(&["a1", "a2"])
+        .delta(&["a1", "a2"]),
     Case::new("NOT (S LIKE 'x_')", Scan),
-    Case::new("NOT (K < 30 AND S LIKE 'x%')", Scan).counted(),
-    Case::new("NOT (S LIKE 'x%' AND K < 30)", Scan).counted(),
+    Case::new("NOT (K < 30 AND S LIKE 'x%')", Scan)
+        .counted()
+        .iceberg(ALL_FILES)
+        .delta(ALL_FILES),
+    Case::new("NOT (S LIKE 'x%' AND K < 30)", Scan)
+        .counted()
+        .iceberg(ALL_FILES)
+        .delta(ALL_FILES),
+    Case::new("NOT (K < 30 AND S LIKE '%a')", Scan).counted(),
+    Case::new("NOT (S LIKE '%a' AND K < 30)", Scan).counted(),
     Case::new("NOT (P = 'a' AND ABS(X) > 0.1)", Scan).counted(),
     Case::new("NOT (SECOND(TS, 3) > 1 AND P = 'b')", OuterWhere).counted(),
     Case::new("NOT (K < 30 AND SECOND(TS, 3) > 1)", OuterWhere).counted(),
-    Case::new("NOT ((K < 30 OR P = 'a') AND S LIKE 'x%')", Scan),
+    Case::new("NOT ((K < 30 OR P = 'a') AND S LIKE 'x%')", Scan)
+        .iceberg(ALL_FILES)
+        .delta(ALL_FILES),
     Case::new("NOT (K >= 10 AND K <= 20)", Scan)
         .iceberg(&["a2", "b1", "n1", "n2"])
         .delta(&["a2", "b1", "n1", "n2"]),

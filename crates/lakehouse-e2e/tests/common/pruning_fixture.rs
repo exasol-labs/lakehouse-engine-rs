@@ -253,6 +253,24 @@ pub fn tz_micros(k: i64) -> i64 {
     BASE_TS_MICROS + k * 60_000_000
 }
 
+/// A scale-2 decimal as SQL and the Delta statistics write it.
+pub fn d_text(unscaled: i128) -> String {
+    let sign = if unscaled < 0 { "-" } else { "" };
+    let magnitude = unscaled.unsigned_abs();
+    format!("{sign}{}.{:02}", magnitude / 100, magnitude % 100)
+}
+
+pub fn day(days: i32) -> chrono::NaiveDate {
+    chrono::DateTime::UNIX_EPOCH
+        .date_naive()
+        .checked_add_signed(chrono::TimeDelta::days(days.into()))
+        .expect("fixture date is a valid day")
+}
+
+pub fn instant(micros: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(micros).expect("fixture timestamp is a valid instant")
+}
+
 pub fn decimal_unscaled(text: &str) -> i128 {
     text.replace('.', "")
         .parse()
@@ -291,11 +309,8 @@ pub fn pruning_relative_path(file: &PruningFile) -> String {
     )
 }
 
-pub fn hive_object_uri(file: &PruningFile) -> String {
-    format!(
-        "{PRUNING_HIVE_BASE}{PRUNING_TABLE}/{}",
-        pruning_relative_path(file)
-    )
+pub fn hive_object_uri(base: &str, file: &PruningFile) -> String {
+    format!("{base}{PRUNING_TABLE}/{}", pruning_relative_path(file))
 }
 
 /// Omits the partition columns, whose values the Hive path and the Delta log carry, so every
@@ -314,13 +329,9 @@ pub fn pruning_data_file(file: &PruningFile) -> Bytes {
 
 /// Drops the table root first, so no file of an earlier layout stays listed.
 pub fn write_pruning_hive_copy(base: &str) {
-    let root = format!("{base}{PRUNING_TABLE}");
-    delete_fixture_prefix(&root);
+    delete_fixture_prefix(&format!("{base}{PRUNING_TABLE}"));
     for file in &PRUNING_FILES {
-        put_fixture_object(
-            &format!("{root}/{}", pruning_relative_path(file)),
-            pruning_data_file(file),
-        );
+        put_fixture_object(&hive_object_uri(base, file), pruning_data_file(file));
     }
 }
 
@@ -347,17 +358,8 @@ pub fn oracle_statements() -> [String; 3] {
 
 fn oracle_values(file: &PruningFile, r: &PruningRow) -> String {
     let timestamp = |micros: i64| {
-        chrono::DateTime::from_timestamp_micros(micros)
-            .expect("fixture timestamp is a valid instant")
+        instant(micros)
             .format("TIMESTAMP '%Y-%m-%d %H:%M:%S%.3f'")
-            .to_string()
-    };
-    let date = |days: i32| {
-        chrono::DateTime::UNIX_EPOCH
-            .date_naive()
-            .checked_add_signed(chrono::TimeDelta::days(days.into()))
-            .expect("fixture date is a valid day")
-            .format("DATE '%Y-%m-%d'")
             .to_string()
     };
     let values = [
@@ -368,9 +370,9 @@ fn oracle_values(file: &PruningFile, r: &PruningRow) -> String {
         r.x.map(|x| format!("{x:?}")),
         r.ts_millis.map(|millis| timestamp(ts_micros(millis))),
         file.typed_partition.map(str::to_string),
-        r.k.map(|k| format!("{}.{:02}", k, d_unscaled(k) % 100)),
+        r.k.map(|k| d_text(d_unscaled(k))),
         r.k.map(|k| format!("{:?}", f64::from(f_value(k)))),
-        r.k.map(|k| date(dt_days(k))),
+        r.k.map(|k| day(dt_days(k)).format("DATE '%Y-%m-%d'").to_string()),
         r.k.map(|k| timestamp(tz_micros(k))),
         Some(sql_string(file.label)),
     ]

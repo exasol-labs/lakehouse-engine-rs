@@ -6,7 +6,7 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 
 * Each path translates a comparison of a bare column with a literal (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, and `LIKE`, combined by `AND`, `OR`, and `NOT`. A function over the column, or a column compared with a column, constrains nothing.
 * Exasol folds a constant `TO_DATE`, `TO_TIMESTAMP`, `CAST`, or `||` into a literal before it sends the pushdown request, and sends `''` as `literal_null`. A filter on an Iceberg `timestamptz` column, which maps to `TIMESTAMP`, carries a `literal_timestamp`. Exasol sends `literal_timestamputc` only for a `TIMESTAMP WITH LOCAL TIME ZONE` value, already shifted to UTC.
-* One converter maps a literal to the column's type, given as an Arrow type, and each path maps the converted value to its own literal type.
+* Exasol sends `escapeChar` only for a `LIKE` that says `ESCAPE`. A plain `LIKE` escapes with the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, `\` unless changed, which the pushdown request does not carry.
 
 ## Scenarios
 
@@ -31,8 +31,9 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 
 * *GIVEN* a string column and a `LIKE` pattern, with or without `ESCAPE`
 * *WHEN* a pruning path translates it
-* *THEN* a pattern with no unescaped wildcard SHALL translate as an equality, and a pattern that starts with a wildcard SHALL constrain nothing
-* *AND* Iceberg SHALL translate the literal prefix as `starts_with`, and Delta as the range from the prefix up to its successor in code point order
+* *THEN* a pattern without `ESCAPE` SHALL read `\` as its escape character, and an escaped character SHALL be that literal character
+* *AND* a pattern with no unescaped wildcard SHALL translate as an equality, and a pattern that starts with a wildcard SHALL constrain nothing
+* *AND* Iceberg and Delta SHALL prune a file only when its bounds admit no value that starts with the literal prefix
 * *AND* the translation SHALL be exact only when nothing but `%` follows the prefix, so `NOT` negates only such a pattern
 * *AND* the Hive partition predicate SHALL evaluate the pattern exactly against each value of a string partition column
 
@@ -47,5 +48,4 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 * *GIVEN* the pruning fixture's Iceberg, Delta, Hive direct-storage, and Unity Parquet copies, with a `decimal(4,1)` partition column and statistics columns of decimal, float, double, date, and UTC-adjusted timestamp type
 * *WHEN* queries apply `=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `<>`, and `LIKE` to them, including literals the column's type cannot hold exactly and constant functions Exasol folds
 * *THEN* each query SHALL return the native oracle's rows, and each format SHALL scan exactly the files its partition and statistics evaluation keeps
-* *AND* direct storage SHALL skip the typed partition column, which it declares a string
 * *AND* on an Exasol version with nanosecond timestamps, an Iceberg `timestamp_ns` column SHALL prune by a literal with nine fraction digits, and a microsecond column SHALL keep its file for a literal finer than its unit

@@ -8,6 +8,9 @@ use vs_expression::timestamp::TimestampLiteral;
 
 use super::filter_json::non_empty_str;
 
+/// The time zone of a UTC-adjusted column's Arrow type, on every pruning path.
+pub(super) const UTC: &str = "+00:00";
+
 /// A literal converts only when the column's type holds it exactly, because a rounded bound
 /// could prune a file holding a matching row. Each pruning path maps the value to its own type.
 pub(super) fn exact_literal(literal: &Json, column: &DataType) -> Option<ScalarValue> {
