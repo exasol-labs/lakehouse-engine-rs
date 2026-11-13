@@ -1,15 +1,15 @@
+use arrow::datatypes::{DataType as ArrowType, TimeUnit};
+use datafusion::scalar::ScalarValue;
 use delta_kernel::expressions::{DecimalData, Scalar};
 use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField};
 use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
-use crate::adapter::pushdown::literal_binary_bytes;
-use vs_expression::timestamp::{TimestampLiteral, TimestampUnit};
-
 use super::filter_json::{
-    Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
-    subject_column,
+    Comparison, LikeBound, Translated, between_operands, comparison_operands, fold_and, fold_or,
+    in_operands, like_operands, operands, subject_column,
 };
+use super::literal::exact_literal;
 
 /// Each declared column's name paired with the current snapshot field its binding key names.
 type FilterColumns<'s> = [(&'s str, &'s StructField)];
@@ -22,100 +22,46 @@ pub(crate) fn to_delta_predicate(filter_json: &Json, columns: &FilterColumns) ->
     translate_node(filter_json, columns).map(|translated| translated.predicate)
 }
 
-/// Only an exact translation may be negated: `NOT` over a widened child would narrow it,
-/// pruning files that still hold matching rows.
-#[derive(Debug, PartialEq)]
-struct Translated {
-    predicate: Predicate,
-    exact: bool,
-}
-
-impl Translated {
-    fn exact(predicate: Predicate) -> Self {
-        Self {
-            predicate,
-            exact: true,
-        }
-    }
-}
-
-fn translate_node(filter_json: &Json, columns: &FilterColumns) -> Option<Translated> {
-    let kind = filter_json.get("type")?.as_str()?;
+fn translate_node(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
+    let kind = node.get("type")?.as_str()?;
     if let Some(comparison) = Comparison::from_node_type(kind) {
-        return translate_comparison(filter_json, comparison, columns);
+        return translate_comparison(node, comparison, columns);
     }
 
     match kind {
-        "predicate_in_constlist" => translate_in(filter_json, columns),
+        "predicate_in_constlist" => translate_in(node, columns),
         "predicate_is_null" => {
-            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, columns)?;
+            let (field_name, _) = resolve_column(subject_column(node)?, columns)?;
             Some(Translated::exact(Predicate::is_null(Expression::column([
                 field_name,
             ]))))
         }
         "predicate_is_not_null" => {
-            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, columns)?;
+            let (field_name, _) = resolve_column(subject_column(node)?, columns)?;
             Some(Translated::exact(Predicate::is_not_null(
                 Expression::column([field_name]),
             )))
         }
+        // An empty junction is never built: `and_from([])` is `true` and `or_from([])` is `false`.
         "predicate_and" => fold_and(
-            operands(filter_json)?
+            operands(node)?
                 .iter()
                 .map(|expr| translate_node(expr, columns)),
+            Predicate::and_from,
         ),
         "predicate_or" => fold_or(
-            operands(filter_json)?
+            operands(node)?
                 .iter()
                 .map(|expr| translate_node(expr, columns)),
+            Predicate::or_from,
         ),
         "predicate_not" => {
-            let inner = filter_json.get("expression")?;
-            let Translated { predicate, exact } = translate_node(inner, columns)?;
-            exact.then(|| Translated::exact(Predicate::not(predicate)))
+            translate_node(node.get("expression")?, columns)?.negated(Predicate::not)
         }
-
-        "predicate_between" => translate_between(filter_json, columns),
-
+        "predicate_between" => translate_between(node, columns),
+        "predicate_like" => translate_like(node, columns),
         _ => None,
     }
-}
-
-/// Untranslatable conjuncts are dropped (fewer constraints only widen). `None` when nothing
-/// survives, since `Predicate::and_from([])` normalizes to literal `true`.
-fn fold_and(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
-    let mut predicates = Vec::new();
-    let mut exact = true;
-    for child in children {
-        match child {
-            Some(translated) => {
-                exact &= translated.exact;
-                predicates.push(translated.predicate);
-            }
-            None => exact = false,
-        }
-    }
-    if predicates.is_empty() {
-        return None;
-    }
-    Some(Translated {
-        predicate: Predicate::and_from(predicates),
-        exact,
-    })
-}
-
-/// One untranslatable disjunct forfeits the whole OR, since dropping it would narrow the
-/// file set. Empty is guarded: `Predicate::or_from([])` normalizes to `false` and prunes all.
-fn fold_or(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
-    let translated: Vec<Translated> = children.collect::<Option<_>>()?;
-    if translated.is_empty() {
-        return None;
-    }
-    let exact = translated.iter().all(|child| child.exact);
-    Some(Translated {
-        predicate: Predicate::or_from(translated.into_iter().map(|child| child.predicate)),
-        exact,
-    })
 }
 
 fn resolve_column<'s>(
@@ -132,138 +78,54 @@ fn resolve_column<'s>(
     }
 }
 
-/// `None` on an empty string: the kernel parses it to a null scalar that constrains nothing.
-fn literal_to_scalar(lit: &Json, prim: &PrimitiveType) -> Option<Scalar> {
-    let kind = lit.get("type")?.as_str()?;
-    let value = lit.get("value")?;
-
-    match (kind, prim) {
-        ("literal_bool", PrimitiveType::Boolean) => parse_bool(value).map(Scalar::Boolean),
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Byte) => {
-            i8::try_from(parse_i64(value)?).ok().map(Scalar::Byte)
+fn arrow_type(primitive: &PrimitiveType) -> Option<ArrowType> {
+    Some(match primitive {
+        PrimitiveType::Boolean => ArrowType::Boolean,
+        PrimitiveType::Byte => ArrowType::Int8,
+        PrimitiveType::Short => ArrowType::Int16,
+        PrimitiveType::Integer => ArrowType::Int32,
+        PrimitiveType::Long => ArrowType::Int64,
+        PrimitiveType::Float => ArrowType::Float32,
+        PrimitiveType::Double => ArrowType::Float64,
+        PrimitiveType::Decimal(decimal) => {
+            ArrowType::Decimal128(decimal.precision(), i8::try_from(decimal.scale()).ok()?)
         }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Short) => {
-            i16::try_from(parse_i64(value)?).ok().map(Scalar::Short)
-        }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Integer) => {
-            i32::try_from(parse_i64(value)?).ok().map(Scalar::Integer)
-        }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Long) => {
-            parse_i64(value).map(Scalar::Long)
-        }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Float) => {
-            let wide = parse_f64(value)?;
-            let narrowed = wide as f32;
-            (f64::from(narrowed) == wide).then_some(Scalar::Float(narrowed))
-        }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Double) => {
-            parse_f64(value).map(Scalar::Double)
-        }
-
-        ("literal_exactnumeric" | "literal_double", PrimitiveType::Decimal(dtype)) => {
-            parse_decimal(value, *dtype)
-        }
-
-        ("literal_string", PrimitiveType::String) => {
-            non_empty_str(value).map(|s| Scalar::String(s.to_owned()))
-        }
-
-        ("literal_date", PrimitiveType::Date)
-        | ("literal_timestamp", PrimitiveType::Timestamp | PrimitiveType::TimestampNtz)
-        | ("literal_timestamp_utc", PrimitiveType::Timestamp) => {
-            let text = non_empty_str(value)?;
-            // Delta timestamps hold microseconds; a truncated finer literal would prune matching files.
-            TimestampLiteral(text)
-                .fits(TimestampUnit::Microsecond)
-                .then(|| prim.parse_scalar(text).ok())?
-        }
-
-        ("literal_binary", PrimitiveType::Binary) => literal_binary_bytes(lit).map(Scalar::Binary),
-
-        _ => None,
-    }
-}
-
-fn parse_bool(value: &Json) -> Option<bool> {
-    match value {
-        Json::Bool(b) => Some(*b),
-        Json::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
-        Json::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
-        Json::Number(n) => match n.as_i64()? {
-            1 => Some(true),
-            0 => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn parse_i64(value: &Json) -> Option<i64> {
-    match value {
-        Json::Number(n) => n.as_i64(),
-        Json::String(s) => s.trim().parse().ok(),
-        _ => None,
-    }
-}
-
-fn parse_f64(value: &Json) -> Option<f64> {
-    match value {
-        Json::Number(n) => n.as_f64(),
-        Json::String(s) => s.trim().parse().ok(),
-        _ => None,
-    }
-}
-
-/// The kernel's `parse_scalar` demands the column's exact scale, so digits are rescaled
-/// here; a literal finer than the column's scale yields `None`, never a rounded bound.
-fn parse_decimal(value: &Json, dtype: DecimalType) -> Option<Scalar> {
-    let raw = match value {
-        Json::Number(n) => n.to_string(),
-        Json::String(s) => s.trim().to_owned(),
+        PrimitiveType::String => ArrowType::Utf8,
+        PrimitiveType::Binary => ArrowType::Binary,
+        PrimitiveType::Date => ArrowType::Date32,
+        PrimitiveType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        PrimitiveType::TimestampNtz => ArrowType::Timestamp(TimeUnit::Microsecond, None),
         _ => return None,
-    };
-    let (unscaled, scale) = split_decimal(&raw)?;
-    let aligned = rescale(unscaled, scale, i32::from(dtype.scale()))?;
-    DecimalData::try_new(aligned, dtype)
-        .ok()
-        .map(Scalar::Decimal)
+    })
 }
 
-fn split_decimal(raw: &str) -> Option<(i128, i32)> {
-    let (mantissa, exponent) = match raw.find(['e', 'E']) {
-        None => (raw, 0),
-        Some(pos) => (&raw[..pos], raw[pos + 1..].parse::<i32>().ok()?),
-    };
-    let (int_part, frac_part) = match mantissa.find('.') {
-        None => (mantissa, ""),
-        Some(pos) => (&mantissa[..pos], &mantissa[pos + 1..]),
-    };
-    let unscaled: i128 = format!("{int_part}{frac_part}").parse().ok()?;
-    let scale = i32::try_from(frac_part.len()).ok()?.checked_sub(exponent)?;
-    Some((unscaled, scale))
-}
-
-fn rescale(unscaled: i128, from: i32, to: i32) -> Option<i128> {
-    let shift = to.checked_sub(from)?;
-    let factor = 10i128.checked_pow(shift.unsigned_abs())?;
-    if shift >= 0 {
-        return unscaled.checked_mul(factor);
-    }
-    let quotient = unscaled.checked_div(factor)?;
-    (quotient.checked_mul(factor)? == unscaled).then_some(quotient)
+fn literal_to_scalar(literal: &Json, primitive: &PrimitiveType) -> Option<Scalar> {
+    Some(match exact_literal(literal, &arrow_type(primitive)?)? {
+        ScalarValue::Boolean(Some(value)) => Scalar::Boolean(value),
+        ScalarValue::Int8(Some(value)) => Scalar::Byte(value),
+        ScalarValue::Int16(Some(value)) => Scalar::Short(value),
+        ScalarValue::Int32(Some(value)) => Scalar::Integer(value),
+        ScalarValue::Int64(Some(value)) => Scalar::Long(value),
+        ScalarValue::Float32(Some(value)) => Scalar::Float(value),
+        ScalarValue::Float64(Some(value)) => Scalar::Double(value),
+        ScalarValue::Decimal128(Some(unscaled), precision, scale) => {
+            let decimal = DecimalType::try_new(precision, u8::try_from(scale).ok()?).ok()?;
+            Scalar::Decimal(DecimalData::try_new(unscaled, decimal).ok()?)
+        }
+        ScalarValue::Utf8(Some(value)) => Scalar::String(value),
+        ScalarValue::Binary(Some(bytes)) => Scalar::Binary(bytes),
+        ScalarValue::Date32(Some(days)) => Scalar::Date(days),
+        ScalarValue::TimestampMicrosecond(Some(micros), Some(_)) => Scalar::Timestamp(micros),
+        ScalarValue::TimestampMicrosecond(Some(micros), None) => Scalar::TimestampNtz(micros),
+        _ => return None,
+    })
 }
 
 fn translate_comparison(
     node: &Json,
     comparison: Comparison,
     columns: &FilterColumns,
-) -> Option<Translated> {
+) -> Option<Translated<Predicate>> {
     let (col_name, lit_node, comparison) = comparison_operands(node, comparison)?;
     let (field_name, prim) = resolve_column(col_name, columns)?;
     let scalar = literal_to_scalar(lit_node, prim)?;
@@ -271,9 +133,8 @@ fn translate_comparison(
     let literal = Expression::literal(scalar);
 
     let predicate = match comparison {
-        // Not soundly prunable to a single range.
-        Comparison::NotEqual => return None,
         Comparison::Equal => Predicate::eq(column, literal),
+        Comparison::NotEqual => Predicate::ne(column, literal),
         Comparison::Less => Predicate::lt(column, literal),
         Comparison::LessEqual => Predicate::le(column, literal),
         Comparison::Greater => Predicate::gt(column, literal),
@@ -283,37 +144,80 @@ fn translate_comparison(
 }
 
 /// Desugared into ORed equalities because the kernel prunes nothing for a native IN.
-fn translate_in(node: &Json, columns: &FilterColumns) -> Option<Translated> {
+fn translate_in(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
     let (col_name, args) = in_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, columns)?;
-    fold_or(args.iter().map(|arg| {
-        let scalar = literal_to_scalar(arg, prim)?;
-        Some(Translated::exact(Predicate::eq(
-            Expression::column([field_name]),
-            Expression::literal(scalar),
-        )))
-    }))
+    fold_or(
+        args.iter().map(|arg| {
+            let scalar = literal_to_scalar(arg, prim)?;
+            Some(Translated::exact(Predicate::eq(
+                Expression::column([field_name]),
+                Expression::literal(scalar),
+            )))
+        }),
+        Predicate::or_from,
+    )
 }
 
 /// Either bound alone is implied by BETWEEN, so an untranslatable bound is dropped.
-fn translate_between(node: &Json, columns: &FilterColumns) -> Option<Translated> {
+fn translate_between(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
     let (col_name, low, high) = between_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, columns)?;
-
-    let low_pred = low.and_then(|n| literal_to_scalar(n, prim)).map(|scalar| {
-        Translated::exact(Predicate::ge(
+    let bound = |literal: Option<&Json>, compare: fn(Expression, Expression) -> Predicate| {
+        let scalar = literal_to_scalar(literal?, prim)?;
+        Some(Translated::exact(compare(
             Expression::column([field_name]),
             Expression::literal(scalar),
-        ))
-    });
-    let high_pred = high.and_then(|n| literal_to_scalar(n, prim)).map(|scalar| {
-        Translated::exact(Predicate::le(
-            Expression::column([field_name]),
-            Expression::literal(scalar),
-        ))
-    });
+        )))
+    };
+    fold_and(
+        [bound(low, Predicate::ge), bound(high, Predicate::le)],
+        Predicate::and_from,
+    )
+}
 
-    fold_and([low_pred, high_pred].into_iter())
+/// The kernel has no prefix predicate, so a prefix becomes the range from it to its successor.
+fn translate_like(node: &Json, columns: &FilterColumns) -> Option<Translated<Predicate>> {
+    let (col_name, pattern) = like_operands(node)?;
+    let (field_name, prim) = resolve_column(col_name, columns)?;
+    (*prim == PrimitiveType::String).then_some(())?;
+    let compare = |compare: fn(Expression, Expression) -> Predicate, value: String| {
+        compare(
+            Expression::column([field_name]),
+            Expression::literal(Scalar::String(value)),
+        )
+    };
+    match pattern.bound()? {
+        LikeBound::Equal(value) => Some(Translated::exact(compare(Predicate::eq, value))),
+        LikeBound::Prefix { prefix, exact } => {
+            let upper = successor(&prefix);
+            let below = upper.map(|upper| Translated::exact(compare(Predicate::lt, upper)));
+            let range = fold_and(
+                [
+                    Some(Translated::exact(compare(Predicate::ge, prefix))),
+                    below,
+                ],
+                Predicate::and_from,
+            )?;
+            Some(Translated {
+                exact: exact && range.exact,
+                ..range
+            })
+        }
+    }
+}
+
+/// The least string above every string starting with `prefix`, in code point order.
+fn successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32);
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -130,8 +130,8 @@ fn grouped_scan_spec_carries_group_keys() {
 }
 
 #[test]
-fn like_filter_yields_df_string_and_no_iceberg_predicate() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+fn leading_wildcard_like_yields_df_string_and_no_iceberg_predicate() {
+    use crate::adapter::pushdown::format::iceberg_predicate::to_iceberg_predicate;
     use iceberg::spec::{NestedField, Schema, Type};
     use std::sync::Arc;
 
@@ -145,7 +145,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
         .build()
         .unwrap();
 
-    let filter_json = like(col("name"), "A%");
+    let filter_json = like(col("name"), "%A");
 
     let df_filter = scan_filter_sql(
         &filter_json,
@@ -862,7 +862,7 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
 
 #[test]
 fn iceberg_pruning_input_unchanged_when_df_render_declines() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+    use crate::adapter::pushdown::format::iceberg_predicate::to_iceberg_predicate;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 

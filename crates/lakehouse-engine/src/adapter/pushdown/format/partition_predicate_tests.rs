@@ -209,7 +209,7 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "an operator this module does not evaluate",
-            like(sales_col("YEAR"), "2025%"),
+            json!({"type": "predicate_is_json", "expression": sales_col("YEAR")}),
             [true, true, true],
         ),
         (
@@ -331,6 +331,55 @@ fn two_files(key: &str, first: &str, second: &str) -> [FileValues; 2] {
     [file_with(key, Some(first)), file_with(key, Some(second))]
 }
 
+/// Scenario: A LIKE pattern prunes by its literal prefix
+#[test]
+fn a_like_evaluates_exactly_against_each_partition_value() {
+    let files = year_files();
+    let escaped = |pattern: &str| {
+        let mut node = like(sales_col("YEAR"), pattern);
+        node["escapeChar"] = str_lit("!");
+        node
+    };
+    let cases = [
+        (
+            "a prefix",
+            like(sales_col("YEAR"), "2025%"),
+            [false, true, false],
+        ),
+        (
+            "a single-character wildcard",
+            like(sales_col("YEAR"), "202_"),
+            [true, true, false],
+        ),
+        (
+            "NOT over a pattern",
+            not(like(sales_col("YEAR"), "2025")),
+            [true, false, false],
+        ),
+        (
+            "an escaped wildcard",
+            escaped("202!_"),
+            [false, false, false],
+        ),
+    ];
+    for (label, filter, expected) in cases {
+        assert_eq!(
+            kept(&filter, &files),
+            expected,
+            "{label}: kept per file [2026, 2025, NULL]"
+        );
+    }
+    assert_eq!(
+        kept_under(
+            &like(sales_col("YEAR"), "9%"),
+            &typed_columns(),
+            &two_files("year", "9", "10")
+        ),
+        [true, true],
+        "a LIKE on a column declared other than a string keeps every file"
+    );
+}
+
 /// Scenario: A partition value compares under its column's declared type
 #[test]
 fn partition_values_compare_under_their_declared_type() {
@@ -398,6 +447,11 @@ fn partition_values_compare_under_their_declared_type() {
             predicate_equal(sales_col("ACTIVE"), bool_lit(true)),
             two_files("active", "true", "false"),
         ),
+        (
+            "ratio > 1.0 on a double column",
+            compare("predicate_greater", sales_col("RATIO"), num_lit("1.0")),
+            two_files("ratio", "2.0", "0.5"),
+        ),
     ];
 
     for (label, filter, files) in cases {
@@ -453,11 +507,6 @@ fn an_undecidable_comparison_keeps_the_file() {
             two_files("ts_ms", "2024-03-01 00:00:00", "2024-03-01 00:00:00.001"),
         ),
         (
-            "a comparison on a float column",
-            compare("predicate_greater", sales_col("RATIO"), num_lit("1.0")),
-            two_files("ratio", "0.5", "2.0"),
-        ),
-        (
             "a double literal on an integer column",
             predicate_equal(sales_col("YEAR"), lit("literal_double", json!("2024"))),
             two_files("year", "2024", "2025"),
@@ -476,7 +525,7 @@ fn an_undecidable_comparison_keeps_the_file() {
             "a UTC timestamp literal on a timestamp column",
             predicate_equal(
                 sales_col("TS"),
-                lit("literal_timestamp_utc", json!("2024-03-01 00:00:00")),
+                lit("literal_timestamputc", json!("2024-03-01 00:00:00")),
             ),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
         ),

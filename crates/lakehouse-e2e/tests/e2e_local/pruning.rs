@@ -34,7 +34,7 @@ fn setup() {
                 .await
                 .expect("seed the Iceberg pruning fixture")
         });
-        write_pruning_hive_copy();
+        write_pruning_hive_copy(PRUNING_HIVE_BASE);
 
         let mut conn = exa_conn();
         for statement in oracle_statements() {
@@ -79,6 +79,7 @@ fn pruning_fixture_files_hold_the_row_groups_and_pages_the_cases_need() {
 /// Scenario: Pruning keeps every file with a matching row for every filter shape
 /// Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 /// Scenario: A NOT over a fully translated predicate still prunes
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
 #[test]
 fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
     setup();
@@ -86,6 +87,7 @@ fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
 }
 
 /// Scenario: A predicate on partition columns prunes files before their footers are read
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
 #[test]
 fn hive_partition_pruning_keeps_every_file_with_a_matching_row() {
     setup();

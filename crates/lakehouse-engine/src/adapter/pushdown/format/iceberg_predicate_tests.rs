@@ -3,6 +3,7 @@ use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
     nullable_field, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
+use iceberg::expr::Bind;
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
 use std::sync::Arc;
@@ -80,15 +81,6 @@ fn leaf_equal_translates() {
         s2.contains("id") && s2.contains('=') && s2.contains('5'),
         "got: {s2}"
     );
-}
-
-#[test]
-fn has_tz_offset_detects_explicit_zones() {
-    assert!(has_tz_offset("2024-01-15T10:00:00Z"));
-    assert!(has_tz_offset("2024-01-15T10:00:00+02:00"));
-    assert!(has_tz_offset("2024-01-15T10:00:00-05:00"));
-    assert!(!has_tz_offset("2024-01-15T10:00:00"));
-    assert!(!has_tz_offset("2024-01-15 10:00:00"));
 }
 
 #[test]
@@ -182,20 +174,84 @@ fn leaf_date_translates() {
 }
 
 #[test]
-fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
-    for prim in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
+fn a_timestamp_literal_becomes_a_datum_at_the_columns_unit() {
+    let micros = 1_705_314_600_123_456;
+    let finer = timestamp_lit("2024-01-15 10:30:00.123456789");
+    let exact = timestamp_lit("2024-01-15 10:30:00.123456000");
+    for (primitive, datum) in [
+        (PrimitiveType::Timestamp, Datum::timestamp_micros(micros)),
+        (
+            PrimitiveType::Timestamptz,
+            Datum::timestamptz_micros(micros),
+        ),
+    ] {
+        assert_eq!(literal_to_datum(&finer, &primitive), None, "{primitive}");
         assert_eq!(
-            literal_to_datum(&timestamp_lit("2024-01-15 10:30:00.123456789"), &prim),
-            None
+            literal_to_datum(&exact, &primitive),
+            Some(datum),
+            "{primitive}"
         );
-        assert!(literal_to_datum(&timestamp_lit("2024-01-15 10:30:00.123456000"), &prim).is_some());
     }
+    for (primitive, datum) in [
+        (
+            PrimitiveType::TimestampNs,
+            Datum::timestamp_nanos(micros * 1_000 + 789),
+        ),
+        (
+            PrimitiveType::TimestamptzNs,
+            Datum::timestamptz_nanos(micros * 1_000 + 789),
+        ),
+    ] {
+        assert_eq!(
+            literal_to_datum(&finer, &primitive),
+            Some(datum),
+            "{primitive}"
+        );
+    }
+}
+
+/// Scenario: A numeric literal converts only when the column's type holds it exactly
+#[test]
+fn a_decimal_literal_binds_at_the_columns_precision_and_scale() {
+    let schema = Schema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            1,
+            "q",
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 4,
+                scale: 1,
+            }),
+        ))])
+        .build()
+        .unwrap();
+    for (numeral, prunes) in [("47", true), ("2.50", true), ("2.55", false)] {
+        let node = predicate_equal(col("Q"), num_lit(numeral));
+        let predicate = translate_as_created(&node, &schema);
+        assert_eq!(predicate.is_some(), prunes, "{numeral}");
+        if let Some(predicate) = predicate {
+            predicate
+                .bind(Arc::new(schema.clone()), false)
+                .unwrap_or_else(|e| panic!("{numeral} must bind to decimal(4,1): {e}"));
+        }
+    }
+}
+
+#[test]
+fn a_float_column_takes_only_a_literal_it_holds_exactly() {
+    assert_eq!(
+        literal_to_datum(&num_lit("0.5"), &PrimitiveType::Float),
+        Some(Datum::float(0.5_f32))
+    );
+    assert_eq!(
+        literal_to_datum(&num_lit("0.2"), &PrimitiveType::Float),
+        None
+    );
 }
 
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
     let translatable = predicate_equal(col("ID"), num_lit(5));
-    let untranslatable = like(col("NAME"), "A%");
+    let untranslatable = like(col("NAME"), "%A");
     let node = and([translatable, untranslatable]);
     let pred = translate(&node).expect("AND with one translatable child must return Some");
     let s = format!("{pred}");
@@ -212,7 +268,7 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 #[test]
 fn and_all_untranslatable_returns_none() {
     let node = and([
-        like(col("NAME"), "A%"),
+        like(col("NAME"), "%A"),
         json!({"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}),
     ]);
     assert!(translate(&node).is_none());
@@ -221,7 +277,7 @@ fn and_all_untranslatable_returns_none() {
 #[test]
 fn or_with_untranslatable_child_returns_none() {
     let translatable = predicate_equal(col("ID"), num_lit(5));
-    let untranslatable = like(col("NAME"), "A%");
+    let untranslatable = like(col("NAME"), "%A");
     let node = or([translatable, untranslatable]);
     // Pruning on only the translatable branch would be unsound.
     assert!(
@@ -243,7 +299,7 @@ fn or_all_translatable_returns_some() {
 
 #[test]
 fn not_of_untranslatable_returns_none() {
-    let node = not(like(col("NAME"), "A%"));
+    let node = not(like(col("NAME"), "%A"));
     assert!(
         translate(&node).is_none(),
         "NOT of untranslatable must be None"
@@ -270,13 +326,33 @@ fn type_mismatch_returns_none() {
     assert!(translate(&node).is_none(), "type mismatch must be None");
 }
 
+/// Scenario: A not-equal comparison prunes
 #[test]
-fn notequal_returns_none() {
+fn notequal_translates() {
     let node = compare("predicate_notequal", col("ID"), num_lit(5));
-    assert!(
-        translate(&node).is_none(),
-        "predicate_notequal must not produce a pruning predicate"
+    assert_eq!(
+        translate(&node),
+        Some(Reference::new("id").not_equal_to(Datum::int(5)))
     );
+}
+
+/// Scenario: A LIKE pattern prunes by its literal prefix
+#[test]
+fn a_like_prefix_prunes_with_starts_with_and_negates_only_when_exact() {
+    let starts_with = Reference::new("name").starts_with(Datum::string("ab"));
+    assert_eq!(translate(&name_like("ab%")), Some(starts_with.clone()));
+    assert_eq!(
+        translate(&not(name_like("ab%"))),
+        Some(starts_with.negate())
+    );
+    assert_eq!(
+        translate(&name_like("ab")),
+        Some(Reference::new("name").equal_to(Datum::string("ab")))
+    );
+    assert!(translate(&name_like("ab_c")).is_some());
+    assert_eq!(translate(&not(name_like("ab_c"))), None);
+    assert_eq!(translate(&name_like("%ab")), None);
+    assert_eq!(translate(&like(col("ID"), "1%")), None);
 }
 
 #[test]
@@ -308,8 +384,8 @@ fn name_like(pattern: &str) -> Json {
 #[test]
 fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
     for conjuncts in [
-        [amount_below(30), name_like("x%")],
-        [name_like("x%"), amount_below(30)],
+        [amount_below(30), name_like("%x")],
+        [name_like("%x"), amount_below(30)],
     ] {
         let node = not(and(conjuncts));
         assert_eq!(translate(&node), None, "{node}");
@@ -325,7 +401,7 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
 #[test]
 fn not_over_an_or_with_an_inexact_branch_returns_none() {
     let node = not(or([
-        and([amount_below(30), name_like("x%")]),
+        and([amount_below(30), name_like("%x")]),
         predicate_equal(col("ID"), num_lit(5)),
     ]));
     assert_eq!(translate(&node), None);

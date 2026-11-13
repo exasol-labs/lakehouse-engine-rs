@@ -1700,7 +1700,7 @@ fn selectlist_untranslatable_item_falls_back_to_column() {
 /// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+    use crate::adapter::pushdown::format::iceberg_predicate::to_iceberg_predicate;
     use iceberg::spec::{NestedField, Schema, Type};
     use std::sync::Arc;
 

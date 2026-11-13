@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, bool_lit, by_name, col, compare, date_lit, in_list, is_not_null,
-    is_null, lit, not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
+    is_null, like, not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
@@ -69,11 +69,18 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
     }
 }
 
+/// Scenario: A not-equal comparison prunes
 #[test]
-fn notequal_returns_none() {
+fn notequal_translates() {
     let node = compare("predicate_notequal", col("ID"), num_lit(5));
 
-    assert_eq!(translate(&node), None);
+    assert_eq!(
+        translate(&node),
+        Some(Predicate::ne(
+            Expression::column(["id"]),
+            Expression::literal(5i32)
+        ))
+    );
 }
 
 #[test]
@@ -109,7 +116,7 @@ fn not_negates_its_translatable_child() {
 
 #[test]
 fn not_of_an_untranslatable_child_returns_none() {
-    let child = compare("predicate_notequal", col("ID"), num_lit(5));
+    let child = predicate_equal(col("ID"), str_lit("5"));
     let node = not(child);
 
     assert_eq!(translate(&node), None);
@@ -119,7 +126,7 @@ fn not_of_an_untranslatable_child_returns_none() {
 fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
     let child = and([
         predicate_equal(col("ID"), num_lit(5)),
-        compare("predicate_notequal", col("ID"), num_lit(7)),
+        predicate_equal(col("ID"), str_lit("7")),
     ]);
     let node = not(child);
 
@@ -190,258 +197,58 @@ fn resolve_column_returns_none_for_non_primitive_column() {
     assert_eq!(resolve_column("NESTED", &by_name(&schema)), None);
 }
 
-fn decimal_type(precision: u8, scale: u8) -> DecimalType {
-    DecimalType::try_new(precision, scale).expect("decimal type must be valid")
-}
-
-fn decimal_of(unscaled: i128, precision: u8, scale: u8) -> Scalar {
-    Scalar::Decimal(
-        DecimalData::try_new(unscaled, decimal_type(precision, scale))
-            .expect("decimal data must be valid"),
-    )
-}
-
-const TIMESTAMP_MICROS: i64 = 1_705_314_600_000_000;
-
 #[test]
-fn boolean_literal_becomes_boolean_scalar() {
-    let json_true = bool_lit(true);
-    let string_false = lit("literal_bool", json!("FALSE"));
-    let number_true = lit("literal_bool", json!(1));
-
-    assert_eq!(
-        literal_to_scalar(&json_true, &PrimitiveType::Boolean),
-        Some(Scalar::Boolean(true))
-    );
-    assert_eq!(
-        literal_to_scalar(&string_false, &PrimitiveType::Boolean),
-        Some(Scalar::Boolean(false))
-    );
-    assert_eq!(
-        literal_to_scalar(&number_true, &PrimitiveType::Boolean),
-        Some(Scalar::Boolean(true))
-    );
-}
-
-#[test]
-fn unrecognized_boolean_spelling_yields_no_scalar() {
-    let node = lit("literal_bool", json!("yes"));
-
-    assert_eq!(literal_to_scalar(&node, &PrimitiveType::Boolean), None);
-}
-
-#[test]
-fn exactnumeric_literal_becomes_integer_scalar() {
-    let node = num_lit(5);
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Integer),
-        Some(Scalar::Integer(5))
-    );
-}
-
-#[test]
-fn exactnumeric_string_literal_becomes_long_scalar() {
-    let node = num_lit("9007199254740993");
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Long),
-        Some(Scalar::Long(9_007_199_254_740_993))
-    );
-}
-
-#[test]
-fn exactnumeric_literal_becomes_narrow_integer_scalar() {
-    let node = num_lit(300);
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Short),
-        Some(Scalar::Short(300))
-    );
-    assert_eq!(
-        literal_to_scalar(&num_lit(7), &PrimitiveType::Byte),
-        Some(Scalar::Byte(7))
-    );
-}
-
-#[test]
-fn integer_literal_outside_the_column_range_yields_no_scalar() {
-    let node = num_lit(300);
-
-    assert_eq!(literal_to_scalar(&node, &PrimitiveType::Byte), None);
-}
-
-#[test]
-fn double_literal_becomes_double_scalar() {
-    let node = lit("literal_double", json!(1.5));
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Double),
-        Some(Scalar::Double(1.5))
-    );
-}
-
-#[test]
-fn double_literal_becomes_float_scalar_on_a_float_column() {
-    let node = lit("literal_double", json!(1.5));
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Float),
-        Some(Scalar::Float(1.5))
-    );
-}
-
-#[test]
-fn double_literal_not_exactly_representable_as_float_yields_no_scalar() {
-    let node = lit("literal_double", json!(0.1234567890123));
-
-    assert_eq!(literal_to_scalar(&node, &PrimitiveType::Float), None);
-}
-
-#[test]
-fn string_literal_becomes_string_scalar() {
-    let node = str_lit("abc");
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::String),
-        Some(Scalar::String("abc".to_string()))
-    );
-}
-
-#[test]
-fn date_literal_becomes_days_since_the_epoch() {
-    let node = date_lit("2024-01-15");
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Date),
-        Some(Scalar::Date(19737))
-    );
-}
-
-#[test]
-fn timestamp_literal_becomes_microseconds_on_a_zoneless_column() {
-    let node = timestamp_lit("2024-01-15 10:30:00");
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::TimestampNtz),
-        Some(Scalar::TimestampNtz(TIMESTAMP_MICROS))
-    );
-}
-
-#[test]
-fn timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
-    let node = timestamp_lit("2024-01-15 10:30:00");
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Timestamp),
-        Some(Scalar::Timestamp(TIMESTAMP_MICROS))
-    );
-}
-
-#[test]
-fn timestamp_literal_finer_than_microseconds_yields_no_scalar() {
-    let finer = timestamp_lit("2024-01-15 10:30:00.123456789");
-    let exact = timestamp_lit("2024-01-15 10:30:00.123456000");
-
-    assert_eq!(
-        literal_to_scalar(&finer, &PrimitiveType::TimestampNtz),
-        None
-    );
-    assert_eq!(
-        literal_to_scalar(&exact, &PrimitiveType::TimestampNtz),
-        Some(Scalar::TimestampNtz(TIMESTAMP_MICROS + 123_456))
-    );
-}
-
-#[test]
-fn utc_timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
-    let node = lit("literal_timestamp_utc", json!("2024-01-15T10:30:00Z"));
-
-    assert_eq!(
-        literal_to_scalar(&node, &PrimitiveType::Timestamp),
-        Some(Scalar::Timestamp(TIMESTAMP_MICROS))
-    );
-}
-
-#[test]
-fn utc_timestamp_literal_yields_no_scalar_on_a_zoneless_column() {
-    let node = lit("literal_timestamp_utc", json!("2024-01-15T10:30:00Z"));
-
-    assert_eq!(literal_to_scalar(&node, &PrimitiveType::TimestampNtz), None);
-}
-
-#[test]
-fn exactnumeric_literal_rescales_to_the_decimal_column_scale() {
-    let whole = num_lit(5);
-    let fractional = num_lit("5.25");
-    let exponent = lit("literal_double", json!("1e2"));
-    let prim = PrimitiveType::Decimal(decimal_type(10, 2));
-
-    assert_eq!(
-        literal_to_scalar(&whole, &prim),
-        Some(decimal_of(500, 10, 2))
-    );
-    assert_eq!(
-        literal_to_scalar(&fractional, &prim),
-        Some(decimal_of(525, 10, 2))
-    );
-    assert_eq!(
-        literal_to_scalar(&exponent, &prim),
-        Some(decimal_of(10_000, 10, 2))
-    );
-}
-
-#[test]
-fn decimal_literal_finer_than_the_column_scale_yields_no_scalar() {
-    let node = num_lit("5.125");
-    let prim = PrimitiveType::Decimal(decimal_type(10, 2));
-
-    assert_eq!(literal_to_scalar(&node, &prim), None);
-}
-
-#[test]
-fn decimal_literal_exceeding_the_column_precision_yields_no_scalar() {
-    let node = num_lit(12345);
-    let prim = PrimitiveType::Decimal(decimal_type(3, 0));
-
-    assert_eq!(literal_to_scalar(&node, &prim), None);
-}
-
-#[test]
-fn empty_string_literal_yields_no_scalar() {
-    assert_eq!(
-        literal_to_scalar(&str_lit(""), &PrimitiveType::String),
-        None
-    );
-    assert_eq!(literal_to_scalar(&date_lit(""), &PrimitiveType::Date), None);
-    assert_eq!(
-        literal_to_scalar(&timestamp_lit(""), &PrimitiveType::TimestampNtz),
-        None
-    );
-}
-
-#[test]
-fn literal_the_column_type_cannot_represent_yields_no_scalar() {
-    assert_eq!(
-        literal_to_scalar(&str_lit("abc"), &PrimitiveType::Integer),
-        None
-    );
-    assert_eq!(literal_to_scalar(&num_lit(5), &PrimitiveType::String), None);
-    assert_eq!(
-        literal_to_scalar(&bool_lit(true), &PrimitiveType::Integer),
-        None
-    );
-    assert_eq!(
-        literal_to_scalar(&date_lit("2024-01-15"), &PrimitiveType::Long),
-        None
-    );
-}
-
-#[test]
-fn unknown_literal_kind_yields_no_scalar() {
-    let node = lit("literal_interval", json!("1-2"));
-
-    assert_eq!(literal_to_scalar(&node, &PrimitiveType::String), None);
+fn a_literal_becomes_the_scalar_of_its_columns_kernel_type() {
+    let decimal = DecimalType::try_new(10, 2).expect("decimal(10,2)");
+    let cases = [
+        (
+            bool_lit(true),
+            PrimitiveType::Boolean,
+            Scalar::Boolean(true),
+        ),
+        (num_lit(7), PrimitiveType::Byte, Scalar::Byte(7)),
+        (num_lit(300), PrimitiveType::Short, Scalar::Short(300)),
+        (num_lit(5), PrimitiveType::Integer, Scalar::Integer(5)),
+        (
+            num_lit("9007199254740993"),
+            PrimitiveType::Long,
+            Scalar::Long(9_007_199_254_740_993),
+        ),
+        (num_lit("1.5"), PrimitiveType::Float, Scalar::Float(1.5)),
+        (num_lit("1.5"), PrimitiveType::Double, Scalar::Double(1.5)),
+        (
+            num_lit("5.25"),
+            PrimitiveType::Decimal(decimal),
+            Scalar::Decimal(DecimalData::try_new(525, decimal).expect("5.25")),
+        ),
+        (
+            str_lit("abc"),
+            PrimitiveType::String,
+            Scalar::String("abc".into()),
+        ),
+        (
+            date_lit("2024-01-15"),
+            PrimitiveType::Date,
+            Scalar::Date(19_737),
+        ),
+        (
+            timestamp_lit("2024-01-15 10:30:00"),
+            PrimitiveType::Timestamp,
+            Scalar::Timestamp(1_705_314_600_000_000),
+        ),
+        (
+            timestamp_lit("2024-01-15 10:30:00"),
+            PrimitiveType::TimestampNtz,
+            Scalar::TimestampNtz(1_705_314_600_000_000),
+        ),
+    ];
+    for (literal, primitive, scalar) in cases {
+        assert_eq!(
+            literal_to_scalar(&literal, &primitive),
+            Some(scalar),
+            "{literal}"
+        );
+    }
 }
 
 #[test]
@@ -463,7 +270,7 @@ fn and_of_two_translatable_children_folds_a_conjunction() {
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
     let node = and([
         predicate_equal(col("ID"), num_lit(5)),
-        compare("predicate_notequal", col("ID"), num_lit(7)),
+        predicate_equal(col("ID"), str_lit("7")),
     ]);
     let pred = translate(&node).expect("an AND must keep the conjuncts it can translate");
 
@@ -474,8 +281,8 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 #[test]
 fn and_all_untranslatable_returns_none_not_a_true_predicate() {
     let node = and([
-        compare("predicate_notequal", col("ID"), num_lit(5)),
-        compare("predicate_notequal", col("ID"), num_lit(7)),
+        predicate_equal(col("ID"), str_lit("5")),
+        predicate_equal(col("ID"), str_lit("7")),
     ]);
 
     assert_eq!(translate(&node), None);
@@ -507,7 +314,7 @@ fn or_of_two_translatable_children_folds_a_disjunction() {
 fn or_with_untranslatable_child_returns_none() {
     let node = or([
         predicate_equal(col("ID"), num_lit(5)),
-        compare("predicate_notequal", col("ID"), num_lit(7)),
+        predicate_equal(col("ID"), str_lit("7")),
     ]);
 
     assert_eq!(translate(&node), None);
@@ -524,24 +331,24 @@ fn or_over_an_empty_expression_list_returns_none() {
 fn empty_and_fold_returns_none_rather_than_the_kernel_true_identity() {
     assert_eq!(Predicate::and_from([]), Predicate::literal(true));
 
-    assert_eq!(fold_and(std::iter::empty()), None);
+    assert_eq!(fold_and(std::iter::empty(), Predicate::and_from), None);
 }
 
 #[test]
 fn empty_or_fold_returns_none_rather_than_the_kernel_false_identity() {
     assert_eq!(Predicate::or_from([]), Predicate::literal(false));
 
-    assert_eq!(fold_or(std::iter::empty()), None);
+    assert_eq!(fold_or(std::iter::empty(), Predicate::or_from), None);
 }
 
 #[test]
 fn fold_and_over_only_untranslatable_children_returns_none() {
-    assert_eq!(fold_and([None, None].into_iter()), None);
+    assert_eq!(fold_and([None, None], Predicate::and_from), None);
 }
 
 #[test]
 fn fold_or_over_only_untranslatable_children_returns_none() {
-    assert_eq!(fold_or([None, None].into_iter()), None);
+    assert_eq!(fold_or([None, None], Predicate::or_from), None);
 }
 
 #[test]
@@ -643,4 +450,58 @@ fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
         None,
         "only the retyped literal names bytes"
     );
+}
+
+fn translate_on_text(node: &Json) -> Option<Predicate> {
+    let schema = StructType::try_new([StructField::nullable(
+        "s",
+        DataType::Primitive(PrimitiveType::String),
+    )])
+    .expect("schema with one string field must build");
+    to_delta_predicate(node, &by_name(&schema))
+}
+
+fn on_s(compare: fn(Expression, Expression) -> Predicate, value: &str) -> Predicate {
+    compare(
+        Expression::column(["s"]),
+        Expression::literal(Scalar::String(value.into())),
+    )
+}
+
+/// Scenario: A LIKE pattern prunes by its literal prefix
+#[test]
+fn a_like_prefix_prunes_as_the_range_up_to_its_successor() {
+    let range = Predicate::and_from([on_s(Predicate::ge, "ab"), on_s(Predicate::lt, "ac")]);
+
+    assert_eq!(
+        translate_on_text(&like(col("S"), "ab%")),
+        Some(range.clone())
+    );
+    assert_eq!(
+        translate_on_text(&not(like(col("S"), "ab%"))),
+        Some(Predicate::not(range)),
+        "a prefix followed by `%` alone is exact, so its negation prunes"
+    );
+    assert_eq!(
+        translate_on_text(&like(col("S"), "abc")),
+        Some(on_s(Predicate::eq, "abc"))
+    );
+}
+
+/// Scenario: A LIKE pattern prunes by its literal prefix
+#[test]
+fn a_like_with_a_wildcard_after_its_prefix_never_prunes_by_its_negation() {
+    let range = Predicate::and_from([on_s(Predicate::ge, "ab"), on_s(Predicate::lt, "ac")]);
+
+    assert_eq!(translate_on_text(&like(col("S"), "ab_d%")), Some(range));
+    assert_eq!(translate_on_text(&not(like(col("S"), "ab_d%"))), None);
+    assert_eq!(translate_on_text(&like(col("S"), "%ab")), None);
+}
+
+#[test]
+fn a_prefix_successor_skips_surrogates_and_carries_past_the_last_code_point() {
+    assert_eq!(successor("ab"), Some("ac".into()));
+    assert_eq!(successor("a\u{D7FF}"), Some("a\u{E000}".into()));
+    assert_eq!(successor("a\u{10FFFF}"), Some("b".into()));
+    assert_eq!(successor("\u{10FFFF}"), None);
 }

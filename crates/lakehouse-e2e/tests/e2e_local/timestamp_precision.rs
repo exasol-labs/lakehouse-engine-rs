@@ -414,6 +414,7 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     );
 }
 
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
 #[test]
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();
@@ -446,6 +447,22 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
         expected.declared_column_type
     );
     assert_pushed_to_scan_udf(&mut conn, &distinct_sql, "the nanosecond distinct count");
+
+    if expected_distinct == 2 {
+        for (literal, count) in [("000000002", 0), ("000000001", 2)] {
+            let sql = format!(
+                "SELECT COUNT(*) FROM {} WHERE {ts_ns_column} > TIMESTAMP '2024-01-01 00:00:00.{literal}'",
+                qualified_probe()
+            );
+            assert_eq!(conn.query_scalar_i64(&sql), count, "{sql}");
+            let plan = isolated_pushdown_statement(&mut conn, &sql);
+            assert_eq!(
+                plan.contains(SCAN_SCRIPT_NAME),
+                count > 0,
+                "a nanosecond literal must prune the file exactly when no row matches: {plan}"
+            );
+        }
+    }
 }
 
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan

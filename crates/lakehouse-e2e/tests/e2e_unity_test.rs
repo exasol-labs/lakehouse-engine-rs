@@ -17,12 +17,14 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
-    Format, VS_DELTA, assert_cases_hold, assert_grouped_aggregates_match_oracle,
-    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle, read_footer,
+    Format, PRUNING_PARQUET_TABLE, VS_UNITY, assert_cases_hold,
+    assert_grouped_aggregates_match_oracle, assert_one_shaped_file_per_label,
+    assert_single_group_aggregates_match_oracle, read_footer,
 };
 use common::pruning_fixture::{
-    PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, labels_named, oracle_statements,
-    pruning_data_file, pruning_relative_path,
+    PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PRUNING_TYPED_PARTITION_COLUMN,
+    PruningFile, d_unscaled, dt_days, f_value, labels_named, oracle_statements, pruning_data_file,
+    pruning_relative_path, tz_micros, write_pruning_hive_copy,
 };
 use common::raw_parquet::{
     delete_fixture_prefix, encode_parquet, get_fixture_object, put_fixture_object,
@@ -88,6 +90,7 @@ const CM_NAME_MODE_PARTITIONED_LOCATION: &str =
     "s3://warehouse/unity_delta/cm_name_mode_partitioned";
 
 const PRUNING_DELTA_LOCATION: &str = "s3://warehouse/delta_pruning/pruning_cases";
+const PRUNING_PARQUET_BASE: &str = "s3://warehouse/parquet_pruning/";
 /// Its own schema, so `VS_NAME` never enumerates the pruning table.
 const PRUNING_UNITY_NAMESPACE: &str = "unity.e2e_pruning";
 const PRUNING_DELTA_CONN: &str = "PRUNING_DELTA_CREDS";
@@ -136,7 +139,7 @@ fn setup() {
         create_catalog_copy_virtual_schema(&mut conn);
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(VS_DELTA, PRUNING_UNITY_NAMESPACE)
+            &VsProps::new(VS_UNITY, PRUNING_UNITY_NAMESPACE)
                 .with_catalog_kind("UNITY_CATALOG")
                 .with_catalog_conn_name(PRUNING_DELTA_CONN),
             UNITY_CATALOG_URI_INTERNAL,
@@ -688,9 +691,8 @@ fn delta_protocol(table: &UnityTable) -> Json {
     }
 }
 
-/// The Delta copy of the pruning fixture: the Hive copy's data files, with each partition value
-/// and the `k` statistics in the log.
 fn seed_pruning_delta_table() {
+    let typed_partition = PRUNING_TYPED_PARTITION_COLUMN;
     let columns = [
         ("id", json!("long"), "LONG"),
         (PRUNING_PARTITION_COLUMN, json!("string"), "STRING"),
@@ -698,14 +700,23 @@ fn seed_pruning_delta_table() {
         ("s", json!("string"), "STRING"),
         ("x", json!("double"), "DOUBLE"),
         ("ts", json!("timestamp_ntz"), "TIMESTAMP_NTZ"),
+        (typed_partition, json!("decimal(4,1)"), "DECIMAL"),
+        ("d", json!("decimal(9,2)"), "DECIMAL"),
+        ("f", json!("float"), "FLOAT"),
+        ("dt", json!("date"), "DATE"),
+        ("tz", json!("timestamp"), "TIMESTAMP"),
     ];
+    let partitions = [PRUNING_PARTITION_COLUMN, typed_partition];
     let files: Vec<DeltaDataFile> = PRUNING_FILES
         .iter()
         .map(|file| DeltaDataFile {
             path: pruning_relative_path(file),
-            partition_values: json!({ PRUNING_PARTITION_COLUMN: file.partition }),
+            partition_values: json!({
+                PRUNING_PARTITION_COLUMN: file.partition,
+                typed_partition: file.typed_partition,
+            }),
             parquet: pruning_data_file(file),
-            stats: k_stats(&file.k_values()),
+            stats: pruning_stats(file),
         })
         .collect();
     let table = UnityTable {
@@ -714,24 +725,78 @@ fn seed_pruning_delta_table() {
         format: "DELTA",
         location: PRUNING_DELTA_LOCATION,
         columns: &columns,
-        partitions: &[PRUNING_PARTITION_COLUMN],
+        partitions: &partitions,
         name_mapped: false,
     };
     write_delta_table(&table, &files);
     register_unity_table(&table);
+
+    write_pruning_hive_copy(PRUNING_PARQUET_BASE);
+    register_unity_table(&UnityTable {
+        name: PRUNING_PARQUET_TABLE,
+        format: "PARQUET",
+        location: &format!("{PRUNING_PARQUET_BASE}{PRUNING_TABLE}"),
+        ..table
+    });
 }
 
-/// Delta PROTOCOL.md § Per-file Statistics: a column that is NULL in every row carries its null
-/// count and no bound.
-fn k_stats(k_values: &[Option<i64>]) -> Json {
-    let present: Vec<i64> = k_values.iter().flatten().copied().collect();
+fn pruning_stats(file: &PruningFile) -> Json {
+    let k_values = file.k_values();
+    let s_values = file.s_values();
+    let present_k: Vec<i64> = k_values.iter().flatten().copied().collect();
+    let present_s: Vec<&str> = s_values.iter().flatten().copied().collect();
+    let x_values = file.x_values();
+    let present_x: Vec<f64> = x_values.iter().flatten().copied().collect();
+    let k_nulls = k_values.len() - present_k.len();
     let mut stats = json!({
         "numRecords": k_values.len(),
-        "nullCount": {"k": k_values.len() - present.len()},
+        "nullCount": {
+            "k": k_nulls, "d": k_nulls, "f": k_nulls, "dt": k_nulls, "tz": k_nulls,
+            "s": s_values.len() - present_s.len(),
+            "x": x_values.len() - present_x.len(),
+        },
+        "minValues": {},
+        "maxValues": {},
     });
-    if let (Some(min), Some(max)) = (present.iter().min(), present.iter().max()) {
-        stats["minValues"] = json!({"k": min});
-        stats["maxValues"] = json!({"k": max});
+    let derived = |k: i64| {
+        let micros = tz_micros(k);
+        json!({
+            "k": k,
+            "d": serde_json::from_str::<Json>(&format!("{k}.{:02}", d_unscaled(k) % 100))
+                .expect("decimal stat"),
+            "f": f_value(k),
+            "dt": (chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::days(dt_days(k).into()))
+                .format("%Y-%m-%d")
+                .to_string(),
+            "tz": chrono::DateTime::from_timestamp_micros(micros)
+                .expect("fixture timestamp is a valid instant")
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        })
+    };
+    for (bound, k, s, x) in [
+        (
+            "minValues",
+            present_k.iter().min(),
+            present_s.iter().min(),
+            present_x.iter().copied().reduce(f64::min),
+        ),
+        (
+            "maxValues",
+            present_k.iter().max(),
+            present_s.iter().max(),
+            present_x.iter().copied().reduce(f64::max),
+        ),
+    ] {
+        if let Some(k) = k {
+            stats[bound] = derived(*k);
+        }
+        if let Some(s) = s {
+            stats[bound]["s"] = json!(s);
+        }
+        if let Some(x) = x {
+            stats[bound]["x"] = json!(x);
+        }
     }
     stats
 }
@@ -2559,10 +2624,19 @@ fn footer_k_statistics(footer: &ParquetMetaData, cannot: &str) -> (Option<i64>, 
 }
 
 /// Scenario: Delta pruning keeps every file with a matching row for every filter shape
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
 #[test]
 fn delta_pruning_keeps_every_file_with_a_matching_row() {
     setup();
     assert_cases_hold(&mut exa_conn(), Format::Delta);
+}
+
+/// Scenario: A partition value compares under its column's declared type
+/// Scenario: Every pruning path keeps every file with a matching row for every column type
+#[test]
+fn unity_parquet_partition_pruning_keeps_every_file_with_a_matching_row() {
+    setup();
+    assert_cases_hold(&mut exa_conn(), Format::UnityParquet);
 }
 
 /// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result

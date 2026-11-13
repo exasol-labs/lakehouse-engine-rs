@@ -39,7 +39,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 
 ### Scenario: Untranslatable conjunct disables pruning for that conjunct only
 
-* *GIVEN* a query whose WHERE clause is `<translatable predicate> AND <untranslatable predicate>` (for example `col = 5 AND name LIKE 'A%'`)
+* *GIVEN* a query whose WHERE clause is `<translatable predicate> AND <untranslatable predicate>` (for example `col = 5 AND name LIKE '%A'`)
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL emit an Iceberg pruning predicate carrying only the translatable conjunct
 * *AND* the adapter SHALL drop the untranslatable conjunct from the pruning predicate
@@ -48,7 +48,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely
 
-* *GIVEN* a query whose WHERE clause is `<translatable predicate> OR <untranslatable predicate>` (for example `col = 5 OR name LIKE 'A%'`)
+* *GIVEN* a query whose WHERE clause is `<translatable predicate> OR <untranslatable predicate>` (for example `col = 5 OR name LIKE '%A'`)
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL NOT apply any Iceberg pruning predicate derived from that `OR`, because a row satisfying the untranslatable branch MAY live in any file
 * *AND* the resolved file list SHALL equal the unpruned file list for that `OR`

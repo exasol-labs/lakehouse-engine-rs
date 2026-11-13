@@ -32,6 +32,18 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 
 `FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` are not Exasol capability names. Exasol normalizes `a > b` to `b < a` before the predicate reaches the adapter.
 
+### File pruning
+
+A filter prunes files at plan time only where it compares a bare column with a literal: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS [NOT] NULL`, and `LIKE` with a literal prefix, combined by `AND`, `OR`, and `NOT`. Exasol folds constant expressions such as `TO_DATE('01.11.2026', 'DD.MM.YYYY')` into literals first. A function over the column (`YEAR(d) = 2026`, `CAST(d AS VARCHAR) LIKE '2026%'`) or a comparison of two columns prunes nothing, so write a range instead: `d >= DATE '2026-01-01' AND d < DATE '2027-01-01'`.
+
+A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32-bit `float` column, `amount = 1.555` on a `decimal(10,2)` column, and a timestamp literal finer than the column's unit prune nothing, and still return the correct rows.
+
+| Format | Prunes by |
+|---|---|
+| Iceberg | Partition values and per-file column bounds. `LIKE 'ab%'` prunes as `starts_with`. |
+| Delta | Partition values and per-file statistics. `LIKE 'ab%'` prunes as `>= 'ab' AND < 'ac'`. |
+| Hive partitions (direct storage, Unity Catalog and Glue Parquet) | Partition values only, compared under the declared partition type. Direct storage declares every partition column a string. |
+
 `ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
 or a broadcast join, no aggregation, and every sort key must be a bare projected column that is not
 JSON-fallback typed. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local

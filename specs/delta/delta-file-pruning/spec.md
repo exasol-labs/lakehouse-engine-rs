@@ -13,14 +13,13 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * `stats` is optional per file (Delta protocol "Add File and Remove File"), so a file without statistics is always kept.
 * `delta_kernel` cannot prune on `BinaryPredicateOp::In`, because `eval_pred_in` returns `None`. An IN list becomes an OR-chain of equalities. `Predicate::or_from([])` returns `false`, which would prune every file, so an IN list with no translatable element produces no constraint.
 * `delta_kernel::Predicate` has no `negate()`. Negation is `Predicate::not(pred)`.
-* A timestamp literal is parsed with `PrimitiveType::parse_scalar`. `Scalar::Timestamp` and `Scalar::TimestampNtz` hold microseconds since the epoch and `Scalar::Date` holds days. A string literal builds `Scalar::String`, which compares against no timestamp bound and prunes nothing. `parse_scalar("")` returns `Scalar::Null`, which is not a constraint.
+* `Scalar::Timestamp` and `Scalar::TimestampNtz` hold microseconds since the epoch and `Scalar::Date` holds days. A `Scalar::String` compares against no timestamp bound and prunes nothing.
 * `Expression::column` takes a path iterator, so a flat column is `Expression::column(["NAME"])`.
 * Exasol delivers upper-cased column names and Delta's `StructType::field` is case-sensitive. The translator resolves a request column through its declared binding key, recorded at `createVirtualSchema` in the column notes (`vs-adapter/column-source-notes`). It finds the note by the uppercase fold, then the current snapshot field with the note's physical name (`name` mode) or field id (`id` mode), and emits that field's current logical name. Under `none` mode it resolves the declared name case-insensitively. A column whose key the snapshot no longer carries yields no constraint.
 * Under column mapping (`name` or `id` mode) the kernel maps the logical column name to the physical statistics path itself, so the translator emits logical names as `snapshot.schema()` reports them.
 * `delta.dataSkippingNumIndexedCols` defaults to 32 leaf fields, and only skipping-eligible types carry min/max. A predicate over a column without statistics reaches the kernel and keeps every file.
 * Exasol rewrites `>` to `<` and `>=` to `<=` (see `file-planning/pushdown-file-pruning`). The translator still handles the greater forms and flips the operator when the column sits on the right.
 * The translator is private to `adapter::pushdown::format`, so the pushdown façade gains no item.
-* A `TIMESTAMP WITH LOCAL TIME ZONE` comparison never prunes, because Exasol's wire node type is `literal_timestamputc` and the translator matches only `literal_timestamp_utc`. The Iceberg translator has the same gap. The gap fails open: it forgoes pruning and returns no wrong rows.
 * Every error is a `UdfError`, never a panic, and no error text carries a credential value.
 
 
@@ -51,7 +50,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 
 ### Scenario: An untranslatable conjunct disables pruning for that conjunct only
 
-* *GIVEN* a query whose WHERE clause is a translatable predicate AND an untranslatable one, for example an equality the translator emits alongside a `LIKE`, or alongside the explicitly-untranslatable not-equal
+* *GIVEN* a query whose WHERE clause is a translatable predicate AND an untranslatable one, for example an equality the translator emits alongside a `LIKE` that starts with a wildcard
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the reader SHALL emit a pruning predicate carrying ONLY the translatable conjunct and SHALL drop the untranslatable one
 * *AND* a conjunction whose EVERY child is untranslatable SHALL yield NO predicate at all, and the reader MUST NOT substitute a literal-true predicate, because handing the kernel a trivial predicate buys no pruning and costs a stats pass
@@ -82,12 +81,10 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * *GIVEN* pushdown requests carrying comparisons over Delta columns spanning the integer, string, floating-point, decimal, boolean, date, timestamp, and timezone-adjusted timestamp types
 * *WHEN* the translator converts each request literal against the resolved column's own Delta type
 * *THEN* each literal SHALL become the `Scalar` variant matching that column's type, and a literal whose request type cannot represent that column's type SHALL yield NO predicate for its node rather than a coerced or reinterpreted value
-* *AND* a timestamp literal SHALL be parsed into MICROSECONDS since the epoch and a date literal into DAYS, through the kernel's own protocol-conformant scalar parser, and MUST NOT be handed to the kernel as a string scalar, which compares against no timestamp bound and silently prunes nothing
+* *AND* a timestamp literal SHALL be parsed into MICROSECONDS since the epoch and a date literal into DAYS, through the shared converter of `file-planning/pruning-predicate-translation`, and MUST NOT be handed to the kernel as a string scalar, which compares against no timestamp bound and silently prunes nothing
 * *AND* an empty-string literal SHALL yield no predicate for its node, because the kernel's parser answers a null scalar for it and a null is not a constraint
 * *AND* a column the table's schema does not declare SHALL yield no predicate for its node, resolved case-insensitively against the schema so an Exasol-upper-cased name still reaches its declared field
 * *AND* a column whose Delta type is not a primitive SHALL yield no predicate for its node
-* *AND* a not-equal comparison SHALL yield no predicate, because it is not soundly reducible to a bound test on a single range
-* *AND* a `TIMESTAMP WITH LOCAL TIME ZONE` comparison SHALL yield no predicate and therefore never prune a Delta table, because Exasol's wire node type is `literal_timestamputc` while this translator's arm matches only `literal_timestamp_utc`; the Iceberg translator has the same gap, and it fails open with no wrong rows and only forgone pruning
 
 ### Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
 
