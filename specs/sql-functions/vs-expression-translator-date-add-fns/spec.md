@@ -67,6 +67,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *AND* the scan SHALL record the error in the session's failure slot, so the message survives the Parquet row filter
 * *AND* an `ADD_DAYS` or `ADD_WEEKS` count outside -999,999,999 to 999,999,999 SHALL fail the query with an error whose message starts with `data exception - numeric value out of range`, where the scan checks a DOUBLE count before rounding and an exact count after rounding, as native Exasol does
 * *AND* an `ADD_HOURS` or `ADD_MINUTES` count that is not a literal and whose nanoseconds exceed 128 bits (about 4.7e25 hours or 2.8e27 minutes) SHALL fail the query with an error whose message starts with `data exception - numeric value out of range`, as native Exasol's does, and a smaller count whose result lies outside the range SHALL fail as an overflow or underflow
+* *AND* on Exasol 8, which the scan reads from the database version in its UDF context, the limit SHALL instead be a rounded count whose milliseconds exceed 999,999,999,999,999,999 (277,777,777,777 hours or 16,666,666,666,666 minutes), as native Exasol 8's is
 * *AND* a NULL argument SHALL return NULL whatever the count, as native Exasol does
 * *AND* the scan MUST NOT return a row, a NULL, or a clamped value in place of the failure
 

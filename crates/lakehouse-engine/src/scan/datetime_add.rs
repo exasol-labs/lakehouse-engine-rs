@@ -5,6 +5,7 @@
 use super::convert::{EXASOL_DATE_MAX_DAYS, EXASOL_DATE_MIN_DAYS};
 use super::exasol_numeric::numeric_overflow;
 use super::raised_failure::RaisedFailure;
+use crate::types::mapping::predates_calendar_versions;
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Float64Array, TimestampMicrosecondBuilder,
 };
@@ -35,9 +36,52 @@ const EXASOL_MAX_MICROS: i128 = (EXASOL_DATE_MAX_DAYS as i128 + 1) * MICROS_PER_
 /// Exasol refuses an `ADD_DAYS` or `ADD_WEEKS` count of a larger magnitude.
 const DAY_AND_WEEK_COUNT_LIMIT: u32 = 999_999_999;
 const NANOS_PER_MICRO: i128 = 1_000;
+const MICROS_PER_MILLI: i128 = 1_000;
+/// Exasol 8 holds the milliseconds of an `ADD_HOURS` or `ADD_MINUTES` count in 18 digits.
+const EXASOL_8_MILLIS_LIMIT: u128 = 999_999_999_999_999_999;
 const NUMERIC_OUT_OF_RANGE: &str = "data exception - numeric value out of range";
 const DATETIME_OVERFLOW: &str = "data exception - datetime field overflow";
 const DATETIME_UNDERFLOW: &str = "data exception - datetime field underflow";
+
+/// The arithmetic an Exasol version adds an `ADD_HOURS` or `ADD_MINUTES` count in. A count
+/// beyond it fails as a numeric overflow, not as a datetime overflow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CountArithmetic {
+    /// Exasol 8 scales the rounded count to milliseconds.
+    Milliseconds,
+    /// Exasol 2025 and later scale the rounded count to 128-bit nanoseconds.
+    #[default]
+    Nanoseconds,
+}
+
+impl CountArithmetic {
+    pub fn from_database_version(version: &str) -> Self {
+        if predates_calendar_versions(version) {
+            Self::Milliseconds
+        } else {
+            Self::Nanoseconds
+        }
+    }
+
+    /// The largest whole count of `micros_per_count` microseconds the arithmetic holds.
+    fn count_limit(self, micros_per_count: i128) -> u128 {
+        match self {
+            Self::Milliseconds => {
+                EXASOL_8_MILLIS_LIMIT / (micros_per_count / MICROS_PER_MILLI).unsigned_abs()
+            }
+            Self::Nanoseconds => {
+                i128::MAX.unsigned_abs() / (micros_per_count * NANOS_PER_MICRO).unsigned_abs()
+            }
+        }
+    }
+
+    fn unit_name(self) -> &'static str {
+        match self {
+            Self::Milliseconds => "millisecond",
+            Self::Nanoseconds => "nanosecond",
+        }
+    }
+}
 
 /// The unit one scan function adds its count in, with the Exasol rules that differ by unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -88,13 +132,9 @@ impl Unit {
         self.keeps_a_date().then_some(DAY_AND_WEEK_COUNT_LIMIT)
     }
 
-    /// The largest whole hour or minute count whose nanoseconds fit 128 bits. Exasol adds these
-    /// units in 128-bit nanoseconds, so a larger count fails as a numeric overflow, not as a
-    /// datetime overflow.
-    fn nanosecond_count_limit(self) -> Option<u128> {
-        (!self.keeps_a_date()).then(|| {
-            i128::MAX.unsigned_abs() / (self.micros_per_count() * NANOS_PER_MICRO).unsigned_abs()
-        })
+    /// The largest whole hour or minute count that `arithmetic` holds.
+    fn arithmetic_count_limit(self, arithmetic: CountArithmetic) -> Option<u128> {
+        (!self.keeps_a_date()).then(|| arithmetic.count_limit(self.micros_per_count()))
     }
 
     fn result_type(self, arg_types: &[DataType]) -> Result<DataType> {
@@ -123,7 +163,11 @@ impl Unit {
     /// The whole count Exasol adds: an exact count rounded half away from zero, a DOUBLE count
     /// `x` as `sign(x) * floor(|x| + 0.5)`. Exasol checks the count limit of a DOUBLE before it
     /// rounds and that of an exact count after.
-    fn whole_count(self, count: Count) -> std::result::Result<i128, String> {
+    fn whole_count(
+        self,
+        count: Count,
+        arithmetic: CountArithmetic,
+    ) -> std::result::Result<i128, String> {
         let name = self.exasol_name();
         let rounded = match count {
             Count::Double(x) if !x.is_finite() => {
@@ -153,12 +197,13 @@ impl Unit {
             }
         };
         if self
-            .nanosecond_count_limit()
+            .arithmetic_count_limit(arithmetic)
             .is_some_and(|limit| rounded.unsigned_abs() > limit)
         {
             return Err(format!(
-                "{NUMERIC_OUT_OF_RANGE}; {} count {rounded} overflows Exasol's nanosecond arithmetic",
-                self.exasol_name()
+                "{NUMERIC_OUT_OF_RANGE}; {} count {rounded} overflows Exasol's {} arithmetic",
+                self.exasol_name(),
+                arithmetic.unit_name()
             ));
         }
         Ok(rounded)
@@ -279,14 +324,16 @@ impl Counts {
 #[derive(Debug)]
 struct DatetimeAddUdf {
     unit: Unit,
+    arithmetic: CountArithmetic,
     signature: Signature,
     raised: Arc<RaisedFailure>,
 }
 
 impl DatetimeAddUdf {
-    fn new(unit: Unit, raised: Arc<RaisedFailure>) -> Self {
+    fn new(unit: Unit, arithmetic: CountArithmetic, raised: Arc<RaisedFailure>) -> Self {
         Self {
             unit,
+            arithmetic,
             signature: Signature::any(2, Volatility::Immutable),
             raised,
         }
@@ -302,7 +349,7 @@ impl DatetimeAddUdf {
         for (row, argument) in arguments.enumerate() {
             match argument.zip(counts.at(row)) {
                 Some((micros, count)) => {
-                    let count = self.unit.whole_count(count)?;
+                    let count = self.unit.whole_count(count, self.arithmetic)?;
                     shifted.append_value(self.unit.add(micros, count)?);
                 }
                 None => shifted.append_null(),
@@ -315,7 +362,9 @@ impl DatetimeAddUdf {
 /// The recorded failure is session state, not identity, so it is excluded from plan comparison.
 impl PartialEq for DatetimeAddUdf {
     fn eq(&self, other: &Self) -> bool {
-        self.unit == other.unit && self.signature == other.signature
+        self.unit == other.unit
+            && self.arithmetic == other.arithmetic
+            && self.signature == other.signature
     }
 }
 
@@ -324,6 +373,7 @@ impl Eq for DatetimeAddUdf {}
 impl Hash for DatetimeAddUdf {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.unit.hash(state);
+        self.arithmetic.hash(state);
         self.signature.hash(state);
     }
 }
@@ -383,9 +433,17 @@ impl ScalarUDFImpl for DatetimeAddUdf {
 
 /// Registered unconditionally once per session, as every scan path splices the same rendered
 /// expressions.
-pub(super) fn register_datetime_add_udfs(ctx: &SessionContext, raised: Arc<RaisedFailure>) {
+pub(super) fn register_datetime_add_udfs(
+    ctx: &SessionContext,
+    arithmetic: CountArithmetic,
+    raised: Arc<RaisedFailure>,
+) {
     for unit in Unit::ALL {
-        ctx.register_udf(ScalarUDF::from(DatetimeAddUdf::new(unit, raised.clone())));
+        ctx.register_udf(ScalarUDF::from(DatetimeAddUdf::new(
+            unit,
+            arithmetic,
+            raised.clone(),
+        )));
     }
 }
 

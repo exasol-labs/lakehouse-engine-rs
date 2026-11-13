@@ -20,7 +20,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use url::{Position, Url};
 
-use super::{scan_session_context, session_config_for_spec};
+use super::{CountArithmetic, scan_session_context, session_config_for_spec};
 use crate::scan::ObjectLocation;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{
@@ -34,10 +34,11 @@ pub(super) fn build_session_context(
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
     memory_limit_bytes: u64,
+    count_arithmetic: CountArithmetic,
 ) -> Result<SessionContext, UdfError> {
     validate_sides_share_one_store(spec)?;
 
-    let config = session_config_for_spec(spec);
+    let config = session_config_for_spec(spec).with_extension(Arc::new(count_arithmetic));
 
     let spill = probe_tmp_spill();
     let runtime_env = build_runtime_env(

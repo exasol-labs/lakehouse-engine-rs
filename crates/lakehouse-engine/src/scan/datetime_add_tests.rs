@@ -58,9 +58,19 @@ fn thirty_digit_almost_half(sign: i128) -> ArrayRef {
 }
 
 fn add(unit: Unit, argument: ArrayRef, count: ArrayRef) -> Result<ArrayRef, DataFusionError> {
+    add_in(CountArithmetic::Nanoseconds, unit, argument, count)
+}
+
+fn add_in(
+    arithmetic: CountArithmetic,
+    unit: Unit,
+    argument: ArrayRef,
+    count: ArrayRef,
+) -> Result<ArrayRef, DataFusionError> {
     let rows = argument.len();
     let args = vec![ColumnarValue::Array(argument), ColumnarValue::Array(count)];
-    invoke_scalar_udf(&DatetimeAddUdf::new(unit, Arc::default()), args, rows)?.to_array(rows)
+    let udf = DatetimeAddUdf::new(unit, arithmetic, Arc::default());
+    invoke_scalar_udf(&udf, args, rows)?.to_array(rows)
 }
 
 /// Each row as Exasol displays it, so a test reads as the SQL it stands for.
@@ -99,7 +109,16 @@ fn added(unit: Unit, argument: ArrayRef, count: ArrayRef) -> String {
 /// The message of a failing call; panics on a returned value, so a value fails as loudly as a
 /// wrong failure.
 fn failure(unit: Unit, argument: ArrayRef, count: ArrayRef) -> String {
-    match add(unit, argument, count) {
+    failure_in(CountArithmetic::Nanoseconds, unit, argument, count)
+}
+
+fn failure_in(
+    arithmetic: CountArithmetic,
+    unit: Unit,
+    argument: ArrayRef,
+    count: ArrayRef,
+) -> String {
+    match add_in(arithmetic, unit, argument, count) {
         Err(DataFusionError::Execution(message)) => message,
         Err(other) => panic!("{unit:?} must fail with Exasol's message, got: {other}"),
         Ok(result) => panic!("{unit:?} must fail, got: {:?}", rendered(&result)),
@@ -470,6 +489,118 @@ fn hour_and_minute_counts_beyond_the_nanosecond_range_fail_as_numeric_out_of_ran
     }
 }
 
+/// Exasol 8 refuses a rounded count whose milliseconds exceed 18 digits; the nanosecond
+/// arithmetic of later versions reads the same counts as a datetime overflow.
+#[test]
+fn hour_and_minute_counts_beyond_exasol_8_milliseconds_fail_as_numeric_out_of_range() {
+    use CountArithmetic::{Milliseconds, Nanoseconds};
+    let numeric = "data exception - numeric value out of range";
+    let overflow = "data exception - datetime field overflow";
+    let underflow = "data exception - datetime field underflow";
+    let cases: Vec<(&str, CountArithmetic, Unit, ArrayRef, &str)> = vec![
+        (
+            "hours at the limit",
+            Milliseconds,
+            Unit::Hours,
+            integer(277_777_777_777),
+            overflow,
+        ),
+        (
+            "hours past it",
+            Milliseconds,
+            Unit::Hours,
+            integer(277_777_777_778),
+            numeric,
+        ),
+        (
+            "negative hours past it",
+            Milliseconds,
+            Unit::Hours,
+            integer(-277_777_777_778),
+            numeric,
+        ),
+        (
+            "negative hours at it",
+            Milliseconds,
+            Unit::Hours,
+            integer(-277_777_777_777),
+            underflow,
+        ),
+        (
+            "DOUBLE hours rounding past it",
+            Milliseconds,
+            Unit::Hours,
+            double(277_777_777_777.5),
+            numeric,
+        ),
+        (
+            "DOUBLE hours rounding to it",
+            Milliseconds,
+            Unit::Hours,
+            double(277_777_777_777.4),
+            overflow,
+        ),
+        (
+            "minutes at the limit",
+            Milliseconds,
+            Unit::Minutes,
+            integer(16_666_666_666_666),
+            overflow,
+        ),
+        (
+            "minutes past it",
+            Milliseconds,
+            Unit::Minutes,
+            integer(16_666_666_666_667),
+            numeric,
+        ),
+        (
+            "DOUBLE 1e15 hours",
+            Milliseconds,
+            Unit::Hours,
+            double(1e15),
+            numeric,
+        ),
+        (
+            "hours past it, nanoseconds",
+            Nanoseconds,
+            Unit::Hours,
+            integer(277_777_777_778),
+            overflow,
+        ),
+        (
+            "DOUBLE 1e15 hours, nanoseconds",
+            Nanoseconds,
+            Unit::Hours,
+            double(1e15),
+            overflow,
+        ),
+    ];
+    for (call, arithmetic, unit, count, expected) in cases {
+        let message = failure_in(arithmetic, unit, date("2024-01-10"), count);
+        assert_eq!(class(&message), expected, "{call}: {message}");
+    }
+}
+
+#[test]
+fn the_database_version_selects_the_count_arithmetic() {
+    let cases = [
+        ("8.29.13", CountArithmetic::Milliseconds),
+        ("7.1.30", CountArithmetic::Milliseconds),
+        ("2025.1.16", CountArithmetic::Nanoseconds),
+        ("2026.1.0", CountArithmetic::Nanoseconds),
+        ("", CountArithmetic::Nanoseconds),
+        ("unknown", CountArithmetic::Nanoseconds),
+    ];
+    for (version, expected) in cases {
+        assert_eq!(
+            CountArithmetic::from_database_version(version),
+            expected,
+            "version={version:?}"
+        );
+    }
+}
+
 /// Scenario: A date before 1582-10-15 follows the proleptic Gregorian calendar in the scan
 #[test]
 fn dates_before_the_gregorian_switch_use_the_proleptic_calendar() {
@@ -578,7 +709,7 @@ fn result_types_follow_the_argument_and_the_unit() {
         (Unit::Minutes, DataType::Date32, timestamp_type.clone()),
     ];
     for (unit, argument, expected) in cases {
-        let udf = DatetimeAddUdf::new(unit, Arc::default());
+        let udf = DatetimeAddUdf::new(unit, CountArithmetic::default(), Arc::default());
         assert_eq!(
             udf.return_type(&[argument.clone(), DataType::Int64])
                 .unwrap(),
@@ -616,7 +747,7 @@ fn other_argument_and_count_types_fail_planning() {
         vec![date_type.clone(), DataType::Int64, DataType::Int64],
     ];
     for unit in Unit::ALL {
-        let udf = DatetimeAddUdf::new(unit, Arc::default());
+        let udf = DatetimeAddUdf::new(unit, CountArithmetic::default(), Arc::default());
         for arguments in &rejected {
             assert!(
                 matches!(udf.return_type(arguments), Err(DataFusionError::Plan(_))),
@@ -628,7 +759,7 @@ fn other_argument_and_count_types_fail_planning() {
 
 #[test]
 fn an_argument_count_other_than_two_fails() {
-    let udf = DatetimeAddUdf::new(Unit::Days, Arc::default());
+    let udf = DatetimeAddUdf::new(Unit::Days, CountArithmetic::default(), Arc::default());
     let args = ScalarFunctionArgs {
         arg_fields: vec![Arc::new(Field::new("arg0", DataType::Date32, true))],
         args: vec![ColumnarValue::Array(date("2024-01-10"))],
@@ -712,4 +843,27 @@ async fn a_failure_is_recorded_on_the_session() {
         "data exception - datetime field overflow",
         "{recorded}"
     );
+}
+
+#[tokio::test]
+async fn the_session_extension_selects_the_count_arithmetic() {
+    let sql = format!("SELECT {ADD_HOURS_FN}(CAST(DATE '2024-01-10' AS DATE), 277777777778)");
+    let cases = [
+        (None, "data exception - datetime field overflow"),
+        (
+            Some(CountArithmetic::Milliseconds),
+            "data exception - numeric value out of range",
+        ),
+    ];
+    for (arithmetic, expected) in cases {
+        let config = arithmetic.map_or_else(SessionConfig::new, |arithmetic| {
+            SessionConfig::new().with_extension(Arc::new(arithmetic))
+        });
+        let ctx = scan_session_context(config, Arc::default());
+        collect(&ctx, &sql)
+            .await
+            .expect_err("a count beyond the range must fail");
+        let recorded = session_raised_failure(&ctx).expect("the session must hold the failure");
+        assert_eq!(class(&recorded), expected, "{arithmetic:?}: {recorded}");
+    }
 }

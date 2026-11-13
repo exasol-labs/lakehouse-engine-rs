@@ -871,12 +871,10 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
         let text = text
             .strip_prefix("F-UDF-CL-RUST-9001: UDF error: ")
             .unwrap_or(text);
-        return Err(text
-            .split([';', '('])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string());
+        // Exasol 8 appends `: value <v> is not in [<range>]` to a numeric range error.
+        let class = text.split([';', '(']).next().unwrap_or_default();
+        let class = class.split(": value ").next().unwrap_or_default();
+        return Err(class.trim().to_string());
     }
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let types = result_set["columns"]
