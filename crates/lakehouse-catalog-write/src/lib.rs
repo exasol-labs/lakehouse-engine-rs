@@ -9,6 +9,10 @@ mod retry;
 mod snapshot_capture;
 mod vended_refresh;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "exported_test_support_tests.rs"]
+pub mod exported_test_support;
+
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
 mod test_support;

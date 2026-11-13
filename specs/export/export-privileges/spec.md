@@ -4,7 +4,7 @@ The export script needs a script-scoped CONNECTION grant of its own. With `--wit
 
 ## Background
 
-* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `CATALOG_CONNECTION` names the CONNECTION object that the virtual schema uses.
+* Statement and options: export/export-options § Background.
 * An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`, granted directly or through a role.
 
 ## Scenarios
