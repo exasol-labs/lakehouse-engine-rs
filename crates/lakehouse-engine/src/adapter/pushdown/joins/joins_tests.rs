@@ -13,6 +13,15 @@ use std::sync::{Arc, Mutex};
 
 /// `from_extra` is spliced into the `from` object.
 pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
+    built_join(
+        customer_orders_request(from_extra, condition)
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .column(table_col("ORDERS", "O_ORDERDATE")),
+    )
+}
+
+/// [`join_request`]'s two tables joined on `condition`, before its select list.
+pub(super) fn customer_orders_request(from_extra: Json, condition: Json) -> PushdownRequestBuilder {
     let mut from = serde_json::json!({
         "type": "join",
         "join_type": "inner",
@@ -24,28 +33,29 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     }
     from["condition"] = condition;
 
+    pushdown_request(
+        "CUSTOMER",
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+        ],
+    )
+    .table(
+        "ORDERS",
+        &[
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("O_ORDERDATE", ExasolType::Date),
+        ],
+    )
+    .field("type", serde_json::json!("select"))
+    .field("from", from)
+    .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+}
+
+/// `join` over [`customer_orders_request`]'s tables, built with each table's identifier note.
+pub(super) fn built_join(join: PushdownRequestBuilder) -> Json {
     with_identifier_notes(
-        pushdown_request(
-            "CUSTOMER",
-            &[
-                ("C_CUSTKEY", ExasolType::decimal(20, 0)),
-                ("C_NAME", ExasolType::varchar(100)),
-            ],
-        )
-        .table(
-            "ORDERS",
-            &[
-                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
-                ("O_ORDERDATE", ExasolType::Date),
-            ],
-        )
-        .field("type", serde_json::json!("select"))
-        .field("from", from)
-        .column(table_col("CUSTOMER", "C_NAME"))
-        .column(table_col("ORDERS", "O_ORDERDATE"))
-        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
-        .build()
-        .0,
+        join.build().0,
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     )
 }

@@ -2,10 +2,11 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
+use crate::adapter::pushdown::scalar_over_agg::substitute_subtrees;
 use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::{ColumnRef, relation_alias};
 use exasol_udf_sdk::error::UdfError;
-use vs_expression::{ColumnNode, rename_columns, rewrite_table_aliases, walk_column_nodes};
+use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
 
 /// The invariant every leg lookup after [`JoinLegs::ensure_columns_declared`] relies on.
 const BOUND: &str = "ensure_columns_declared binds every column of the request to one leg";
@@ -128,11 +129,17 @@ impl JoinLegs {
         rewrite_table_aliases(expr, &mut |column| self.leg_alias(self.leg(column)))
     }
 
-    /// Renames each `column` to the `LHS_T{leg}_{COLUMN}` column a broadcast fan-out emits it as.
+    /// The `LHS_T{leg}_{COLUMN}` name a broadcast fan-out emits leg `leg`'s `column` as.
+    pub(super) fn fan_out_name(&self, leg: usize, column: &str) -> String {
+        ColumnRef::qualified(self.leg_alias(leg), column).output_name()
+    }
+
+    /// Replaces each `column` node with an unqualified one naming its broadcast fan-out output.
     pub(super) fn to_fan_out_output(&self, expr: &Json) -> Json {
-        rename_columns(expr, &mut |column| {
-            ColumnRef::qualified(self.leg_alias(self.leg(column)), column.upper_name())
-                .output_name()
+        substitute_subtrees(expr, &mut |subtree| {
+            let column = ColumnNode::parse(subtree)?;
+            let name = self.fan_out_name(self.leg(column), &column.upper_name());
+            Some(ColumnNode::to_json(&name, None, None))
         })
     }
 

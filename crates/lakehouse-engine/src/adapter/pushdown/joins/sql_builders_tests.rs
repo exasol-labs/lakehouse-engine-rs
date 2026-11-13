@@ -3,9 +3,9 @@ use super::super::planning::{
     JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
 };
 use super::super::tests::{
-    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    nq3_join_request, request_legs, resolved_side, self_join_request, three_table_join_request,
-    two_scan_tuning,
+    broadcast_projection, built_join, customer_orders_request, detected_join, equi_condition,
+    join_request, legs_from_leaves, nq3_join_request, request_legs, resolved_side,
+    self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
@@ -13,15 +13,22 @@ use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
+/// One file per side of [`join_request`]'s tables, typed as `request` declares them.
+fn customer_orders_sides(request: &Json) -> Vec<ResolvedJoinSide> {
+    request_typed(
+        request,
+        &[
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ],
+    )
+}
+
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
     build_n_scan_join_sql(
         &parsed_pushdown(request),
         &detected_join(request),
-        &request_typed(request, &sides),
+        &customer_orders_sides(request),
         &two_scan_tuning(),
         "SCAN",
         "DISTRIBUTE",
@@ -955,11 +962,6 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     );
     request["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
 
-    assert!(matches!(
-        classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
     let sql = n_scan_sql(&request).expect("aggregate-over-join must build the unified wrapper");
     assert!(
         sql.ends_with(" GROUP BY ()"),
@@ -1119,11 +1121,6 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
     ]);
     request["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
 
-    assert!(matches!(
-        classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
     let sql =
         n_scan_sql(&request).expect("a CAST-to-CHAR select item must build the unified wrapper");
 
@@ -1173,7 +1170,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
 
     assert!(matches!(
         classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
 
     let sql = n_scan_sql(&request)
@@ -1186,7 +1183,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
 }
 
 #[test]
-fn join_window_classification_covers_every_forcing_and_served_shape() {
+fn join_window_classification_covers_every_unservable_and_served_shape() {
     let plain = join_request(Json::Null, equi_condition());
     assert!(matches!(
         classify_join_window(&pd(&plain)),
@@ -1205,7 +1202,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
         serde_json::json!({"numElements": 10, "offset": 5});
     assert!(matches!(
         classify_join_window(&pd(&offset_without_order)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
 
     let mut ordered = join_request(Json::Null, equi_condition());
@@ -1227,33 +1224,8 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ),]);
     assert!(matches!(
         classify_join_window(&pd(&ordered_by_expression)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
-
-    // The stripped select list holds no aggregate, so only `aggregationType` forces it (#627).
-    let mut stripped_single_group = selecting(
-        join_request(Json::Null, equi_condition()),
-        &[(null_lit(), ExasolType::decimal(18, 0))],
-    );
-    stripped_single_group["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
-    let mut having = selecting(
-        join_request(Json::Null, equi_condition()),
-        &[(count_star(), ExasolType::decimal(18, 0))],
-    );
-    having["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
-    having["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
-    let mut grouped = join_request(Json::Null, equi_condition());
-    grouped["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
-    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
-    for request in [stripped_single_group, having, grouped] {
-        assert!(
-            matches!(
-                classify_join_window(&pd(&request)),
-                JoinWindowPlan::ExasolPostProcessed
-            ),
-            "{request}"
-        );
-    }
 }
 
 #[test]
@@ -2609,15 +2581,9 @@ fn join_block_names_the_dimension_legs_alias() {
 }
 
 fn aggregating_broadcast_sql(request: &Json) -> String {
-    let sides = request_typed(
-        request,
-        &[
-            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-        ],
-    );
+    let sides = customer_orders_sides(request);
     let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
-    build_aggregating_broadcast_join_sql(
+    build_broadcast_plan_sql(
         &parsed_pushdown(request),
         &detected_join(request),
         &sides,
@@ -2631,26 +2597,22 @@ fn aggregating_broadcast_sql(request: &Json) -> String {
 }
 
 #[test]
-fn aggregating_broadcast_aggregates_in_exasol_over_the_columns_it_reads() {
-    let mut request = selecting(
-        join_request(Json::Null, equi_condition()),
-        &[
-            (table_col("CUSTOMER", "C_NAME"), ExasolType::varchar(100)),
-            (
+fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .item(
                 agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
                 ExasolType::Date,
-            ),
-        ],
+            )
+            .group_by(vec![table_col("CUSTOMER", "C_NAME")])
+            .order_by(serde_json::json!([order_by_element(
+                table_col("CUSTOMER", "C_NAME"),
+                false,
+                true
+            )]))
+            .limit(1),
     );
-    let pushdown = &mut request["pushdownRequest"];
-    pushdown["aggregationType"] = serde_json::json!("group_by");
-    pushdown["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
-    pushdown["orderBy"] = serde_json::json!([order_by_element(
-        table_col("CUSTOMER", "C_NAME"),
-        false,
-        true
-    )]);
-    pushdown["limit"] = serde_json::json!({"numElements": 1});
 
     let sql = aggregating_broadcast_sql(&request);
 
@@ -2666,10 +2628,6 @@ fn aggregating_broadcast_aggregates_in_exasol_over_the_columns_it_reads() {
         ),
         "{sql}"
     );
-    assert_eq!(
-        emits_clause(&sql),
-        r#""LHS_T0_C_NAME" VARCHAR(100), "LHS_T1_O_ORDERDATE" DATE"#
-    );
     let common = broadcast_common_blob(&sql);
     assert!(common["join"].get("post_join_limit").is_none(), "{common}");
     assert!(
@@ -2680,11 +2638,11 @@ fn aggregating_broadcast_aggregates_in_exasol_over_the_columns_it_reads() {
 
 #[test]
 fn aggregating_broadcast_reading_no_column_emits_one_column_per_joined_row() {
-    let mut request = selecting(
-        join_request(Json::Null, equi_condition()),
-        &[(count_star(), ExasolType::decimal(18, 0))],
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .count_star()
+            .single_group(),
     );
-    request["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
 
     let sql = aggregating_broadcast_sql(&request);
 

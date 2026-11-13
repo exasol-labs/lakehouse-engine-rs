@@ -31,7 +31,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, carries a non-equi conjunct beside its equality, spans more than two legs, or carries a condition/filter/projection detail that keeps it off the broadcast path
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
 * *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 legs, the two-leg case being N = 2), so Exasol's core engine produces the correct result
-* *AND* spanning more than two legs or needing Exasol postprocessing SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
+* *AND* spanning more than two legs SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
 * *AND* the adapter SHALL return a HARD error, a client-facing `F-UDF-CL-RUST-9001`, NOT a request that Exasol retries natively (Exasol does not re-plan on an adapter error), ONLY when an involved table carries no readable identifier note
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
 

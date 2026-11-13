@@ -110,24 +110,6 @@ pub fn rewrite_table_aliases(tree: &Json, f: &mut impl FnMut(ColumnNode<'_>) -> 
     }
 }
 
-/// Copies `tree`, replacing each `column` node with an unqualified one named by `f`'s answer.
-pub fn rename_columns(tree: &Json, f: &mut impl FnMut(ColumnNode<'_>) -> String) -> Json {
-    match tree {
-        Json::Object(map) => match ColumnNode::from_map(map) {
-            Some(column) => ColumnNode::to_json(&f(column), None, None),
-            None => Json::Object(
-                map.iter()
-                    .map(|(key, value)| (key.clone(), rename_columns(value, f)))
-                    .collect(),
-            ),
-        },
-        Json::Array(items) => {
-            Json::Array(items.iter().map(|item| rename_columns(item, f)).collect())
-        }
-        other => other.clone(),
-    }
-}
-
 #[cfg(test)]
 #[path = "column_node_tests.rs"]
 mod tests;

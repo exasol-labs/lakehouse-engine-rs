@@ -3,6 +3,7 @@ use crate::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
     StorageBackend, relation_alias, render_ordered,
 };
+use crate::types::exasol_type::exasol_type_to_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{ColumnNode, SqlFragment};
@@ -21,9 +22,8 @@ use super::planning::{
 };
 use super::rendering::{
     LegColumns, aggregated_leg_columns, conjoin_filters, cross_leg_residual_filter,
-    has_no_explicit_select_list, leg_local_filter, projection_item_select_sql,
-    referenced_clause_values, referenced_leg_columns, render_expression_qualified,
-    screen_leg_filter, select_item_type,
+    leg_local_filter, projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
+    render_expression_qualified, screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -158,7 +158,7 @@ fn build_n_scan_join_from(
     from
 }
 
-fn n_full_row_qualified_items(
+fn n_full_row_items(
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
     naming: LegColumns,
@@ -218,7 +218,7 @@ fn n_scan_join_select_items(
                 .map(|expr| ProjectionItem::Expr { expr })
                 .collect())
         }
-        _ => Ok(n_full_row_qualified_items(legs, cols_per_leg, naming)),
+        _ => Ok(n_full_row_items(legs, cols_per_leg, naming)),
     }
 }
 
@@ -237,9 +237,9 @@ fn outer_wrapper_clauses(
 ) -> Result<OuterWrapperClauses, UdfError> {
     let pushdown_req = pushdown.json();
     let select_items = n_scan_join_select_items(pushdown, legs, cols_per_leg, naming)?;
-    let group_by = qualified_join_group_by(pushdown_req, legs, naming);
-    let having = qualified_join_having(pushdown_req, legs, naming);
-    let order_by = qualified_join_order_by(pushdown_req, legs, naming);
+    let group_by = join_group_by(pushdown_req, legs, naming);
+    let having = join_having(pushdown_req, legs, naming);
+    let order_by = join_order_by(pushdown_req, legs, naming);
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     // Exasol withholds `limit` when it cannot delegate an ordering, so an offset never arrives
@@ -506,7 +506,7 @@ fn place_broadcast_window(
                 wrapper: Some((keys, limit, offset)),
             })
         }
-        JoinWindowPlan::ExasolPostProcessed => None,
+        JoinWindowPlan::BroadcastUnservable => None,
     }
 }
 
@@ -581,11 +581,11 @@ pub(in super::super) fn build_broadcast_join_sql(
     )))
 }
 
-/// Exasol aggregates over a broadcast fan-out of the plain columns the aggregation reads, so no
-/// shard aggregates, sorts, or truncates. `None` falls through to the N-scan wrapper, as
-/// [`render_broadcast_join`] and [`build_broadcast_join_sql`] decide.
-#[allow(clippy::too_many_arguments)]
-pub(in super::super) fn build_aggregating_broadcast_join_sql(
+/// The broadcast plan of an eligible two-leg join. An aggregating request broadcasts the plain
+/// columns its aggregation reads, and one outer Exasol SELECT aggregates, sorts, and applies the
+/// LIMIT over them, so no shard aggregates, sorts, or truncates. `None` falls through to the
+/// N-scan wrapper, as [`render_broadcast_join`] and [`build_broadcast_join_sql`] decide.
+pub(in super::super) fn build_broadcast_plan_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
@@ -594,8 +594,12 @@ pub(in super::super) fn build_aggregating_broadcast_join_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
-    let fan_out_request = aggregation_input_request(pushdown, join, sides);
-    let Some(rendered) = render_broadcast_join(&fan_out_request, join, sides)? else {
+    let aggregation_input = match aggregation_type(pushdown.json()) {
+        Some(_) => Some(aggregation_input_request(pushdown, join, sides)?),
+        None => None,
+    };
+    let fan_out_request = aggregation_input.as_ref().unwrap_or(pushdown);
+    let Some(rendered) = render_broadcast_join(fan_out_request, join, sides)? else {
         return Ok(None);
     };
     let Some(fan_out) =
@@ -603,6 +607,9 @@ pub(in super::super) fn build_aggregating_broadcast_join_sql(
     else {
         return Ok(None);
     };
+    if aggregation_input.is_none() {
+        return Ok(Some(fan_out));
+    }
     let cols_per_leg: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
     let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
         pushdown,
@@ -614,31 +621,25 @@ pub(in super::super) fn build_aggregating_broadcast_join_sql(
 }
 
 /// The request's WHERE under a select list of the plain columns the aggregation reads, in leg
-/// and declaration order. Without an explicit select list the aggregation reads the full row.
-/// When it reads no column, the first column of leg 0 keeps one row per joined pair.
+/// and declaration order. A request without a select list returns the full row, which is valid
+/// only when every column is a GROUP BY key, so the keys already read it. When the aggregation
+/// reads no column, the first column of leg 0 keeps one row per joined pair.
 fn aggregation_input_request(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-) -> PushdownRequest {
+) -> Result<PushdownRequest, UdfError> {
     let pushdown_req = pushdown.json();
     let legs = join.legs();
-    let full_row = has_no_explicit_select_list(pushdown_req);
     let mut read: Vec<ColumnTypes> = sides
         .iter()
         .enumerate()
-        .map(|(leg, side)| {
-            if full_row {
-                side.column_types.clone()
-            } else {
-                aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types)
-            }
-        })
+        .map(|(leg, side)| aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types))
         .collect();
     if read.iter().all(ColumnTypes::is_empty) {
         read[0] = sides[0].column_types.first_only();
     }
-    let (select_list, select_types): (Vec<Json>, Vec<_>) = join
+    let (select_list, select_types): (Vec<Json>, Vec<Json>) = join
         .tables
         .iter()
         .zip(&read)
@@ -649,22 +650,21 @@ fn aggregation_input_request(
                     Some(&leaf.table_name),
                     leaf.table_alias.as_deref(),
                 );
-                (node, column_type.exa_type)
+                (node, exasol_type_to_json(&column_type.exa_type))
             })
         })
         .unzip();
-    let mut json = serde_json::json!({ "selectList": select_list });
+    let mut json = serde_json::json!({
+        "selectList": select_list,
+        "selectListDataTypes": select_types,
+    });
     if let Some(filter) = pushdown_req.get("filter") {
         json["filter"] = filter.clone();
     }
-    PushdownRequest::rewritten(json, select_types)
+    PushdownRequest::parse(json)
 }
 
-fn qualified_join_group_by(
-    pushdown_req: &Json,
-    legs: &JoinLegs,
-    naming: LegColumns,
-) -> Option<String> {
+fn join_group_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {
     let keys = match pushdown_req.get("groupBy").and_then(|v| v.as_array()) {
         Some(keys) if !keys.is_empty() => keys,
         // Exasol may strip every aggregate from a single-group select list (#627).
@@ -677,22 +677,14 @@ fn qualified_join_group_by(
     Some(parts.join(", "))
 }
 
-fn qualified_join_having(
-    pushdown_req: &Json,
-    legs: &JoinLegs,
-    naming: LegColumns,
-) -> Option<String> {
+fn join_having(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {
     pushdown_req
         .get("having")
         .filter(|h| !h.is_null())
         .map(|having| naming.render(having, legs))
 }
 
-fn qualified_join_order_by(
-    pushdown_req: &Json,
-    legs: &JoinLegs,
-    naming: LegColumns,
-) -> Option<String> {
+fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {
     let elements = pushdown_req
         .get("orderBy")
         .and_then(|v| v.as_array())

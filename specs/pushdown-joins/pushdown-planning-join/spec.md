@@ -5,7 +5,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 ## Background
 
 * The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, and a condition, filter, and projection that `crates/vs-expression` can render. Any deviation takes the fallback.
-* Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it. Exasol postprocesses over the broadcast fan-out.
+* Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it.
 * The dimension side rides in the shard-invariant common spec. Only the fact side's per-shard file subset flows through the `LAKEHOUSE_DISTRIBUTE_FILES` distributor.
 * A join leg is one occurrence of a table in the FROM tree. `pushdown-joins/pushdown-planning-join-fallback-self-join` owns the one binding that resolves a `column` node to its leg.
 * Exasol binds the pushdown result to the select list by position, so the column names the pushdown SQL emits stay inside it.
@@ -37,7 +37,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 * *GIVEN* a `pushdown` request that meets the broadcast contract and requires Exasol postprocessing
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, one column when they read none, and the full row of both legs when the select list is absent or empty
+* *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, and one column when they read none
 * *AND* one outer Exasol `SELECT` SHALL render the select list, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` over the fan-out's `<alias>_<column>` output names, so no shard aggregates, sorts, or truncates
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 

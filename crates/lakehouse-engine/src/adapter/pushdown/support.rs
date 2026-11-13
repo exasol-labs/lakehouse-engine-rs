@@ -914,11 +914,6 @@ impl PushdownRequest {
             .filter(ExasolType::is_udf_emittable)
     }
 
-    /// A request the adapter builds, whose select list `select_types` types item by item.
-    pub(super) fn rewritten(json: Json, select_types: Vec<ExasolType>) -> Self {
-        Self { json, select_types }
-    }
-
     /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
     /// copy a broadcast join projects from, beside the types already checked for it.
     pub fn with_json(&self, json: Json) -> Self {

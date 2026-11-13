@@ -5,7 +5,7 @@ use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
-    ColumnTypes, InvolvedColumns, aggregation_type, extract_limit, extract_offset, involved_columns,
+    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
@@ -224,7 +224,8 @@ pub(in super::super) fn involved_table<'r>(
     })
 }
 
-/// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
+/// The window of a request that does not aggregate. [`Self::BroadcastUnservable`] falls through
+/// to the fallback, never an error.
 #[derive(Debug, Clone, PartialEq)]
 pub(in super::super) enum JoinWindowPlan {
     Unbounded,
@@ -237,18 +238,13 @@ pub(in super::super) enum JoinWindowPlan {
         limit: Option<u64>,
         offset: u64,
     },
-    ExasolPostProcessed,
+    BroadcastUnservable,
 }
 
-/// Whether the projection can bind an `Ordered` key is decided at construction: rendering
-/// a projection here would let an aggregate-carrying join reach a render that can `Err` on
-/// absent column metadata.
+/// Whether the projection can bind an `Ordered` key is decided at construction, once the broadcast
+/// render has built that projection. An aggregating request never reaches here: Exasol renders
+/// its window over the fan-out.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    // The broadcast in-UDF join renders only projection, filter, and join condition, so
-    // Exasol aggregates over its output.
-    if aggregation_type(pushdown_req).is_some() {
-        return JoinWindowPlan::ExasolPostProcessed;
-    }
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     let Some(order_by) = pushdown_req
@@ -258,7 +254,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     else {
         // Exasol rejects OFFSET without ORDER BY and a per-shard offset does not compose.
         if offset != 0 {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         }
         return match limit {
             Some(n) => JoinWindowPlan::BareLimit(n),
@@ -271,7 +267,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
         // The wrapper binds ORDER BY against emitted columns and appends no hidden ones, so
         // only a flagged plain column, never an expression, is servable.
         let Some(key) = parse_sort_key_element(element) else {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         };
         keys.push(ParsedSortKey::Column(key));
     }

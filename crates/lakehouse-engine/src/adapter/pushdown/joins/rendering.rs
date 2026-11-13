@@ -1,4 +1,4 @@
-use crate::scan::spec::{ColumnRef, ProjectionItem};
+use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -66,10 +66,13 @@ impl LegColumns {
     }
 
     pub(super) fn column(self, legs: &JoinLegs, leg: usize, name: &str) -> String {
-        let alias = legs.leg_alias(leg);
         match self {
-            Self::Relations => format!("{}.{}", quote_ident(&alias), quote_ident(name)),
-            Self::FanOutOutput => quote_ident(&ColumnRef::qualified(alias, name).output_name()),
+            Self::Relations => format!(
+                "{}.{}",
+                quote_ident(&legs.leg_alias(leg)),
+                quote_ident(name)
+            ),
+            Self::FanOutOutput => quote_ident(&legs.fan_out_name(leg, name)),
         }
     }
 }
@@ -224,9 +227,9 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
     }
 }
 
-/// Leg `leg`'s columns that an Exasol aggregation over a broadcast fan-out reads: those of the
-/// select list, GROUP BY, HAVING and ORDER BY, in declaration order. The scan applies the
-/// condition and WHERE itself.
+/// Leg `leg`'s columns that an Exasol aggregation over a broadcast fan-out reads, in declaration
+/// order. The join condition and the WHERE are left out, because the scan applies both itself.
+/// The fold matches [`referenced_leg_columns`]'s (see its CROSS-FOLD note).
 pub(super) fn aggregated_leg_columns(
     pushdown_req: &Json,
     legs: &JoinLegs,
@@ -236,11 +239,7 @@ pub(super) fn aggregated_leg_columns(
     let mut names = std::collections::HashSet::new();
     for clause in ["selectList", "groupBy", "having", "orderBy"] {
         if let Some(value) = pushdown_req.get(clause) {
-            walk_column_nodes(value, &mut |column| {
-                if legs.leg(column) == leg {
-                    names.insert(column.upper_name());
-                }
-            });
+            collect_leg_column_names(value, legs, leg, &mut names);
         }
     }
     full_cols.narrowed(|column| names.contains(&column.name))

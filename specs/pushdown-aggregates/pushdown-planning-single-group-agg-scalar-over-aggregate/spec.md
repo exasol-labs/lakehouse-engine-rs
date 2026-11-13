@@ -59,7 +59,7 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 * *WHEN* the adapter plans the request
 * *THEN* the scalar-over-aggregate classification SHALL decline and the adapter SHALL route the request to the qualified single-table wrapper, the same wrapper the grouped decline (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`) and the multi-`DISTINCT` single-group decline (`pushdown-aggregates/pushdown-planning-single-group-agg`) already use, whose own rendered SQL computes the whole select list as native Exasol SQL over a materialized sharded raw scan narrowed to the referenced columns
 * *AND* the adapter MUST NOT emit the item as a per-shard projection expression, and MUST NOT return a bare row scan whose column count or column types differ from `selectListDataTypes` (`sqlCode 04000`), because Exasol never re-aggregates a declined pushdown
-* *AND* over a join, Exasol SHALL compute the select list over the join's fan-out (`pushdown-joins/pushdown-planning-join`)
+* *AND* over a join, the join's own wrapper SHALL compute the select list in Exasol, the outer SELECT over the broadcast fan-out (`pushdown-joins/pushdown-planning-join`) or the N-scan wrapper (`pushdown-joins/pushdown-planning-join-fallback`)
 * *AND* the decline SHALL hold on the EMPTY-RESULT path, where every data file is pruned, so the response is the single-group empty shape (`file-planning/pushdown-planning-empty-result`) rather than the full base row
 * *AND* the returned result SHALL equal the same select list evaluated on a single node for every one of those shapes
 
