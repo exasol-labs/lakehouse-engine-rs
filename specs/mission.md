@@ -55,6 +55,10 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 12. **Result parity**: once the adapter advertises a pushdown capability it honors it fully, so results match native Exasol. A deviation is accepted only when it is documented in `docs/semantic-differences.md`, which lists only differences realistic data can hit in rows, values, or whether a query succeeds. Error wording and limits that only absurd inputs reach are not deviations. Guards cover declined-filter self-application, empty results, text conversion under session settings, split-aggregate types, CHAR type declaration, and ORDER BY capability.
 13. **End-to-end test infrastructure**: besides the local Exasol Docker suite, E2E suites run against real AWS (Glue and assume-role), Azure, Unity Catalog (Databricks), and Lakekeeper. Shared fixtures cover type promotion, positional deletes, deletion vectors, and INT96 timestamps. Scheduled sweeps remove orphaned Azure containers and Glue resources. `specs/testing.md` states how the suites are built, run, and cleaned up.
 
+### Export
+
+14. **Export into a new Iceberg table**: `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT` writes source rows into a new Iceberg table through the Iceberg REST catalog.
+
 ## Out of Scope
 
 - Caching across statements, result reuse, materialization, query acceleration. Reusing a table's metadata within one statement is in scope
@@ -64,7 +68,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 - General and multi-way joins and complex query rewrites (only broadcast-eligible inner equi-joins are pushed down, see Core Capability 6)
 - **Explicit non-goals (not building):** Reyden, Lakehouse RT, a DataFusion cluster scheduler, an Iceberg cache, a Databricks acceleration layer, a materialized query engine
 
-Every query is executed independently, starts from source metadata, and leaves no state behind.
+Every query is executed independently, starts from source metadata, and leaves no state behind. An export creates its namespace and table, and a failed export can leave data files in storage.
 
 Architecture: see specs/architecture.md.
 
@@ -102,7 +106,7 @@ Architecture: see specs/architecture.md.
 | Build | Rust builder image (`UDF_BUILDER_IMAGE`) in Docker, x86 and aarch64 | Builds a `.so` whose glibc matches the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit and cluster behavior validation |
 
-> The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access) are workspace-internal splits from `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.
+> The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF programming model and build/E2E workflow. `crates/vs-expression` (expression translation), `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access), and `crates/lakehouse-catalog-write` (Iceberg REST catalog writes for the export) are workspace-internal splits from `crates/lakehouse-engine`; all four build into the one `.so` that carries every UDF entry point.
 
 ## Commands
 
@@ -128,10 +132,11 @@ lakehouse-engine/
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
 │   ├── lakehouse-catalog/  # Iceberg REST, Unity Catalog, and AWS Glue access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing, AWS STS role assumption
+│   ├── lakehouse-catalog-write/ # Iceberg REST catalog writes of the export: namespace and table creation, staged creation, the commit loop, vended-credential renewal
 │   ├── vs-expression/      # expression-translation crate
 │   └── lakehouse-e2e/      # E2E suites and their harness; deploys the built .so, never links the engine
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
 ```
 
-One `.so` carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF). `lakehouse-catalog` and `vs-expression` compile into `lakehouse-engine`'s cdylib as workspace dependencies, so the crate layout does not affect UDF packaging.
+One `.so` carries all four entry points (VS adapter + DataFusion scan UDF + version query UDF + export script). `lakehouse-catalog`, `lakehouse-catalog-write`, and `vs-expression` compile into `lakehouse-engine`'s cdylib as workspace dependencies, so the crate layout does not affect UDF packaging.
