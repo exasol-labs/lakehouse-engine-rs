@@ -1276,14 +1276,25 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         assert_eq!(typed(&filter), expected, "{shape}");
     }
 
-    for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_MINUTES"] {
+    // ADD_MINUTES over a DATE is a TIMESTAMP(0); ADD_DAYS and ADD_WEEKS are a DATE, which
+    // DataFusion compares with the literal in nanoseconds.
+    for (name, floored) in [
+        ("ADD_MINUTES", true),
+        ("ADD_DAYS", false),
+        ("ADD_WEEKS", false),
+    ] {
         let typed_call = scalar_fn(name, [cast_to(ExasolType::Date, col("D")), num_lit(1)]);
+        let expected = if floored {
+            compare("predicate_notequal", typed_call.clone(), typed_call)
+        } else {
+            predicate_equal(typed_call, over())
+        };
         assert_eq!(
             typed(&predicate_equal(
                 scalar_fn(name, [col("D"), num_lit(1)]),
                 over()
             )),
-            compare("predicate_notequal", typed_call.clone(), typed_call),
+            expected,
             "{name}"
         );
     }
