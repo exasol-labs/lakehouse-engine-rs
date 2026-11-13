@@ -44,11 +44,7 @@ pub fn detect_aggregates(
         return None;
     }
 
-    let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
-
-    if list.is_empty() {
-        return None;
-    }
+    let list = pushdown.select_items()?;
 
     let mut items = Vec::with_capacity(list.len());
     for (select_index, item) in list.iter().enumerate() {

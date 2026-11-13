@@ -7,7 +7,7 @@ use vs_expression::{
     render_expression_exasol, strip_table_alias, walk_column_nodes,
 };
 
-use super::super::support::{ColumnTypes, ScanTranslator, quote_ident};
+use super::super::support::{ColumnTypes, Emitted, OutputContract, ScanTranslator, quote_ident};
 use super::attribution::JoinLegs;
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
@@ -199,70 +199,35 @@ pub(super) fn possible_side_column_names(
     names
 }
 
-/// The projection then holds columns no `column` node names (`SELECT *` or the universe's
-/// first column), so per-side consumers must charge them themselves.
-pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
-    !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty())
+/// The clauses an Exasol wrapper renders over a fan-out that already applied the WHERE.
+pub(super) fn wrapper_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
+    ["selectList", "groupBy", "orderBy", "having"]
+        .into_iter()
+        .filter_map(|clause| pushdown_req.get(clause))
 }
 
-/// The single owner of which clauses can name a source column. The collector is a
-/// parameter because the callers must stay divergent: they fold case differently (see
-/// `ColumnNode::ascii_upper_name`) and fall back differently.
-/// [`referenced_leg_columns`]'s empty-`selectList` short-circuit must not move in here:
-/// `referenced_columns` must keep narrowing through the remaining clauses.
-pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {
-    if let Some(list) = pushdown_req.get("selectList") {
-        visit(list);
-    }
-    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
-        visit(f);
-    }
-    for key in ["groupBy", "orderBy"] {
-        if let Some(v) = pushdown_req.get(key) {
-            visit(v);
-        }
-    }
-    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
-        visit(h);
-    }
+/// The single owner of which clauses can name a source column.
+pub(super) fn referenced_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
+    wrapper_clause_values(pushdown_req).chain(pushdown_req.get("filter"))
 }
 
-/// Leg `leg`'s columns that an Exasol aggregation over a broadcast fan-out reads, in declaration
-/// order. The join condition and the WHERE are left out, because the scan applies both itself.
-/// The fold matches [`referenced_leg_columns`]'s (see its CROSS-FOLD note).
-pub(super) fn aggregated_leg_columns(
-    pushdown_req: &Json,
+/// Leg `leg`'s columns that `values` name, in declaration order. CROSS-FOLD: `full_cols` is
+/// Unicode-uppercased and `names` ASCII-uppercased; fix a divergence where names are declared.
+pub(super) fn leg_columns_named_in<'a>(
+    values: impl IntoIterator<Item = &'a Json>,
     legs: &JoinLegs,
     leg: usize,
     full_cols: &ColumnTypes,
 ) -> ColumnTypes {
     let mut names = std::collections::HashSet::new();
-    for clause in ["selectList", "groupBy", "having", "orderBy"] {
-        if let Some(value) = pushdown_req.get(clause) {
-            collect_leg_column_names(value, legs, leg, &mut names);
-        }
+    for value in values {
+        collect_leg_column_names(value, legs, leg, &mut names);
     }
     full_cols.narrowed(|column| names.contains(&column.name))
 }
 
-/// Leg `leg`'s columns that the join conditions read, in declaration order.
-pub(super) fn join_key_columns(
-    conditions: &[Json],
-    legs: &JoinLegs,
-    leg: usize,
-    full_cols: &ColumnTypes,
-) -> ColumnTypes {
-    let mut names = std::collections::HashSet::new();
-    for condition in conditions {
-        collect_leg_column_names(condition, legs, leg, &mut names);
-    }
-    full_cols.narrowed(|column| names.contains(&column.name))
-}
-
-/// Whether broadcasting `read`, leg `leg`'s columns that the aggregation reads, keeps each
-/// joined row narrow. The fan-out repeats them once per joined row, while the N-scan sends each
-/// of the leg's rows once. Every text column has the same declared length, so only a top-level
-/// WHERE `filter` that limits it to literals bounds its width.
+/// The fan-out repeats `read`, leg `leg`'s columns that the aggregation reads, once per joined
+/// row. Only a fixed-width type or a literal-bounding WHERE `filter` keeps such a column narrow.
 pub(super) fn broadcast_width_bounded(
     filter: Option<&Json>,
     legs: &JoinLegs,
@@ -325,37 +290,64 @@ fn literal_bounded_columns(
         .collect()
 }
 
-/// Drops columns the N-scan wrapper never references so each leg ships narrow rows. Kept:
-/// this leg's columns in SELECT, the join condition, the full WHERE (the wrapper renders
-/// all of it), GROUP BY, HAVING, and ORDER BY. An empty select list (`SELECT *`) or an empty
-/// narrowing keeps `full_cols`.
-///
-/// CROSS-FOLD match: `full_cols` is Unicode-uppercased by `support::involved_columns`, `names`
-/// ASCII-uppercased. They agree only because `build_listing_virtual_tables` Unicode-uppercases
-/// every declared name (guarded by E2E `non_ascii_table_and_column_stay_queryable`); repair
-/// any divergence at that premise, never by unifying the folds. A partial mismatch would
-/// drop a referenced column, surfacing as an Exasol column-not-found error.
-pub(super) fn referenced_leg_columns(
-    pushdown_req: &Json,
-    condition: &Json,
+/// What the clauses `above` a fan-out make it emit per leg of `scanned`: every column for
+/// `SELECT *`, else the columns they name.
+pub(super) fn named_emission(
+    output: OutputContract,
+    above: &[&Json],
+    legs: &JoinLegs,
+    scanned: &[(usize, &ColumnTypes)],
+) -> Result<Vec<Emitted>, UdfError> {
+    scanned
+        .iter()
+        .map(|&(leg, cols)| match output {
+            OutputContract::WholeRow => cols.named(|_| true),
+            OutputContract::AnyOneColumn | OutputContract::Items => {
+                let named = leg_columns_named_in(above.iter().copied(), legs, leg, cols);
+                cols.named(|column| named.get(column).is_some())
+            }
+        })
+        .collect()
+}
+
+/// A fan-out must emit a column, and Exasol only counts the rows of one whose clauses name
+/// none. Its first leg then emits one placeholder, never its row, which may hold a refused column.
+pub(super) fn with_placeholder(
+    mut emitted: Vec<Emitted>,
+    scanned: &[(usize, &ColumnTypes)],
+    prefer: &ColumnTypes,
+) -> Result<Vec<Emitted>, UdfError> {
+    if emitted.iter().all(Emitted::is_empty)
+        && let Some((_, cols)) = scanned.first()
+    {
+        emitted[0] = cols.placeholder(prefer)?;
+    }
+    Ok(emitted)
+}
+
+/// The one owner of the columns a fan-out over `scanned` emits per leg.
+pub(super) fn fan_out_emission(
+    output: OutputContract,
+    above: &[&Json],
+    legs: &JoinLegs,
+    scanned: &[(usize, &ColumnTypes)],
+    prefer: &ColumnTypes,
+) -> Result<Vec<Emitted>, UdfError> {
+    let named = named_emission(output, above, legs, scanned)?;
+    with_placeholder(named, scanned, prefer)
+}
+
+/// [`fan_out_emission`] of a fan-out that scans the one leg `leg`.
+pub(super) fn leg_emission(
+    output: OutputContract,
+    above: &[&Json],
     legs: &JoinLegs,
     leg: usize,
-    full_cols: &ColumnTypes,
-) -> ColumnTypes {
-    if has_no_explicit_select_list(pushdown_req) {
-        return full_cols.clone();
-    }
-    let mut names = std::collections::HashSet::new();
-    collect_leg_column_names(condition, legs, leg, &mut names);
-    referenced_clause_values(pushdown_req, |v| {
-        collect_leg_column_names(v, legs, leg, &mut names)
-    });
-    let narrowed = full_cols.narrowed(|column| names.contains(&column.name));
-    if narrowed.is_empty() {
-        full_cols.clone()
-    } else {
-        narrowed
-    }
+    cols: &ColumnTypes,
+) -> Result<Emitted, UdfError> {
+    let mut emitted =
+        fan_out_emission(output, above, legs, &[(leg, cols)], &ColumnTypes::default())?;
+    Ok(emitted.remove(0))
 }
 
 #[cfg(test)]

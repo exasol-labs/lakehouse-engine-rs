@@ -9,7 +9,7 @@ use super::scalar_over_agg::{
     substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
-    AggregationType, ColumnTypes, PushdownRequest, ScanTranslator, aggregation_type,
+    AggregationType, ColumnTypes, FanOut, PushdownRequest, ScanTranslator, aggregation_type,
     build_fan_out_inner, output_select_list, quote_ident, render_limit_offset,
 };
 use super::topn::sort_flags;
@@ -101,10 +101,7 @@ pub fn detect_group_by_aggregates(
     }
     let group_keys: Vec<String> = key_fragments.iter().map(|key| key.sql.clone()).collect();
 
-    let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
-    if list.is_empty() {
-        return None;
-    }
+    let list = pushdown.select_items()?;
 
     let mut plans = Vec::new();
     let mut plan_types = Vec::new();
@@ -287,8 +284,6 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .chain(aggregates.emits.iter())
         .cloned()
         .collect();
-    let emits = all_emits.join(", ");
-
     // Exasol validates this SELECT positionally, so it follows `selectList` order,
     // not the inner keys-first fan-out order.
     let mut ordered = select_items.to_vec();
@@ -316,13 +311,8 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // structurally keeps LIMIT out of every per-shard partial.
     let mut common_template = spec_template.clone();
     common_template.common.limit = None;
-    let fan_out = build_fan_out_inner(
-        &common_template,
-        shards,
-        &emits,
-        udf_name,
-        distribute_udf_name,
-    );
+    let fan_out = FanOut::aggregate(common_template.common, &all_emits);
+    let fan_out = build_fan_out_inner(&fan_out, shards, udf_name, distribute_udf_name);
 
     let from = with_stat_grand_means(&fan_out, &aggregates.plans, &outer_group_by);
 

@@ -47,9 +47,9 @@ fn a_request_touching_no_refused_column_is_admitted() {
         .column(column_node("INT_COL"))
         .build()
         .0;
-    let projection = [ProjectionItem::from("INT_COL")];
 
-    let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()]);
+    let gated =
+        ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()]);
 
     assert!(
         gated.is_ok(),
@@ -68,12 +68,8 @@ fn a_table_with_no_refused_column_admits_every_request() {
         .column(column_node("MAP_COL"))
         .build()
         .0;
-    let projection = [
-        ProjectionItem::from("SHAPE_COL"),
-        ProjectionItem::from("MAP_COL"),
-    ];
 
-    let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[]);
+    let gated = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[]);
 
     assert!(
         gated.is_ok(),
@@ -103,9 +99,8 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
         .column(column_node("INT_COL"))
         .build()
         .0;
-    let projection = [ProjectionItem::from("INT_COL")];
 
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
         .expect_err("a filter reaching SHAPE_COL at any depth must be refused");
 
     let message = user_message(err);
@@ -117,51 +112,26 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
 
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
-fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
-    let int_col_present = is_not_null(column_node("INT_COL"));
-    let request = stats_all_types()
-        .field("type", "select")
-        .filter(int_col_present)
-        .build()
-        .0;
-    let projection = [
-        ProjectionItem::from("INT_COL"),
-        ProjectionItem::from("SHAPE_COL"),
-        ProjectionItem::from("MAP_COL"),
-    ];
-
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
-        .expect_err("a full-base-row projection emitting SHAPE_COL must be refused");
-
-    let message = user_message(err);
-    assert!(
-        message.contains(&shape_col().reason),
-        "refusal must carry the reader's own reason for the emitted column, got: {message}"
-    );
-}
-
-/// Scenario: A refused column refuses only the requests that read or emit it
-#[test]
-fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_touched_set() {
+fn an_aggregate_that_names_no_column_is_admitted() {
     let request = stats_all_types()
         .field("type", "select")
         .count_star()
         .build()
         .0;
 
-    let gated = ensure_no_refused_column_referenced(&request, None, &[shape_col()]);
+    let gated =
+        ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()]);
 
     assert!(
         gated.is_ok(),
-        "COUNT(*) reads no column value, so a widened projection must not stand in \
-         for \"columns this request touches\": {:?}",
+        "COUNT(*) reads no column value, so no declared column counts as touched: {:?}",
         gated.err()
     );
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
-fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused_column() {
+fn an_aggregate_whose_argument_names_a_refused_column_is_refused() {
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
         .item(
@@ -171,12 +141,12 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&request, None, &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
         .expect_err("an aggregate whose argument names the refused column must be refused");
 
     assert!(
         user_message(err).contains(&shape_col().reason),
-        "withholding the widened projection must not withhold the walk's own finding"
+        "the walk must find a column an aggregate argument names"
     );
 }
 
@@ -191,16 +161,13 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
             true
         )]))
         .column(column_node("INT_COL"))
+        .column(column_node("SHAPE_COL"))
         .build()
         .0;
-    let projection = [
-        ProjectionItem::from("INT_COL"),
-        ProjectionItem::from("SHAPE_COL"),
-    ];
 
     let err = ensure_no_refused_column_referenced(
         &request,
-        Some(&projection),
+        OutputContract::Items,
         &[shape_col(), refused_column("variant_col", VARIANT_REASON)],
     )
     .expect_err("a request reaching two refused columns must be refused");
@@ -208,7 +175,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
     let message = user_message(err);
     let binary_position = message
         .find(&shape_col().reason)
-        .expect("refusal must carry the emitted column's reason");
+        .expect("refusal must carry the selected column's reason");
     let variant_position = message
         .find(VARIANT_REASON)
         .expect("refusal must carry the ordered-by column's reason");
@@ -227,13 +194,9 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         .column(column_node("NESTED_STRUCT"))
         .build()
         .0;
-    let nested_projection = [
-        ProjectionItem::from("MAP_COL"),
-        ProjectionItem::from("NESTED_STRUCT"),
-    ];
 
     let gated =
-        ensure_no_refused_column_referenced(&nested_request, Some(&nested_projection), &refused);
+        ensure_no_refused_column_referenced(&nested_request, OutputContract::Items, &refused);
     assert!(
         gated.is_ok(),
         "a rendered nested column must not be gated, got: {:?}",
@@ -247,7 +210,7 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&binary_request, None, &refused)
+    let err = ensure_no_refused_column_referenced(&binary_request, OutputContract::Items, &refused)
         .expect_err("a request naming SHAPE_COL must still be refused");
     assert!(user_message(err).contains(&shape_col().reason));
 }
@@ -260,13 +223,29 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
         .column(table_col("STATS_ALL_TYPES", "shape_col"))
         .build()
         .0;
-    let projection = [ProjectionItem::from("INT_COL")];
 
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
         .expect_err("the request's case must not decide whether the gate matches");
 
     assert!(
         user_message(err).contains(&shape_col().reason),
         "a lower-cased reference must match a refused column of the same name"
     );
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+#[test]
+fn select_star_is_refused_with_every_refused_columns_reason() {
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .build()
+        .0;
+    let refused = [shape_col(), refused_column("variant_col", VARIANT_REASON)];
+
+    let err = ensure_no_refused_column_referenced(&request, OutputContract::WholeRow, &refused)
+        .expect_err("SELECT * emits every declared column, so each refused one refuses it");
+
+    let message = user_message(err);
+    assert!(message.contains(&shape_col().reason), "{message}");
+    assert!(message.contains(VARIANT_REASON), "{message}");
 }

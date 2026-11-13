@@ -25,12 +25,13 @@ pub(crate) use binary_filter::literal_binary_bytes;
 
 mod support;
 pub use support::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
+    AggregateMergeInputs, ColumnTypes, FanOut, ProjectedColumn, PushdownRequest, ScanTranslator,
     build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_limit, involved_columns, order_by_present,
-    project_columns, projection_items, scan_storage_for,
+    DISTRIBUTE_FILES_UDF_NAME, Emitted, RowProjection, SCAN_UDF_NAME, extract_limit,
+    involved_columns, order_by_present, project_columns, projection_items, pushdown_response,
+    scan_storage_for,
 };
 use vs_expression::strip_table_alias;
 
@@ -81,7 +82,7 @@ pub(crate) use joins::{
 };
 use joins::{
     EmptyRelation, ensure_columns_declared, plan_join, qualified_single_table_fallback_pushdown,
-    qualify_udf,
+    qualify_udf, single_table_emission,
 };
 
 #[cfg(test)]
@@ -185,7 +186,11 @@ pub(crate) async fn handle_pushdown(
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
     let scan = ScanTranslator::over(&col_types, &[pushdown_req])?;
-    let (projection, projection_widened) = project_columns(&pushdown, scan)?;
+    // Before the zero-files early return: a refused column must error, never yield an empty
+    // result.
+    ensure_no_refused_column_referenced(request, pushdown.output(), &refused_columns)?;
+    let emitted = single_table_emission(request, &pushdown, &col_types)?;
+    let projection = project_columns(&pushdown, scan, &emitted)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
@@ -199,23 +204,13 @@ pub(crate) async fn handle_pushdown(
         conn.sealed_storage_key.as_ref(),
     )?;
 
-    // Before the zero-files early return: a refused column must error, never yield an
-    // empty result.
-    ensure_no_refused_column_referenced(
-        request,
-        (!projection_widened)
-            .then(|| projection_items(&projection))
-            .as_deref(),
-        &refused_columns,
-    )?;
-
     if files.is_empty() {
         return empty_result_sql(
             &pushdown,
+            &pushdown,
             &projection,
-            projection_widened,
             scan,
-            &EmptyRelation::single_scan(request, &col_types),
+            &EmptyRelation::single_scan(request, emitted),
         );
     }
 
@@ -231,7 +226,7 @@ pub(crate) async fn handle_pushdown(
         request,
         &pushdown,
         projection,
-        projection_widened,
+        &emitted,
         scan,
         filter,
         declined_filter,
@@ -255,15 +250,14 @@ pub(crate) async fn handle_pushdown(
     )
 }
 
-/// `projection_widened` means `projection` is the full base row rather
-/// than one item per select-list item (#196). `filter` and `declined_filter` are
-/// never both `Some`.
+/// `emitted` is the single-table emission every row fan-out of the request draws its columns
+/// from. `filter` and `declined_filter` are never both `Some`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_dispatch_sql(
+fn build_dispatch_sql(
     request: &Json,
     pushdown: &PushdownRequest,
-    mut projection: Vec<ProjectedColumn>,
-    projection_widened: bool,
+    projection: RowProjection,
+    emitted: &Emitted,
     scan: ScanTranslator<'_>,
     filter: Option<String>,
     declined_filter: Option<&Json>,
@@ -318,7 +312,7 @@ pub(crate) fn build_dispatch_sql(
             &base,
             None,
             shards,
-            scan.columns(),
+            emitted,
             udf_name,
             distribute_udf_name,
             Some(declined),
@@ -332,14 +326,14 @@ pub(crate) fn build_dispatch_sql(
             &base,
             filter.clone(),
             shards,
-            scan.columns(),
+            emitted,
             udf_name,
             distribute_udf_name,
             None,
         )
     };
 
-    let single_group_merge = match classify_request_shape(pushdown, scan) {
+    let (single_group_merge, mut projection) = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {
             detection,
             having,
@@ -386,7 +380,7 @@ pub(crate) fn build_dispatch_sql(
                 // Defensive: a shortened select list fails Exasol's positional validation.
                 return fallback();
             };
-            return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+            return Ok(pushdown_response(sql));
         }
         RequestShape::GroupByWrapper | RequestShape::SingleGroupWrapper => {
             // Never fall through to the bare row scan: Exasol expects exactly the
@@ -422,12 +416,12 @@ pub(crate) fn build_dispatch_sql(
                     &base_spec,
                     shards,
                     &items,
-                    scan.columns(),
+                    emitted,
                     limit,
                     udf_name,
                     distribute_udf_name,
-                );
-                return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+                )?;
+                return Ok(pushdown_response(sql));
             }
             // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
             // validation (`04000`), and per-distinct fan-outs cannot be composed as scalar
@@ -447,18 +441,14 @@ pub(crate) fn build_dispatch_sql(
                 // Defensive: a shortened select list fails Exasol's positional validation.
                 return fallback();
             };
-            Some((plans, merge_inputs))
+            (Some((plans, merge_inputs)), Vec::new())
         }
-        RequestShape::RowScan => {
-            // A widened projection must go to the qualified wrapper: Exasol validates the
-            // returned columns positionally (`04000`). Decided by `project_columns`'s own
-            // widening signal, never by comparing column counts, which misses widenings
-            // whose base-row width equals the select-list arity (#196).
-            if projection_widened {
-                return fallback();
-            }
-            None
-        }
+        // An item only Exasol computes goes to the qualified wrapper. `project_columns` decides
+        // it, never a column-count comparison, which can coincide (#196).
+        RequestShape::RowScan => match projection {
+            RowProjection::Wrapped => return fallback(),
+            RowProjection::Direct(projection) => (None, projection),
+        },
     };
 
     // One Option, so an aggregate spec can never pair with absent merge inputs.
@@ -495,14 +485,13 @@ pub(crate) fn build_dispatch_sql(
     };
 
     // Declined ORDER BY: missing sort-key columns are appended as hidden columns, and
-    // the wrapper below drops them again (#225). Must run after `detect_topn` and
-    // before `spec_template`, so EMITS and the scan projection stay in sync.
+    // the wrapper below drops them again (#225). Must run after `detect_topn`.
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let mut keys = parse_order_by_keys(pushdown_req);
-        topn::sort_by_select_items(&mut keys, pushdown_req, &projection);
-        topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
+        topn::sort_by_select_items(&mut keys, pushdown, &projection);
+        topn::extend_projection_with_sort_keys(&mut projection, &keys, emitted)?;
         keys
     } else {
         Vec::new()
@@ -510,16 +499,8 @@ pub(crate) fn build_dispatch_sql(
 
     let has_aggregates = aggregates.is_some();
     let proj_items = projection_items(&projection);
-
     let spec_template = ScanSpec {
         common: CommonScanSpec {
-            // Empty on the aggregate sub-path (inert, keeps EXPLAIN VIRTUAL accurate, #145);
-            // the row-scan sub-path's projection drives EMITS and the scan.
-            projection: if has_aggregates {
-                Vec::new()
-            } else {
-                proj_items.clone()
-            },
             filter,
             limit: effective_limit,
             order_by,
@@ -561,7 +542,7 @@ pub(crate) fn build_dispatch_sql(
         sql
     };
 
-    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+    Ok(pushdown_response(sql))
 }
 
 #[cfg(test)]

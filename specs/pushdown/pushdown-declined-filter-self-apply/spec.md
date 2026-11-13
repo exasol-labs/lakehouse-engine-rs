@@ -11,7 +11,7 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * The adapter self-applies a declined predicate through the Exasol-dialect render. That render renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so every declined predicate is applied.
 * `handle_pushdown` computes the decline classification once per path and passes it down.
 * The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
-* On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row.
+* On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row. An empty select list narrows to the columns the declined filter names.
 * Iceberg file pruning keeps every conjunct, renderable or not, at both pruning inputs: the single-table scan-resolution tree and each join side's side-local predicate. Pruning only removes files that cannot match.
 * The N-scan partition screens per side and per conjunct after attribution, because it needs the owning side's column metadata. `pushdown-joins/pushdown-planning-join-fallback` owns the leg-eligibility rule.
 

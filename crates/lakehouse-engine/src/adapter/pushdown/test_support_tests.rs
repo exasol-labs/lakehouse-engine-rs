@@ -420,14 +420,25 @@ pub(crate) fn column_types_under<N: AsRef<str>>(
     declared: &[LogicalField],
     binary_as_string: bool,
 ) -> ColumnTypes {
-    let involved = support::InvolvedColumns {
+    ColumnTypes::of(&involved_of(columns), declared, &[], binary_as_string)
+}
+
+/// [`column_types`] with each column `refused` names marked as one the reader refuses.
+pub(crate) fn refusing_column_types<N: AsRef<str>>(
+    columns: &[(N, ExasolType)],
+    refused: &[RefusedColumn],
+) -> ColumnTypes {
+    ColumnTypes::of(&involved_of(columns), &[], refused, false)
+}
+
+fn involved_of<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> support::InvolvedColumns<'static> {
+    support::InvolvedColumns {
         types: columns
             .iter()
             .map(|(name, exa_type)| (name.as_ref().to_string(), *exa_type))
             .collect(),
         notes: TableNotes::default(),
-    };
-    ColumnTypes::of(&involved, declared, binary_as_string)
+    }
 }
 
 /// The map `handle_pushdown` builds for `request`'s first involved table, which declares no binary
@@ -451,7 +462,12 @@ pub(crate) fn request_typed(
         .map(|side| {
             let involved = joins::involved_table(request, &side.table_name).unwrap();
             joins::ResolvedJoinSide {
-                column_types: ColumnTypes::of(&involved, &side.logical_schema, false),
+                column_types: ColumnTypes::of(
+                    &involved,
+                    &side.logical_schema,
+                    &side.refused_columns,
+                    false,
+                ),
                 ..side.clone()
             }
         })
@@ -566,15 +582,59 @@ pub(crate) fn split_projection(
         .unzip()
 }
 
-/// `project_columns` split into its items, its types, and its widening flag.
-pub(crate) fn project_split(
+/// `project_columns` over a fan-out that emits every column of `all_cols`.
+pub(super) fn project_row(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
-) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
+) -> Result<RowProjection, UdfError> {
     let scan = ScanTranslator::over(all_cols, &[pushdown.json()])?;
-    let (projection, widened) = support::project_columns(pushdown, scan)?;
-    let (items, types) = split_projection(&projection);
-    Ok((items, types, widened))
+    support::project_columns(pushdown, scan, &emitting(all_cols))
+}
+
+/// The items and the types of a direct `projection`. Both are empty for a wrapped one.
+pub(super) fn direct_columns(projection: &RowProjection) -> (Vec<ProjectionItem>, Vec<ExasolType>) {
+    match projection {
+        RowProjection::Direct(projection) => split_projection(projection),
+        RowProjection::Wrapped => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Every column of `columns` as one fan-out's emission. `columns` must refuse none.
+pub(super) fn emitting(columns: &ColumnTypes) -> Emitted {
+    columns
+        .named(|_| true)
+        .expect("the fixture refuses no column")
+}
+
+/// The columns `names` of `columns` as one fan-out's emission, in declaration order.
+pub(super) fn emitting_named(columns: &ColumnTypes, names: &[&str]) -> Emitted {
+    columns
+        .named(|column| names.contains(&column.name.as_str()))
+        .expect("the fixture names no refused column")
+}
+
+/// The N-scan wrapper over `sides`, each leg's fan-out emitting every column of its side.
+pub(super) fn full_row_n_scan_sql(
+    pushdown: &PushdownRequest,
+    join: &joins::DetectedJoin,
+    sides: &[joins::ResolvedJoinSide],
+    inputs: &joins::JoinScanRequestConfig<'_>,
+    udf_name: &str,
+    distribute_udf_name: &str,
+) -> Result<String, UdfError> {
+    let emitted: Vec<Emitted> = sides
+        .iter()
+        .map(|side| emitting(&side.column_types))
+        .collect();
+    joins::build_n_scan_join_sql(
+        pushdown,
+        join,
+        sides,
+        &emitted,
+        inputs,
+        udf_name,
+        distribute_udf_name,
+    )
 }
 
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
@@ -595,18 +655,14 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
     );
     let declined = declined
         .expect("fixture precondition: a declining filter must be handed back for self-applying");
-    let col_types = first_table_column_types(request);
-    let fan_out = joins::FanOutProjection::new(
-        crate::scan::spec::CommonScanSpec {
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        &col_types,
-    );
     joins::build_qualified_single_table_fallback_sql(
         request,
         &pushdown,
-        &fan_out,
+        CommonScanSpec {
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
+        },
+        &emitting(&first_table_column_types(request)),
         &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -615,12 +671,12 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
     .expect("the wrapper must render the declined predicate")
 }
 
-/// [`project_split`] over `request`'s first involved table, as `handle_pushdown` projects it.
-pub(crate) fn project_first_table(
+/// [`project_row`] over `request`'s first involved table.
+pub(super) fn project_first_table(
     request: &Json,
     pushdown_req: &Json,
-) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    project_split(
+) -> Result<RowProjection, UdfError> {
+    project_row(
         &PushdownRequest::parse(pushdown_req.clone())?,
         &first_table_column_types(request),
     )

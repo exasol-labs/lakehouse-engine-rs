@@ -2,8 +2,9 @@ use super::attribution::JoinLegs;
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::pushdown::ResolvedScan;
+use crate::adapter::pushdown::support::RowProjection;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
+use crate::scan::spec::{FileEntry, LogicalField};
 use crate::types::exasol_type::ExasolType;
 use futures::FutureExt;
 use std::collections::HashSet;
@@ -38,6 +39,24 @@ pub(super) fn customer_orders_request_declaring(
     from_extra: Json,
     condition: Json,
 ) -> PushdownRequestBuilder {
+    customer_orders_request_over(
+        customer_columns,
+        &[
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("O_ORDERDATE", ExasolType::Date),
+        ],
+        from_extra,
+        condition,
+    )
+}
+
+/// CUSTOMER and ORDERS, each declaring the given columns, joined on `condition`.
+pub(super) fn customer_orders_request_over(
+    customer_columns: &[(&str, ExasolType)],
+    orders_columns: &[(&str, ExasolType)],
+    from_extra: Json,
+    condition: Json,
+) -> PushdownRequestBuilder {
     let mut from = serde_json::json!({
         "type": "join",
         "join_type": "inner",
@@ -50,13 +69,7 @@ pub(super) fn customer_orders_request_declaring(
     from["condition"] = condition;
 
     pushdown_request("CUSTOMER", customer_columns)
-        .table(
-            "ORDERS",
-            &[
-                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
-                ("O_ORDERDATE", ExasolType::Date),
-            ],
-        )
+        .table("ORDERS", orders_columns)
         .field("type", serde_json::json!("select"))
         .field("from", from)
         .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
@@ -249,8 +262,8 @@ pub(super) fn request_legs(request: &Json) -> JoinLegs {
 }
 
 /// The select list projected as `render_broadcast_join` projects it: every column qualified
-/// through the leg binding and typed by its own leg's universe, widened row included.
-pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
+/// through the leg binding and typed by its own leg's universe.
+pub(super) fn broadcast_projection(request: &Json) -> RowProjection {
     let join = detected_join(request);
     let legs = join.legs();
     let qualified = legs.qualify(&pd(request));
@@ -261,10 +274,7 @@ pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let (items, types, widened) =
-        project_split(&parsed_pushdown(request).with_json(qualified), &leg_types)
-            .expect("projectable");
-    (items, types, widened)
+    project_row(&parsed_pushdown(request).with_json(qualified), &leg_types).expect("projectable")
 }
 
 /// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play
@@ -303,6 +313,21 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             refused_columns: Vec::new(),
         },
         column_types(NO_COLUMNS),
+    )
+}
+
+/// One CUSTOMER and one ORDERS file of the given sizes, typed as `request` declares the tables.
+pub(super) fn customer_orders_sides(
+    request: &Json,
+    customer_bytes: u64,
+    orders_bytes: u64,
+) -> Vec<ResolvedJoinSide> {
+    request_typed(
+        request,
+        &[
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
+        ],
     )
 }
 
@@ -746,5 +771,43 @@ async fn resolved_join_sides_stay_in_leg_index_order() {
     assert!(
         customer < orders,
         "the resolved sides must stay in leg-index order, left leaf first: {sql}"
+    );
+}
+
+/// A name refused on one leg must not fail a query that reads only the other leg's column.
+#[test]
+fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
+    let shared = |x: ExasolType| [("ID", ExasolType::decimal(20, 0)), ("X", x)];
+    let on_id = predicate_equal(table_col("CUSTOMER", "ID"), table_col("ORDERS", "ID"));
+    let request = built_join(
+        customer_orders_request_over(
+            &shared(ExasolType::WIDEST_VARCHAR),
+            &shared(ExasolType::Date),
+            Json::Null,
+            on_id,
+        )
+        .column(table_col("ORDERS", "X")),
+    );
+    let customer = ResolvedJoinSide {
+        refused_columns: vec![unread_refused("Parquet", "x", None, "geometry")],
+        ..resolved_side("CUSTOMER", Vec::new())
+    };
+    let sides = request_typed(&request, &[customer, resolved_side("ORDERS", Vec::new())]);
+    let emitted = vec![
+        emitting_named(&sides[0].column_types, &["ID"]),
+        emitting_named(&sides[1].column_types, &["ID", "X"]),
+    ];
+
+    let response = empty_join_sql(
+        &parsed_pushdown(&request),
+        &detected_join(&request),
+        &sides,
+        emitted,
+    )
+    .expect("ORDERS.X is readable");
+
+    assert_eq!(
+        response["sql"],
+        r#"SELECT CAST(NULL AS DATE) AS "LHS_T1_X" FROM DUAL WHERE 1=0"#
     );
 }

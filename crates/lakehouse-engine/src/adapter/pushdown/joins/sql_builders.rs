@@ -10,10 +10,10 @@ use vs_expression::{ColumnNode, SqlFragment};
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    AggregationType, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
-    aggregation_type, build_scan_driving_sql, collect_all_column_names, extract_limit,
-    extract_offset, output_select_list, project_columns, projection_items, quote_ident,
-    render_limit_offset, scan_storage_for, shard_count,
+    AggregationType, ColumnTypes, Emitted, OutputContract, ProjectedColumn, PushdownRequest,
+    RowProjection, ScanTranslator, aggregation_type, build_scan_driving_sql, extract_limit,
+    extract_offset, output_select_list, project_columns, projection_items, pushdown_response,
+    quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
 use super::attribution::JoinLegs;
@@ -21,10 +21,10 @@ use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
-    LegColumns, aggregated_leg_columns, broadcast_width_bounded, conjoin_filters,
-    cross_leg_residual_filter, join_key_columns, leg_local_filter, projection_item_select_sql,
-    referenced_clause_values, referenced_leg_columns, render_expression_qualified,
-    screen_leg_filter, select_item_type,
+    LegColumns, broadcast_width_bounded, conjoin_filters, cross_leg_residual_filter,
+    fan_out_emission, leg_columns_named_in, leg_emission, leg_local_filter, named_emission,
+    projection_item_select_sql, referenced_clause_values, render_expression_qualified,
+    screen_leg_filter, select_item_type, with_placeholder, wrapper_clause_values,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -43,8 +43,8 @@ pub(crate) struct RenderedJoinPushdown {
     pub(in super::super) window: JoinWindowPlan,
 }
 
-/// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, the
-/// projection widened to the full row (#196), a projected output name exceeds Exasol's
+/// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, a
+/// select-list item is one only Exasol computes (#196), a projected output name exceeds Exasol's
 /// identifier limit, or the WHERE filter declines through [`ScanTranslator::split_where`]: broadcast
 /// has no outer WHERE to apply a declined predicate.
 ///
@@ -85,13 +85,13 @@ pub(crate) fn render_broadcast_join(
         return Ok(None);
     }
 
-    let (projection, widened) = project_columns(&qualified, scan)?;
-    // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
-    // (#196).
-    if widened
-        || projection
-            .iter()
-            .any(|column| exceeds_identifier_limit(&column.item))
+    let emitted = broadcast_emission(pushdown, join, sides)?;
+    let RowProjection::Direct(projection) = project_columns(&qualified, scan, &emitted)? else {
+        return Ok(None);
+    };
+    if projection
+        .iter()
+        .any(|column| exceeds_identifier_limit(&column.item))
     {
         return Ok(None);
     }
@@ -102,6 +102,39 @@ pub(crate) fn render_broadcast_join(
         projection,
         window: classify_join_window(qualified.json()),
     }))
+}
+
+/// What the broadcast fan-out emits, each column qualified with its leg's alias: the columns the
+/// select list names. The scan reads a join key anyway, so one serves a list that names none.
+fn broadcast_emission(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+) -> Result<Emitted, UdfError> {
+    let legs = join.legs();
+    let above: Vec<&Json> = pushdown.json().get("selectList").into_iter().collect();
+    let scanned = scanned_legs(sides);
+    let keys = leg_columns_named_in(&join.conditions, &legs, 0, &sides[0].column_types);
+    let per_leg = fan_out_emission(pushdown.output(), &above, &legs, &scanned, &keys)?;
+    Ok(qualified_emission(&legs, &per_leg))
+}
+
+fn scanned_legs(sides: &[ResolvedJoinSide]) -> Vec<(usize, &ColumnTypes)> {
+    sides
+        .iter()
+        .map(|side| &side.column_types)
+        .enumerate()
+        .collect()
+}
+
+/// `per_leg` as one emission, each column qualified with its leg's alias.
+pub(super) fn qualified_emission(legs: &JoinLegs, per_leg: &[Emitted]) -> Emitted {
+    Emitted::per_relation(
+        per_leg
+            .iter()
+            .enumerate()
+            .map(|(leg, emitted)| (legs.leg_alias(leg), emitted)),
+    )
 }
 
 /// The request clauses the broadcast plan renders, so the ones it qualifies and type-checks.
@@ -161,16 +194,18 @@ fn build_n_scan_join_from(
 
 fn n_full_row_items(
     legs: &JoinLegs,
-    cols_per_leg: &[&ColumnTypes],
+    emitted: &[Emitted],
     naming: LegColumns,
 ) -> Vec<ProjectionItem> {
-    cols_per_leg
+    emitted
         .iter()
         .enumerate()
         .flat_map(|(leg, cols)| {
-            cols.iter().map(move |(column, _)| ProjectionItem::Expr {
-                expr: naming.column(legs, leg, &column.name),
-            })
+            cols.columns()
+                .iter()
+                .map(move |(column, _)| ProjectionItem::Expr {
+                    expr: naming.column(legs, leg, &column.name),
+                })
         })
         .collect()
 }
@@ -192,35 +227,39 @@ fn join_render_decline(clause: &str) -> UdfError {
     ))
 }
 
-/// An absent/empty select list projects every column of every leg. An item without a stated type
+/// The wrapper's select list over the columns the fan-outs emit. An item without a stated type
 /// is cast to its declared type: Exasol sends `''` and `NULL` alike as `literal_null` (#587).
 fn n_scan_join_select_items(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
-    cols_per_leg: &[&ColumnTypes],
+    emitted: &[Emitted],
     naming: LegColumns,
 ) -> Result<Vec<ProjectionItem>, UdfError> {
-    match pushdown.json().get("selectList") {
-        Some(Json::Array(list)) if !list.is_empty() => {
-            let mut fragments = Vec::with_capacity(list.len());
-            for item in list {
-                let sql = naming.render(item, legs);
-                fragments.push(SqlFragment::new(
-                    sql,
-                    select_item_type(item, legs, cols_per_leg),
-                ));
-            }
-            let items =
-                output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
-                    join_render_decline("the select list and its declared types differ in length")
-                })?;
-            Ok(items
-                .into_iter()
-                .map(|expr| ProjectionItem::Expr { expr })
-                .collect())
+    let list = match pushdown.output() {
+        OutputContract::WholeRow => {
+            return pushdown.whole_row(n_full_row_items(legs, emitted, naming));
         }
-        _ => Ok(n_full_row_items(legs, cols_per_leg, naming)),
-    }
+        // Exasol counts the rows and rejects any width but one column.
+        OutputContract::AnyOneColumn => {
+            let row = n_full_row_items(legs, emitted, naming);
+            return Ok(row.into_iter().take(1).collect());
+        }
+        OutputContract::Items => pushdown.select_items().unwrap_or_default(),
+    };
+    let cols_per_leg: Vec<&ColumnTypes> = emitted.iter().map(Emitted::columns).collect();
+    let fragments = list.iter().map(|item| {
+        SqlFragment::new(
+            naming.render(item, legs),
+            select_item_type(item, legs, &cols_per_leg),
+        )
+    });
+    let items = output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
+        join_render_decline("the select list and its declared types differ in length")
+    })?;
+    Ok(items
+        .into_iter()
+        .map(|expr| ProjectionItem::Expr { expr })
+        .collect())
 }
 
 /// Shared by the N-scan wrapper and the grouped single-table fallback. The window renders
@@ -233,11 +272,16 @@ struct OuterWrapperClauses {
 fn outer_wrapper_clauses(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
-    cols_per_leg: &[&ColumnTypes],
+    emitted: &[Emitted],
     naming: LegColumns,
 ) -> Result<OuterWrapperClauses, UdfError> {
     let pushdown_req = pushdown.json();
-    let select_items = n_scan_join_select_items(pushdown, legs, cols_per_leg, naming)?;
+    let select_items = n_scan_join_select_items(pushdown, legs, emitted, naming)?;
+    if select_items.is_empty() {
+        return Err(UdfError::User(
+            "internal adapter error: the pushdown wrapper selects no column".into(),
+        ));
+    }
     let group_by = join_group_by(pushdown_req, legs, naming);
     let having = join_having(pushdown_req, legs, naming);
     let order_by = join_order_by(pushdown_req, legs, naming);
@@ -251,15 +295,11 @@ fn outer_wrapper_clauses(
          so a non-zero offset must never arrive without a non-empty orderBy"
     );
 
-    let select = if select_items.is_empty() {
-        "*".to_string()
-    } else {
-        select_items
-            .iter()
-            .map(projection_item_select_sql)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let select = select_items
+        .iter()
+        .map(projection_item_select_sql)
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut trailing = String::new();
     if let Some(clause) = group_by {
@@ -276,19 +316,45 @@ fn outer_wrapper_clauses(
     Ok(OuterWrapperClauses { select, trailing })
 }
 
-/// The sole unaccelerated fallback: each table scans through its own sharded fan-out, and
-/// Exasol rebuilds the join via a left-to-right `INNER JOIN … ON` chain. Leg identity is
-/// owned by [`JoinLegs`], so self-join occurrences stay distinct legs (#361). All references
-/// render leg-qualified (`"LHS_T{i}"."COL"`), so shared column or table names are safe.
-///
-/// Each leg receives the leg-local conjuncts [`screen_leg_filter`] renders; every other conjunct,
-/// declined ones included, goes to the outer WHERE, so the fan-out loop runs first.
-///
+/// What each leg's fan-out of the N-scan wrapper emits: its columns that a join condition or a
+/// request clause names. The wrapper renders the whole WHERE, so the filter counts.
+pub(in super::super) fn n_scan_emission(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+) -> Result<Vec<Emitted>, UdfError> {
+    let legs = join.legs();
+    let above: Vec<&Json> = join
+        .conditions
+        .iter()
+        .chain(referenced_clause_values(pushdown.json()))
+        .collect();
+    sides
+        .iter()
+        .enumerate()
+        .map(|(leg, side)| leg_emission(pushdown.output(), &above, &legs, leg, &side.column_types))
+        .collect()
+}
+
+/// What the qualified single-table wrapper's fan-out emits: the columns a request clause names.
+pub(in super::super) fn single_table_emission(
+    request: &Json,
+    pushdown: &PushdownRequest,
+    col_types: &ColumnTypes,
+) -> Result<Emitted, UdfError> {
+    let legs = JoinLegs::for_single_scan(request);
+    let above: Vec<&Json> = referenced_clause_values(pushdown.json()).collect();
+    leg_emission(pushdown.output(), &above, &legs, 0, col_types)
+}
+
+/// The sole unaccelerated fallback: Exasol rebuilds the join over one fan-out per leg. A declined
+/// or cross-leg conjunct goes to the outer WHERE, so it applies once, after the fan-outs.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_n_scan_join_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
+    emitted: &[Emitted],
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -306,14 +372,9 @@ pub(in super::super) fn build_n_scan_join_sql(
     let pushdown_req = pushdown.json();
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
 
-    // All conditions go in as one array so `referenced_leg_columns` keeps any side column a
-    // condition references.
-    let all_conditions = Json::Array(join.conditions.clone());
     let mut fan_outs = Vec::with_capacity(sides.len());
     let mut declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
-        let narrowed =
-            referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
         let (side_filter, side_declined) =
             match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
                 Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i])?,
@@ -323,7 +384,7 @@ pub(in super::super) fn build_n_scan_join_sql(
         declined = conjoin_filters(declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(
             side,
-            &narrowed,
+            &emitted[i],
             side_filter,
             inputs,
             udf_name,
@@ -339,7 +400,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     let filter = residual.map(|tree| render_expression_qualified(&tree, &legs));
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown, &legs, &cols_per_side, LegColumns::Relations)?;
+        outer_wrapper_clauses(pushdown, &legs, emitted, LegColumns::Relations)?;
 
     let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
@@ -371,11 +432,9 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 }
 
 /// Carries only `primary`'s own storage; the broadcast dimension's storage rides in
-/// `join.storage`. `common.limit` is always `None`: a post-join cap rides in
-/// [`JoinSpec::post_join_limit`] instead.
+/// `join.storage`. A post-join cap rides in [`JoinSpec::post_join_limit`], never `common.limit`.
 fn join_fan_out_scan_spec(
     primary: &ResolvedJoinSide,
-    projection: Vec<ProjectionItem>,
     filter: Option<String>,
     join: Option<JoinSpec>,
     inputs: &JoinScanRequestConfig<'_>,
@@ -384,7 +443,8 @@ fn join_fan_out_scan_spec(
     Ok(ScanSpec {
         common: CommonScanSpec {
             table_root: primary.table_root.clone(),
-            projection,
+            // The fan-out builder writes the projection beside its `EMITS`.
+            projection: Vec::new(),
             filter,
             limit: None,
             order_by: Vec::new(),
@@ -422,11 +482,10 @@ fn scan_storage_for_side(
     )
 }
 
-/// `filter` is the leg filter [`screen_leg_filter`] rendered. `columns` must expose every
-/// column any outer clause references.
+/// `filter` is the leg filter [`screen_leg_filter`] rendered.
 pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
-    columns: &ColumnTypes,
+    columns: &Emitted,
     filter: Option<String>,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
@@ -435,7 +494,7 @@ pub(super) fn build_side_fan_out_sql(
     let projection = columns.projection();
 
     let shards = shard_side(side, inputs);
-    let spec = join_fan_out_scan_spec(side, projection_items(&projection), filter, None, inputs)?;
+    let spec = join_fan_out_scan_spec(side, filter, None, inputs)?;
     Ok(build_scan_driving_sql(
         &spec,
         &shards,
@@ -551,13 +610,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
 
-    let spec = join_fan_out_scan_spec(
-        fact,
-        projection_items(&rendered.projection),
-        rendered.filter.clone(),
-        Some(join),
-        inputs,
-    )?;
+    let spec = join_fan_out_scan_spec(fact, rendered.filter.clone(), Some(join), inputs)?;
 
     let fan_out = build_scan_driving_sql(
         &spec,
@@ -574,19 +627,16 @@ pub(in super::super) fn build_broadcast_join_sql(
     };
     Ok(Some(wrap_declined_order_by(
         &fan_out,
-        &spec.common.projection,
-        spec.common.projection.len(),
+        &projection_items(&rendered.projection),
+        rendered.projection.len(),
         &keys,
         limit,
         offset,
     )))
 }
 
-/// The broadcast plan of an eligible two-leg join. An aggregating request broadcasts the plain
-/// columns its aggregation reads, and one outer Exasol SELECT aggregates, sorts, and applies the
-/// LIMIT over them, so no shard aggregates, sorts, or truncates. `None` falls through to the
-/// N-scan wrapper, as [`aggregation_input_request`], [`render_broadcast_join`], and
-/// [`build_broadcast_join_sql`] decide.
+/// The broadcast plan of an eligible two-leg join. An aggregating request is aggregated, sorted,
+/// and limited only by an outer Exasol SELECT, never per shard. `None` falls through to the N-scan.
 pub(in super::super) fn build_broadcast_plan_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
@@ -599,66 +649,58 @@ pub(in super::super) fn build_broadcast_plan_sql(
     let aggregation_input = match aggregation_type(pushdown.json()) {
         Some(_) => {
             match aggregation_input_request(pushdown, join, sides, broadcast.dimension_leg)? {
-                Some(request) => Some(request),
+                Some(input) => Some(input),
                 None => return Ok(None),
             }
         }
         None => None,
     };
-    let fan_out_request = aggregation_input.as_ref().unwrap_or(pushdown);
+    let fan_out_request = aggregation_input
+        .as_ref()
+        .map_or(pushdown, |(request, _)| request);
     let Some(rendered) = render_broadcast_join(fan_out_request, join, sides)? else {
         return Ok(None);
     };
-    let Some(fan_out) =
+    let Some(sql) =
         build_broadcast_join_sql(broadcast, &rendered, inputs, udf_name, distribute_udf_name)?
     else {
         return Ok(None);
     };
-    if aggregation_input.is_none() {
-        return Ok(Some(fan_out));
-    }
-    let cols_per_leg: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
-    let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
-        pushdown,
-        &join.legs(),
-        &cols_per_leg,
-        LegColumns::FanOutOutput,
-    )?;
-    Ok(Some(format!("SELECT {select} FROM ({fan_out}){trailing}")))
+    let Some((_, emitted)) = aggregation_input else {
+        return Ok(Some(sql));
+    };
+    let OuterWrapperClauses { select, trailing } =
+        outer_wrapper_clauses(pushdown, &join.legs(), &emitted, LegColumns::FanOutOutput)?;
+    Ok(Some(format!("SELECT {select} FROM ({sql}){trailing}")))
 }
 
-/// The request's WHERE under a select list of the plain columns the aggregation reads, in leg
-/// and declaration order. A request without a select list returns the full row, which is valid
-/// only when every column is a GROUP BY key, so the keys already read it. When the aggregation
-/// reads no column, a join key of leg 0 keeps one row per joined pair: the scan reads it for the
-/// condition anyway, while the first declared column may be one the reader refuses. `None` when
-/// the dimension's read columns are not [`broadcast_width_bounded`], so the N-scan serves it.
+/// The fan-out request of an aggregating broadcast beside the columns it emits per leg. `None`
+/// when a dimension column the aggregation reads is not [`broadcast_width_bounded`].
 fn aggregation_input_request(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     dimension_leg: usize,
-) -> Result<Option<PushdownRequest>, UdfError> {
+) -> Result<Option<(PushdownRequest, Vec<Emitted>)>, UdfError> {
     let pushdown_req = pushdown.json();
     let legs = join.legs();
-    let mut read: Vec<ColumnTypes> = sides
-        .iter()
-        .enumerate()
-        .map(|(leg, side)| aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types))
-        .collect();
+    let above: Vec<&Json> = wrapper_clause_values(pushdown_req).collect();
+    let scanned = scanned_legs(sides);
+    let read = named_emission(pushdown.output(), &above, &legs, &scanned)?;
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    if !broadcast_width_bounded(filter, &legs, dimension_leg, &read[dimension_leg]) {
+    if !broadcast_width_bounded(filter, &legs, dimension_leg, read[dimension_leg].columns()) {
         return Ok(None);
     }
-    if read.iter().all(ColumnTypes::is_empty) {
-        read[0] = join_key_columns(&join.conditions, &legs, 0, &sides[0].column_types).first_only();
-    }
+    // After the width rule, which judges only what the aggregation reads. The scan reads a
+    // join key anyway, so one serves an aggregation that reads no column.
+    let keys = leg_columns_named_in(&join.conditions, &legs, 0, &sides[0].column_types);
+    let read = with_placeholder(read, &scanned, &keys)?;
     let (select_list, select_types): (Vec<Json>, Vec<Json>) = join
         .tables
         .iter()
         .zip(&read)
-        .flat_map(|(leaf, columns)| {
-            columns.iter().map(|(column, column_type)| {
+        .flat_map(|(leaf, emitted)| {
+            emitted.columns().iter().map(|(column, column_type)| {
                 let node = ColumnNode::to_json(
                     &column.name,
                     Some(&leaf.table_name),
@@ -675,7 +717,7 @@ fn aggregation_input_request(
     if let Some(filter) = pushdown_req.get("filter") {
         json["filter"] = filter.clone();
     }
-    PushdownRequest::parse(json).map(Some)
+    Ok(Some((PushdownRequest::parse(json)?, read)))
 }
 
 fn join_group_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {
@@ -714,85 +756,36 @@ fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Op
     Some(parts.join(", "))
 }
 
-/// The shared inner-scan projection for both decline wrappers (#160).
-///
-/// With no select list it must not narrow: a genuine `SELECT *` is validated positionally
-/// against the full base row (`04000` otherwise). Live Exasol sends an absent `selectList`
-/// (captured via `EXPLAIN VIRTUAL`) while the protocol documents an empty one, so absent,
-/// `null`, `[]`, and non-arrays are all accepted.
-///
-/// Otherwise walks every clause via [`referenced_clause_values`] with the Unicode fold.
-/// Falls back to the first column the reader does not refuse when nothing is referenced (an
-/// empty EMITS is invalid), unlike [`referenced_leg_columns`], which falls back to all columns.
-pub(in super::super) fn referenced_columns(
-    pushdown_req: &Json,
-    all_cols: &ColumnTypes,
-) -> ColumnTypes {
-    if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
-        return all_cols.clone();
-    }
-
-    let mut names = std::collections::HashSet::new();
-    referenced_clause_values(pushdown_req, |v| collect_all_column_names(v, &mut names));
-
-    let referenced = all_cols.narrowed(|column| names.contains(&column.name));
-    if referenced.is_empty() {
-        return all_cols.first_readable();
-    }
-    referenced
-}
-
-/// `columns` is the spec's projection, the `EMITS (...)` clause, and the wrapper's full row.
-/// The constructor derives the projection from it, so the three stay aligned by construction.
-#[derive(Debug)]
-pub(in super::super) struct FanOutProjection<'a> {
-    spec: ScanSpec,
-    columns: &'a ColumnTypes,
-}
-
-impl<'a> FanOutProjection<'a> {
-    /// `common`'s own projection is replaced.
-    pub(in super::super) fn new(common: CommonScanSpec, columns: &'a ColumnTypes) -> Self {
-        let spec = ScanSpec {
-            common: CommonScanSpec {
-                projection: projection_items(&columns.projection()),
-                ..common
-            },
-            files: vec![],
-        };
-        Self { spec, columns }
-    }
-}
-
-/// The N-scan fallback at N = 1 for an aggregate request that could not be decomposed
-/// (grouped, or single-group multi/mixed `COUNT(DISTINCT)`): Exasol computes the aggregate
-/// over the raw fan-out aliased `LHS_T0`.
-///
-/// `declined_filter` is a predicate DataFusion cannot render, applied as the wrapper's own
-/// Exasol-dialect `WHERE`: since the fan-out is aggregate-, sort-, and LIMIT-free, it
-/// restricts the rows the outer clauses consume. Callers must leave `fan_out_spec.filter`
-/// `None` alongside it so it applies exactly once.
+/// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out, which emits
+/// `emitted`. `declined_filter` is the wrapper's WHERE, so `fan_out.filter` must then be `None`.
+#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown: &PushdownRequest,
-    fan_out: &FanOutProjection<'_>,
+    fan_out: CommonScanSpec,
+    emitted: &Emitted,
     shards: &[Vec<E>],
     udf_name: &str,
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<String, UdfError> {
-    let fan_out_spec = &fan_out.spec;
-
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
 
-    let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown, &legs, &[fan_out.columns], LegColumns::Relations)?;
+    let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
+        pushdown,
+        &legs,
+        std::slice::from_ref(emitted),
+        LegColumns::Relations,
+    )?;
 
     let fan_out = build_scan_driving_sql(
-        fan_out_spec,
+        &ScanSpec {
+            common: fan_out,
+            files: vec![],
+        },
         shards,
-        &fan_out.columns.projection(),
+        &emitted.projection(),
         None,
         None,
         udf_name,
@@ -812,8 +805,8 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     Ok(sql)
 }
 
-/// `filter` must be `None` when `declined_filter` is set. Projection is decided by the select
-/// list, not the decline, so a declined filter over a real select list keeps the narrowing
+/// `filter` must be `None` when `declined_filter` is set. The emission is decided by the request's
+/// clauses, not the decline, so a declined filter over a real select list keeps the narrowing
 /// (#160), which matters here since the fan-out ships every row.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
@@ -822,69 +815,68 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     base: &CommonScanSpec,
     filter: Option<String>,
     shards: &[Vec<FileEntry>],
-    col_types: &ColumnTypes,
+    emitted: &Emitted,
     udf_name: &str,
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
-    let referenced = referenced_columns(pushdown.json(), col_types);
-    let fan_out = FanOutProjection::new(
-        CommonScanSpec {
-            filter,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            ..base.clone()
-        },
-        &referenced,
-    );
+    let fan_out = CommonScanSpec {
+        filter,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        distinct: false,
+        ..base.clone()
+    };
     let sql = build_qualified_single_table_fallback_sql(
         request,
         pushdown,
-        &fan_out,
+        fan_out,
+        emitted,
         shards,
         udf_name,
         distribute_udf_name,
         declined_filter,
     )?;
-    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+    Ok(pushdown_response(sql))
 }
 
+/// The empty relation of a request whose scan has no file: one empty subquery per leg, exposing
+/// the columns the leg's fan-out would emit, so the wrapper over it is the non-empty wrapper.
 pub(in super::super) struct EmptyRelation {
     legs: JoinLegs,
-    cols_per_leg: Vec<ColumnTypes>,
+    emitted: Vec<Emitted>,
 }
 
 impl EmptyRelation {
-    pub(in super::super) fn single_scan(request: &Json, col_types: &ColumnTypes) -> Self {
+    pub(in super::super) fn single_scan(request: &Json, emitted: Emitted) -> Self {
         Self {
             legs: JoinLegs::for_single_scan(request),
-            cols_per_leg: vec![col_types.clone()],
+            emitted: vec![emitted],
         }
     }
 
-    pub(super) fn join(join: &DetectedJoin, cols_per_leg: Vec<ColumnTypes>) -> Self {
+    pub(super) fn join(join: &DetectedJoin, emitted: Vec<Emitted>) -> Self {
         Self {
             legs: join.legs(),
-            cols_per_leg,
+            emitted,
         }
     }
 
-    pub(in super::super) fn pushdown(&self, pushdown: &PushdownRequest) -> Result<Json, UdfError> {
-        let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
-            pushdown,
-            &self.legs,
-            &self.cols_per_leg.iter().collect::<Vec<_>>(),
-            LegColumns::Relations,
-        )?;
+    pub(in super::super) fn pushdown(
+        &self,
+        pushdown: &PushdownRequest,
+    ) -> Result<String, UdfError> {
+        let OuterWrapperClauses { select, trailing } =
+            outer_wrapper_clauses(pushdown, &self.legs, &self.emitted, LegColumns::Relations)?;
         let from = self
-            .cols_per_leg
+            .emitted
             .iter()
             .enumerate()
             .map(|(leg, cols)| {
                 let nulls = cols
+                    .columns()
                     .iter()
                     .map(|(column, column_type)| {
                         format!(
@@ -902,8 +894,7 @@ impl EmptyRelation {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {select} FROM {from}{trailing}");
-        Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+        Ok(format!("SELECT {select} FROM {from}{trailing}"))
     }
 }
 
