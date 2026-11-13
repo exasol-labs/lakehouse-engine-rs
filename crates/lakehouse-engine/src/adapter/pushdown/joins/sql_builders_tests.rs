@@ -953,6 +953,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
             ),
         ],
     );
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
 
     assert!(matches!(
         classify_join_window(&pd(&request)),
@@ -960,6 +961,10 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     ));
 
     let sql = n_scan_sql(&request).expect("aggregate-over-join must build the unified wrapper");
+    assert!(
+        sql.ends_with(" GROUP BY ()"),
+        "a single-group request aggregates to one row: {sql}"
+    );
 
     assert!(sql.contains("COUNT(*)"), "COUNT(*) must be rendered: {sql}");
     assert!(
@@ -1107,6 +1112,11 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
             (table_col("ORDERS", "O_ORDERDATE"), ExasolType::Date),
         ],
     );
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+    request["pushdownRequest"]["groupBy"] = serde_json::json!([
+        table_col("CUSTOMER", "C_NAME"),
+        table_col("ORDERS", "O_ORDERDATE")
+    ]);
     request["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
 
     assert!(matches!(
@@ -1220,36 +1230,30 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
         JoinWindowPlan::ExasolPostProcessed
     ));
 
-    let mut aggregate_item = join_request(Json::Null, equi_condition());
-    aggregate_item = selecting(
-        aggregate_item,
+    // The stripped select list holds no aggregate, so only `aggregationType` forces it (#627).
+    let mut stripped_single_group = selecting(
+        join_request(Json::Null, equi_condition()),
+        &[(null_lit(), ExasolType::decimal(18, 0))],
+    );
+    stripped_single_group["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
+    let mut having = selecting(
+        join_request(Json::Null, equi_condition()),
         &[(count_star(), ExasolType::decimal(18, 0))],
     );
-    assert!(matches!(
-        classify_join_window(&pd(&aggregate_item)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut grouped = join_request(Json::Null, equi_condition());
-    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
-    assert!(matches!(
-        classify_join_window(&pd(&grouped)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut group_by_aggregation = join_request(Json::Null, equi_condition());
-    group_by_aggregation["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
-    assert!(matches!(
-        classify_join_window(&pd(&group_by_aggregation)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut having = join_request(Json::Null, equi_condition());
+    having["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
     having["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
-    assert!(matches!(
-        classify_join_window(&pd(&having)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
+    let mut grouped = join_request(Json::Null, equi_condition());
+    grouped["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
+    for request in [stripped_single_group, having, grouped] {
+        assert!(
+            matches!(
+                classify_join_window(&pd(&request)),
+                JoinWindowPlan::ExasolPostProcessed
+            ),
+            "{request}"
+        );
+    }
 }
 
 #[test]

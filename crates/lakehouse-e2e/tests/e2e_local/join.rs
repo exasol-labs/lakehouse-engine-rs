@@ -530,6 +530,7 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     );
 }
 
+/// Scenario: Aggregate over a join routes through the unified qualified wrapper
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
     setup_e2e();
@@ -569,6 +570,11 @@ fn e2e_aggregate_over_join_result_correct() {
             expected_min,
             "MIN(O_ORDERDATE) over the join must equal the single-table MIN for {vs_name}"
         );
+
+        let nested = format!("SELECT COUNT(*) FROM ({})", aggregate_join_query(vs_name));
+        let cols = conn.query_columns(&nested);
+        assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
+        assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
     }
 }
 
