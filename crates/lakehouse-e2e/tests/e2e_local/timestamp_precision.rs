@@ -5,15 +5,18 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
-    E2E_TSPRECISION_NAMESPACE, E2E_TSPRECISION_TABLE, TSPRECISION_COL_TS, TSPRECISION_COL_TS_NS,
-    TSPRECISION_COL_TSTZ, TSPRECISION_MICROS, TSPRECISION_NANOS, seed_timestamp_precision_probe,
+    E2E_ALL_TYPES_TABLE, E2E_TSPRECISION_NAMESPACE, E2E_TSPRECISION_TABLE, TSPRECISION_COL_TS,
+    TSPRECISION_COL_TS_NS, TSPRECISION_COL_TSTZ, TSPRECISION_MICROS, TSPRECISION_NANOS,
+    seed_timestamp_precision_probe,
 };
 use crate::common::stack::iceberg_catalog_url;
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
     live_engine_version,
 };
-use crate::fixtures::{assert_pushed_to_scan_udf, emits_clause, stack};
+use crate::fixtures::{
+    LAKEHOUSE_VS, assert_pushed_to_scan_udf, emits_clause, lakehouse_vs, stack, vs_table,
+};
 use std::sync::OnceLock;
 
 const VS_NAME: &str = "TS_PRECISION_VS";
@@ -446,6 +449,161 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
         expected.declared_column_type
     );
     assert_pushed_to_scan_udf(&mut conn, &distinct_sql, "the nanosecond distinct count");
+}
+
+/// The scan's `date_part` call over `unit`, with the doubled quotes of the scan spec literal.
+fn scan_date_part(unit: &str) -> String {
+    format!("date_part(''{unit}''")
+}
+
+type NativeCase<'a> = (String, PathCheck<'a>, Expect);
+
+fn native_copy_mismatches(conn: &mut ExaConn, table: &str, cases: &[NativeCase]) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|(query, path, expect)| {
+            native_copy_mismatch(conn, table, NATIVE_COPY, query, *path, *expect)
+        })
+        .collect()
+}
+
+/// Scenario: SECOND and EXTRACT(SECOND) return native results through the virtual schema
+/// Scenario: An unprojected SECOND group key takes the type of its argument's precision
+/// Scenario: SECOND over a DATE computes 0 without a stated type
+/// Scenario: SECOND over any other argument, or EXTRACT(SECOND) over a DATE, runs in Exasol
+#[test]
+fn second_and_extract_second_match_a_native_copy() {
+    setup();
+    let mut conn = exa_conn();
+    let microsecond = scan_date_part("microsecond");
+    // On 8.x a nanosecond column is declared bare TIMESTAMP, so the scan reads its microseconds.
+    let nanosecond = if engine_honors_declared_precision(&mut conn) {
+        scan_date_part("nanosecond")
+    } else {
+        microsecond.clone()
+    };
+    let whole_second = scan_date_part("second");
+
+    let mut cases: Vec<NativeCase> = Vec::new();
+    for (column, marker, filter, grouped) in [
+        (
+            "TS",
+            &microsecond,
+            "> 0.1",
+            "SELECT {call}, COUNT(*) FROM {T} GROUP BY {call}",
+        ),
+        (
+            "TS_NS",
+            &nanosecond,
+            "= 0.000000002",
+            "SELECT COUNT(*) FROM {T} GROUP BY {call}",
+        ),
+    ] {
+        for call in [
+            format!("SECOND({column})"),
+            format!("EXTRACT(SECOND FROM {column})"),
+        ] {
+            cases.extend([
+                (
+                    format!("SELECT ID, {call} FROM {{T}} ORDER BY ID"),
+                    PathCheck::Has(marker),
+                    Expect::Rows,
+                ),
+                (
+                    format!("SELECT ID FROM {{T}} WHERE {call} {filter} ORDER BY ID"),
+                    PathCheck::Has(marker),
+                    Expect::Rows,
+                ),
+                (
+                    grouped.replace("{call}", &call),
+                    PathCheck::Split,
+                    Expect::Rows,
+                ),
+            ]);
+        }
+    }
+    cases.extend([
+        (
+            "SELECT ID, SECOND(TSTZ) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Has(&microsecond),
+            Expect::Rows,
+        ),
+        (
+            "SELECT MAX(SECOND(TS)) + 1, SUM(SECOND(TS_NS)) FROM {T}".to_string(),
+            PathCheck::Split,
+            Expect::Rows,
+        ),
+        (
+            "SELECT ID, SECOND(CAST(TS AS TIMESTAMP)) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Has(&microsecond),
+            Expect::Rows,
+        ),
+        (
+            "SELECT ID, SECOND(CAST(TS AS DATE)) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Has(&whole_second),
+            Expect::Rows,
+        ),
+        (
+            "SELECT ID, EXTRACT(SECOND FROM CAST(TS AS DATE)) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Unchecked,
+            Expect::Error,
+        ),
+        (
+            "SELECT ID, SECOND(TS, 2) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Lacks("date_part("),
+            Expect::Rows,
+        ),
+    ]);
+    if engine_honors_declared_precision(&mut conn) {
+        // DataFusion parses only TIMESTAMP(0|3|6|9), so a CAST to any other precision runs in Exasol.
+        cases.push((
+            "SELECT ID, SECOND(CAST(TS AS TIMESTAMP(7))) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Lacks("date_part("),
+            Expect::Rows,
+        ));
+    }
+    let probe = qualified_probe();
+    create_native_copy(&mut conn, &probe, "TS, TSTZ, TS_NS");
+    let mut failures = native_copy_mismatches(&mut conn, &probe, &cases);
+
+    // Every probe value sits at second 0, so these rows compare the whole-second part.
+    lakehouse_vs();
+    let all_types = vs_table(LAKEHOUSE_VS, E2E_ALL_TYPES_TABLE);
+    create_native_copy(&mut conn, &all_types, "C_TIMESTAMPTZ, C_TIMESTAMP_NS");
+    let whole_second_cases: Vec<NativeCase> = [
+        (
+            "SELECT ID, SECOND(C_TIMESTAMPTZ) FROM {T} ORDER BY ID",
+            &microsecond,
+        ),
+        (
+            "SELECT ID, EXTRACT(SECOND FROM C_TIMESTAMP_NS) FROM {T} ORDER BY ID",
+            &nanosecond,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE SECOND(C_TIMESTAMPTZ) > 45 ORDER BY ID",
+            &microsecond,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE EXTRACT(SECOND FROM C_TIMESTAMP_NS) = 45.123 ORDER BY ID",
+            &nanosecond,
+        ),
+    ]
+    .into_iter()
+    .map(|(query, marker)| (query.to_string(), PathCheck::Has(marker), Expect::Rows))
+    .collect();
+    failures.extend(native_copy_mismatches(
+        &mut conn,
+        &all_types,
+        &whole_second_cases,
+    ));
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} SECOND cases differ from native Exasol:\n{}",
+        failures.len(),
+        cases.len() + whole_second_cases.len(),
+        failures.join("\n")
+    );
 }
 
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan

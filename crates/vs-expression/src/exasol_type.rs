@@ -16,7 +16,7 @@ const MAX_CHAR_SIZE: u32 = 2000;
 pub const MAX_DECIMAL_PRECISION: u8 = 36;
 
 /// The most fractional-second digits a TIMESTAMP or an INTERVAL DAY TO SECOND holds.
-const MAX_FRACTIONAL_DIGITS: u8 = 9;
+pub(crate) const MAX_FRACTIONAL_DIGITS: u8 = 9;
 
 /// The widest leading field an INTERVAL declares, as in `INTERVAL DAY(9) TO SECOND`.
 const MAX_INTERVAL_PRECISION: u8 = 9;
