@@ -17,7 +17,7 @@ The scan reads only the projected columns. The scan also evaluates select-list e
 
 ## Filtering
 
-Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop.
+Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -68,7 +68,7 @@ full scan.
 
 ## Scalar functions
 
-The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. For example, `TO_DATE` with a format outside the supported subset runs in Exasol SQL. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
+The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
 
 | Family | Capabilities | Example |
 |---|---|---|
@@ -76,9 +76,17 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Math | `FN_ABS`, `FN_ACOS`, `FN_ASIN`, `FN_ATAN`, `FN_ATAN2`, `FN_CEIL`, `FN_COS`, `FN_COSH`, `FN_COT`, `FN_DEGREES`, `FN_EXP`, `FN_FLOOR`, `FN_LN`, `FN_LOG`, `FN_MOD`, `FN_POWER`, `FN_RADIANS`, `FN_ROUND`, `FN_SIGN`, `FN_SIN`, `FN_SINH`, `FN_SQRT`, `FN_TAN`, `FN_TANH`, `FN_TRUNC` | `SELECT ROUND(amt, 2)` |
 | String | `FN_ASCII`, `FN_CHR`, `FN_CONCAT`, `FN_INITCAP`, `FN_INSTR`, `FN_LEFT`, `FN_LENGTH`, `FN_LOCATE`, `FN_LOWER`, `FN_LPAD`, `FN_LTRIM`, `FN_OCTET_LENGTH`, `FN_REPEAT`, `FN_REPLACE`, `FN_REVERSE`, `FN_RIGHT`, `FN_RPAD`, `FN_RTRIM`, `FN_SUBSTR`, `FN_TRANSLATE`, `FN_TRIM`, `FN_UNICODE`, `FN_UNICODECHR`, `FN_UPPER` | `WHERE UPPER(code) = 'AB'` |
 | Conversion | `FN_CAST` | `SELECT CAST(id AS VARCHAR(20))` |
-| Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
+| Date / time | `FN_ADD_DAYS`, `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_WEEKS`, `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 | JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
+
+`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or `TIMESTAMP` argument and a numeric count. Over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, the scan computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)). Any other argument form (`TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over two date values, another date function, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
+
+`DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
+
+A `CAST` to `INTERVAL`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE` runs in Exasol SQL. A cast that converts text by the session's NLS settings also does, see [Text and session settings](#text-and-session-settings).
+
+`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
 
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
 
@@ -90,8 +98,6 @@ The scan computes these functions when DataFusion can render the whole filter or
 - `ON EMPTY` and `ON ERROR` are `NULL`, or `DEFAULT` with a literal of the returning type that fits it.
 
 Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
-
-The scan reads a document nested at most about 200 levels deep. A deeper document takes the `ON ERROR` behavior.
 
 ### Text and session settings
 

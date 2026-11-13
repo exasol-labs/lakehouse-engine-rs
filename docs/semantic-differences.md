@@ -4,9 +4,9 @@
 
 # Semantic differences from native Exasol
 
-Some pushed-down queries return a different result than the same query on a native Exasol
-table. Each difference on this page is a current compatibility gap. The
-[Capabilities](capabilities.md) page lists which functions are pushed down.
+Some pushed-down queries return different rows or values than the same query on a native
+Exasol table. Each difference on this page is a current compatibility gap that realistic data
+can hit. [Capabilities](capabilities.md) says which forms of each function run in the scan.
 
 ## Case conversion of non-ASCII text
 
@@ -67,42 +67,15 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
 
-## AVG of very large values
-
-`AVG` returns an average where native Exasol fails with `data exception - numeric value out of
-range`. This happens only when the sum of the averaged values exceeds about 38 digits, counting
-the digits after the decimal point.
-
-## Addition and subtraction with different scales
-
-An expression that adds or subtracts DECIMAL values with different scales can return rows where
-native Exasol fails with `data exception - numeric value out of range`. Before it adds them,
-native Exasol converts the value with the smaller scale to `DECIMAL(36, s)`, where `s` is the
-larger scale, and fails when that value has too many integer digits for that type. The virtual
-schema converts the value to a 128-bit intermediate, which has room for it.
-
-For example, `WHERE W + 0.0000001 > W` with `W` a `DECIMAL(36,6)` value of
-`999999999999999999999999999999.999999` fails natively, because the 30 integer digits of `W` do
-not fit `DECIMAL(36,7)`. The virtual schema returns the row. `WHERE H * H + 0.5 > 0` with `H` a
-BIGINT of `4000000000000000000` differs in the same way. A projected sum that exceeds 36 digits
-still fails in the virtual schema too.
-
 ## TO_DATE and TO_TIMESTAMP with a format
 
-The scan runs `TO_DATE` and `TO_TIMESTAMP` with a string-literal format built from `YYYY`, `MM`, and
-`DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally
-`SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_`
-and space. Other formats run in Exasol.
-
-For a few input strings the scan and native Exasol parse differently:
+For a few input strings the scan fails where native Exasol parses the value:
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
 | `TO_DATE('2024-01-01 ', 'YYYY-MM-DD')` (trailing space) | error | `2024-01-01` |
 | `TO_TIMESTAMP('2024-01-01', 'YYYY-MM-DD HH24:MI:SS')` (input shorter than the format) | error | `2024-01-01 00:00:00` |
 | `TO_TIMESTAMP('1600-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` | error | `1600-01-01 00:00:00` |
-
-The scan also accepts some strings Exasol rejects, such as a sign before the year, seconds 60, or a tab inside the value. Those queries return a result where Exasol raises an error.
 
 ## CAST of text to a shorter VARCHAR
 
@@ -115,7 +88,31 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 | `WHERE CAST(val \|\| 'abcdefghij' AS VARCHAR(5)) IS NOT NULL` | returns rows | right-truncation error |
 | `WHERE CAST(val \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | returns rows | error |
 
-A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
+## ADD_DAYS, ADD_WEEKS, ADD_HOURS, and ADD_MINUTES before 1582-10-15
+
+The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses the Julian calendar before 1582-10-15. A call returns a different value when the days between its argument and its result include February 29 of a year divisible by 100 but not by 400, which only the Julian calendar has, or cross 1582-10-15. A call whose arguments are all literals runs in Exasol, because Exasol computes it before pushdown.
+
+| Call | Native Exasol (2025.1.16) | Scan |
+|---|---|---|
+| `ADD_DAYS(d, 1)` with `d` = 1000-02-28 | `1000-02-29` | `1000-03-01` |
+| `ADD_DAYS(d, -1)` with `d` = 1500-03-01 | `1500-02-29` | `1500-02-28` |
+| `ADD_HOURS(d, 24)` with `d` = 1500-02-28 | `1500-02-29 00:00:00` | `1500-03-01 00:00:00` |
+| `ADD_DAYS(d, -1)` with `d` = 1582-10-15 | `1582-10-04` | `1582-10-14` |
+| `ADD_DAYS(d, -200000)` with `d` = 2024-01-01 | `1476-05-24` | `1476-06-02` |
+
+## Nanosecond timestamps outside 1677 to 2262
+
+The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
+in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
+a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
+`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. Native Exasol returns rows.
+
+| Query | Scan |
+|---|---|
+| `WHERE ts_ns < TIMESTAMP '9999-12-31 00:00:00'` | error `Cannot cast … to Timestamp(ns)` |
+| `SELECT ADD_DAYS(ts_ns, 100000)` | error `datetime field overflow` |
+
+Workaround: `CAST(ts_ns AS TIMESTAMP(6))`, which covers Exasol's whole range.
 
 ## JSON_VALUE without a DEFAULT ON ERROR
 
@@ -129,10 +126,6 @@ A `DEFAULT ... ON ERROR` clause on any `JSON_VALUE` call over the document, anyw
 | `JSON_VALUE('{"a":1,"a":2}', '$.a')` | `'1'` | `NULL` (`ON ERROR`) |
 | `JSON_VALUE('{"a":{"c":2},"a":{"b":1}}', '$.a.b')` | `NULL` (`ON EMPTY`) | `'1'` |
 | `JSON_VALUE('nul', '$.a' DEFAULT 'E' ON EMPTY)` | `'E'` (`ON EMPTY`) | `NULL` (`ON ERROR`) |
-
-## JSON_VALUE on deeply nested documents
-
-The scan reads a document nested at most about 200 levels deep, with or without a `DEFAULT ... ON ERROR`. A deeper document takes the `ON ERROR` behavior, while native Exasol reads it.
 
 ## ORDER BY with LIMIT under `EXCLUDED_CAPABILITIES`
 

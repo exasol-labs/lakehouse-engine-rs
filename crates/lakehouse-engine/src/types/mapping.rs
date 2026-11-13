@@ -84,6 +84,16 @@ pub(crate) fn iceberg_decimal(precision: u32, scale: u32) -> Option<Decimal> {
 
 const FIRST_CALENDAR_VERSIONED_MAJOR: u32 = 2025;
 
+/// Whether `version` is an Exasol 8.x or older release. An unparseable version reads as a newer
+/// one, because an unrecognised version is more likely a future release than an old one.
+pub(crate) fn predates_calendar_versions(version: &str) -> bool {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < FIRST_CALENDAR_VERSIONED_MAJOR)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampPrecision {
     Millisecond,
@@ -144,16 +154,11 @@ pub enum EngineTimestampSupport {
 }
 
 impl EngineTimestampSupport {
-    /// An unparseable version maps to `DeclaredPrecision`: misdeclaring on 8.x is harmless,
-    /// whereas truncating on an unrecognised newer engine would lose data.
     pub fn from_database_version(version: &str) -> Self {
-        match version
-            .split('.')
-            .next()
-            .and_then(|major| major.parse::<u32>().ok())
-        {
-            Some(major) if major < FIRST_CALENDAR_VERSIONED_MAJOR => Self::MillisecondOnly,
-            _ => Self::DeclaredPrecision,
+        if predates_calendar_versions(version) {
+            Self::MillisecondOnly
+        } else {
+            Self::DeclaredPrecision
         }
     }
 

@@ -5,7 +5,7 @@ The scan evaluates pushed numeric expressions with Exasol's typing rules, so a p
 ## Background
 
 * Exasol combines DOUBLE with DECIMAL in DOUBLE. DataFusion combines them in DECIMAL, which overflows for large DOUBLE values and rounds small ones to zero.
-* Exasol computes exact arithmetic on 128-bit values. It limits a materialized value to 36 digits, and it limits the operand that `+` or `-` rescales to the larger scale to `DECIMAL(36, larger scale)`. The scan does not limit the rescaled operand, a difference that `docs/semantic-differences.md` records. DataFusion's integer arithmetic and its `SUM` wrap around on overflow.
+* Exasol computes exact arithmetic on 128-bit values. It limits a materialized value to 36 digits, and it limits the operand that `+` or `-` rescales to the larger scale to `DECIMAL(36, larger scale)`. The scan does not limit the rescaled operand. DataFusion's integer arithmetic and its `SUM` wrap around on overflow.
 * Exasol compares exact values exactly at any width, and it returns DOUBLE from a value combinator whose common DECIMAL type exceeds 36 digits. DataFusion clamps the common type of two exact operands to 38 digits, which fails the cast of a wider value.
 * One constructor builds every scan session. It installs a rewrite rule that runs before DataFusion's type coercion, and it registers the functions that the rule calls. Planning that derives the scan's result types uses the same constructor.
 
