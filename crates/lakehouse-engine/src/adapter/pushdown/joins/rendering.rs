@@ -245,6 +245,20 @@ pub(super) fn aggregated_leg_columns(
     full_cols.narrowed(|column| names.contains(&column.name))
 }
 
+/// Leg `leg`'s columns that the join conditions read, in declaration order.
+pub(super) fn join_key_columns(
+    conditions: &[Json],
+    legs: &JoinLegs,
+    leg: usize,
+    full_cols: &ColumnTypes,
+) -> ColumnTypes {
+    let mut names = std::collections::HashSet::new();
+    for condition in conditions {
+        collect_leg_column_names(condition, legs, leg, &mut names);
+    }
+    full_cols.narrowed(|column| names.contains(&column.name))
+}
+
 /// Drops columns the N-scan wrapper never references so each leg ships narrow rows. Kept:
 /// this leg's columns in SELECT, the join condition, the full WHERE (the wrapper renders
 /// all of it), GROUP BY, HAVING, and ORDER BY. An empty select list (`SELECT *`) or an empty

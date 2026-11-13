@@ -22,6 +22,22 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
 
 /// [`join_request`]'s two tables joined on `condition`, before its select list.
 pub(super) fn customer_orders_request(from_extra: Json, condition: Json) -> PushdownRequestBuilder {
+    customer_orders_request_declaring(
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+        ],
+        from_extra,
+        condition,
+    )
+}
+
+/// [`customer_orders_request`] with CUSTOMER declaring `customer_columns`, in that order.
+pub(super) fn customer_orders_request_declaring(
+    customer_columns: &[(&str, ExasolType)],
+    from_extra: Json,
+    condition: Json,
+) -> PushdownRequestBuilder {
     let mut from = serde_json::json!({
         "type": "join",
         "join_type": "inner",
@@ -33,23 +49,17 @@ pub(super) fn customer_orders_request(from_extra: Json, condition: Json) -> Push
     }
     from["condition"] = condition;
 
-    pushdown_request(
-        "CUSTOMER",
-        &[
-            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
-            ("C_NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .table(
-        "ORDERS",
-        &[
-            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
-            ("O_ORDERDATE", ExasolType::Date),
-        ],
-    )
-    .field("type", serde_json::json!("select"))
-    .field("from", from)
-    .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+    pushdown_request("CUSTOMER", customer_columns)
+        .table(
+            "ORDERS",
+            &[
+                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("O_ORDERDATE", ExasolType::Date),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field("from", from)
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
 }
 
 /// `join` over [`customer_orders_request`]'s tables, built with each table's identifier note.

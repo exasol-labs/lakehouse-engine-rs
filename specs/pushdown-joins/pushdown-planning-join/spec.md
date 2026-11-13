@@ -37,7 +37,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 * *GIVEN* a `pushdown` request that meets the broadcast contract and requires Exasol postprocessing
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, and one column when they read none
+* *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, and one join-key column of the first leg when they read none
 * *AND* one outer Exasol `SELECT` SHALL render the select list, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` over the fan-out's `<alias>_<column>` output names, so no shard aggregates, sorts, or truncates
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 

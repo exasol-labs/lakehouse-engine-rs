@@ -3,9 +3,9 @@ use super::super::planning::{
     JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
 };
 use super::super::tests::{
-    broadcast_projection, built_join, customer_orders_request, detected_join, equi_condition,
-    join_request, legs_from_leaves, nq3_join_request, request_legs, resolved_side,
-    self_join_request, three_table_join_request, two_scan_tuning,
+    broadcast_projection, built_join, customer_orders_request, customer_orders_request_declaring,
+    detected_join, equi_condition, join_request, legs_from_leaves, nq3_join_request, request_legs,
+    resolved_side, self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
@@ -2636,20 +2636,25 @@ fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
     );
 }
 
+/// The first declared column may be one the reader refuses, so the fan-out emits a join key.
 #[test]
-fn aggregating_broadcast_reading_no_column_emits_one_column_per_joined_row() {
-    let request = built_join(
-        customer_orders_request(Json::Null, equi_condition())
-            .count_star()
-            .single_group(),
-    );
+fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
+    let key = ("C_CUSTKEY", ExasolType::decimal(20, 0));
+    let name = ("C_NAME", ExasolType::varchar(100));
+    for customer_columns in [[key, name], [name, key]] {
+        let request = built_join(
+            customer_orders_request_declaring(&customer_columns, Json::Null, equi_condition())
+                .count_star()
+                .single_group(),
+        );
 
-    let sql = aggregating_broadcast_sql(&request);
+        let sql = aggregating_broadcast_sql(&request);
 
-    assert!(
-        sql.starts_with("SELECT CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN("),
-        "{sql}"
-    );
-    assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
-    assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
+        assert!(
+            sql.starts_with("SELECT CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN("),
+            "{sql}"
+        );
+        assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
+        assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
+    }
 }

@@ -22,8 +22,8 @@ use super::planning::{
 };
 use super::rendering::{
     LegColumns, aggregated_leg_columns, conjoin_filters, cross_leg_residual_filter,
-    leg_local_filter, projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
-    render_expression_qualified, screen_leg_filter, select_item_type,
+    join_key_columns, leg_local_filter, projection_item_select_sql, referenced_clause_values,
+    referenced_leg_columns, render_expression_qualified, screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -623,7 +623,8 @@ pub(in super::super) fn build_broadcast_plan_sql(
 /// The request's WHERE under a select list of the plain columns the aggregation reads, in leg
 /// and declaration order. A request without a select list returns the full row, which is valid
 /// only when every column is a GROUP BY key, so the keys already read it. When the aggregation
-/// reads no column, the first column of leg 0 keeps one row per joined pair.
+/// reads no column, a join key of leg 0 keeps one row per joined pair: the scan reads it for the
+/// condition anyway, while the first declared column may be one the reader refuses.
 fn aggregation_input_request(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
@@ -637,7 +638,7 @@ fn aggregation_input_request(
         .map(|(leg, side)| aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types))
         .collect();
     if read.iter().all(ColumnTypes::is_empty) {
-        read[0] = sides[0].column_types.first_only();
+        read[0] = join_key_columns(&join.conditions, &legs, 0, &sides[0].column_types).first_only();
     }
     let (select_list, select_types): (Vec<Json>, Vec<Json>) = join
         .tables

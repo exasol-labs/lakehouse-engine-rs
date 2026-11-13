@@ -2715,6 +2715,7 @@ const BASE_TWO_SPELLINGS: &str = "s3://warehouse/direct_two_spellings/";
 const BASE_SPELLING_DRIFT: &str = "s3://warehouse/direct_spelling_drift/";
 const BASE_KEY_CASE: &str = "s3://warehouse/direct_key_case/";
 const BASE_OVER_LIMIT: &str = "s3://warehouse/direct_over_limit/";
+const BASE_REFUSED_FIRST: &str = "s3://warehouse/direct_refused_first/";
 
 const VS_NOTES: &str = "DIRECT_COLUMN_NOTES_VS";
 const VS_DRIFT: &str = "DIRECT_SOURCE_DRIFT_VS";
@@ -2722,8 +2723,10 @@ const VS_TWO_SPELLINGS: &str = "DIRECT_TWO_SPELLINGS_VS";
 const VS_SPELLING_DRIFT: &str = "DIRECT_SPELLING_DRIFT_VS";
 const VS_KEY_CASE: &str = "DIRECT_KEY_CASE_VS";
 const VS_OVER_LIMIT: &str = "DIRECT_OVER_LIMIT_VS";
+const VS_REFUSED_FIRST: &str = "DIRECT_REFUSED_FIRST_VS";
 
 const CONN_NOTES: &str = "DIRECT_STORAGE_COLUMN_NOTES_CREDS";
+const CONN_REFUSED_FIRST: &str = "DIRECT_STORAGE_REFUSED_FIRST_CREDS";
 
 /// Scenario: Every declared column carries its source shape in its adapterNotes
 #[test]
@@ -2802,6 +2805,72 @@ fn direct_storage_refused_column_note_records_the_refusal() {
         vs_table(VS_DIRECT, "ANNOTATED_TYPES")
     ));
     assert_eq!(ids[0].len(), ALL_TYPES_IDS.len(), "SELECT ID must succeed");
+}
+
+/// A refused column first, so the fan-out of an aggregation that reads no column cannot fall
+/// back to the first declared column.
+fn refused_first_bytes() -> Bytes {
+    encode_parquet_message(
+        "message refused_first {
+            OPTIONAL GROUP c_struct_enum {
+                OPTIONAL BYTE_ARRAY k (ENUM);
+            }
+            REQUIRED INT64 id;
+            REQUIRED INT64 x;
+        }",
+        |row_group| {
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &vec![ByteArray::from("blue"); 4],
+                Some(&[2; 4]),
+            );
+            write_parquet_column::<_, Int64Type>(row_group, &[1, 2, 3, 4], None);
+            write_parquet_column::<_, Int64Type>(row_group, &[10, 20, 30, 40], None);
+        },
+    )
+}
+
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+#[test]
+fn aggregating_join_that_reads_no_column_skips_a_refused_first_column() {
+    setup();
+    let mut conn = exa_conn();
+    delete_fixture_prefix(BASE_REFUSED_FIRST);
+    put_fixture_object(
+        &format!("{BASE_REFUSED_FIRST}fact/f.parquet"),
+        refused_first_bytes(),
+    );
+    for id in 1..=3 {
+        write_parquet_fixture(
+            &format!("{BASE_REFUSED_FIRST}dims/d{id}.parquet"),
+            dimension_batch(id),
+        );
+    }
+    create_direct_vs(
+        &mut conn,
+        VS_REFUSED_FIRST,
+        CONN_REFUSED_FIRST,
+        BASE_REFUSED_FIRST,
+    );
+    let notes = column_adapter_notes(&mut conn, VS_REFUSED_FIRST, "FACT");
+    assert!(
+        note_of(&notes, "C_STRUCT_ENUM").get("refused").is_some(),
+        "FACT's first column must be refused for this test to discriminate: {notes:?}"
+    );
+
+    let join = format!(
+        "SELECT COUNT(*) FROM {} a JOIN {} b ON a.ID = b.DIM_ID",
+        vs_table(VS_REFUSED_FIRST, "FACT"),
+        vs_table(VS_REFUSED_FIRST, "DIMS")
+    );
+    for (filter, expected) in [("", 3), (" WHERE a.X >= 20", 2)] {
+        let sql = format!("{join}{filter}");
+        assert!(
+            has_broadcast_join_block(&explain_virtual_sql(&mut conn, &sql)),
+            "{sql} must take the broadcast path"
+        );
+        assert_eq!(conn.query_scalar_i64(&sql), expected, "{sql}");
+    }
 }
 
 fn dimension_batch(id: i64) -> RecordBatch {
