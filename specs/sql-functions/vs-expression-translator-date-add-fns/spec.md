@@ -95,7 +95,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *AND* the query SHALL return the rows native Exasol returns
 * *AND* a `TIMESTAMP(7)` to `TIMESTAMP(9)` argument SHALL decline, because the scan can neither keep its nanosecond digits in microseconds nor return a nanosecond result after 2262-04-11, which native Exasol returns, and a text argument or count SHALL decline, because Exasol reads text by the session's NLS settings
 * *AND* a numeric literal count with a magnitude above 1e10 SHALL decline, because Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits before it reads a row
-* *AND* `docs/semantic-differences.md` SHALL list the argument forms that run in Exasol
+* *AND* `docs/capabilities.md` SHALL list the argument forms that run in Exasol
 * *AND* the adapter SHALL still advertise the four capabilities, because the fallback computes each declined form in Exasol SQL
 
 ### Scenario: The four functions render verbatim in the Exasol dialect

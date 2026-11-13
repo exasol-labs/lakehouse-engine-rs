@@ -5,44 +5,36 @@
 # Capability matrix
 
 This page lists every Exasol Virtual Schema capability and whether the adapter advertises it.
-Exasol evaluates an unadvertised capability itself, over the rows the scan returns.
+Exasol evaluates an unadvertised capability itself. [Capabilities](capabilities.md) explains how
+each advertised capability runs and which forms run in Exasol SQL.
+[Semantic differences](semantic-differences.md) lists where results can differ from native Exasol.
+`EXCLUDED_CAPABILITIES` withdraws an advertised capability per schema.
 
-Exasol delegates an advertised capability to the adapter and never re-checks it. The adapter
-then either pushes it into the DataFusion scan, which evaluates it per shard, or renders it in
-Exasol SQL inside the pushdown query it returns, which Exasol evaluates over the scan output.
-The query shape decides which: a filter that DataFusion cannot fully evaluate stays in Exasol
-SQL, and an aggregate runs as DataFusion partials that Exasol SQL merges. A ✓ therefore says
-that the adapter receives the capability, not that DataFusion runs it.
-[Capabilities](capabilities.md) explains how each pushed-down capability is executed.
-
-A ✓ is the default. The virtual schema property `EXCLUDED_CAPABILITIES` withdraws a listed capability per schema, and Exasol then evaluates that capability itself. See [Excluding a capability](capabilities.md#excluding-a-capability).
-
-The capability names come from the Exasol
+The names come from the Exasol
 [capabilities list](https://github.com/exasol/virtual-schema-common-java/blob/main/doc/development/api/capabilities_list.md).
-The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capabilities.rs`.
 
 ## Main capabilities
 
 | Capability | Advertised | Notes |
 |---|:---:|---|
-| `AGGREGATE_GROUP_BY_COLUMN` | ✓ | DataFusion computes partials per shard. Exasol SQL merges them. |
-| `AGGREGATE_GROUP_BY_EXPRESSION` | ✓ | DataFusion computes partials per shard. Exasol SQL merges them. A key DataFusion cannot render moves the aggregation to Exasol SQL. |
-| `AGGREGATE_GROUP_BY_TUPLE` | ✓ | DataFusion computes partials per shard. Exasol SQL merges them. |
-| `AGGREGATE_HAVING` | ✓ | Exasol SQL, over the merged aggregates. |
-| `AGGREGATE_SINGLE_GROUP` | ✓ | DataFusion computes partials per shard. Exasol SQL merges them. |
-| `FILTER_EXPRESSIONS` | ✓ | DataFusion evaluates the filter when it can render every conjunct. Otherwise the whole filter runs in Exasol SQL. |
+| `AGGREGATE_GROUP_BY_COLUMN` | ✓ | Partials per shard, merged in Exasol SQL. |
+| `AGGREGATE_GROUP_BY_EXPRESSION` | ✓ | Partials per shard, merged in Exasol SQL. |
+| `AGGREGATE_GROUP_BY_TUPLE` | ✓ | Partials per shard, merged in Exasol SQL. |
+| `AGGREGATE_HAVING` | ✓ | Runs in Exasol SQL. |
+| `AGGREGATE_SINGLE_GROUP` | ✓ | Partials per shard, merged in Exasol SQL. |
+| `FILTER_EXPRESSIONS` | ✓ | Some forms run in Exasol SQL. |
 | `JOIN` | ✓ |  |
-| `JOIN_CONDITION_ALL` |  | Only inner equi-joins are pushed down. Exasol pushes each table separately and joins the results. |
+| `JOIN_CONDITION_ALL` |  | Only inner equi-joins push down. |
 | `JOIN_CONDITION_EQUI` | ✓ |  |
-| `JOIN_TYPE_FULL_OUTER` |  | Only inner equi-joins are pushed down. Exasol pushes each table separately and joins the results. |
-| `JOIN_TYPE_INNER` | ✓ | Joined in DataFusion when the smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` and the query fits the broadcast rules. Otherwise Exasol SQL joins the per-table scans. |
-| `JOIN_TYPE_LEFT_OUTER` |  | Only inner equi-joins are pushed down. Exasol pushes each table separately and joins the results. |
-| `JOIN_TYPE_RIGHT_OUTER` |  | Only inner equi-joins are pushed down. Exasol pushes each table separately and joins the results. |
-| `LIMIT` | ✓ | On a plain row scan each shard stops early. Exasol SQL re-applies the limit. |
-| `LIMIT_WITH_OFFSET` | ✓ | Exasol SQL applies the offset. A non-zero offset drops the per-shard limit. |
-| `ORDER_BY_COLUMN` | ✓ | DataFusion runs a per-shard top-N for `ORDER BY ... LIMIT n` on projected columns, without aggregation or offset. Otherwise Exasol SQL sorts. See [Capabilities](capabilities.md#filtering). |
-| `ORDER_BY_EXPRESSION` | ✓ | Always sorted in Exasol SQL, never as a per-shard top-N. |
-| `SELECTLIST_EXPRESSIONS` | ✓ | DataFusion evaluates them when it can render every item. Otherwise Exasol SQL does. |
+| `JOIN_TYPE_FULL_OUTER` |  | Only inner equi-joins push down. |
+| `JOIN_TYPE_INNER` | ✓ | Broadcast join when one side is small. |
+| `JOIN_TYPE_LEFT_OUTER` |  | Only inner equi-joins push down. |
+| `JOIN_TYPE_RIGHT_OUTER` |  | Only inner equi-joins push down. |
+| `LIMIT` | ✓ | Stops each shard early. |
+| `LIMIT_WITH_OFFSET` | ✓ | Offset runs in Exasol SQL. |
+| `ORDER_BY_COLUMN` | ✓ | Per-shard top-N for some shapes. |
+| `ORDER_BY_EXPRESSION` | ✓ | Sorts in Exasol SQL. |
+| `SELECTLIST_EXPRESSIONS` | ✓ | Some forms run in Exasol SQL. |
 | `SELECTLIST_PROJECTION` | ✓ |  |
 
 ## Literals
@@ -53,16 +45,13 @@ The ✓ marks mirror `CAPABILITIES` in `crates/lakehouse-engine/src/adapter/capa
 | `DATE` | ✓ |  |
 | `DOUBLE` | ✓ |  |
 | `EXACTNUMERIC` | ✓ |  |
-| `INTERVAL` |  | INTERVAL has no faithful DataFusion mapping. |
+| `INTERVAL` |  | No DataFusion mapping. |
 | `NULL` | ✓ |  |
 | `STRING` | ✓ |  |
 | `TIMESTAMP` | ✓ |  |
 | `TIMESTAMP_UTC` | ✓ |  |
 
 ## Predicates
-
-There is no `GREATER` or `GREATEREQUAL` predicate. Exasol rewrites `a > b` as `b < a` before it
-sends the query to the adapter.
 
 | Predicate | Advertised | Notes |
 |---|:---:|---|
@@ -81,7 +70,7 @@ sends the query to the adapter.
 | `NOT` | ✓ |  |
 | `NOTEQUAL` | ✓ |  |
 | `OR` | ✓ |  |
-| `REGEXP_LIKE` |  | DataFusion regex matching differs from Exasol's PCRE matching. |
+| `REGEXP_LIKE` |  | Regex dialect differs. |
 
 ## Scalar functions
 
@@ -90,53 +79,53 @@ sends the query to the adapter.
 | `ABS` | ✓ |  |
 | `ACOS` | ✓ |  |
 | `ADD` | ✓ |  |
-| `ADD_DAYS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
-| `ADD_HOURS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
-| `ADD_MINUTES` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
-| `ADD_MONTHS` |  | Exasol keeps a month-end date at month-end. DataFusion keeps the day of month. |
-| `ADD_SECONDS` |  | Parity with DataFusion for fractional seconds is not established. |
-| `ADD_WEEKS` | ✓ | Runs in the scan over a `DATE` or `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Other forms run in Exasol SQL. |
-| `ADD_YEARS` |  | Exasol keeps a month-end date at month-end. DataFusion keeps the day of month. |
+| `ADD_DAYS` | ✓ | Some forms run in Exasol SQL. |
+| `ADD_HOURS` | ✓ | Some forms run in Exasol SQL. |
+| `ADD_MINUTES` | ✓ | Some forms run in Exasol SQL. |
+| `ADD_MONTHS` |  | Month-end handling differs. |
+| `ADD_SECONDS` |  | Fractional-second parity unverified. |
+| `ADD_WEEKS` | ✓ | Some forms run in Exasol SQL. |
+| `ADD_YEARS` |  | Month-end handling differs. |
 | `ASCII` | ✓ |  |
 | `ASIN` | ✓ |  |
 | `ATAN` | ✓ |  |
 | `ATAN2` | ✓ |  |
-| `BIT_AND` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
-| `BIT_CHECK` |  | DataFusion has no equivalent (#108). |
+| `BIT_AND` |  | Signedness differs (#108). |
+| `BIT_CHECK` |  | No DataFusion equivalent (#108). |
 | `BIT_LENGTH` |  |  |
-| `BIT_LROTATE` |  | DataFusion has no equivalent (#108). |
-| `BIT_LSHIFT` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
-| `BIT_NOT` |  | DataFusion has no equivalent (#108). |
-| `BIT_OR` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
-| `BIT_RROTATE` |  | DataFusion has no equivalent (#108). |
-| `BIT_RSHIFT` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
-| `BIT_SET` |  | DataFusion has no equivalent (#108). |
-| `BIT_TO_NUM` |  | DataFusion has no equivalent (#108). |
-| `BIT_XOR` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
+| `BIT_LROTATE` |  | No DataFusion equivalent (#108). |
+| `BIT_LSHIFT` |  | Signedness differs (#108). |
+| `BIT_NOT` |  | No DataFusion equivalent (#108). |
+| `BIT_OR` |  | Signedness differs (#108). |
+| `BIT_RROTATE` |  | No DataFusion equivalent (#108). |
+| `BIT_RSHIFT` |  | Signedness differs (#108). |
+| `BIT_SET` |  | No DataFusion equivalent (#108). |
+| `BIT_TO_NUM` |  | No DataFusion equivalent (#108). |
+| `BIT_XOR` |  | Signedness differs (#108). |
 | `CASE` | ✓ |  |
-| `CAST` | ✓ | Exasol SQL applies a cast to INTERVAL, GEOMETRY, HASHTYPE, or TIMESTAMP WITH LOCAL TIME ZONE over the scan output. |
+| `CAST` | ✓ | Some forms run in Exasol SQL. |
 | `CEIL` | ✓ |  |
 | `CHR` | ✓ |  |
 | `COLOGNE_PHONETIC` |  |  |
 | `CONCAT` | ✓ |  |
-| `CONVERT_TZ` |  | Depends on the session's `TIME_ZONE_BEHAVIOR`, which the scan cannot see. |
+| `CONVERT_TZ` |  | Needs the session time zone. |
 | `COS` | ✓ |  |
 | `COSH` | ✓ |  |
 | `COT` | ✓ |  |
 | `CURRENT_CLUSTER` |  |  |
-| `CURRENT_DATE` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `CURRENT_SCHEMA` |  | Exasol session function. |
+| `CURRENT_DATE` |  | Needs the statement clock. |
+| `CURRENT_SCHEMA` |  | Session function. |
 | `CURRENT_SESSION` |  |  |
 | `CURRENT_STATEMENT` |  |  |
-| `CURRENT_TIMESTAMP` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `CURRENT_USER` |  | Exasol session function. |
+| `CURRENT_TIMESTAMP` |  | Needs the statement clock. |
+| `CURRENT_USER` |  | Session function. |
 | `DATE_TRUNC` | ✓ |  |
 | `DAY` | ✓ |  |
-| `DAYOFWEEK` |  | Depends on the session's `NLS_FIRST_DAY_OF_WEEK`, which the scan cannot see. |
+| `DAYOFWEEK` |  | Needs the session's `NLS_FIRST_DAY_OF_WEEK`. |
 | `DAYS_BETWEEN` | ✓ |  |
-| `DBTIMEZONE` |  | The scan sees neither the session nor the database time zone. |
+| `DBTIMEZONE` |  | Needs the session time zone. |
 | `DEGREES` | ✓ |  |
-| `DIV` | ✓ | The scan computes integer operands. Exasol SQL computes decimal and DOUBLE operands. |
+| `DIV` | ✓ | Some forms run in Exasol SQL. |
 | `DUMP` |  |  |
 | `EDIT_DISTANCE` |  |  |
 | `EXP` | ✓ |  |
@@ -145,11 +134,11 @@ sends the query to the adapter.
 | `FLOOR` | ✓ |  |
 | `FROM_POSIX_TIME` |  |  |
 | `GREATEST` | ✓ |  |
-| `HASHTYPE_MD5` |  | Returns HASHTYPE, which has no faithful DataFusion mapping. |
-| `HASHTYPE_SHA1` |  | Returns HASHTYPE, which has no faithful DataFusion mapping. |
-| `HASHTYPE_SHA256` |  | Returns HASHTYPE, which has no faithful DataFusion mapping. |
-| `HASHTYPE_SHA512` |  | Returns HASHTYPE, which has no faithful DataFusion mapping. |
-| `HASHTYPE_TIGER` |  | Returns HASHTYPE, which has no faithful DataFusion mapping. |
+| `HASHTYPE_MD5` |  | Result type has no DataFusion mapping. |
+| `HASHTYPE_SHA1` |  | Result type has no DataFusion mapping. |
+| `HASHTYPE_SHA256` |  | Result type has no DataFusion mapping. |
+| `HASHTYPE_SHA512` |  | Result type has no DataFusion mapping. |
+| `HASHTYPE_TIGER` |  | Result type has no DataFusion mapping. |
 | `HASH_MD5` |  |  |
 | `HASH_SHA1` |  |  |
 | `HASH_SHA256` |  |  |
@@ -157,25 +146,25 @@ sends the query to the adapter.
 | `HASH_TIGER` |  |  |
 | `HOUR` | ✓ |  |
 | `HOURS_BETWEEN` | ✓ |  |
-| `INITCAP` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
+| `INITCAP` | ✓ | Non-ASCII text can differ. |
 | `INSERT` |  |  |
-| `INSTR` | ✓ | With a start position or an occurrence, it runs in Exasol SQL. |
+| `INSTR` | ✓ | Some forms run in Exasol SQL. |
 | `IS_BOOLEAN` |  |  |
 | `IS_DATE` |  |  |
 | `IS_DSINTERVAL` |  |  |
 | `IS_NUMBER` |  |  |
 | `IS_TIMESTAMP` |  |  |
 | `IS_YMINTERVAL` |  |  |
-| `JSON_VALUE` | ✓ | Runs in the scan for the forms [Capabilities](capabilities.md#scalar-functions) lists. Other forms run in Exasol SQL. |
+| `JSON_VALUE` | ✓ | Some forms run in Exasol SQL. |
 | `LAST_DAY` |  | Not translated. |
 | `LEAST` | ✓ |  |
 | `LEFT` | ✓ |  |
 | `LENGTH` | ✓ |  |
 | `LN` | ✓ |  |
-| `LOCALTIMESTAMP` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `LOCATE` | ✓ | With a start position, it runs in Exasol SQL. |
+| `LOCALTIMESTAMP` |  | Needs the statement clock. |
+| `LOCATE` | ✓ | Some forms run in Exasol SQL. |
 | `LOG` | ✓ |  |
-| `LOWER` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
+| `LOWER` | ✓ | Non-ASCII text can differ. |
 | `LPAD` | ✓ |  |
 | `LTRIM` | ✓ |  |
 | `MINUTE` | ✓ |  |
@@ -183,21 +172,21 @@ sends the query to the adapter.
 | `MIN_SCALE` |  |  |
 | `MOD` | ✓ |  |
 | `MONTH` | ✓ |  |
-| `MONTHS_BETWEEN` |  | Exasol returns an Oracle-style fraction. DataFusion has no equivalent. |
+| `MONTHS_BETWEEN` |  | No DataFusion equivalent. |
 | `MULT` | ✓ |  |
 | `NEG` | ✓ |  |
 | `NULLIFZERO` | ✓ |  |
-| `NUMTODSINTERVAL` |  | Returns INTERVAL, which has no faithful DataFusion mapping. |
-| `NUMTOYMINTERVAL` |  | Returns INTERVAL, which has no faithful DataFusion mapping. |
+| `NUMTODSINTERVAL` |  | Result type has no DataFusion mapping. |
+| `NUMTOYMINTERVAL` |  | Result type has no DataFusion mapping. |
 | `OCTET_LENGTH` | ✓ |  |
 | `POSIX_TIME` |  |  |
 | `POWER` | ✓ |  |
 | `RADIANS` | ✓ |  |
 | `RAND` |  |  |
-| `REGEXP_COUNT` |  | DataFusion regex matching differs from Exasol's PCRE matching. |
-| `REGEXP_INSTR` |  | DataFusion regex matching differs from Exasol's PCRE matching. |
-| `REGEXP_REPLACE` |  | DataFusion regex matching differs from Exasol's PCRE matching. |
-| `REGEXP_SUBSTR` |  | DataFusion regex matching differs from Exasol's PCRE matching. |
+| `REGEXP_COUNT` |  | Regex dialect differs. |
+| `REGEXP_INSTR` |  | Regex dialect differs. |
+| `REGEXP_REPLACE` |  | Regex dialect differs. |
+| `REGEXP_SUBSTR` |  | Regex dialect differs. |
 | `REPEAT` | ✓ |  |
 | `REPLACE` | ✓ |  |
 | `REVERSE` | ✓ |  |
@@ -207,7 +196,7 @@ sends the query to the adapter.
 | `RTRIM` | ✓ |  |
 | `SECOND` | ✓ |  |
 | `SECONDS_BETWEEN` | ✓ |  |
-| `SESSIONTIMEZONE` |  | The scan sees neither the session nor the database time zone. |
+| `SESSIONTIMEZONE` |  | Needs the session time zone. |
 | `SESSION_PARAMETER` |  |  |
 | `SIGN` | ✓ |  |
 | `SIN` | ✓ |  |
@@ -215,118 +204,118 @@ sends the query to the adapter.
 | `SOUNDEX` |  |  |
 | `SPACE` |  |  |
 | `SQRT` | ✓ |  |
-| `ST_AREA` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_BOUNDARY` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_BUFFER` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_CENTROID` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_CONTAINS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_CONVEXHULL` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_CROSSES` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_DIFFERENCE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_DIMENSION` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_DISJOINT` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_DISTANCE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ENDPOINT` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ENVELOPE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_EQUALS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_EXTERIORRING` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_FORCE2D` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_GEOMETRYN` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_GEOMETRYTYPE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_INTERIORRINGN` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_INTERSECTION` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_INTERSECTS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ISCLOSED` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ISEMPTY` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ISRING` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_ISSIMPLE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_LENGTH` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_NUMGEOMETRIES` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_NUMINTERIORRINGS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_NUMPOINTS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_OVERLAPS` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_POINTN` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_SETSRID` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_STARTPOINT` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_SYMDIFFERENCE` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_TOUCHES` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_TRANSFORM` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_UNION` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_WITHIN` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_X` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_Y` |  | No lakehouse type maps to GEOMETRY. |
+| `ST_AREA` |  | No GEOMETRY type. |
+| `ST_BOUNDARY` |  | No GEOMETRY type. |
+| `ST_BUFFER` |  | No GEOMETRY type. |
+| `ST_CENTROID` |  | No GEOMETRY type. |
+| `ST_CONTAINS` |  | No GEOMETRY type. |
+| `ST_CONVEXHULL` |  | No GEOMETRY type. |
+| `ST_CROSSES` |  | No GEOMETRY type. |
+| `ST_DIFFERENCE` |  | No GEOMETRY type. |
+| `ST_DIMENSION` |  | No GEOMETRY type. |
+| `ST_DISJOINT` |  | No GEOMETRY type. |
+| `ST_DISTANCE` |  | No GEOMETRY type. |
+| `ST_ENDPOINT` |  | No GEOMETRY type. |
+| `ST_ENVELOPE` |  | No GEOMETRY type. |
+| `ST_EQUALS` |  | No GEOMETRY type. |
+| `ST_EXTERIORRING` |  | No GEOMETRY type. |
+| `ST_FORCE2D` |  | No GEOMETRY type. |
+| `ST_GEOMETRYN` |  | No GEOMETRY type. |
+| `ST_GEOMETRYTYPE` |  | No GEOMETRY type. |
+| `ST_INTERIORRINGN` |  | No GEOMETRY type. |
+| `ST_INTERSECTION` |  | No GEOMETRY type. |
+| `ST_INTERSECTS` |  | No GEOMETRY type. |
+| `ST_ISCLOSED` |  | No GEOMETRY type. |
+| `ST_ISEMPTY` |  | No GEOMETRY type. |
+| `ST_ISRING` |  | No GEOMETRY type. |
+| `ST_ISSIMPLE` |  | No GEOMETRY type. |
+| `ST_LENGTH` |  | No GEOMETRY type. |
+| `ST_NUMGEOMETRIES` |  | No GEOMETRY type. |
+| `ST_NUMINTERIORRINGS` |  | No GEOMETRY type. |
+| `ST_NUMPOINTS` |  | No GEOMETRY type. |
+| `ST_OVERLAPS` |  | No GEOMETRY type. |
+| `ST_POINTN` |  | No GEOMETRY type. |
+| `ST_SETSRID` |  | No GEOMETRY type. |
+| `ST_STARTPOINT` |  | No GEOMETRY type. |
+| `ST_SYMDIFFERENCE` |  | No GEOMETRY type. |
+| `ST_TOUCHES` |  | No GEOMETRY type. |
+| `ST_TRANSFORM` |  | No GEOMETRY type. |
+| `ST_UNION` |  | No GEOMETRY type. |
+| `ST_WITHIN` |  | No GEOMETRY type. |
+| `ST_X` |  | No GEOMETRY type. |
+| `ST_Y` |  | No GEOMETRY type. |
 | `SUB` | ✓ |  |
 | `SUBSTR` | ✓ |  |
-| `SYSDATE` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `SYSTIMESTAMP` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `SYS_GUID` |  | Exasol-only function. |
+| `SYSDATE` |  | Needs the statement clock. |
+| `SYSTIMESTAMP` |  | Needs the statement clock. |
+| `SYS_GUID` |  | Exasol-only. |
 | `TAN` | ✓ |  |
 | `TANH` | ✓ |  |
-| `TO_CHAR` |  | DataFusion `to_char` takes chrono formats, not Exasol format models. |
-| `TO_DATE` | ✓ | Only some formats run in DataFusion, the rest in Exasol SQL. See [Semantic differences](semantic-differences.md). |
-| `TO_DSINTERVAL` |  | Returns INTERVAL, which has no faithful DataFusion mapping. |
-| `TO_NUMBER` |  | DataFusion has no `to_number`. |
-| `TO_TIMESTAMP` | ✓ | Only some formats run in DataFusion, the rest in Exasol SQL. See [Semantic differences](semantic-differences.md). |
-| `TO_YMINTERVAL` |  | Returns INTERVAL, which has no faithful DataFusion mapping. |
+| `TO_CHAR` |  | Exasol format models unsupported. |
+| `TO_DATE` | ✓ | Some formats run in Exasol SQL. |
+| `TO_DSINTERVAL` |  | Result type has no DataFusion mapping. |
+| `TO_NUMBER` |  | No DataFusion equivalent. |
+| `TO_TIMESTAMP` | ✓ | Some formats run in Exasol SQL. |
+| `TO_YMINTERVAL` |  | Result type has no DataFusion mapping. |
 | `TRANSLATE` | ✓ |  |
 | `TRIM` | ✓ |  |
 | `TRUNC` | ✓ |  |
 | `TYPEOF` |  |  |
 | `UNICODE` | ✓ |  |
 | `UNICODECHR` | ✓ |  |
-| `UPPER` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
+| `UPPER` | ✓ | Non-ASCII text can differ. |
 | `WEEK` | ✓ |  |
 | `WIDTH_BUCKET` |  |  |
 | `YEAR` | ✓ |  |
-| `YEARS_BETWEEN` |  | Exasol returns an Oracle-style fraction. DataFusion has no equivalent. |
+| `YEARS_BETWEEN` |  | No DataFusion equivalent. |
 | `ZEROIFNULL` | ✓ |  |
 
 ## Aggregate functions
 
 | Aggregate function | Advertised | Notes |
 |---|:---:|---|
-| `APPROXIMATE_COUNT_DISTINCT` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `AVG` | ✓ | DataFusion sums and counts per shard. Exasol SQL divides. See [Semantic differences](semantic-differences.md). |
+| `APPROXIMATE_COUNT_DISTINCT` |  | No partial/merge plan. |
+| `AVG` | ✓ | Partials per shard, merged in Exasol SQL. |
 | `AVG_DISTINCT` |  |  |
 | `CORR` |  |  |
 | `COUNT` | ✓ |  |
-| `COUNT_DISTINCT` | ✓ | DataFusion deduplicates per shard only for a lone single-group `COUNT(DISTINCT col)`. Otherwise Exasol SQL computes it over the scanned rows. |
+| `COUNT_DISTINCT` | ✓ | Some forms run in Exasol SQL. |
 | `COUNT_STAR` | ✓ |  |
 | `COUNT_TUPLE` |  |  |
 | `EVERY` |  |  |
 | `FIRST_VALUE` |  |  |
 | `GROUPING` |  |  |
 | `GROUPING_ID` |  |  |
-| `GROUP_CONCAT` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `GROUP_CONCAT_DISTINCT` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `GROUP_CONCAT_ORDER_BY` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `GROUP_CONCAT_SEPARATOR` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
+| `GROUP_CONCAT` |  | No partial/merge plan. |
+| `GROUP_CONCAT_DISTINCT` |  | No partial/merge plan. |
+| `GROUP_CONCAT_ORDER_BY` |  | No partial/merge plan. |
+| `GROUP_CONCAT_SEPARATOR` |  | No partial/merge plan. |
 | `LAST_VALUE` |  |  |
-| `LISTAGG` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `LISTAGG_DISTINCT` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `LISTAGG_ON_OVERFLOW_ERROR` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `LISTAGG_ON_OVERFLOW_TRUNCATE` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `LISTAGG_ORDER_BY` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
-| `LISTAGG_SEPARATOR` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
+| `LISTAGG` |  | No partial/merge plan. |
+| `LISTAGG_DISTINCT` |  | No partial/merge plan. |
+| `LISTAGG_ON_OVERFLOW_ERROR` |  | No partial/merge plan. |
+| `LISTAGG_ON_OVERFLOW_TRUNCATE` |  | No partial/merge plan. |
+| `LISTAGG_ORDER_BY` |  | No partial/merge plan. |
+| `LISTAGG_SEPARATOR` |  | No partial/merge plan. |
 | `MAX` | ✓ |  |
-| `MEDIAN` |  | Not decomposable into a partial/merge plan. Exasol computes it on the returned rows. |
+| `MEDIAN` |  | No partial/merge plan. |
 | `MIN` | ✓ |  |
 | `MUL` |  |  |
 | `MUL_DISTINCT` |  |  |
 | `SOME` |  |  |
-| `STDDEV` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `STDDEV` | ✓ | Double precision. |
 | `STDDEV_DISTINCT` |  |  |
-| `STDDEV_POP` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `STDDEV_POP` | ✓ | Double precision. |
 | `STDDEV_POP_DISTINCT` |  |  |
-| `STDDEV_SAMP` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `STDDEV_SAMP` | ✓ | Double precision. |
 | `STDDEV_SAMP_DISTINCT` |  |  |
-| `ST_INTERSECTION` |  | No lakehouse type maps to GEOMETRY. |
-| `ST_UNION` |  | No lakehouse type maps to GEOMETRY. |
+| `ST_INTERSECTION` |  | No GEOMETRY type. |
+| `ST_UNION` |  | No GEOMETRY type. |
 | `SUM` | ✓ |  |
 | `SUM_DISTINCT` |  |  |
-| `VARIANCE` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `VARIANCE` | ✓ | Double precision. |
 | `VARIANCE_DISTINCT` |  |  |
-| `VAR_POP` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `VAR_POP` | ✓ | Double precision. |
 | `VAR_POP_DISTINCT` |  |  |
-| `VAR_SAMP` | ✓ | Computed in double precision for a bare-column argument. See [Semantic differences](semantic-differences.md). |
+| `VAR_SAMP` | ✓ | Double precision. |
 | `VAR_SAMP_DISTINCT` |  |  |

@@ -17,7 +17,7 @@ The scan reads only the projected columns. The scan also evaluates select-list e
 
 ## Filtering
 
-Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop.
+Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -68,7 +68,7 @@ full scan.
 
 ## Scalar functions
 
-The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. For example, `TO_DATE` with a format outside the supported subset runs in Exasol SQL. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
+The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
 
 | Family | Capabilities | Example |
 |---|---|---|
@@ -82,6 +82,12 @@ The scan computes these functions when DataFusion can render the whole filter or
 
 `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or a `TIMESTAMP(0)` to `TIMESTAMP(6)` argument and a numeric count. Any other argument form (`TIMESTAMP(7)` to `TIMESTAMP(9)`, `TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over two date values, another date function, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
 
+`DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
+
+A `CAST` to `INTERVAL`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE` runs in Exasol SQL. A cast that converts text by the session's NLS settings also does, see [Text and session settings](#text-and-session-settings).
+
+`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
+
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
 
 `JSON_VALUE` runs in the scan when all of these hold:
@@ -92,8 +98,6 @@ The scan computes these functions when DataFusion can render the whole filter or
 - `ON EMPTY` and `ON ERROR` are `NULL`, or `DEFAULT` with a literal of the returning type that fits it.
 
 Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
-
-The scan reads a document nested at most about 200 levels deep. A deeper document takes the `ON ERROR` behavior.
 
 ### Text and session settings
 
