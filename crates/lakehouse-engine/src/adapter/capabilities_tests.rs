@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{col, pushdown_request, untyped_scan};
+use crate::adapter::pushdown::test_support::{col, pushdown_request};
 use crate::types::exasol_type::ExasolType;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
@@ -15,14 +15,12 @@ fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
 #[test]
 fn capabilities_are_assembled_without_the_catalog_kind() {
     let _capabilities: &[&str] = CAPABILITIES;
-    let _response_builder: fn() -> Json = get_capabilities_response;
+    let _response_builder: fn(Option<&str>) -> Json = get_capabilities_response;
 }
 
 #[test]
 fn reports_group_by_capabilities() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     assert!(
         cap_strs.contains(&"AGGREGATE_GROUP_BY_COLUMN"),
@@ -37,7 +35,7 @@ fn reports_group_by_capabilities() {
         "AGGREGATE_GROUP_BY_TUPLE must be advertised: {cap_strs:?}"
     );
 
-    let multi_key_group_by = pushdown_request(
+    let (multi_key_group_by, scan) = pushdown_request(
         "T",
         &[
             ("REGION", ExasolType::WIDEST_VARCHAR),
@@ -48,10 +46,9 @@ fn reports_group_by_capabilities() {
     .column(col("REGION"))
     .count_star()
     .column(col("YEAR"))
-    .build_pushdown();
-    let detection =
-        crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by, untyped_scan())
-            .expect("multi-key GROUP BY must be detected by the backing pushdown path");
+    .build_scanned();
+    let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by, scan)
+        .expect("multi-key GROUP BY must be detected by the backing pushdown path");
     assert_eq!(
         detection.group_keys.len(),
         2,
@@ -79,9 +76,7 @@ fn reports_group_by_capabilities() {
 /// Scenario: Adapter reports its pushdown capabilities
 #[test]
 fn reports_audited_capability_set() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     for name in &[
         "FN_PRED_LIKE_ESCAPE",
@@ -117,7 +112,6 @@ fn reports_audited_capability_set() {
     }
 
     for name in &[
-        "FN_DIV",
         "FN_TO_CHAR",
         "FN_TO_NUMBER",
         "FN_PRED_REGEXP_LIKE",
@@ -184,7 +178,7 @@ fn reports_audited_capability_set() {
         );
     }
 
-    for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
+    for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV", "FN_DIV"] {
         assert!(
             cap_strs.contains(name),
             "{name} must be advertised: {cap_strs:?}"
@@ -351,9 +345,7 @@ fn reports_audited_capability_set() {
 
 #[test]
 fn advertises_order_by_column_and_expression() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     assert!(
         cap_strs.contains(&"ORDER_BY_COLUMN"),
@@ -367,23 +359,19 @@ fn advertises_order_by_column_and_expression() {
 
 #[test]
 fn reports_projection_filter_and_limit_capabilities() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     assert!(cap_strs.contains(&"SELECTLIST_PROJECTION"));
     assert!(cap_strs.contains(&"FILTER_EXPRESSIONS"));
     assert!(cap_strs.contains(&"LIMIT"));
 
-    assert_eq!(resp["type"].as_str().unwrap(), "getCapabilities");
+    assert_eq!(get_capabilities_response(None)["type"], "getCapabilities");
 }
 
 /// Scenario: Adapter advertises aggregate pushdown for supported functions
 #[test]
 fn reports_supported_aggregate_capabilities() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
         assert!(
@@ -452,9 +440,7 @@ fn reports_supported_aggregate_capabilities() {
 
 #[test]
 fn capabilities_advertise_count_distinct() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     assert!(
         cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
@@ -468,9 +454,7 @@ fn capabilities_advertise_count_distinct() {
 
 #[test]
 fn cast_neg_week_introduce_no_join_capability() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     let join_caps: Vec<&&str> = cap_strs.iter().filter(|c| c.starts_with("JOIN")).collect();
     assert_eq!(
@@ -486,9 +470,7 @@ fn cast_neg_week_introduce_no_join_capability() {
 
 #[test]
 fn advertises_inner_equi_join_capabilities() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     for name in &["JOIN", "JOIN_TYPE_INNER", "JOIN_CONDITION_EQUI"] {
         assert!(
@@ -518,9 +500,7 @@ fn advertises_inner_equi_join_capabilities() {
 
 #[test]
 fn reports_capabilities_includes_inner_join() {
-    let resp = get_capabilities_response();
-    let caps = resp["capabilities"].as_array().unwrap();
-    let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+    let cap_strs = advertised_names(None);
 
     assert!(
         cap_strs.contains(&"JOIN")
@@ -575,4 +555,58 @@ fn capabilities_doc_lists_exactly_the_advertised_set() {
         "docs/capabilities.md drifted from CAPABILITIES: advertised but undocumented \
          {missing_from_doc:?}; documented but not advertised {not_advertised:?}"
     );
+}
+
+/// The names a `getCapabilities` answer lists, each an entry of [`CAPABILITIES`].
+fn advertised_names(excluded: Option<&str>) -> Vec<&'static str> {
+    get_capabilities_response(excluded)["capabilities"]
+        .as_array()
+        .expect("capabilities array")
+        .iter()
+        .map(|c| {
+            let name = c.as_str().expect("capability name");
+            *CAPABILITIES
+                .iter()
+                .find(|&&known| known == name)
+                .unwrap_or_else(|| panic!("{name} is not in CAPABILITIES"))
+        })
+        .collect()
+}
+
+fn full_list_without(withheld: &[&str]) -> Vec<&'static str> {
+    CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| !withheld.contains(c))
+        .collect()
+}
+
+#[test]
+fn excluded_capabilities_are_withheld_in_advertised_order() {
+    let cases: [(Option<&str>, &[&str]); 10] = [
+        (
+            Some(" FN_PRED_LIKE ,, FN_AGG_COUNT_DISTINCT,"),
+            &["FN_PRED_LIKE", "FN_AGG_COUNT_DISTINCT"],
+        ),
+        (
+            Some("FN_AGG_COUNT_DISTINCT,FN_PRED_LIKE"),
+            &["FN_PRED_LIKE", "FN_AGG_COUNT_DISTINCT"],
+        ),
+        (Some("LIMIT_WITH_OFFSET"), &["LIMIT_WITH_OFFSET"]),
+        (Some("fn_pred_like"), &[]),
+        (Some("FN_PRED_LIK"), &[]),
+        (Some("NO_SUCH_CAPABILITY, FN_PRED_LIKE"), &["FN_PRED_LIKE"]),
+        (None, &[]),
+        (Some(""), &[]),
+        (Some(" , "), &[]),
+        (Some(",,"), &[]),
+    ];
+
+    for (value, withheld) in cases {
+        assert_eq!(
+            advertised_names(value),
+            full_list_without(withheld),
+            "{value:?}"
+        );
+    }
 }

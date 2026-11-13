@@ -161,7 +161,8 @@ fn proxied_static() -> Target {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         setup();
-        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let proxy_url = stack::proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         let password = STATIC.password().via_proxy();
         let catalog = stack::via_proxy(LAKEKEEPER_CATALOG_URI_INTERNAL);
         let token_uri = password

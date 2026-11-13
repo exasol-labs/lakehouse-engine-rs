@@ -1,39 +1,27 @@
 use super::*;
-use crate::export::batch::BATCH_ROWS;
-use crate::export::batch::tests::measured_column;
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
-use exasol_udf_sdk::connection::ConnectionObject;
+use crate::export::test_support::{CONNECTION, SENTINELS, connection_object, merged};
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use vs_expression::udf_column_test_support::measured_column;
 
-const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","table":"ns.t","export_id":"00ff","columns":["ID"],"single_commit":false,"allow_http":false}"#;
-const SENTINELS: [&str; 3] = [
-    "https://sentinel-address.example",
-    "sentinel-user",
-    "sentinel-password",
-];
-
-fn sentinel_connection() -> ConnectionObject {
-    ConnectionObject {
-        kind: "password".to_string(),
-        address: SENTINELS[0].to_string(),
-        user: SENTINELS[1].to_string(),
-        password: serde_json::json!({ "warehouse": "wh", "token": SENTINELS[2] }).to_string(),
-    }
+fn sentinel_connection() -> exasol_udf_sdk::connection::ConnectionObject {
+    let password = serde_json::json!({ "warehouse": "wh", "token": SENTINELS[2] });
+    connection_object(SENTINELS[0], SENTINELS[1], &password.to_string())
 }
 
 fn granted(ctx: TestContext) -> TestContext {
     ctx.with_connection(CONNECTION, sentinel_connection())
 }
 
-/// The hook over a target that records its calls and makes no request.
+/// The writer SELECT the hook plans before it makes any catalog call.
 fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
-    export_hook(ctx, json, fake_target(&Calls::default(), None))
+    plan_export(ctx, json).map(|plan| plan.select)
+}
+
+/// The writer plan of a group, with the context standing on its first row as in a real run.
+fn writer_plan(ctx: &mut TestContext) -> Result<WriterPlan, UdfError> {
+    ctx.next().expect("the group has a first row");
+    plan_writer(ctx)
 }
 
 fn hook_context() -> TestContext {
@@ -54,7 +42,7 @@ fn writer_row(spec: &str, id: i64) -> Vec<Value> {
 }
 
 fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> String {
-    let mut spec = serde_json::json!({
+    let spec = serde_json::json!({
         "has_truncate": false,
         "has_replace": false,
         "source_column_names": [r#""T"."A""#],
@@ -63,17 +51,10 @@ fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> 
             {"key": "TABLE_NAME", "value": "ns.t"},
         ],
     });
-    let fields = spec.as_object_mut().expect("the spec is an object");
-    fields.extend(connection.as_object().cloned().unwrap_or_default());
-    fields.extend(extra.as_object().cloned().unwrap_or_default());
-    spec.to_string()
+    merged(merged(spec, connection), extra).to_string()
 }
 
-fn no_at_clause() -> serde_json::Value {
-    serde_json::json!({})
-}
-
-fn no_extra() -> serde_json::Value {
+fn no_fields() -> serde_json::Value {
     serde_json::json!({})
 }
 
@@ -95,7 +76,7 @@ fn assert_no_connection_value(text: &str, what: &str) {
 
 fn export_spec_with_columns(columns: &[&str]) -> String {
     let mut spec: serde_json::Value =
-        serde_json::from_str(&export_spec_json(no_at_clause(), no_extra())).unwrap();
+        serde_json::from_str(&export_spec_json(no_fields(), no_fields())).unwrap();
     spec["source_column_names"] = serde_json::json!(columns);
     spec.to_string()
 }
@@ -112,7 +93,7 @@ fn rendered_writer_spec(sql: &str) -> serde_json::Value {
 fn generated_sql_and_errors_carry_no_connection_value() {
     let sql = hook(
         &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
+        &export_spec_json(no_fields(), no_fields()),
     )
     .expect("a valid export yields SQL");
     assert!(
@@ -136,14 +117,14 @@ fn generated_sql_and_errors_carry_no_connection_value() {
             "inline CONNECTION",
             generate_export_sql(
                 &mut granted(hook_context()),
-                &export_spec_json(inline, no_extra()),
+                &export_spec_json(inline, no_fields()),
             ),
         ),
         (
             "missing script grant in the hook",
             generate_export_sql(
                 &mut hook_context(),
-                &export_spec_json(no_at_clause(), no_extra()),
+                &export_spec_json(no_fields(), no_fields()),
             ),
         ),
     ];
@@ -153,7 +134,10 @@ fn generated_sql_and_errors_carry_no_connection_value() {
     let writer_refusals = [
         (
             "missing script grant in the writer",
-            run_writer(&mut writer_context(vec![writer_row(WRITER_SPEC, 1)])),
+            run_writer(&mut writer_context(vec![writer_row(
+                &writer_spec(false),
+                1,
+            )])),
         ),
         (
             "forged writer spec",
@@ -172,7 +156,7 @@ fn generated_sql_and_errors_carry_no_connection_value() {
 fn hook_without_script_grant_names_connection_script_user_and_grant() {
     let message = error_text(generate_export_sql(
         &mut hook_context(),
-        &export_spec_json(no_at_clause(), no_extra()),
+        &export_spec_json(no_fields(), no_fields()),
     ));
 
     for fragment in [
@@ -190,34 +174,6 @@ fn hook_refuses_a_specification_it_cannot_parse() {
         .expect_err("an unparseable specification is refused");
 
     assert!(matches!(error, UdfError::Type(_)), "{error:?}");
-}
-
-#[test]
-fn the_hook_prepares_its_target_before_it_answers() {
-    let calls = Calls::default();
-
-    let sql = export_hook(
-        &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
-        fake_target(&calls, None),
-    );
-
-    assert!(sql.is_ok(), "{sql:?}");
-    assert_eq!(
-        calls.recorded(),
-        ["target ns.t at https://sentinel-address.example", "prepare"]
-    );
-}
-
-#[test]
-fn a_target_that_refuses_the_table_fails_the_hook_with_its_error() {
-    let refused = export_hook(
-        &mut granted(hook_context()),
-        &export_spec_json(no_at_clause(), no_extra()),
-        fake_target(&Calls::default(), Some("prepare")),
-    );
-
-    assert_eq!(error_text(refused), "prepare failed");
 }
 
 #[test]
@@ -246,7 +202,7 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
 
 #[test]
 fn writer_refuses_a_spec_whose_table_breaks_the_table_name_rule() {
-    let forged = WRITER_SPEC.replace(r#""table":"ns.t""#, r#""table":"t""#);
+    let forged = writer_spec(false).replace(r#""table":"ns.t""#, r#""table":"t""#);
 
     let message = error_text(run_writer(&mut granted(writer_context(vec![writer_row(
         &forged, 1,
@@ -328,7 +284,8 @@ fn a_column_named_like_an_iceberg_metadata_column_is_refused() {
 
 #[test]
 fn missing_grant_without_a_known_user_names_a_user_placeholder() {
-    let mut ctx = TestContext::set(vec![writer_row(WRITER_SPEC, 1)]).with_script_schema("LHVS");
+    let mut ctx =
+        TestContext::set(vec![writer_row(&writer_spec(false), 1)]).with_script_schema("LHVS");
 
     let message = error_text(run_writer(&mut ctx));
 
@@ -377,9 +334,8 @@ mod sql {
         assert_eq!(sql, expected);
     }
 
-    /// Scenario: The writer count never exceeds 300
     #[test]
-    fn group_count_follows_the_writer_layout_and_caps_at_300() {
+    fn group_count_follows_the_writer_layout() {
         let cases = [
             (
                 "nodes times writers per node",
@@ -388,7 +344,6 @@ mod sql {
                 6,
             ),
             ("single commit", WriterLayout::SingleCommit, 4, 1),
-            ("capped at 300", WriterLayout::PerNode(500), 4, 300),
         ];
 
         for (case, writers, node_count, expected) in cases {
@@ -438,122 +393,6 @@ mod sql {
     }
 }
 
-pub(in crate::export) const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
-
-/// Every call the export makes on its target and sink, in order.
-#[derive(Clone, Default)]
-pub(in crate::export) struct Calls(Rc<RefCell<Vec<String>>>);
-
-impl Calls {
-    fn record(&self, call: String) {
-        self.0.borrow_mut().push(call);
-    }
-
-    pub(in crate::export) fn recorded(&self) -> Vec<String> {
-        self.0.borrow().clone()
-    }
-}
-
-/// A target that records its calls and fails the one named by `fail_at`, such as `"prepare"`.
-pub(in crate::export) fn fake_target(
-    calls: &Calls,
-    fail_at: Option<&'static str>,
-) -> impl FnOnce(ExportConnection, &str) -> Result<Box<dyn ExportTarget>, UdfError> {
-    let calls = calls.clone();
-    move |connection, table| {
-        calls.record(format!("target {table} at {}", connection.address));
-        Ok(Box::new(FakeTarget { calls, fail_at }))
-    }
-}
-
-struct FakeTarget {
-    calls: Calls,
-    fail_at: Option<&'static str>,
-}
-
-struct FakeSink {
-    calls: Calls,
-    fail_at: Option<&'static str>,
-    schema: SchemaRef,
-}
-
-fn failure(call: &str, fail_at: Option<&str>) -> Result<(), UdfError> {
-    match fail_at {
-        Some(failing) if failing == call => Err(UdfError::User(format!("{call} failed"))),
-        _ => Ok(()),
-    }
-}
-
-#[async_trait(?Send)]
-impl ExportTarget for FakeTarget {
-    async fn prepare(&self) -> Result<(), UdfError> {
-        self.calls.record("prepare".into());
-        failure("prepare", self.fail_at)
-    }
-
-    async fn open_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        Ok(self.sink("open_table", schema, tag))
-    }
-
-    async fn stage_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        Ok(self.sink("stage_table", schema, tag))
-    }
-}
-
-impl FakeTarget {
-    fn sink(&self, call: &str, schema: &Schema, tag: &WriterTag) -> Box<dyn ExportSink> {
-        self.calls.record(format!(
-            "{call} export_id={} writer_id={}",
-            tag.export_id,
-            tag.writer_id.len()
-        ));
-        Box::new(FakeSink {
-            calls: self.calls.clone(),
-            fail_at: self.fail_at,
-            schema: Arc::new(schema.clone()),
-        })
-    }
-}
-
-#[async_trait(?Send)]
-impl ExportSink for FakeSink {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError> {
-        self.calls.record(format!("write {}", batch.num_rows()));
-        failure("write", self.fail_at)
-    }
-
-    async fn finish(&mut self) -> Result<usize, UdfError> {
-        self.calls.record("finish".into());
-        failure("finish", self.fail_at).map(|()| 1)
-    }
-
-    async fn abort(&mut self) {
-        self.calls.record("abort".into());
-    }
-}
-
-/// A CONNECTION the export accepts, named [`CONNECTION`].
-pub(in crate::export) fn export_connection(address: &str, token: &str) -> ConnectionObject {
-    ConnectionObject {
-        kind: "password".to_string(),
-        address: address.to_string(),
-        user: String::new(),
-        password: serde_json::json!({ "warehouse": "wh", "token": token }).to_string(),
-    }
-}
-
 fn writer_spec(single_commit: bool) -> String {
     serde_json::json!({
         "connection": CONNECTION,
@@ -575,7 +414,11 @@ fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
         .with_current_user("EXPORTER")
         .with_connection(
             CONNECTION,
-            export_connection("https://catalog.example", "t"),
+            connection_object(
+                "https://catalog.example",
+                "",
+                &serde_json::json!({ "warehouse": "wh", "token": "t" }).to_string(),
+            ),
         )
         .with_input_columns(vec![
             measured_column("VARCHAR(2000000) UTF8"),
@@ -584,95 +427,48 @@ fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
 }
 
 #[test]
-fn a_writer_streams_its_rows_in_batches_into_the_sink_and_commits_once() {
-    for (single_commit, opened) in [
-        (true, "stage_table export_id=00ff writer_id=16"),
-        (false, "open_table export_id=00ff writer_id=16"),
-    ] {
-        let calls = Calls::default();
-        let rows = BATCH_ROWS + 1;
-
-        let written = write_group(
-            &mut group(&writer_spec(single_commit), rows, "DECIMAL(18,0)"),
-            fake_target(&calls, None),
-        );
-
-        assert_eq!(written.expect("the writer succeeds"), rows as i64);
-        assert_eq!(
-            calls.recorded(),
-            [
-                "target ns.t at https://catalog.example",
-                opened,
-                &format!("write {BATCH_ROWS}"),
-                "write 1",
-                "finish",
-            ]
-        );
-    }
-}
-
-#[test]
-fn a_failed_write_or_commit_aborts_the_sink_and_fails_the_writer() {
-    for failing in ["write", "finish"] {
-        let calls = Calls::default();
-
-        let error = write_group(
-            &mut group(&writer_spec(false), 3, "DECIMAL(18,0)"),
-            fake_target(&calls, Some(failing)),
-        )
-        .expect_err("the writer fails");
-
-        assert_eq!(error.to_string(), format!("{failing} failed"));
-        assert_eq!(calls.recorded().last().map(String::as_str), Some("abort"));
-    }
-}
-
-#[test]
-fn an_empty_group_opens_no_table() {
-    let calls = Calls::default();
-
-    let written = write_group(
-        &mut group(&writer_spec(false), 0, "TIMESTAMP(9)"),
-        fake_target(&calls, None),
-    );
-
-    assert_eq!(written.expect("an empty group succeeds"), 0);
-    assert!(calls.recorded().is_empty());
-}
-
-#[test]
-fn an_unwritable_column_fails_the_writer_before_its_target_is_opened() {
-    let calls = Calls::default();
-
-    let error = write_group(
-        &mut group(&writer_spec(false), 1, "TIMESTAMP(9)"),
-        fake_target(&calls, None),
-    )
-    .expect_err("TIMESTAMP(9) is refused");
-
-    assert!(
-        error
-            .to_string()
-            .contains("column ID has type TIMESTAMP(9)"),
-        "{error}"
-    );
-    assert!(calls.recorded().is_empty());
-}
-
-#[test]
 fn a_spec_whose_columns_do_not_match_the_input_is_refused() {
     let spec = writer_spec(false).replace(r#"["ID"]"#, r#"["ID","EXTRA"]"#);
-    let calls = Calls::default();
 
-    let error = write_group(
-        &mut group(&spec, 1, "DECIMAL(18,0)"),
-        fake_target(&calls, None),
-    )
-    .expect_err("the column count differs");
+    let error = writer_plan(&mut group(&spec, 1, "DECIMAL(18,0)"))
+        .err()
+        .expect("the column count differs");
 
     assert!(
         error.to_string().contains("runs as the target of EXPORT"),
         "{error}"
     );
-    assert!(calls.recorded().is_empty());
+}
+
+#[test]
+fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
+    let plan = writer_plan(&mut group(&writer_spec(true), 1, "DECIMAL(18,0)"))
+        .expect("the spec matches the input");
+
+    assert_eq!(plan.spec.export_id, "00ff");
+    assert!(plan.spec.single_commit);
+    let fields: Vec<_> = plan
+        .schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.is_nullable()))
+        .collect();
+    assert_eq!(fields, [("ID", true)]);
+}
+
+#[test]
+fn export_and_writer_ids_are_fresh_hex_of_their_length() {
+    let (export_id, writer_id) = (new_export_id(), new_writer_id());
+
+    assert_eq!((export_id.len(), writer_id.len()), (32, 16));
+    assert!(export_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(writer_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(new_export_id(), export_id);
+}
+
+#[test]
+fn the_export_runtime_drives_a_future() {
+    let runtime = export_runtime().expect("a runtime");
+
+    assert_eq!(runtime.block_on(async { 7 }), 7);
 }

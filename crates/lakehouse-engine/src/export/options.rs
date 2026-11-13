@@ -45,7 +45,7 @@ impl ExportOptions {
         let writers = with_options.writer_layout()?;
         let allow_http = with_options
             .allow_http
-            .map(parse_allow_http)
+            .map(|value| parse_bool_option(ALLOW_HTTP, value))
             .transpose()?
             .unwrap_or(false);
         Ok(Self {
@@ -132,7 +132,10 @@ impl<'a> WithOptions<'a> {
             .writers_per_node
             .map(parse_writers_per_node)
             .transpose()?;
-        let single_commit = self.single_commit.map(parse_single_commit).transpose()?;
+        let single_commit = self
+            .single_commit
+            .map(|value| parse_bool_option(SINGLE_COMMIT, value))
+            .transpose()?;
         match (single_commit, per_node) {
             (Some(true), Some(_)) => Err(refusal(format_args!(
                 "{WRITERS_PER_NODE} cannot be combined with {SINGLE_COMMIT} = 'true', which runs one writer for the whole cluster; remove one of the two options"
@@ -170,18 +173,10 @@ fn parse_writers_per_node(value: &str) -> Result<usize, UdfError> {
         })
 }
 
-fn parse_allow_http(value: &str) -> Result<bool, UdfError> {
+fn parse_bool_option(option: &str, value: &str) -> Result<bool, UdfError> {
     parse_boolean(value).ok_or_else(|| {
         refusal(format_args!(
-            "{ALLOW_HTTP} = '{value}' is not 'true' or 'false'"
-        ))
-    })
-}
-
-fn parse_single_commit(value: &str) -> Result<bool, UdfError> {
-    parse_boolean(value).ok_or_else(|| {
-        refusal(format_args!(
-            "{SINGLE_COMMIT} = '{value}' is not 'true' or 'false'"
+            "{option} = '{value}' is not 'true' or 'false'"
         ))
     })
 }

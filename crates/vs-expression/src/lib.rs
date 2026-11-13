@@ -5,12 +5,15 @@ mod column_node;
 mod datetime_format;
 pub mod exasol_type;
 mod fragment;
+mod json_value;
 mod scalar_functions;
 mod scan_typing;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
+use json_value::{Fallback, JsonValueCall, Returning};
+pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{
@@ -225,6 +228,10 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
 /// exactly as in a projection.
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
+/// The scalar UDF the DataFusion dialect renders `DIV` as, registered by `lakehouse-engine`.
+/// It raises on a zero divisor, so division by zero fails in a filter exactly as in a projection.
+pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
+
 fn render_cast(
     args: Option<&Vec<Json>>,
     data_type: Option<&Json>,
@@ -240,6 +247,60 @@ fn render_cast(
     let target = exasol_type_from_json(data_type)?;
     let target_type = render_cast_target(target, dialect)?;
     Ok(Some(format!("CAST({inner} AS {target_type})")))
+}
+
+fn json_value_operand(node: &Json, dialect: Dialect) -> Result<String, UdfError> {
+    render_expression_inner(node, dialect)?
+        .ok_or_else(|| UdfError::User("JSON_VALUE operand is null".into()))
+}
+
+/// Every clause Exasol sent, so Exasol computes the forms the scan declines.
+fn render_json_value_exasol(expr: &Json) -> Result<String, UdfError> {
+    let operand = |node: &Json| json_value_operand(node, Dialect::Exasol);
+    let args = expr
+        .get("arguments")
+        .and_then(Json::as_array)
+        .filter(|args| args.len() == 2)
+        .ok_or_else(|| UdfError::User("JSON_VALUE takes a document and a path".into()))?;
+    let mut sql = format!("JSON_VALUE({}, {}", operand(&args[0])?, operand(&args[1])?);
+    if let Some(data_type) = expr.get("returningDataType") {
+        sql.push_str(&format!(" RETURNING {}", exasol_type_from_json(data_type)?));
+    }
+    for (field, clause) in [("emptyBehavior", "EMPTY"), ("errorBehavior", "ERROR")] {
+        let Some(behavior) = expr.get(field) else {
+            continue;
+        };
+        let rendered = match behavior.get("type").and_then(Json::as_str) {
+            Some("DEFAULT") => format!(
+                "DEFAULT {}",
+                operand(behavior.get("expression").unwrap_or(&Json::Null))?
+            ),
+            Some(kind @ ("NULL" | "ERROR")) => kind.to_string(),
+            _ => return Err(UdfError::User(format!("JSON_VALUE behavior {behavior}"))),
+        };
+        sql.push_str(&format!(" {rendered} ON {clause}"));
+    }
+    Ok(sql + ")")
+}
+
+fn render_json_value_scan(expr: &Json) -> Result<String, UdfError> {
+    let call = JsonValueCall::parse(expr)?;
+    let fallback = |fallback: &Fallback| match fallback {
+        Fallback::Null => "NULL".to_string(),
+        Fallback::Text(text) => format!("'{}'", sql_escape(text)),
+        Fallback::Boolean(value) => value.to_string().to_uppercase(),
+    };
+    let doc = json_value_operand(call.document, Dialect::DataFusion)?;
+    let path = format!("'{}'", sql_escape(call.path));
+    let (on_empty, on_error) = (fallback(&call.on_empty), fallback(&call.on_error));
+    Ok(match call.returning {
+        Returning::Text { max_chars } => {
+            format!("{JSON_VALUE_TEXT_FN}({doc}, {path}, {max_chars}, {on_empty}, {on_error})")
+        }
+        Returning::Boolean => {
+            format!("{JSON_VALUE_BOOLEAN_FN}({doc}, {path}, {on_empty}, {on_error})")
+        }
+    })
 }
 
 /// `Ok(None)` for `Json::Null` (an absent optional child).
@@ -524,6 +585,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             sql.push_str(" END");
             Ok(Some(format!("({sql})")))
         }
+        "function_scalar_json_value" => match dialect {
+            Dialect::Exasol => render_json_value_exasol(expr),
+            Dialect::DataFusion => render_json_value_scan(expr),
+        }
+        .map(Some),
         // The CAST wire shape Exasol sends; the nested `function_scalar` CAST arm
         // is a defensive alternate encoding.
         "function_scalar_cast" => {
@@ -553,7 +619,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 .to_uppercase();
             let args = value("arguments").and_then(|a| a.as_array());
 
-            // An Exasol-dialect `VerbatimCall` and a DataFusion string call render here, ahead
+            // An Exasol-dialect `VerbatimCall` and a DataFusion call render here, ahead
             // of the per-name arms, so arm order carries no dialect precedence.
             let Some(function) = scalar_function(&fn_name) else {
                 return Err(UdfError::User(format!(
@@ -564,7 +630,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 Dialect::Exasol => {
                     (function.exasol == ExasolForm::VerbatimCall).then_some(fn_name.as_str())
                 }
-                Dialect::DataFusion => function.string_call,
+                Dialect::DataFusion => function.datafusion_call,
             };
             if let Some(call_name) = verbatim {
                 let args = args.ok_or_else(|| {
@@ -1013,12 +1079,13 @@ pub fn render_scan_expression(
     Ok(SqlFragment::new(render_expression(&typed)?, ty))
 }
 
-/// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`).
+/// [`render_scan_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
+/// filter it sends renders as `TRUE`.
 pub fn render_scan_filter(
     filter_expr: &Json,
     columns: &dyn ColumnTypeLookup,
-) -> Result<Option<String>, UdfError> {
-    Ok(non_trivial_filter(
+) -> Result<String, UdfError> {
+    Ok(null_keeps_no_row(
         render_scan_expression(filter_expr, columns)?.sql,
     ))
 }
@@ -1028,16 +1095,12 @@ pub fn conjoin_scan_filters(conjuncts: Vec<String>) -> Option<String> {
     if conjuncts.is_empty() {
         return None;
     }
-    non_trivial_filter(join_junction(conjuncts, " AND ", "TRUE"))
+    Some(null_keeps_no_row(join_junction(conjuncts, " AND ", "TRUE")))
 }
 
 /// A `NULL` condition keeps no row, like `FALSE`. Exasol folds `''` to `NULL` too.
-fn non_trivial_filter(sql: String) -> Option<String> {
-    match sql.as_str() {
-        "TRUE" => None,
-        "NULL" => Some("FALSE".into()),
-        _ => Some(sql),
-    }
+fn null_keeps_no_row(sql: String) -> String {
+    if sql == "NULL" { "FALSE".into() } else { sql }
 }
 
 /// DataFusion dialect, untyped. Use [`render_scan_expression`].
@@ -1049,31 +1112,26 @@ pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
 /// Exasol dialect, for SQL parsed by Exasol itself (join and grouped-aggregate
 /// wrappers), never for a DataFusion `ScanSpec`. Character CAST targets are
 /// length-qualified, since Exasol has no length-less character type.
-pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
-    render_expression_inner(expr, Dialect::Exasol)?
-        .ok_or_else(|| UdfError::User("expression node is null".into()))
+///
+/// Panics on a tree Exasol does not send: Exasol pushes only the capabilities the adapter
+/// advertises, and this dialect renders every one of them.
+pub fn render_expression_exasol(expr: &Json) -> String {
+    match render_expression_inner(expr, Dialect::Exasol) {
+        Ok(Some(sql)) => sql,
+        Ok(None) => panic!("{EXASOL_RENDERS}: a null node"),
+        Err(err) => panic!("{EXASOL_RENDERS}: {err}"),
+    }
 }
+
+const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
 /// [`render_expression_exasol`] for an output select item, typed where the request states the
 /// type: the Exasol dialect renders a CAST's target and a column as they are.
-pub fn render_exasol_fragment(
-    expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-) -> Result<SqlFragment, UdfError> {
-    Ok(SqlFragment::new(
-        render_expression_exasol(expr)?,
+pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
+    SqlFragment::new(
+        render_expression_exasol(expr),
         exact_expression_type(expr, columns),
-    ))
-}
-
-/// `None` on any failure.
-pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, Dialect::Exasol).ok()?
-}
-
-/// [`render_expression_exasol_safe`] for a filter: also `None` when it is trivially true.
-pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
-    non_trivial_filter(render_expression_inner(filter_expr, Dialect::Exasol).ok()??)
+    )
 }
 
 #[cfg(test)]

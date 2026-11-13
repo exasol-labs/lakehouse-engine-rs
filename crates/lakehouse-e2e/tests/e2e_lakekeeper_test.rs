@@ -1605,7 +1605,8 @@ fn create_proxy_virtual_schema() {
     DONE.get_or_init(|| {
         setup();
         permission_setup();
-        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let proxy_url = stack::proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         let password = lakekeeper_connection_password(WAREHOUSE_AUTHZ, false).via_proxy();
         let token_uri = password
             .oauth2_server_uri

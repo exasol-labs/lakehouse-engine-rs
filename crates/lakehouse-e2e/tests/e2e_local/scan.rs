@@ -28,8 +28,8 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    LAKEHOUSE_VS, emits_clause, events_table, explain_virtual_pushdown_sql, lakehouse_vs,
-    typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
+    LAKEHOUSE_VS, TYPED_COLUMNS, emits_clause, events_table, explain_virtual_pushdown_sql,
+    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
 /// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
@@ -2887,51 +2887,35 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
     }
 }
 
-// #52: Exasol flattens `COUNT(*) FROM (SELECT k, COUNT(*) ... GROUP BY k)` into one
-// group_by request with a literal-only select list; the scan must keep the GROUP BY
-// so Exasol's outer COUNT(*) counts group rows.
-
+/// Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     lakehouse_vs();
     let mut conn = exa_conn();
+    let events = events_table();
 
-    // Must be 4, not the 20 a row-scan fallback would return; `GROUP BY id` alone cannot
-    // tell the two apart.
-    let sql_duplicate_keys = format!(
-        "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
-        events_table()
-    );
-    let cols = conn.query_columns(&sql_duplicate_keys);
-    assert_eq!(
-        cols.len(),
-        1,
-        "nested COUNT(*) must return one column: {cols:?}"
-    );
-    assert_eq!(
-        cols[0].len(),
-        1,
-        "nested COUNT(*) must return one row: {cols:?}"
-    );
-    let distinct_group_count = parse_int(&cols[0][0]);
-    assert_eq!(
-        distinct_group_count, 4,
-        "COUNT(*) over (GROUP BY MOD(id,4)) sub-select must be 4 (distinct groups), \
-         got {distinct_group_count} — 20 would indicate an unsafe row-scan fallback \
-         instead of a correctly preserved grouped scan"
-    );
-
-    let sql_unique_key = format!(
-        "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
-        events_table()
-    );
-    let cols_unique = conn.query_columns(&sql_unique_key);
-    let unique_group_count = parse_int(&cols_unique[0][0]);
-    assert_eq!(
-        unique_group_count, 20,
-        "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
-         got {unique_group_count}"
-    );
+    // Exasol flattens each into one group_by request with a literal-only select list (#52).
+    // `MOD(id, 4)` tells a kept GROUP BY (4) from a row-scan fallback (20); `id` alone cannot.
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {events} GROUP BY MOD(id, 4))"
+            ),
+            4,
+        ),
+        (
+            format!("SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {events} GROUP BY id)"),
+            20,
+        ),
+    ] {
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            (cols.len(), cols[0].len()),
+            (1, 1),
+            "must return one column and one row: {sql}\n{cols:?}"
+        );
+        assert_eq!(parse_int(&cols[0][0]), expected, "{sql}");
+    }
 }
 
 // ORDER BY ... LIMIT n OFFSET m coverage (#191) for each wrapper site routed through
@@ -3672,6 +3656,83 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
         "a zero divisor inside a pushed aggregate argument must fail under the \
          same SQL state as one in a projection or a filter"
     );
+}
+
+/// Scenario: Integer division over integer operands runs in the scan
+/// Scenario: Integer division over a decimal or DOUBLE operand runs in Exasol
+#[test]
+fn e2e_integer_div_matches_native_over_a_native_copy() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+
+    let cases: [(&str, PathCheck); 7] = [
+        (
+            "SELECT ID, DIV(ID - 7, 2), DIV(ID - 7, -2), DIV(ID - 7, NULLIF(ID - 6, 0)), \
+             DIV(C_QTY, ID) FROM {T}",
+            PathCheck::Has(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT ID FROM {T} WHERE DIV(ID - 7, 2) < 0",
+            PathCheck::Has(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT ID, DIV(C_DECIMAL_A, 2) FROM {T}",
+            PathCheck::Lacks(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT ID, DIV(C_DOUBLE, 2) FROM {T}",
+            PathCheck::Lacks(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT ID FROM {T} WHERE DIV(C_DECIMAL_A, 3) > 5",
+            PathCheck::Lacks(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT ID, DIV(NULLIF(ID - 7, ID - 7), ID - ID) FROM {T}",
+            PathCheck::Has(CHECKED_INT_DIV_FN),
+        ),
+        (
+            "SELECT DIV(ID, 4), COUNT(*) FROM {T} GROUP BY DIV(ID, 4)",
+            PathCheck::Has(CHECKED_INT_DIV_FN),
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(query, path)| {
+            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
+        })
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} integer DIV cases failed:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// Scenario: A pushed-down integer division by zero fails the query
+#[test]
+fn e2e_integer_div_by_zero_fails_with_division_by_zero() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let typed = typed_table();
+
+    for query in [
+        format!("SELECT DIV(ID, ID - ID) FROM {typed}"),
+        format!("SELECT ID FROM {typed} WHERE DIV(ID, ID - ID) > 0"),
+        format!("SELECT DIV(ID - ID, ID - ID) FROM {typed}"),
+    ] {
+        let sql_code = division_by_zero_failure_sql_code(&mut conn, &query);
+
+        assert_eq!(
+            sql_code, UDF_ERROR_SQL_CODE,
+            "the recorded SQL state for a scan-UDF-raised integer division by zero:\n{query}"
+        );
+    }
 }
 
 #[test]

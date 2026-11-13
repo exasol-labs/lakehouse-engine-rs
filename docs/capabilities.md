@@ -53,9 +53,8 @@ result in the correct order:
 - The qualified single-table, N-scan join wrapper renders any sortable expression directly,
   because it already qualifies column references.
 
-A sort key that the adapter cannot render in Exasol SQL fails the query with an error. Exasol does
-not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`, so dropping
-the key would return rows in the wrong order.
+Exasol does not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`,
+so the adapter renders every sort key Exasol pushes in Exasol SQL.
 
 The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
 
@@ -73,14 +72,26 @@ The scan computes these functions when DataFusion can render the whole filter or
 
 | Family | Capabilities | Example |
 |---|---|---|
-| Arithmetic | `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, `FN_NEG` | `SELECT price * discount` |
+| Arithmetic | `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, `FN_DIV`, `FN_NEG` | `SELECT price * discount` |
 | Math | `FN_ABS`, `FN_ACOS`, `FN_ASIN`, `FN_ATAN`, `FN_ATAN2`, `FN_CEIL`, `FN_COS`, `FN_COSH`, `FN_COT`, `FN_DEGREES`, `FN_EXP`, `FN_FLOOR`, `FN_LN`, `FN_LOG`, `FN_MOD`, `FN_POWER`, `FN_RADIANS`, `FN_ROUND`, `FN_SIGN`, `FN_SIN`, `FN_SINH`, `FN_SQRT`, `FN_TAN`, `FN_TANH`, `FN_TRUNC` | `SELECT ROUND(amt, 2)` |
 | String | `FN_ASCII`, `FN_CHR`, `FN_CONCAT`, `FN_INITCAP`, `FN_INSTR`, `FN_LEFT`, `FN_LENGTH`, `FN_LOCATE`, `FN_LOWER`, `FN_LPAD`, `FN_LTRIM`, `FN_OCTET_LENGTH`, `FN_REPEAT`, `FN_REPLACE`, `FN_REVERSE`, `FN_RIGHT`, `FN_RPAD`, `FN_RTRIM`, `FN_SUBSTR`, `FN_TRANSLATE`, `FN_TRIM`, `FN_UNICODE`, `FN_UNICODECHR`, `FN_UPPER` | `WHERE UPPER(code) = 'AB'` |
 | Conversion | `FN_CAST` | `SELECT CAST(id AS VARCHAR(20))` |
 | Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
+| JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
+
+`JSON_VALUE` runs in the scan when all of these hold:
+
+- the document is text;
+- the path is `$` followed by `.name`, `."name"`, and `[n]` steps, with no whitespace;
+- there is no `RETURNING` clause, or it names `VARCHAR(n)` in UTF8 or `BOOLEAN`;
+- `ON EMPTY` and `ON ERROR` are `NULL`, or `DEFAULT` with a literal of the returning type that fits it.
+
+Any other form runs in Exasol SQL over the document column, among them `RETURNING DECIMAL`, `DOUBLE`, `DATE`, and `TIMESTAMP`, which convert by the session's NLS settings, and `ERROR ON EMPTY` or `ERROR ON ERROR`, which raise Exasol's own error.
+
+The scan reads a document nested at most about 200 levels deep. A deeper document takes the `ON ERROR` behavior.
 
 ### Text and session settings
 
@@ -152,3 +163,17 @@ The adapter does not advertise these capabilities, so Exasol evaluates them itse
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
 | `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` | `WHERE created_at < CURRENT_TIMESTAMP` | The scan receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE` and holds no statement anchor, so Exasol evaluates the clock itself, once per statement, in its own zones. Results are correct; a predicate over one of these names prunes no files |
 | Geospatial and session functions | — | Exasol evaluates them. No lakehouse type maps to GEOMETRY |
+
+## Excluding a capability
+
+The property `EXCLUDED_CAPABILITIES` withdraws advertised capabilities from one virtual schema. Exasol then evaluates each excluded construct itself over the rows the scan returns, as it does for the capabilities in the section above. The property takes a comma-separated list of capability names from the tables above. Use it to stop pushing a capability that misbehaves or runs slowly for a workload, with no new adapter release.
+
+```sql
+ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_PRED_LIKE';
+```
+
+After this statement, a `WHERE name LIKE 'event-1%'` predicate no longer reaches the scan, and a pushed-down query returns the same rows as before. The change applies from the next query, with no `REFRESH`. `SET EXCLUDED_CAPABILITIES = null` restores the full advertised set.
+
+The exclusion subtracts the listed names and nothing else. The adapter does not withhold a capability because another one is excluded. Excluding `LIMIT` or `LIMIT_WITH_OFFSET` while an `ORDER_BY_*` capability stays advertised changes the result of `ORDER BY ... LIMIT n OFFSET m`. [Semantic differences](semantic-differences.md#order-by-with-limit-under-excluded_capabilities) describes the effect and its workaround. [Parameters](tuning.md) lists the accepted values.
+
+`CREATE`, `REFRESH`, and `SET` reject a name the adapter does not advertise and suggest the nearest one, for example `invalid value 'FN_PRED_LIK' for 'EXCLUDED_CAPABILITIES': expected an advertised capability name (did you mean 'FN_PRED_LIKE'?)`. When an upgrade stops advertising a listed name, `REFRESH` and `SET` fail until a `SET` of `EXCLUDED_CAPABILITIES` removes that name, while queries keep working. Unset `EXCLUDED_CAPABILITIES` before you downgrade to an adapter version without the property, because that version rejects it as an unknown property on `REFRESH` and `SET`.

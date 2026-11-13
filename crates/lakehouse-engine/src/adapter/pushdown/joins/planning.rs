@@ -5,20 +5,10 @@ use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
-    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
+    ColumnTypes, InvolvedColumns, aggregation_type, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
-
-/// Every inner join of any arity is served, so an ineligible shape is the last resort,
-/// routed to a hard client-facing error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IneligibleJoinReason {
-    /// A join node anywhere in the tree is not inner; a cross join plus WHERE cannot reproduce
-    /// outer-join semantics.
-    NotInnerJoinType,
-    UnsupportedShape,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinLeaf {
@@ -42,52 +32,28 @@ pub(crate) struct DetectedJoin {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum JoinShape {
     NotAJoin,
-    Ineligible(IneligibleJoinReason),
     Join(DetectedJoin),
 }
 
 /// Leaves in left-to-right order, conditions in post-order. A leaf without `alias` is an
-/// alias-less occurrence, a leg identity of its own.
+/// alias-less occurrence, a leg identity of its own. Exasol pushes only the inner equi-joins
+/// the adapter advertises, so every join node is inner with both sides and a condition.
 fn collect_join_tree(
     node: &Json,
     leaves: &mut Vec<(String, Option<String>)>,
     conditions: &mut Vec<Json>,
-) -> Result<(), IneligibleJoinReason> {
-    match node.get("type").and_then(|t| t.as_str()) {
-        Some("join") => {
-            let is_inner = node
-                .get("join_type")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.eq_ignore_ascii_case("inner"));
-            if !is_inner {
-                return Err(IneligibleJoinReason::NotInnerJoinType);
-            }
-            let (left, right) = match (node.get("left"), node.get("right")) {
-                (Some(left), Some(right)) => (left, right),
-                _ => return Err(IneligibleJoinReason::UnsupportedShape),
-            };
-            let condition = match node.get("condition").filter(|c| !c.is_null()) {
-                Some(condition) => condition.clone(),
-                None => return Err(IneligibleJoinReason::UnsupportedShape),
-            };
-            collect_join_tree(left, leaves, conditions)?;
-            collect_join_tree(right, leaves, conditions)?;
-            conditions.push(condition);
-            Ok(())
-        }
-        Some("table") => match node.get("name").and_then(|n| n.as_str()) {
-            Some(name) => {
-                let alias = node
-                    .get("alias")
-                    .and_then(|a| a.as_str())
-                    .map(str::to_string);
-                leaves.push((name.to_string(), alias));
-                Ok(())
-            }
-            None => Err(IneligibleJoinReason::UnsupportedShape),
-        },
-        _ => Err(IneligibleJoinReason::UnsupportedShape),
+) {
+    if node["type"] == "join" {
+        collect_join_tree(&node["left"], leaves, conditions);
+        collect_join_tree(&node["right"], leaves, conditions);
+        conditions.push(node["condition"].clone());
+        return;
     }
+    let name = node["name"]
+        .as_str()
+        .expect("Exasol names the table of every join leaf");
+    let alias = node["alias"].as_str().map(str::to_string);
+    leaves.push((name.to_string(), alias));
 }
 
 /// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
@@ -104,9 +70,7 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 
     let mut leaves = Vec::new();
     let mut conditions = Vec::new();
-    if let Err(reason) = collect_join_tree(from, &mut leaves, &mut conditions) {
-        return Ok(JoinShape::Ineligible(reason));
-    }
+    collect_join_tree(from, &mut leaves, &mut conditions);
 
     let mut tables = Vec::with_capacity(leaves.len());
     for (table_name, table_alias) in leaves {
@@ -249,7 +213,7 @@ pub(super) async fn resolve_one_join_side(
 }
 
 /// One leg's column types and notes from the same pass.
-pub(super) fn involved_table<'r>(
+pub(in super::super) fn involved_table<'r>(
     request: &'r Json,
     table_name: &str,
 ) -> Result<InvolvedColumns<'r>, UdfError> {
@@ -258,29 +222,6 @@ pub(super) fn involved_table<'r>(
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
     })
-}
-
-/// The broadcast in-UDF join renders only projection, filter, and join condition, so any
-/// aggregation must be executed by Exasol over the materialized join.
-fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
-    let has_aggregate_item = pushdown_req
-        .get("selectList")
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| {
-            list.iter()
-                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
-        });
-    let has_group_by = pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    let is_group_by_aggregation =
-        pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by");
-    let has_having = pushdown_req
-        .get("having")
-        .filter(|h| !h.is_null())
-        .is_some();
-    has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
 }
 
 /// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
@@ -303,7 +244,9 @@ pub(in super::super) enum JoinWindowPlan {
 /// a projection here would let an aggregate-carrying join reach a render that can `Err` on
 /// absent column metadata.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    if carries_aggregation_clause(pushdown_req) {
+    // The broadcast in-UDF join renders only projection, filter, and join condition, so
+    // Exasol aggregates over the materialized join instead.
+    if aggregation_type(pushdown_req).is_some() {
         return JoinWindowPlan::ExasolPostProcessed;
     }
     let limit = extract_limit(pushdown_req);

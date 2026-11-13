@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.58.2"
+version = "0.58.3"
 edition = "2024"
 license.workspace = true
 
@@ -50,6 +50,7 @@ delta_kernel_default_engine = { version = "0.30.0", default-features = false, fe
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+jiter      = { workspace = true }
 
 chrono  = { workspace = true }
 futures = { workspace = true }
@@ -73,6 +74,7 @@ tokio               = { workspace = true, features = ["rt-multi-thread", "macros
 exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 vs-expression       = { path = "../vs-expression", features = ["test-support"] }
 lakehouse-catalog   = { path = "../lakehouse-catalog", features = ["test-support"] }
+lakehouse-catalog-write = { path = "../lakehouse-catalog-write", features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 tempfile            = { version = "3" }

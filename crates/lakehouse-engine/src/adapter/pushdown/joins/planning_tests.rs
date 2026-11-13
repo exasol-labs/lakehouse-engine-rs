@@ -4,7 +4,6 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::types::exasol_type::ExasolType;
 
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
@@ -32,41 +31,26 @@ fn plain_single_table_request_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
+/// `ON c = o AND c < o` arrives as one `predicate_and` condition. Kept whole, its type is not
+/// `predicate_equal`, so `plan_join` takes the fallback instead of broadcast.
 #[test]
-fn from_table_node_is_not_a_join() {
-    let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = table_ref("LINEITEM");
-    let shape = detect_join(&request, &pd(&request)).expect("not a join");
-    assert_eq!(shape, JoinShape::NotAJoin);
-}
-
-#[test]
-fn outer_join_is_ineligible() {
-    for outer in ["left_outer", "right_outer", "full_outer"] {
-        let request = join_request(serde_json::json!({"join_type": outer}), equi_condition());
-        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-        assert_eq!(
-            shape,
-            JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType),
-            "join_type '{outer}' must be ineligible, not broadcast-eligible"
-        );
-    }
-}
-
-#[test]
-fn non_equi_two_table_join_is_served_by_unified_fallback() {
-    let condition = compare(
-        "predicate_less",
-        table_col("CUSTOMER", "C_CUSTKEY"),
-        table_col("ORDERS", "O_CUSTKEY"),
-    );
+fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
+    let condition = and([
+        equi_condition(),
+        compare(
+            "predicate_less",
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        ),
+    ]);
     let request = join_request(Json::Null, condition.clone());
-    match detect_join(&request, &pd(&request)).expect("served, not declined") {
+    match detect_join(&request, &pd(&request)).expect("a join with a non-equi conjunct is detected")
+    {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
             assert_eq!(join.conditions, vec![condition]);
         }
-        other => panic!("expected Join (unified fallback), got {other:?}"),
+        other => panic!("expected Join, got {other:?}"),
     }
 }
 
@@ -89,17 +73,6 @@ fn three_table_inner_join_is_unified_join() {
         }
         other => panic!("expected Join, got {other:?}"),
     }
-}
-
-#[test]
-fn non_inner_node_in_join_tree_is_ineligible() {
-    let mut request = three_table_join_request();
-    request["pushdownRequest"]["from"]["left"]["join_type"] = serde_json::json!("left_outer");
-    let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-    assert_eq!(
-        shape,
-        JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType)
-    );
 }
 
 /// Scenario: Each join leg resolves its catalog identifier from its own identifier note
@@ -141,7 +114,7 @@ fn a_leg_without_an_identifier_note_is_err() {
         .as_object_mut()
         .unwrap()
         .remove("adapterNotes");
-    let err = detect_join(&request, &pd(&request))
+    let err = detect_join(&request, &request["pushdownRequest"])
         .expect_err("LINEITEM has no note: must be Err, not a decline");
     let message = err.to_string();
     assert!(
@@ -171,25 +144,6 @@ fn four_table_inner_join_is_unified_join() {
             assert_eq!(join.conditions.len(), 3, "N-1 conditions for N=4 tables");
         }
         other => panic!("expected Join, got {other:?}"),
-    }
-}
-
-#[test]
-fn detect_join_follows_from_tree_not_involved_tables_count() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["involvedTables"]
-        .as_array_mut()
-        .unwrap()
-        .push(involved_table_json(
-            "NATION",
-            &[("N_NATIONKEY", ExasolType::decimal(20, 0))],
-        ));
-    match detect_join(&request, &pd(&request)).expect("tree-driven, no decline") {
-        JoinShape::Join(join) => {
-            let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
-            assert_eq!(names, ["CUSTOMER", "ORDERS"], "only the from-tree leaves");
-        }
-        other => panic!("expected Join over the two from-tree tables, got {other:?}"),
     }
 }
 

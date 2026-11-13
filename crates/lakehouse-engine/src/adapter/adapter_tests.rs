@@ -79,23 +79,27 @@ fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
     resolve_tuning_notes(&checked(props), nr_of_cores)
 }
 
-#[test]
-fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
+#[track_caller]
+fn assert_every_schema_request_fails_before_the_connection_is_read(
+    property: &str,
+    value: &str,
+    expected_entry: &str,
+) {
     for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
         let request = schema_request(
             request_type,
             serde_json::json!({
                 PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                "NAMESPCE": "sales",
+                property: value,
             }),
         );
 
-        let err = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an unknown property name must fail the request");
+        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+            .expect_err("an invalid property must fail the request")
+            .to_string();
 
-        let message = err.to_string();
         assert!(
-            message.contains("unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)"),
+            message.contains(expected_entry),
             "{request_type}: {message}"
         );
         assert!(
@@ -103,6 +107,15 @@ fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_
             "{request_type} must fail before it reads the CONNECTION: {message}"
         );
     }
+}
+
+#[test]
+fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
+    assert_every_schema_request_fails_before_the_connection_is_read(
+        "NAMESPCE",
+        "sales",
+        "unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)",
+    );
 }
 
 #[test]
@@ -129,26 +142,11 @@ fn a_misspelled_required_property_is_reported_instead_of_the_missing_one() {
 
 #[test]
 fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_read() {
-    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
-        let request = schema_request(
-            request_type,
-            serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                PROP_DF_BATCH_SIZE: "0",
-            }),
-        );
-
-        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an invalid tuning value must fail the request")
-            .to_string();
-
-        assert!(
-            message.contains(
-                "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295"
-            ),
-            "{request_type}: {message}"
-        );
-    }
+    assert_every_schema_request_fails_before_the_connection_is_read(
+        PROP_DF_BATCH_SIZE,
+        "0",
+        "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295",
+    );
 }
 
 #[test]
@@ -946,7 +944,11 @@ fn pushdown_request_involving(involved: &str) -> Json {
 /// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
 fn pushdown_without_an_identifier_note_fails_naming_refresh() {
-    let request = pushdown_request_involving("UNKNOWN_TABLE");
+    let mut request = pushdown_request_involving("UNKNOWN_TABLE");
+    request["involvedTables"][0]
+        .as_object_mut()
+        .expect("an involved table")
+        .remove("adapterNotes");
 
     let message = resolve_pushdown_identifier(&request)
         .unwrap_err()
@@ -985,12 +987,24 @@ fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
         build_listing_virtual_tables(&[], &listing, EngineTimestampSupport::MillisecondOnly)
             .unwrap();
 
-    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
-        resolve_pushdown_identifier(&request).unwrap(),
+        resolve_pushdown_identifier(&pushdown_over(&tables, "ORDERS")).unwrap(),
         "Orders",
         "the recorded bare directory name round-trips through pushdown resolution"
     );
+}
+
+/// A pushdown request over the one listed virtual table named `name`.
+fn pushdown_over(tables: &impl serde::Serialize, name: &str) -> Json {
+    let tables = serde_json::to_value(tables).unwrap();
+    let table = tables
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["name"] == name)
+        .unwrap_or_else(|| panic!("no listed table {name}: {tables}"))
+        .clone();
+    json!({"type": "pushdown", "involvedTables": [table]})
 }
 
 fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
@@ -1026,13 +1040,12 @@ fn create_vs_records_the_multi_level_identifier_in_the_table_note() {
     )
     .unwrap();
 
-    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
-        resolve_pushdown_identifier(&request).unwrap(),
+        resolve_pushdown_identifier(&pushdown_over(&tables, "ORDERS")).unwrap(),
         "prod.finance.orders"
     );
     assert_eq!(
-        read_identifier(&request, "EU__ORDERS").unwrap(),
+        read_identifier(&pushdown_over(&tables, "EU__ORDERS"), "EU__ORDERS").unwrap(),
         "prod.finance.eu.orders"
     );
 }

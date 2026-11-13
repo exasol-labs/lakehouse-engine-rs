@@ -8,6 +8,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::{Decimal, ExaType, Value};
 use std::sync::Arc;
+use vs_expression::udf_column_test_support::measured_column;
 
 const SPEC: &str = "the writer spec";
 
@@ -20,13 +21,9 @@ fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
     ))
 }
 
-fn names(fields: &[(&str, DataType)]) -> Vec<String> {
-    fields.iter().map(|(name, _)| name.to_string()).collect()
-}
-
 /// The batch of `rows`, each given without the writer spec of input column 0.
 fn batch_of(fields: &[(&str, DataType)], rows: Vec<Vec<Value>>) -> Result<RecordBatch, UdfError> {
-    let mut builder = BatchBuilder::bind(schema(fields), &names(fields))?;
+    let mut builder = BatchBuilder::bind(schema(fields))?;
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -227,7 +224,7 @@ fn a_decimal_too_large_for_the_table_column_is_refused_naming_the_column() {
 
 #[test]
 fn a_table_field_of_an_unwritable_arrow_type_is_refused_naming_it() {
-    let refused = BatchBuilder::bind(schema(&[("N", DataType::Int64)]), &["N".into()]);
+    let refused = BatchBuilder::bind(schema(&[("N", DataType::Int64)]));
 
     let message = refused.err().expect("a refusal").to_string();
     assert!(
@@ -237,36 +234,9 @@ fn a_table_field_of_an_unwritable_arrow_type_is_refused_naming_it() {
 }
 
 #[test]
-fn source_columns_bind_to_table_fields_by_name() {
-    let fields = [("A", DataType::Utf8), ("B", DataType::Float64)];
-    let mut builder = BatchBuilder::bind(schema(&fields), &["B".into(), "A".into()])
-        .expect("both fields have a source column");
-    let mut ctx = TestContext::set(vec![vec![
-        Value::String(SPEC.into()),
-        Value::Double(2.0),
-        Value::String("a".into()),
-    ]]);
-    ctx.next().unwrap();
-
-    builder.append_row(&ctx).unwrap();
-    let batch = builder.take().unwrap();
-
-    assert_eq!(column::<StringArray>(&batch, 0).value(0), "a");
-    assert_eq!(column::<Float64Array>(&batch, 1).value(0), 2.0);
-}
-
-#[test]
-fn a_table_field_without_a_source_column_is_refused_naming_it() {
-    let refused = BatchBuilder::bind(schema(&[("MISSING", DataType::Utf8)]), &["A".into()]);
-
-    let message = refused.err().expect("a refusal").to_string();
-    assert!(message.contains("MISSING"), "{message}");
-}
-
-#[test]
 fn a_batch_fills_at_its_row_limit_and_starts_empty_after_it_is_taken() {
     let fields = [("ID", DataType::Decimal128(9, 0))];
-    let mut builder = BatchBuilder::bind(schema(&fields), &names(&fields)).unwrap();
+    let mut builder = BatchBuilder::bind(schema(&fields)).unwrap();
     let rows = (0..BATCH_ROWS as i32)
         .map(|id| vec![Value::String(SPEC.into()), Value::Int32(id)])
         .collect();
@@ -365,49 +335,5 @@ fn a_column_without_a_measured_spelling_is_refused_naming_it() {
             message.contains(&format!("column G has type {}", column.type_name)),
             "{message}"
         );
-    }
-}
-
-/// Column metadata as the Rust SLC reported an input column on `exasol/docker-db:2025.1.16`,
-/// for the type spellings the export's tests use. Panics on any other spelling.
-pub(in crate::export) fn measured_column(type_name: &str) -> ColumnInfo {
-    let digits = |prefix: &str| -> Option<Vec<u32>> {
-        let args = type_name.strip_prefix(prefix)?.split(')').next()?;
-        Some(
-            args.split(',')
-                .map(|n| n.parse().expect("number"))
-                .collect(),
-        )
-    };
-    let (typ, size, precision, scale) = if let Some(args) = digits("DECIMAL(") {
-        let (precision, scale) = (args[0], args[1]);
-        let typ = match (precision, scale) {
-            (0..=9, 0) => ExaType::Int32,
-            (10..=18, 0) => ExaType::Int64,
-            _ => ExaType::Numeric { precision, scale },
-        };
-        (typ, 0, precision, scale)
-    } else if let Some(args) = digits("TIMESTAMP(") {
-        (ExaType::Timestamp { precision: args[0] }, 0, args[0], 0)
-    } else if let Some(args) = digits("VARCHAR(") {
-        (ExaType::String { size: args[0] }, args[0], 0, 0)
-    } else if let Some(args) = digits("CHAR(") {
-        (ExaType::Char { size: args[0] }, args[0], 0, 0)
-    } else {
-        let typ = match type_name {
-            "DOUBLE" => ExaType::Double,
-            "BOOLEAN" => ExaType::Boolean,
-            "DATE" => ExaType::Date,
-            unmeasured => panic!("no measured column metadata for {unmeasured}"),
-        };
-        (typ, 0, 0, 0)
-    };
-    ColumnInfo {
-        name: "0".to_string(),
-        typ,
-        type_name: type_name.to_string(),
-        size: Some(size),
-        precision: Some(precision),
-        scale: Some(scale),
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::*;
-use crate::{SqlFragment, render_scan_expression};
+use crate::{CHECKED_INT_DIV_FN, SqlFragment, render_scan_expression};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -157,23 +157,6 @@ fn only_string_positions_convert_to_text() {
     }
 }
 
-/// Scenario: A column of unknown type declines
-#[test]
-fn a_column_of_unknown_type_declines_where_it_meets_text() {
-    for expr in [
-        like(col("UNKNOWN"), "1%"),
-        scalar_fn("UPPER", [col("UNKNOWN")]),
-        predicate_equal(col("UNKNOWN"), str_lit("1")),
-        cast_to(ExasolType::WIDEST_VARCHAR, col("UNKNOWN")),
-    ] {
-        assert!(render(&expr).is_err(), "{expr} must decline");
-    }
-    assert!(
-        render(&predicate_equal(col("UNKNOWN"), num_lit(1))).is_ok(),
-        "no text conversion, so the column's type does not matter"
-    );
-}
-
 #[test]
 fn integer_and_text_sources_keep_their_pushdown() {
     assert_eq!(
@@ -212,6 +195,11 @@ fn a_computed_integer_converts_like_a_column() {
             "quotient",
             to_text(scalar_fn("FLOAT_DIV", [col("I"), num_lit(2)])),
             false,
+        ),
+        (
+            "integer quotient",
+            to_text(scalar_fn("DIV", [col("I"), num_lit(2)])),
+            true,
         ),
         (
             "CASE over integers",
@@ -263,6 +251,73 @@ fn a_computed_integer_converts_like_a_column() {
         let rendered = render(&expr);
         assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
     }
+}
+
+#[test]
+fn div_runs_in_the_scan_only_over_integer_operands() {
+    let cases = [
+        (
+            "integer column and literal",
+            scalar_fn("DIV", [col("I"), num_lit(2)]),
+            true,
+        ),
+        (
+            "two integer columns",
+            scalar_fn("DIV", [col("I"), col("I18")]),
+            true,
+        ),
+        (
+            "NULL numerator",
+            scalar_fn("DIV", [null_lit(), col("I")]),
+            true,
+        ),
+        (
+            "NULL divisor",
+            scalar_fn("DIV", [col("I"), null_lit()]),
+            true,
+        ),
+        (
+            "nested integer sum",
+            scalar_fn(
+                "DIV",
+                [scalar_fn("ADD", [col("I"), num_lit(1)]), num_lit(2)],
+            ),
+            true,
+        ),
+        (
+            "scaled decimal numerator",
+            scalar_fn("DIV", [col("N"), num_lit(2)]),
+            false,
+        ),
+        (
+            "scaled decimal divisor",
+            scalar_fn("DIV", [col("I"), col("N")]),
+            false,
+        ),
+        (
+            "DOUBLE numerator",
+            scalar_fn("DIV", [col("F"), num_lit(2)]),
+            false,
+        ),
+        (
+            "DOUBLE divisor",
+            scalar_fn("DIV", [col("I"), col("F")]),
+            false,
+        ),
+        (
+            "text divisor",
+            scalar_fn("DIV", [col("I"), col("S")]),
+            false,
+        ),
+    ];
+    for (label, expr, pushed) in cases {
+        let rendered = render(&expr);
+        assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
+    }
+    assert_eq!(
+        render(&scalar_fn("DIV", [col("I"), num_lit(2)])).unwrap(),
+        format!(r#"{CHECKED_INT_DIV_FN}("I", 2)"#)
+    );
 }
 
 #[test]
@@ -599,7 +654,7 @@ fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
 
 #[test]
 fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
-    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns()).unwrap();
+    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns());
     assert_eq!(
         typed(&cast_to(ExasolType::char(3), col("S10"))),
         SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))

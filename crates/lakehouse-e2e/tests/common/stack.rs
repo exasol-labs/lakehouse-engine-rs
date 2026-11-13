@@ -178,8 +178,31 @@ pub fn wait_for_iceberg_catalog() {
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
-pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
-pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
+/// Defaults match `docker-compose.yml`; overridable so a parallel stack can use its own network.
+fn env_or(env_var: &str, default: &str) -> String {
+    std::env::var(env_var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+pub fn network_name() -> String {
+    env_or("LH_NETWORK", "lakehouse-engine")
+}
+
+pub fn proxy_host_internal() -> String {
+    format!("{}.0.12", env_or("LH_SUBNET_PREFIX", "10.84"))
+}
+
+pub fn proxy_url_internal() -> String {
+    format!("http://{}:8888", proxy_host_internal())
+}
+
+pub fn closed_proxy_url_internal() -> String {
+    format!("http://{}:1", proxy_host_internal())
+}
+
 /// Only the forward proxy resolves a `-via-proxy` host, so a request that bypasses it fails.
 pub const ICEBERG_REST_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
 pub const SEAWEEDFS_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
@@ -206,16 +229,14 @@ pub fn url_host(url: &str) -> &str {
 /// Probes from the Exasol container, because only the UDFs there reach the proxy.
 pub fn wait_for_proxy() {
     let container = exasol_container();
+    let probe = format!(
+        "timeout 3 bash -c '</dev/tcp/{}/8888'",
+        proxy_host_internal()
+    );
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         let reachable = std::process::Command::new("docker")
-            .args([
-                "exec",
-                &container,
-                "bash",
-                "-c",
-                "timeout 3 bash -c '</dev/tcp/10.84.0.12/8888'",
-            ])
+            .args(["exec", &container, "bash", "-c", &probe])
             .status()
             .is_ok_and(|s| s.success());
         if reachable {
@@ -223,7 +244,8 @@ pub fn wait_for_proxy() {
         }
         assert!(
             Instant::now() < deadline,
-            "forward proxy at {PROXY_URL_INTERNAL} unreachable from {container}; start the `proxy` Compose service"
+            "forward proxy at {} unreachable from {container}; start the `proxy` Compose service",
+            proxy_url_internal()
         );
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -254,13 +276,14 @@ pub fn proxy_log_mark() -> String {
 }
 
 pub fn proxy_log_since(since: &str) -> String {
+    let network = network_name();
     let out = std::process::Command::new("docker")
         .args([
             "ps",
             "--filter",
             "label=com.docker.compose.service=proxy",
             "--filter",
-            "network=lakehouse-engine",
+            &format!("network={network}"),
             "--format",
             "{{.Names}}",
         ])
@@ -271,7 +294,7 @@ pub fn proxy_log_since(since: &str) -> String {
         .next()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .expect("no running `proxy` Compose service on the lakehouse-engine network")
+        .unwrap_or_else(|| panic!("no running `proxy` Compose service on the {network} network"))
         .to_string();
     let out = std::process::Command::new("docker")
         .args(["logs", "--since", since, &container])

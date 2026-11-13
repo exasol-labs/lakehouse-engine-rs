@@ -24,7 +24,6 @@ Renders `CONCAT`, the wire encoding of Exasol's `||` operator, so the DataFusion
 * *AND* each argument SHALL be rendered exactly ONCE and referenced exactly once, so no sub-expression is walked or evaluated twice
 * *AND* a nested `CONCAT` argument SHALL render its own `nullif(concat(...), '')`, because Exasol sends `a || b || c` as nested `CONCAT` nodes, so that every level reproduces Exasol's own per-level semantics
 * *AND* a single-argument call SHALL render `nullif(concat(<a1>), '')`, which is Exasol's own single-argument behavior, `CONCAT('a')` is `'a'` and a single NULL argument yields NULL, both captured live
-* *AND* a node whose `arguments` key is absent SHALL return an error, and an EMPTY argument list SHALL return an error in raising mode and `None` in the safe variants, in BOTH dialects, REPLACING the recorded absence of any arity floor, which rendered the syntactically invalid `()` in the Exasol dialect and `concat()` in the DataFusion dialect
 * *AND* `render_expression_exasol` SHALL render `(<a1> || <a2> ...)`, chained `||`, parenthesized, carrying NO `nullif`/`concat` wrapper and NO boolean rewrite; the `ExasolForm::Shaped` declaration is unchanged, so the declaration-driven verbatim sweep test keeps its `("A" || "B")` expectation and stays green with no edit
 * *AND* `capabilities.rs` SHALL keep advertising `FN_CONCAT` unchanged, so the fix restores the semantics at the rendering site rather than withdrawing the pushdown
 

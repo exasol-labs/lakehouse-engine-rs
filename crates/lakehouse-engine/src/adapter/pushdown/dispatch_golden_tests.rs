@@ -3,9 +3,9 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types, count_star,
-    float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
-    request_typed, round_of, sample_scan_storage, sample_storage, with_identifier_notes,
+    NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
+    count_star, float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
+    request_typed, round_of, sample_scan_storage, sample_storage, scan_for, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -72,6 +72,7 @@ fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
 
 pub(super) fn lone_count_distinct_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -81,6 +82,7 @@ pub(super) fn lone_count_distinct_request() -> (Json, Vec<ExasolType>) {
 
 fn multi_count_distinct_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -111,6 +113,7 @@ fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
 
 pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::decimal(36, 2),
@@ -121,6 +124,7 @@ pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
 /// An inner `DISTINCT` declines the decomposition, so the projection widens (#194).
 fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("SUM", Some("AMOUNT"), true), 2),
             ExasolType::decimal(36, 2),
@@ -130,6 +134,7 @@ fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
 
 fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("SUM", Some("AMOUNT"), false), 2),
             ExasolType::decimal(36, 2),
@@ -140,6 +145,7 @@ fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
 /// The nested `COUNT(*)` must dedup against the bare item's partial column.
 fn single_group_scalar_over_aggregate_dedup_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .count_star()
         .item(round_of_sum_over_count(), ExasolType::decimal(36, 2))
         .build()
@@ -155,6 +161,7 @@ fn round_of_sum_over_count() -> Json {
 
 fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::decimal(36, 2),
@@ -166,6 +173,7 @@ fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<Exasol
 
 fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
     events_request()
+        .single_group()
         .item(
             round_of(agg_item("VARIANCE", Some("AMOUNT"), false), 4),
             ExasolType::decimal(36, 4),
@@ -198,11 +206,10 @@ fn dispatch_sql(
 /// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
-    let (projection, widened) = super::support::project_columns(
-        &pushdown,
-        ScanTranslator::new(&column_types(&base_col_types())),
-    )
-    .expect("the fixture must project");
+    let columns = column_types(&base_col_types());
+    let (projection, widened) =
+        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()))
+            .expect("the fixture must project");
     assert!(
         widened,
         "this fixture must exercise the widening guard, not a per-item projection"
@@ -212,7 +219,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         &pushdown,
         projection,
         widened,
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&columns, pushdown.json()),
         None,
         None,
         None,
@@ -257,7 +264,7 @@ fn dispatch_sql_with_pushdown_req(
             .expect("the fixture declares a valid selectListDataTypes"),
         projected_columns(&proj_cols, &proj_types),
         false,
-        ScanTranslator::new(&column_types(&col_types)),
+        scan_for(&column_types(&col_types), pushdown_req),
         filter,
         None,
         limit,
@@ -290,7 +297,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &parsed_pushdown(request),
         &projected_columns(proj_cols, proj_types),
         false,
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&column_types(&base_col_types()), &pd(request)),
         &EmptyRelation::single_scan(request, &column_types(&base_col_types())),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
@@ -450,7 +457,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
 
     let shape = classify_request_shape(
         &parsed_pushdown(&request),
-        ScanTranslator::new(&column_types(&base_col_types())),
+        scan_for(&column_types(&base_col_types()), &pd(&request)),
     );
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -735,7 +742,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 10,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     }
 }
 
@@ -759,7 +766,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
-        column_types: ColumnTypes::default(),
+        column_types: column_types(NO_COLUMNS),
     }
 }
 

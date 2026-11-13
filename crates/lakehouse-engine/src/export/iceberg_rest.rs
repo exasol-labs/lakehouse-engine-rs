@@ -2,7 +2,7 @@
 
 use super::iceberg_sink::{IcebergSink, OpenedTable};
 use super::refusal;
-use super::target::{ExportConnection, ExportSink, ExportTarget, WriterTag};
+use super::target::{ExportConnection, ExportSink, ExportTarget};
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
@@ -60,44 +60,32 @@ impl ExportTarget for IcebergRestTarget {
     async fn open_table(
         &self,
         schema: &Schema,
-        tag: &WriterTag,
+        tag: &CommitTag,
+        single_commit: bool,
     ) -> Result<Box<dyn ExportSink>, UdfError> {
         let session = self.session().await?;
         let schema = iceberg_schema(schema)?;
-        let created = session
-            .create_table(&self.ident, schema, &tag.export_id)
-            .await?;
-        sink(session, OpenedTable::Created(created), tag).await
+        let opened = if single_commit {
+            OpenedTable::Staged(
+                session
+                    .stage_table(&self.ident, schema, &tag.export_id)
+                    .await?,
+            )
+        } else {
+            OpenedTable::Created(
+                session
+                    .create_table(&self.ident, schema, &tag.export_id)
+                    .await?,
+            )
+        };
+        Ok(Box::new(
+            IcebergSink::open(session, opened, tag.clone()).await?,
+        ))
     }
-
-    async fn stage_table(
-        &self,
-        schema: &Schema,
-        tag: &WriterTag,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        let session = self.session().await?;
-        let schema = iceberg_schema(schema)?;
-        let staged = session
-            .stage_table(&self.ident, schema, &tag.export_id)
-            .await?;
-        sink(session, OpenedTable::Staged(staged), tag).await
-    }
-}
-
-async fn sink(
-    session: TableWriteSession,
-    opened: OpenedTable,
-    tag: &WriterTag,
-) -> Result<Box<dyn ExportSink>, UdfError> {
-    let tag = CommitTag {
-        export_id: tag.export_id.clone(),
-        writer_id: tag.writer_id.clone(),
-    };
-    Ok(Box::new(IcebergSink::open(session, opened, tag).await?))
 }
 
 /// The Iceberg schema of an export table, derived from the export's Arrow schema with field IDs
-/// 1 to n in input order. The type rules live in `arrow_schema.rs`, not here (decision [8]).
+/// 1 to n in input order. The type rules live in `batch.rs`, not here.
 fn iceberg_schema(arrow: &Schema) -> Result<iceberg::spec::Schema, UdfError> {
     arrow_schema_to_schema_auto_assign_ids(arrow).map_err(|error| {
         UdfError::User(format!(

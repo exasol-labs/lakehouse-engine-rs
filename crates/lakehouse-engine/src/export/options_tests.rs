@@ -1,8 +1,6 @@
 use super::*;
+use crate::export::test_support::{CONNECTION, SENTINELS, connection_object};
 use exasol_udf_sdk::connection::ConnectionObject;
-
-const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
-const SENTINELS: [&str; 3] = ["sentinel-address", "sentinel-user", "sentinel-password"];
 
 fn spec_with(parameters: &[(&str, &str)]) -> ExportSpec {
     let mut with = vec![("CATALOG_CONNECTION", CONNECTION)];
@@ -29,12 +27,7 @@ fn valid_spec() -> ExportSpec {
 }
 
 fn inline_connection() -> ConnectionObject {
-    ConnectionObject {
-        kind: "password".to_string(),
-        address: SENTINELS[0].to_string(),
-        user: SENTINELS[1].to_string(),
-        password: SENTINELS[2].to_string(),
-    }
+    connection_object(SENTINELS[0], SENTINELS[1], SENTINELS[2])
 }
 
 fn refusal_message(spec: &ExportSpec) -> String {

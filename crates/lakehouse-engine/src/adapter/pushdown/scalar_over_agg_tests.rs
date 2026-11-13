@@ -1,15 +1,27 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, aggregate_scan, cast_to, col, column_types,
-    count_star, float_div, num_lit, round_of, scalar_fn,
+    AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, cast_to, col, column_types,
+    count_star, float_div, num_lit, round_of, scalar_fn, scan_over, typed_scan,
 };
+
+/// The translator these node-level units take: the aggregate fixtures' columns and the key a
+/// grouped caller counts.
+fn scan() -> ScanTranslator<'static> {
+    typed_scan(
+        &[
+            AGGREGATED.as_slice(),
+            &[("L_ORDERKEY", ExasolType::decimal(20, 0))],
+        ]
+        .concat(),
+    )
+}
 
 fn sum_over_count() -> Json {
     float_div(agg_item("SUM", Some("X"), false), count_star())
 }
 
 fn plan_of(node: &Json) -> AggregatePlan {
-    parse_agg_item(node, aggregate_scan()).expect("test fixture aggregate must parse to a plan")
+    parse_agg_item(node, scan()).expect("test fixture aggregate must parse to a plan")
 }
 
 #[test]
@@ -173,7 +185,7 @@ fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
 fn classify_returns_the_nested_plans_in_encounter_order() {
     let node = round_of(sum_over_count(), 2);
 
-    let plans = classify_scalar_over_aggregate(&node, aggregate_scan())
+    let plans = classify_scalar_over_aggregate(&node, scan())
         .expect("ROUND(SUM(x) / COUNT(*), 2) must classify as a scalar-over-aggregate");
 
     assert_eq!(
@@ -191,16 +203,15 @@ fn classify_returns_the_nested_plans_in_encounter_order() {
 #[test]
 fn classify_declines_a_node_with_no_nested_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(col("X"), 2), aggregate_scan()).is_none(),
+        classify_scalar_over_aggregate(&round_of(col("X"), 2), scan()).is_none(),
         "a plain scalar over a column is not a scalar-over-aggregate"
     );
 }
 
 #[test]
 fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
-    let plans =
-        classify_scalar_over_aggregate(&agg_item("SUM", Some("X"), false), aggregate_scan())
-            .expect("a bare aggregate is structurally decomposable");
+    let plans = classify_scalar_over_aggregate(&agg_item("SUM", Some("X"), false), scan())
+        .expect("a bare aggregate is structurally decomposable");
 
     assert_eq!(
         plans,
@@ -214,11 +225,8 @@ fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
 #[test]
 fn classify_declines_a_distinct_inner_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(
-            &round_of(agg_item("SUM", Some("X"), true), 2),
-            aggregate_scan()
-        )
-        .is_none(),
+        classify_scalar_over_aggregate(&round_of(agg_item("SUM", Some("X"), true), 2), scan())
+            .is_none(),
         "an undecomposable DISTINCT inner aggregate must decline the whole item"
     );
 }
@@ -227,7 +235,7 @@ fn classify_declines_a_distinct_inner_aggregate() {
 fn classify_declines_a_residual_column_outside_the_aggregate() {
     let node = scalar_fn("ADD", [agg_item("SUM", Some("X"), false), col("Y")]);
 
-    assert!(classify_scalar_over_aggregate(&node, aggregate_scan()).is_none());
+    assert!(classify_scalar_over_aggregate(&node, scan()).is_none());
 }
 
 #[test]
@@ -239,7 +247,7 @@ fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     ];
     let merged = vec!["<MERGED_COUNT>".to_string(), "<MERGED_SUM>".to_string()];
 
-    let sql = render_scalar_over_merge(&node, &plans, &merged, aggregate_scan())
+    let sql = render_scalar_over_merge(&node, &plans, &merged, scan())
         .expect("a classified scalar-over-aggregate must render over the merge wrapper")
         .sql;
 
@@ -251,14 +259,9 @@ fn render_leaves_no_sentinel_token_behind() {
     let node = round_of(agg_item("SUM", Some("X"), false), 2);
     let plans = vec![plan_of(&agg_item("SUM", Some("X"), false))];
 
-    let sql = render_scalar_over_merge(
-        &node,
-        &plans,
-        &["<MERGED_SUM>".to_string()],
-        aggregate_scan(),
-    )
-    .expect("a single-aggregate item must render")
-    .sql;
+    let sql = render_scalar_over_merge(&node, &plans, &["<MERGED_SUM>".to_string()], scan())
+        .expect("a single-aggregate item must render")
+        .sql;
 
     assert!(
         !sql.contains(&agg_sentinel_token(0)),
@@ -272,13 +275,7 @@ fn render_declines_an_aggregate_absent_from_the_plans() {
     let plans = vec![plan_of(&count_star())];
 
     assert!(
-        render_scalar_over_merge(
-            &node,
-            &plans,
-            &["<MERGED_COUNT>".to_string()],
-            aggregate_scan()
-        )
-        .is_none(),
+        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], scan()).is_none(),
         "an aggregate with no merge slot cannot be rendered"
     );
 }
@@ -292,13 +289,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
     ];
 
     assert!(
-        render_scalar_over_merge(
-            &node,
-            &plans,
-            &["<MERGED_COUNT>".to_string()],
-            aggregate_scan()
-        )
-        .is_none(),
+        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], scan()).is_none(),
         "a merged list not aligned with plans must decline, not panic"
     );
 }
@@ -306,7 +297,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
 #[test]
 fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     let node = round_of(sum_over_count(), 2);
-    let nested = classify_scalar_over_aggregate(&node, aggregate_scan())
+    let nested = classify_scalar_over_aggregate(&node, scan())
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg_item("COUNT", Some("L_ORDERKEY"), false))];
@@ -349,18 +340,13 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         "SUM(\"PARTIAL_count_2\")".to_string(),
     ];
 
-    let grouped_sql =
-        render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, aggregate_scan())
-            .expect("the grouped-shaped caller must render")
+    let grouped_sql = render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, scan())
+        .expect("the grouped-shaped caller must render")
+        .sql;
+    let single_group_sql =
+        render_scalar_over_merge(&node, &single_group_plans, &single_group_merged, scan())
+            .expect("the single-group-shaped caller must render")
             .sql;
-    let single_group_sql = render_scalar_over_merge(
-        &node,
-        &single_group_plans,
-        &single_group_merged,
-        aggregate_scan(),
-    )
-    .expect("the single-group-shaped caller must render")
-    .sql;
 
     assert_eq!(
         grouped_sql, single_group_sql,
@@ -392,9 +378,9 @@ fn sum_widens_a_decimal_to_precision_36_keeps_a_double_and_types_nothing_else() 
 }
 
 fn nested_type_of(agg_node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
-    let plan = parse_agg_item(agg_node, ScanTranslator::new(col_types))
+    let plan = parse_agg_item(agg_node, scan_over(col_types))
         .expect("test aggregate must parse to a plan");
-    nested_aggregate_type(agg_node, &plan, ScanTranslator::new(col_types))
+    nested_aggregate_type(agg_node, &plan, scan_over(col_types))
 }
 
 #[test]

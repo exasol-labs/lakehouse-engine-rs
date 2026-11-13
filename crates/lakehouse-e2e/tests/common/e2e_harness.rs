@@ -59,6 +59,9 @@ pub const LANG_ALIAS: &str = "RUST";
 /// copy, so a renamed engine constant fails the pushdown-shape checks.
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
+/// The scalar UDF the pushed DataFusion SQL renders Exasol's `DIV` over integer operands as.
+pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
+
 pub const DEFAULT_CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
 /// Replaces any existing `RUST=` entry; this Exasol is dedicated to lakehouse-engine.

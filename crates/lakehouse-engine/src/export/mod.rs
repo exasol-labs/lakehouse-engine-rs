@@ -8,17 +8,19 @@ mod options;
 mod target;
 
 use crate::exasol::{group_count, quote_ident, sql_string_literal};
+use arrow::datatypes::Schema;
 use batch::{BatchBuilder, arrow_schema};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::ExportSpec;
 use exasol_udf_sdk::value::ColumnInfo;
 use iceberg::metadata_columns::is_metadata_column_name;
+use lakehouse_catalog_write::CommitTag;
 use options::{ExportOptions, WriterLayout, check_table_name};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
-use target::{ExportConnection, ExportSink, ExportTarget, WriterTag, read_connection};
+use target::{ExportConnection, ExportSink, read_connection};
 use tokio::runtime::Runtime;
 
 /// The script name the installer creates and the writer SELECT calls.
@@ -28,42 +30,87 @@ pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
 /// an invalid statement, a CONNECTION the script cannot read, and a table the catalog already
 /// holds, before any source row is read. The SELECT carries the CONNECTION name and no value.
 pub fn generate_export_sql(ctx: &mut dyn UdfContext, json: &str) -> Result<String, UdfError> {
-    export_hook(ctx, json, iceberg_rest::target)
+    let plan = plan_export(ctx, json)?;
+    let target = iceberg_rest::target(plan.connection, &plan.table)?;
+    export_runtime()?.block_on(target.prepare())?;
+    Ok(plan.select)
 }
 
 /// Runs one writer invocation over its SET group and returns the group's row count. It
-/// reads the CONNECTION again, because a direct `SELECT` call skips the export hook.
+/// reads the CONNECTION again, because a direct `SELECT` call skips the export hook. A writer
+/// opens its table at its first row, so an empty group creates no table and checks no column
+/// type.
 pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
-    write_group(ctx, iceberg_rest::target)
+    // The host opens a SET group on its first row, and its first next() returns true without
+    // advancing.
+    if !ctx.next()? {
+        return Ok(0);
+    }
+    let plan = plan_writer(ctx)?;
+    let runtime = export_runtime()?;
+    let target = iceberg_rest::target(plan.connection, &plan.spec.table)?;
+    let tag = CommitTag {
+        export_id: plan.spec.export_id.clone(),
+        writer_id: new_writer_id(),
+    };
+    let mut sink =
+        runtime.block_on(target.open_table(&plan.schema, &tag, plan.spec.single_commit))?;
+    write_rows(ctx, &runtime, sink.as_mut())
 }
 
-fn export_hook(
-    ctx: &mut dyn UdfContext,
-    json: &str,
-    open_target: impl FnOnce(ExportConnection, &str) -> Result<Box<dyn ExportTarget>, UdfError>,
-) -> Result<String, UdfError> {
+/// What the hook decides before its first network call.
+struct ExportPlan {
+    connection: ExportConnection,
+    table: String,
+    /// The writer SELECT the hook answers with.
+    select: String,
+}
+
+fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfError> {
     let spec = ExportSpec::from_json(json)?;
     let options = ExportOptions::from_spec(&spec)?;
     let columns = column_names(&spec.source_column_names)?;
     let connection = read_connection(ctx, &options.connection_name, options.allow_http)?;
-    let target = open_target(connection, &options.table_name)?;
-    export_runtime()?.block_on(target.prepare())?;
     let writer_spec = WriterSpec {
         connection: options.connection_name,
-        table: options.table_name,
+        table: options.table_name.clone(),
         export_id: new_export_id(),
         columns,
         single_commit: options.writers == WriterLayout::SingleCommit,
         allow_http: options.allow_http,
     };
-    Ok(WriterSelect {
+    let select = WriterSelect {
         script_schema: &ctx.script_schema(),
         writer_spec: &writer_spec.render(),
         source_columns: &spec.source_column_names,
         writers: options.writers,
         node_count: ctx.node_count() as usize,
     }
-    .render())
+    .render();
+    Ok(ExportPlan {
+        connection,
+        table: options.table_name,
+        select,
+    })
+}
+
+/// What a writer decides before its first network call. `ctx` must already stand on the group's
+/// first row.
+struct WriterPlan {
+    spec: WriterSpec,
+    connection: ExportConnection,
+    schema: Schema,
+}
+
+fn plan_writer(ctx: &dyn UdfContext) -> Result<WriterPlan, UdfError> {
+    let spec = WriterSpec::read(ctx)?;
+    let connection = read_connection(ctx, &spec.connection, spec.allow_http)?;
+    let schema = arrow_schema(&spec.columns, &source_columns(ctx, spec.columns.len())?)?;
+    Ok(WriterPlan {
+        spec,
+        connection,
+        schema,
+    })
 }
 
 /// The first argument of every writer call. A direct `SELECT` call can forge it, so the
@@ -215,40 +262,6 @@ impl WriterSelect<'_> {
     }
 }
 
-/// One writer invocation: the input rows of its SET group become Arrow batches that stream into
-/// the sink its target opens, and the sink commits them once the last row is in. Returns the
-/// group's row count. A writer opens its table at its first row,
-/// so an empty group creates no table and checks no column type.
-fn write_group(
-    ctx: &mut dyn UdfContext,
-    open_target: impl FnOnce(ExportConnection, &str) -> Result<Box<dyn ExportTarget>, UdfError>,
-) -> Result<i64, UdfError> {
-    // The host opens a SET group on its first row, and its first next() returns true without
-    // advancing.
-    if !ctx.next()? {
-        return Ok(0);
-    }
-    let spec = WriterSpec::read(ctx)?;
-    let connection = read_connection(ctx, &spec.connection, spec.allow_http)?;
-    let schema = arrow_schema(&spec.columns, &source_columns(ctx, spec.columns.len())?)?;
-    let runtime = export_runtime()?;
-    let target = open_target(connection, &spec.table)?;
-    let tag = WriterTag {
-        export_id: spec.export_id.clone(),
-        writer_id: new_writer_id(),
-    };
-    let mut sink = if spec.single_commit {
-        runtime.block_on(target.stage_table(&schema, &tag))?
-    } else {
-        runtime.block_on(target.open_table(&schema, &tag))?
-    };
-    let written = write_rows(ctx, &runtime, sink.as_mut(), &spec.columns);
-    if written.is_err() {
-        runtime.block_on(sink.abort());
-    }
-    written
-}
-
 /// The metadata of the source columns, input columns 1 to `count`.
 fn source_columns(ctx: &dyn UdfContext, count: usize) -> Result<Vec<ColumnInfo>, UdfError> {
     if ctx.input_column_count() != count + 1 {
@@ -259,13 +272,26 @@ fn source_columns(ctx: &dyn UdfContext, count: usize) -> Result<Vec<ColumnInfo>,
         .collect()
 }
 
+/// Streams the group's rows into the sink and commits them once the last row is in. A failure
+/// aborts the sink.
 fn write_rows(
     ctx: &mut dyn UdfContext,
     runtime: &Runtime,
     sink: &mut dyn ExportSink,
-    columns: &[String],
 ) -> Result<i64, UdfError> {
-    let mut batch = BatchBuilder::bind(sink.schema(), columns)?;
+    let written = stream_rows(ctx, runtime, sink);
+    if written.is_err() {
+        runtime.block_on(sink.abort());
+    }
+    written
+}
+
+fn stream_rows(
+    ctx: &mut dyn UdfContext,
+    runtime: &Runtime,
+    sink: &mut dyn ExportSink,
+) -> Result<i64, UdfError> {
+    let mut batch = BatchBuilder::bind(sink.schema())?;
     let mut rows = 0;
     loop {
         batch.append_row(ctx)?;
@@ -283,6 +309,10 @@ fn write_rows(
     runtime.block_on(sink.finish())?;
     Ok(rows)
 }
+
+#[cfg(test)]
+#[path = "test_support_tests.rs"]
+mod test_support;
 
 #[cfg(test)]
 #[path = "export_tests.rs"]

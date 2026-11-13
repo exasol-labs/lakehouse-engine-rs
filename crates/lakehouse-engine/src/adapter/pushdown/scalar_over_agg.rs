@@ -3,10 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{
-    ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment,
-    render_expression_exasol,
-};
+use vs_expression::{ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -149,7 +146,6 @@ pub(super) fn sentinelize_aggregates(
     })
 }
 
-/// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect.
 /// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
@@ -157,11 +153,10 @@ pub(super) fn classify_scalar_over_aggregate(
 ) -> Option<Vec<(AggregatePlan, Json)>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
-    let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
+    sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     if aggregates.is_empty() || residual_column {
         return None;
     }
-    render_expression_exasol(&sentinel_tree).ok()?;
     aggregates
         .into_iter()
         .map(|agg| Some((parse_agg_item(&agg, scan)?, agg)))
@@ -181,8 +176,7 @@ pub(super) fn render_scalar_over_merge(
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    let SqlFragment { mut sql, ty } =
-        render_exasol_fragment(&sentinel_tree, scan.columns()).ok()?;
+    let SqlFragment { mut sql, ty } = render_exasol_fragment(&sentinel_tree, scan.columns());
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;
