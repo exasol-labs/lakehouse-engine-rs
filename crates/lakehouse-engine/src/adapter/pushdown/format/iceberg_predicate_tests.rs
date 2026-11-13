@@ -377,18 +377,6 @@ fn between_with_one_failing_bound_keeps_other() {
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
 }
 
-/// Exasol compares a string column with a BETWEEN of mixed kinds as a number, so the string
-/// bound's string order could prune a matching row.
-#[test]
-fn a_string_between_with_a_bound_of_another_kind_constrains_nothing() {
-    for node in [
-        between(col("NAME"), str_lit("a"), num_lit(5)),
-        between(col("NAME"), num_lit(5), str_lit("z")),
-    ] {
-        assert_eq!(translate(&node), None, "{node}");
-    }
-}
-
 fn amount_below(v: i64) -> Json {
     compare("predicate_less", col("AMOUNT"), num_lit(v))
 }

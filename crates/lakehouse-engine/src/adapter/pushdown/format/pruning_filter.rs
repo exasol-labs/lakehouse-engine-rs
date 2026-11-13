@@ -96,14 +96,10 @@ impl<C: Clone> PruningFilter<C> {
                 let (column, low, high) = between_operands(node)?;
                 let (column, data_type) = resolve(column)?;
                 let data_type = data_type?;
-                let convert = |literal: Option<&Json>| exact_literal(literal?, &data_type);
-                let (low, high) = (convert(low), convert(high));
-                // Exasol compares a string column with mixed-kind bounds as numbers, string bound
-                // too. Otherwise either bound alone is implied, so an unconvertible one is opaque.
-                if data_type.is_string() && (low.is_none() || high.is_none()) {
-                    return None;
-                }
-                let bound = |literal: Option<ScalarValue>, comparison| {
+                // Exasol compares each bound in its own kind, so either bound alone is implied and
+                // an unconvertible one is opaque.
+                let bound = |literal: Option<&Json>, comparison| {
+                    let literal = literal.and_then(|literal| exact_literal(literal, &data_type));
                     literal.map_or(Self::Opaque, |literal| Self::Compare {
                         column: column.clone(),
                         comparison,

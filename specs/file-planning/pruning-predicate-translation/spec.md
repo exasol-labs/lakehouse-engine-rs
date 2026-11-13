@@ -6,7 +6,7 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 
 * Each path translates a comparison of a bare column with a literal (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, and `LIKE`, combined by `AND`, `OR`, and `NOT`. A function over the column, or a column compared with a column, constrains nothing.
 * Exasol folds a constant `TO_DATE`, `TO_TIMESTAMP`, `CAST`, or `||` into a literal before it sends the pushdown request, and sends `''` as `literal_null`. A filter on an Iceberg `timestamptz` column, which maps to `TIMESTAMP`, carries a `literal_timestamp`. Exasol sends `literal_timestamputc` only for a `TIMESTAMP WITH LOCAL TIME ZONE` value, already shifted to UTC.
-* Exasol compares a string column with a `BETWEEN` whose bounds mix kinds as a number, string bound included. So a string column's `BETWEEN` constrains nothing unless both bounds convert, while on any other column a bound that does not convert constrains nothing and the other bound still prunes.
+* Exasol compares each `BETWEEN` bound in its own kind, as `col >= low AND col <= high`, so a bound that does not convert constrains nothing and the other bound still prunes.
 * Exasol sends `escapeChar` only for a `LIKE` that says `ESCAPE`. A plain `LIKE` escapes with the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, `\` unless changed, which the pushdown request does not carry.
 
 ## Scenarios

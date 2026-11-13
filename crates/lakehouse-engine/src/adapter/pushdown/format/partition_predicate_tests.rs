@@ -156,6 +156,11 @@ fn range_and_between_nodes_evaluate_under_three_valued_logic() {
             not(between(sales_col("REGION"), str_lit("B"), str_lit("a"))),
             [false, false, true, false],
         ),
+        (
+            "BETWEEN with a numeric bound prunes by its string bound, which Exasol compares alone",
+            between(sales_col("REGION"), str_lit("a"), num_lit("5")),
+            [false, true, true, false],
+        ),
     ];
 
     for (label, filter, expected) in cases {
@@ -256,11 +261,6 @@ fn a_non_partition_node_never_prunes() {
         (
             "an IN list holding one empty string",
             in_list(sales_col("YEAR"), [str_lit("2024"), str_lit("")]),
-            [true, true, true],
-        ),
-        (
-            "a BETWEEN with one non-string bound",
-            between(sales_col("YEAR"), str_lit("2023"), num_lit("2024")),
             [true, true, true],
         ),
         (
