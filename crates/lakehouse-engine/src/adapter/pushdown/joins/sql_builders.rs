@@ -709,8 +709,8 @@ fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Op
 /// `null`, `[]`, and non-arrays are all accepted.
 ///
 /// Otherwise walks every clause via [`referenced_clause_values`] with the Unicode fold.
-/// Falls back to the first column when nothing is referenced (an empty EMITS is invalid),
-/// unlike [`referenced_leg_columns`], which falls back to all columns.
+/// Falls back to the first column the reader does not refuse when nothing is referenced (an
+/// empty EMITS is invalid), unlike [`referenced_leg_columns`], which falls back to all columns.
 pub(in super::super) fn referenced_columns(
     pushdown_req: &Json,
     all_cols: &ColumnTypes,
@@ -724,7 +724,7 @@ pub(in super::super) fn referenced_columns(
 
     let referenced = all_cols.narrowed(|column| names.contains(&column.name));
     if referenced.is_empty() {
-        return all_cols.first_only();
+        return all_cols.first_readable();
     }
     referenced
 }

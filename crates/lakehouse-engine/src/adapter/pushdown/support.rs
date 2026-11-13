@@ -12,12 +12,13 @@ use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
 use crate::types::mapping::timestamp_literal_digits;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use vs_expression::{
     ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
     render_scan_expression, render_scan_filter, walk_column_nodes,
 };
 
+use super::RefusedColumn;
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
@@ -420,6 +421,8 @@ pub(super) struct ColumnType {
     pub(super) exa_type: ExasolType,
     /// `None` for a column the scan reads as text.
     pub(super) binary: Option<BinaryLayout>,
+    /// The column is absent from the scan's logical schema, so no fan-out may emit it.
+    pub(super) refused: bool,
 }
 
 /// The per-column type map a request's `column` nodes resolve against, one entry per (relation
@@ -456,11 +459,24 @@ impl ColumnTypes {
                     let column_type = ColumnType {
                         exa_type: *exa_type,
                         binary,
+                        refused: false,
                     };
                     (ColumnRef::from(name.as_str()), column_type)
                 })
                 .collect(),
         )
+    }
+
+    /// Marks each column `refused` names, matched under the same fold as [`Self::of`].
+    pub(super) fn with_refused(mut self, refused: &[RefusedColumn]) -> Self {
+        let names: HashSet<String> = refused
+            .iter()
+            .map(|column| column.column_name.to_uppercase())
+            .collect();
+        for (column, column_type) in &mut self.0 {
+            column_type.refused = names.contains(&column.name);
+        }
+        self
     }
 
     /// `relations` in leg order, so the full row lists each leg's columns in turn. Each leg's map
@@ -508,6 +524,19 @@ impl ColumnTypes {
     /// The first entry alone, empty when the map is.
     pub(super) fn first_only(&self) -> Self {
         Self(self.0.iter().take(1).cloned().collect())
+    }
+
+    /// The first entry the reader does not refuse, alone. Empty only when every column is
+    /// refused, a table the adapter refuses as a whole.
+    pub(super) fn first_readable(&self) -> Self {
+        Self(
+            self.0
+                .iter()
+                .filter(|(_, column_type)| !column_type.refused)
+                .take(1)
+                .cloned()
+                .collect(),
+        )
     }
 
     pub(super) fn is_empty(&self) -> bool {

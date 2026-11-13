@@ -68,7 +68,8 @@ impl<'a> TableScanResolver<'a> {
         self.require_admitted(table_identifier)?;
         let declared = involved.notes.declared_schema()?;
         let column_types =
-            ColumnTypes::of(involved, &declared.logical_schema, self.binary_as_string);
+            ColumnTypes::of(involved, &declared.logical_schema, self.binary_as_string)
+                .with_refused(&declared.refused_columns);
         // Retyped so every reader prunes binary comparisons on the raw bytes.
         let filter_json =
             filter_json.map(|filter| with_binary_literals(filter.clone(), &column_types));

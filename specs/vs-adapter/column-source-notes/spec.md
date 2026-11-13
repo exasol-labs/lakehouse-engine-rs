@@ -39,6 +39,14 @@ When a virtual schema is created, refreshed, or has its properties set, the adap
 * *AND* the request that reads `s` SHALL fail at plan time with that recorded reason, and `SELECT id` SHALL succeed
 * *AND* the pushdown SHALL omit a refused column from the scan's logical schema, so a gate miss fails with an unresolved column rather than a silent NULL column
 
+### Scenario: A request that reads no column never emits a refused column
+
+* *GIVEN* a virtual table whose first declared column is refused
+* *AND* a request whose scan must emit one column although the query reads none, such as `SELECT COUNT(*) FROM (SELECT SUM(x) FROM t)`, whose aggregates Exasol strips, or a `COUNT(*)` over a broadcast join with that table
+* *WHEN* the adapter plans the request
+* *THEN* the scan SHALL emit a column the reader does not refuse, the first such declared column for a single table and a join-key column for a broadcast join
+* *AND* the query SHALL return the same rows as native Exasol
+
 ### Scenario: Pushdown takes the declared schema from the column notes for every kind
 
 * *GIVEN* a virtual table whose columns carry notes, under any catalog kind

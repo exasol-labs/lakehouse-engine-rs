@@ -27,7 +27,7 @@ use crate::common::seed::{
 };
 use crate::common::stack::{CatalogConnectionPassword, seaweedfs_url_internal};
 use crate::common::timestamp_precision::engine_honors_declared_precision;
-use crate::fixtures::{stack, vs_table};
+use crate::fixtures::{assert_single_table_wrapper, stack, vs_table};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -2831,8 +2831,9 @@ fn refused_first_bytes() -> Bytes {
 }
 
 /// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+/// Scenario: A request that reads no column never emits a refused column
 #[test]
-fn aggregating_join_that_reads_no_column_skips_a_refused_first_column() {
+fn aggregation_that_reads_no_column_skips_a_refused_first_column() {
     setup();
     let mut conn = exa_conn();
     delete_fixture_prefix(BASE_REFUSED_FIRST);
@@ -2858,18 +2859,26 @@ fn aggregating_join_that_reads_no_column_skips_a_refused_first_column() {
         "FACT's first column must be refused for this test to discriminate: {notes:?}"
     );
 
+    let fact = vs_table(VS_REFUSED_FIRST, "FACT");
     let join = format!(
-        "SELECT COUNT(*) FROM {} a JOIN {} b ON a.ID = b.DIM_ID",
-        vs_table(VS_REFUSED_FIRST, "FACT"),
+        "SELECT COUNT(*) FROM {fact} a JOIN {} b ON a.ID = b.DIM_ID",
         vs_table(VS_REFUSED_FIRST, "DIMS")
     );
-    for (filter, expected) in [("", 3), (" WHERE a.X >= 20", 2)] {
-        let sql = format!("{join}{filter}");
+    for (sql, expected) in [(join.clone(), 3), (format!("{join} WHERE a.X >= 20"), 2)] {
         assert!(
             has_broadcast_join_block(&explain_virtual_sql(&mut conn, &sql)),
             "{sql} must take the broadcast path"
         );
         assert_eq!(conn.query_scalar_i64(&sql), expected, "{sql}");
+    }
+    // Exasol strips the aggregates of a subquery whose columns the outer query ignores, so the
+    // single-table wrapper's fan-out reads no column.
+    for sql in [
+        format!("SELECT COUNT(*) FROM (SELECT SUM(X) FROM {fact})"),
+        format!("SELECT COUNT(*) FROM (SELECT COUNT(DISTINCT ID), COUNT(DISTINCT X) FROM {fact})"),
+    ] {
+        assert_single_table_wrapper(&mut conn, &sql);
+        assert_eq!(conn.query_scalar_i64(&sql), 1, "{sql}");
     }
 }
 

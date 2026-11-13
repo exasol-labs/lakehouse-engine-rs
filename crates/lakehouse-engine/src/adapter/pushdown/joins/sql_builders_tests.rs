@@ -1952,24 +1952,31 @@ fn referenced_columns_narrows_with_a_real_select_list() {
 }
 
 #[test]
-fn referenced_columns_falls_back_to_first_column() {
-    let all_cols = vec![
-        ("A".to_string(), ExasolType::decimal(18, 0)),
-        ("B".to_string(), ExasolType::varchar(10)),
+fn referenced_columns_falls_back_to_the_first_column_the_reader_does_not_refuse() {
+    let all_cols = [
+        ("A", ExasolType::decimal(18, 0)),
+        ("B", ExasolType::varchar(10)),
     ];
     let req = pushdown_request("T", NO_COLUMNS)
         .filter(serde_json::json!(null))
         .field("having", serde_json::json!(null))
         .item(num_lit(1), ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
-    let (proj, types) =
-        split_projection(&referenced_columns(req.json(), &column_types(&all_cols)).projection());
-    assert_eq!(
-        proj,
-        vec![ProjectionItem::from("A")],
-        "no referenced source column ⇒ exactly one column, the first of all_cols"
-    );
-    assert_eq!(types, vec![ExasolType::decimal(18, 0)]);
+    for (refused, expected) in [
+        (vec![], ("A", ExasolType::decimal(18, 0))),
+        (
+            vec![unread_refused("Parquet", "a", None, "geometry")],
+            ("B", ExasolType::varchar(10)),
+        ),
+    ] {
+        let all_cols = column_types(&all_cols).with_refused(&refused);
+
+        let (proj, types) =
+            split_projection(&referenced_columns(req.json(), &all_cols).projection());
+
+        assert_eq!(proj, vec![ProjectionItem::from(expected.0)], "{refused:?}");
+        assert_eq!(types, vec![expected.1], "{refused:?}");
+    }
 }
 
 /// The qualified single-table wrapper over one shard of `request`'s first table.
