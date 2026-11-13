@@ -1189,3 +1189,7 @@ mod tests;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "test_support_tests.rs"]
 pub mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "udf_column_test_support_tests.rs"]
+pub mod udf_column_test_support;
