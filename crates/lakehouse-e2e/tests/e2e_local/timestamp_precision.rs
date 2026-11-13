@@ -605,3 +605,87 @@ fn second_and_extract_second_match_a_native_copy() {
         failures.join("\n")
     );
 }
+
+/// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn date_addition_over_a_nanosecond_timestamp_runs_in_the_scan() {
+    setup();
+    let mut conn = exa_conn();
+    if !engine_honors_declared_precision(&mut conn) {
+        return;
+    }
+    let qualified = qualified_probe();
+    create_native_copy(&mut conn, &qualified, "TS, TSTZ, TS_NS");
+
+    // The seeded instants differ only in their last nanosecond digit, so only a result that keeps
+    // it equals the literal for a strict subset of the rows.
+    let first = chrono::DateTime::from_timestamp_nanos(TSPRECISION_NANOS[0]).naive_utc();
+    let queries: Vec<String> = [
+        ("ADD_DAYS", chrono::Duration::days(1)),
+        ("ADD_WEEKS", chrono::Duration::weeks(1)),
+        ("ADD_HOURS", chrono::Duration::hours(1)),
+        ("ADD_MINUTES", chrono::Duration::minutes(1)),
+    ]
+    .into_iter()
+    .flat_map(|(function, one)| {
+        let result = (first + one).format("%Y-%m-%d %H:%M:%S%.9f");
+        [
+            format!("SELECT ID, {function}(TS_NS, ID) FROM {{T}}"),
+            format!("SELECT ID FROM {{T}} WHERE {function}(TS_NS, 1) = TIMESTAMP '{result}'"),
+        ]
+    })
+    .collect();
+    let failures: Vec<String> = queries
+        .iter()
+        .filter_map(|query| {
+            native_copy_mismatch(
+                &mut conn,
+                &qualified,
+                NATIVE_COPY,
+                query,
+                PathCheck::Has("vs_add_"),
+                Expect::Rows,
+            )
+        })
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "a date addition over a TIMESTAMP(9) column must run in the scan and match native:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Scenario: A result outside the nanosecond range fails the query
+#[test]
+fn a_nanosecond_date_addition_outside_the_arrow_range_fails_in_the_scan() {
+    setup();
+    let mut conn = exa_conn();
+    if !engine_honors_declared_precision(&mut conn) {
+        return;
+    }
+    let qualified = qualified_probe();
+    create_native_copy(&mut conn, &qualified, "TS, TSTZ, TS_NS");
+
+    // docs/semantic-differences.md lists both: native Exasol returns rows for each.
+    let cases = [
+        (
+            "SELECT ID, ADD_DAYS(TS_NS, 100000) FROM {T}",
+            "lies after 2262-04-11 23:47:16.854775807",
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ADD_DAYS(TS_NS, 1) < TIMESTAMP '9999-12-31 00:00:00'",
+            "to Timestamp(ns)",
+        ),
+    ];
+    for (query, message) in cases {
+        let native = conn.query_columns(&query.replace("{T}", NATIVE_COPY));
+        assert!(!native[0].is_empty(), "`{query}` must return rows natively");
+        let error = error_text(&conn.try_execute(&query.replace("{T}", &qualified)), query);
+        assert!(
+            error.contains(message),
+            "`{query}` must fail in the scan with `{message}`, got: {error}"
+        );
+    }
+}

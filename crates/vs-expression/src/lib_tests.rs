@@ -1457,14 +1457,11 @@ fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
     }
 }
 
+/// Scenario: Unsupported date functions fall through as unsupported nodes
 #[test]
 fn unsupported_date_functions_decline_in_the_datafusion_dialect() {
     let unsupported = [
-        "ADD_HOURS",
-        "ADD_MINUTES",
-        "ADD_DAYS",
         "ADD_SECONDS",
-        "ADD_WEEKS",
         "ADD_MONTHS",
         "ADD_YEARS",
         "MONTHS_BETWEEN",
@@ -2006,6 +2003,10 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     }
     fixtures.push(verbatim("DIV", vec![col("a"), col("b")]));
 
+    for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"] {
+        fixtures.push(verbatim(name, vec![col("d"), col("n")]));
+    }
+
     fixtures.extend([
         shaped(
             "ADD",
@@ -2329,4 +2330,105 @@ fn a_binary_literal_renders_only_as_hex() {
         "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
     );
     assert!(render_expression(&binary_lit("0a'")).is_err());
+}
+
+const DATE_ADDITIONS: [(&str, &str); 4] = [
+    ("ADD_DAYS", "vs_add_days"),
+    ("ADD_WEEKS", "vs_add_weeks"),
+    ("ADD_HOURS", "vs_add_hours"),
+    ("ADD_MINUTES", "vs_add_minutes"),
+];
+
+/// Scenario: ADD_DAYS and ADD_WEEKS over a DATE return a DATE from the scan
+/// Scenario: ADD_HOURS and ADD_MINUTES over a DATE return a timestamp from the scan
+#[test]
+fn date_addition_renders_scan_function_calls() {
+    let columns = typed_columns(&[
+        ("D", ExasolType::Date),
+        ("TS", ExasolType::timestamp(3)),
+        ("S", ExasolType::WIDEST_VARCHAR),
+    ]);
+    for (exasol_name, scan_name) in DATE_ADDITIONS {
+        let date_column = scalar_fn(exasol_name, [col("d"), num_lit(2)]);
+        assert_eq!(
+            render_scan_expression(&date_column, &columns).unwrap().sql,
+            format!("{scan_name}(CAST(\"D\" AS DATE), 2)"),
+            "{exasol_name} over a DATE column"
+        );
+        let timestamp_column = scalar_fn(exasol_name, [col("ts"), num_lit(2)]);
+        assert_eq!(
+            render_scan_expression(&timestamp_column, &columns)
+                .unwrap()
+                .sql,
+            format!("{scan_name}(CAST(\"TS\" AS TIMESTAMP(6)), 2)"),
+            "{exasol_name} over a TIMESTAMP column"
+        );
+        let date_literal = scalar_fn(exasol_name, [date_lit("2024-02-28"), num_lit(1)]);
+        assert_eq!(
+            render_scan_expression(&date_literal, &columns).unwrap().sql,
+            format!("{scan_name}(CAST(DATE '2024-02-28' AS DATE), 1)"),
+            "{exasol_name} over a DATE literal"
+        );
+        let timestamp_literal = scalar_fn(
+            exasol_name,
+            [timestamp_lit("2024-01-01 00:00:00.5"), num_lit(30)],
+        );
+        assert_eq!(
+            render_scan_expression(&timestamp_literal, &columns)
+                .unwrap()
+                .sql,
+            format!(
+                "{scan_name}(CAST(arrow_cast('2024-01-01 00:00:00.5', 'Timestamp(Microsecond, None)') AS TIMESTAMP(6)), 30)"
+            ),
+            "{exasol_name} over a TIMESTAMP literal"
+        );
+        let cast = scalar_fn(
+            exasol_name,
+            [cast_to(ExasolType::Date, col("ts")), num_lit(1)],
+        );
+        assert_eq!(
+            render_scan_expression(&cast, &columns).unwrap().sql,
+            format!("{scan_name}(CAST(CAST(\"TS\" AS DATE) AS DATE), 1)"),
+            "{exasol_name} over a CAST"
+        );
+    }
+    let nested = scalar_fn(
+        "ADD_HOURS",
+        [scalar_fn("ADD_DAYS", [col("d"), num_lit(1)]), num_lit(2)],
+    );
+    assert_eq!(
+        render_scan_expression(&nested, &columns).unwrap().sql,
+        "vs_add_hours(CAST(vs_add_days(CAST(\"D\" AS DATE), 1) AS DATE), 2)"
+    );
+    let over_a_timestamp_result = scalar_fn(
+        "ADD_DAYS",
+        [scalar_fn("ADD_HOURS", [col("d"), num_lit(1)]), num_lit(2)],
+    );
+    assert_eq!(
+        render_scan_expression(&over_a_timestamp_result, &columns)
+            .unwrap()
+            .sql,
+        "vs_add_days(CAST(vs_add_hours(CAST(\"D\" AS DATE), 1) AS TIMESTAMP(6)), 2)"
+    );
+}
+
+/// Scenario: The four functions render verbatim in the Exasol dialect
+#[test]
+fn date_addition_renders_verbatim_in_the_exasol_dialect() {
+    for (exasol_name, scan_name) in DATE_ADDITIONS {
+        let expr = scalar_fn(exasol_name, [col("d"), col("n")]);
+        let sql = render_expression_exasol(&expr);
+        assert_eq!(sql, format!("{exasol_name}(\"D\", \"N\")"));
+        assert!(!sql.contains(scan_name), "Exasol has no {scan_name}: {sql}");
+    }
+}
+
+#[test]
+fn date_addition_with_one_argument_fails_in_the_datafusion_dialect() {
+    for (exasol_name, _) in DATE_ADDITIONS {
+        assert!(
+            render_expression(&scalar_fn(exasol_name, [col("d")])).is_err(),
+            "the DataFusion dialect needs 2 arguments for {exasol_name}"
+        );
+    }
 }

@@ -148,7 +148,7 @@ fn run_scan_one_redacts_a_secret_from_an_unredacted_inner_error() {
         &mut ctx,
         minimal_spec(),
         &storage,
-        |_, _, _| {
+        |_, _, _, _| {
             Err(UdfError::User(format!(
                 "failed to register table: {secret}"
             )))

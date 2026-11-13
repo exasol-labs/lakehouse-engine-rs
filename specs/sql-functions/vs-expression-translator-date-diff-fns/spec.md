@@ -5,19 +5,9 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ## Background
 
 * The functions are arms of the same recursive walker behind the public entry points of `crates/vs-expression`: `render_scan_expression` and `render_scan_filter` for DataFusion, and `render_expression_exasol` and `render_exasol_fragment` for Exasol.
-* `sql-functions/vs-expression-translator-date-fns` covers the field-shortcut date functions, `EXTRACT`, `DATE_TRUNC`, `TO_DATE`/`TO_TIMESTAMP`, `WEEK` and the now-family. Both features share the Exasol-dialect verbatim rule and the `SCALAR_FUNCTIONS` declaration table described in `sql-comprehension/vs-expression-translator`.
+* `sql-functions/vs-expression-translator-date-fns` covers the field-shortcut date functions, `EXTRACT`, `DATE_TRUNC`, `TO_DATE`/`TO_TIMESTAMP`, `WEEK` and the now-family. `sql-functions/vs-expression-translator-date-add-fns` covers `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES`. All three features share the Exasol-dialect verbatim rule and the `SCALAR_FUNCTIONS` declaration table described in `sql-comprehension/vs-expression-translator`.
 * The adapter translates only functions whose DataFusion rendering executes and matches Exasol, verified against Exasol 2025.1.3. `DAYS_BETWEEN` renders as `DATE − DATE`, which yields an `Int64` day count. `HOURS_BETWEEN`, `MINUTES_BETWEEN` and `SECONDS_BETWEEN` render as fractional differences of `date_part('epoch', …)` seconds.
-* These functions are not translated, and each falls through so Exasol post-processes it:
-  * `ADD_HOURS`, `ADD_MINUTES`: the integer-microsecond rendering matches Exasol for a TIMESTAMP argument. For a DATE argument it yields `Timestamp(Microsecond)`, mapped to `TIMESTAMP(3)`, while Exasol infers `TIMESTAMP(0)` and rejects the pushdown with `Data type mismatch ... Expected TIMESTAMP(0), but got TIMESTAMP(3)`. The renderer picks one rendering per function, and the typed scan pass does not tell a DATE from a TIMESTAMP, so one rendering cannot serve both.
-  * `ADD_DAYS`, `ADD_WEEKS`: Exasol returns a DATE for a DATE argument and a TIMESTAMP for a TIMESTAMP argument. The typed scan pass does not tell a DATE from a TIMESTAMP, so the translator cannot reproduce both, and every execution-safe DataFusion rendering widens a DATE result to TIMESTAMP.
-  * `ADD_YEARS`, `ADD_MONTHS`: Exasol maps a month-end date to the last day of the target month (`ADD_YEARS(DATE '2001-02-28', 3)` is `2004-02-29`). Arrow interval addition keeps the day of month and yields `2004-02-28`. `ADD_YEARS` also has an input-type-dependent return type.
-  * `ADD_SECONDS`: the count is fractional and truncated to the argument's fractional-seconds precision, and DataFusion parity is not established.
-  * `MONTHS_BETWEEN`, `YEARS_BETWEEN`: Exasol returns Oracle-style fractional results, and DataFusion has no native equivalent.
-  * `DAYOFWEEK`: the numbering depends on the `NLS_FIRST_DAY_OF_WEEK` session parameter, which the VS cannot observe.
-  * `CONVERT_TZ`: the result depends on the `TIME_ZONE_BEHAVIOR` session value and on Exasol-specific shift options. Iceberg `timestamptz` maps to plain Exasol `TIMESTAMP`, so no per-value zone survives to convert.
-  * `POSIX_TIME`: not translated.
-  * `LAST_DAY`: not an Exasol function. Exasol returns `function or script LAST_DAY not found` (SQL code 42000), and its `ScalarFunctionCapability` enum has no such member.
-* A function in this unsupported set falls through in the DataFusion dialect, and Exasol never sends it, because the adapter does not advertise it. The Exasol-dialect verbatim rule covers only names this feature translates, because the adapter advertises one capability set for both dialects, and a name advertised for the Exasol wrapper would also be pushed at the DataFusion scan.
+* The untranslated date functions diverge from DataFusion: `ADD_YEARS` and `ADD_MONTHS` move a month-end date to the target month's end (`ADD_YEARS(DATE '2001-02-28', 3)` is `2004-02-29`) where Arrow keeps the day of month, `ADD_SECONDS` has no established fractional-count parity, `MONTHS_BETWEEN` and `YEARS_BETWEEN` return Oracle-style fractions, `DAYOFWEEK` follows `NLS_FIRST_DAY_OF_WEEK`, `CONVERT_TZ` follows `TIME_ZONE_BEHAVIOR`, `POSIX_TIME` has no rendering, and `LAST_DAY` is not an Exasol function.
 
 ## Scenarios
 
@@ -48,9 +38,10 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: Unsupported date functions fall through as unsupported nodes
 
-* *GIVEN* a VS expression node of type `function_scalar` named with a date-function name this feature does not translate: `ADD_HOURS`, `ADD_MINUTES`, `ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`, `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`, `POSIX_TIME`, or `LAST_DAY`
+* *GIVEN* a VS expression node of type `function_scalar` named with a date-function name that no feature translates: `ADD_YEARS`, `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`, `POSIX_TIME`, or `LAST_DAY`
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return an error naming the unsupported function
 * *AND* `render_scan_expression` SHALL return an error for the same node without panicking
-* *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because each named function either has an execution, parity, session-state, or input-type-dependent-return divergence from its DataFusion equivalent or (`LAST_DAY`) is not an Exasol function at all (see Background)
-* *AND* the capabilities `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_DAYS`, `FN_ADD_WEEKS`, `FN_ADD_YEARS`, `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, and `FN_CONVERT_TZ` MUST NOT be advertised, and no `FN_LAST_DAY` capability SHALL exist to advertise (Exasol has no `LAST_DAY` function and its `ScalarFunctionCapability` enum has no `LAST_DAY` member; `ADD_HOURS`/`ADD_MINUTES` are in this set because their end-to-end parity test found a DATE-argument `TIMESTAMP(0)` vs. `TIMESTAMP(3)` divergence, see Background)
+* *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because each named function diverges from its DataFusion equivalent (see Background)
+* *AND* the capabilities `FN_ADD_YEARS`, `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, and `FN_CONVERT_TZ` MUST NOT be advertised, and no `FN_LAST_DAY` capability SHALL exist to advertise, because Exasol has no `LAST_DAY` function (`function or script LAST_DAY not found`, SQL code 42000) and its `ScalarFunctionCapability` enum has no `LAST_DAY` member
+* *AND* the Exasol-dialect verbatim rule SHALL cover none of these names, because the adapter advertises one capability set for both dialects, and a name advertised for the Exasol wrapper would also be pushed at the DataFusion scan

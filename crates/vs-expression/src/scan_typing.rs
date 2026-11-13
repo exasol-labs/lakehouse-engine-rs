@@ -3,9 +3,13 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::exasol_type::{ExasolType, MAX_FRACTIONAL_DIGITS, exasol_type_from_json};
+use crate::exasol_type::{
+    ExasolType, MAX_FRACTIONAL_DIGITS, exasol_type_from_json, exasol_type_to_json,
+};
 use crate::json_value::{JsonValueCall, Returning};
-use crate::scalar_functions::{ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function};
+use crate::scalar_functions::{
+    DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
+};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
@@ -26,7 +30,12 @@ pub(crate) enum TypeClass {
     /// DOUBLE, DECIMAL(p,s>0), or a number of unproven scale. Its text form follows
     /// `NLS_NUMERIC_CHARACTERS`.
     Number,
-    /// DATE, TIMESTAMP, or a type this pass does not derive.
+    /// DATE. Its text form follows `NLS_DATE_FORMAT`.
+    Date,
+    /// `TIMESTAMP(precision)`, `precision` counting fractional-second digits. Its text form
+    /// follows `NLS_TIMESTAMP_FORMAT`.
+    Timestamp { precision: u8 },
+    /// `TIMESTAMP WITH LOCAL TIME ZONE`, or a type this pass does not derive.
     Other,
 }
 
@@ -39,6 +48,8 @@ impl TypeClass {
             },
             ExasolType::Decimal(_) | ExasolType::DoublePrecision => Self::Number,
             ExasolType::Boolean => Self::Boolean,
+            ExasolType::Date => Self::Date,
+            ExasolType::Timestamp { precision } => Self::Timestamp { precision },
             _ => Self::Other,
         }
     }
@@ -67,6 +78,16 @@ impl TypeClass {
         }
     }
 }
+
+/// The fractional digits of the Arrow microsecond and nanosecond timestamps a date addition
+/// computes in.
+const MICROSECOND_DIGITS: u8 = 6;
+const NANOSECOND_DIGITS: u8 = 9;
+/// Exasol rejects a constant `ADD_HOURS` or `ADD_MINUTES` count whose nanoseconds exceed 36 digits
+/// before it reads a row, while the scan fails only per non-NULL row. No count above 1e10 yields a
+/// result inside 0001-01-01 to 9999-12-31 in any unit (the range spans 5,258,964,960 minutes), so
+/// Exasol computes such a call.
+const MAX_SCAN_CONSTANT_COUNT: f64 = 1e10;
 
 /// Synthetic node: an integer operand converted to text, rendered only in the DataFusion dialect.
 pub(crate) const INTEGER_TEXT_NODE: &str = "scan_integer_text";
@@ -180,10 +201,12 @@ fn to_text(node: Json, class: TypeClass) -> Result<Json, UdfError> {
         TypeClass::Text | TypeClass::Null => Ok(node),
         TypeClass::Integer { .. } => Ok(wrap(INTEGER_TEXT_NODE, node)),
         TypeClass::Boolean => Ok(wrap(BOOLEAN_TEXT_NODE, node)),
-        TypeClass::Number | TypeClass::Other => Err(decline(format!(
-            "converting {} to text depends on the session's NLS settings",
-            short(&node)
-        ))),
+        TypeClass::Number | TypeClass::Date | TypeClass::Timestamp { .. } | TypeClass::Other => {
+            Err(decline(format!(
+                "converting {} to text depends on the session's NLS settings",
+                short(&node)
+            )))
+        }
     }
 }
 
@@ -226,9 +249,10 @@ impl ScalarFunction {
                 .copied()
                 .reduce(TypeClass::union)
                 .unwrap_or(TypeClass::Other),
-            ResultRule::Arithmetic | ResultRule::NumberOverNumbers | ResultRule::Other => {
-                TypeClass::Other
-            }
+            ResultRule::Arithmetic
+            | ResultRule::NumberOverNumbers
+            | ResultRule::DateAddition(_)
+            | ResultRule::Other => TypeClass::Other,
         }
     }
 }
@@ -274,7 +298,9 @@ fn cast_to_text(
             }
             Ok(wrap(BOOLEAN_TEXT_NODE, source))
         }
-        TypeClass::Number | TypeClass::Other => refuse("depends on the session's NLS settings"),
+        TypeClass::Number | TypeClass::Date | TypeClass::Timestamp { .. } | TypeClass::Other => {
+            refuse("depends on the session's NLS settings")
+        }
     }
 }
 
@@ -393,6 +419,10 @@ fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<Ty
         "literal_string" => TypeClass::Text,
         "literal_double" => TypeClass::Number,
         "literal_exactnumeric" => exact_numeric_class(node),
+        "literal_date" => TypeClass::Date,
+        "literal_timestamp" => TypeClass::Timestamp {
+            precision: fractional_digits(node),
+        },
         "predicate_like" => {
             for field in ["expression", "pattern"] {
                 if let Some(class) = children.one(field) {
@@ -457,6 +487,16 @@ fn exact_numeric_class(node: &Json) -> TypeClass {
         })
 }
 
+/// The count of fractional-second digits in a timestamp literal's value.
+fn fractional_digits(node: &Json) -> u8 {
+    node.get("value")
+        .and_then(Json::as_str)
+        .and_then(|value| value.split_once('.'))
+        .map_or(0, |(_, digits)| {
+            u8::try_from(digits.len()).unwrap_or(u8::MAX)
+        })
+}
+
 fn case_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
     // A simple CASE compares its basis with each WHEN value.
     if children.one("basis").is_some() {
@@ -484,6 +524,9 @@ fn scalar_function_class(
     if function.result == ResultRule::Unified {
         return unify_branches(node, args);
     }
+    if let ResultRule::DateAddition(date_result) = function.result {
+        return date_addition_class(node, out, args, date_result);
+    }
     let converted: Vec<TypeClass> = args
         .iter()
         .enumerate()
@@ -499,6 +542,115 @@ fn scalar_function_class(
         )));
     }
     Ok(function.class(args))
+}
+
+/// The fractional digits of the Arrow timestamp a date addition over a `TIMESTAMP(precision)`
+/// computes in. Nanoseconds end at 2262-04-11 (`docs/semantic-differences.md`).
+fn scan_timestamp_digits(precision: u8) -> u8 {
+    if precision <= MICROSECOND_DIGITS {
+        MICROSECOND_DIGITS
+    } else {
+        NANOSECOND_DIGITS
+    }
+}
+
+/// The fractional digits the scan result of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or
+/// `ADD_MINUTES` call holds. `None` for another node, or for a call the scan does not compute.
+pub fn date_addition_scan_digits(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<u8> {
+    if kind(node) != "function_scalar"
+        || !matches!(
+            typed_function(&upper_name(node)).result,
+            ResultRule::DateAddition(_)
+        )
+    {
+        return None;
+    }
+    match type_scan_tree(node, columns).ok()?.1 {
+        TypeClass::Date => Some(MICROSECOND_DIGITS),
+        TypeClass::Timestamp { precision } => Some(scan_timestamp_digits(precision)),
+        _ => None,
+    }
+}
+
+/// The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or a
+/// TIMESTAMP. The first argument gets a CAST to the Arrow type the scan computes in, so the scan
+/// function sees `Date32`, or a microsecond or nanosecond timestamp, whatever Arrow type holds the
+/// column.
+fn date_addition_class(
+    node: &Json,
+    out: &mut Json,
+    args: &[TypeClass],
+    date_result: DateResult,
+) -> Result<TypeClass, UdfError> {
+    let &[first, count] = args else {
+        return Err(decline(format!(
+            "a date addition takes 2 arguments, got {}: {}",
+            args.len(),
+            short(node)
+        )));
+    };
+    refuse_implicit_text(node, args)?;
+    let (cast_target, result) = match first {
+        TypeClass::Date => (
+            ExasolType::Date,
+            match date_result {
+                DateResult::Date => TypeClass::Date,
+                DateResult::Timestamp => TypeClass::Timestamp { precision: 0 },
+            },
+        ),
+        TypeClass::Timestamp { precision } => (
+            ExasolType::timestamp(scan_timestamp_digits(precision)),
+            first,
+        ),
+        _ => {
+            return Err(decline(format!(
+                "a date addition over a value that is not a DATE or TIMESTAMP: {}",
+                short(node)
+            )));
+        }
+    };
+    match count {
+        TypeClass::Integer { .. } | TypeClass::Number | TypeClass::Null => {}
+        TypeClass::Boolean => {
+            out["arguments"][1] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][1].take());
+        }
+        _ => {
+            return Err(decline(format!(
+                "a date addition count that is not a number: {}",
+                short(node)
+            )));
+        }
+    }
+    refuse_constant_count_beyond_scan_limit(node)?;
+    out["arguments"][0] = serde_json::json!({
+        "type": "function_scalar_cast",
+        "dataType": exasol_type_to_json(&cast_target),
+        "arguments": [out["arguments"][0].take()],
+    });
+    Ok(result)
+}
+
+fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> {
+    let count = &node["arguments"][1];
+    if !matches!(
+        count["type"].as_str(),
+        Some("literal_exactnumeric" | "literal_double")
+    ) {
+        return Ok(());
+    }
+    let magnitude = match &count["value"] {
+        Json::String(text) => text.parse::<f64>().ok(),
+        Json::Number(number) => number.as_f64(),
+        _ => None,
+    }
+    .map(f64::abs);
+    if magnitude.is_some_and(|magnitude| magnitude <= MAX_SCAN_CONSTANT_COUNT) {
+        return Ok(());
+    }
+    Err(decline(format!(
+        "a constant date addition count beyond {MAX_SCAN_CONSTANT_COUNT} runs in Exasol, which checks it before it reads a row: {}",
+        short(node)
+    )))
 }
 
 fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
