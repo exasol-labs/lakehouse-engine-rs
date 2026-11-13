@@ -9,22 +9,26 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * The scan declares each computed output column with the type Exasol states in `selectListDataTypes` and casts the computed value to it (`datafusion-scan/scan-execution-value-conversion`).
 * The scan holds a `TIMESTAMP(7)` to `TIMESTAMP(9)` value as an Arrow nanosecond timestamp, whose range spans 1677-09-21 00:12:43.145224192 to 2262-04-11 23:47:16.854775807. A microsecond timestamp drops its digits below a microsecond, and spans Exasol's whole range.
 * A declined expression takes its path's fallback (`pushdown-types/pushdown-planning-scan-text-conversion`), so Exasol computes it.
+* Exasol sends `COALESCE` and `NULLIF` as CASE expressions.
+* Exasol 8 and 2025 give a CASE, `GREATEST`, or `LEAST` over only dates a DATE, and one over a `TIMESTAMP(p)` and a `TIMESTAMP(q)` a `TIMESTAMP(max(p, q))`. Over a DATE and a TIMESTAMP, Exasol 2025 gives the TIMESTAMP's type and Exasol 8 the first branch's type.
+* Exasol 2025 types `TO_TIMESTAMP` as `TIMESTAMP(9)`, and Exasol 8 as `TIMESTAMP(3)`.
 
 ## Scenarios
 
 ### Scenario: The typed pass tells a DATE from a TIMESTAMP
 
-* *GIVEN* a scan expression that contains a DATE or `TIMESTAMP(p)` column, a DATE or TIMESTAMP literal, a CAST to DATE or `TIMESTAMP(p)`, an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call, or a `MIN`, `MAX`, or CASE over one of them
+* *GIVEN* a scan expression that contains a DATE or `TIMESTAMP(p)` column, a DATE or TIMESTAMP literal, a CAST to DATE or `TIMESTAMP(p)`, an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call, a `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP` call, or a `MIN`, `MAX`, CASE, `COALESCE`, `GREATEST`, `LEAST`, or `NULLIF` over one of them
 * *WHEN* `render_scan_expression` types the expression
-* *THEN* the typed pass SHALL give a DATE class to a DATE column, a DATE literal, a CAST to DATE, and `ADD_DAYS` or `ADD_WEEKS` over a DATE
-* *AND* it SHALL give a TIMESTAMP class of precision `p` to a `TIMESTAMP(p)` column, a TIMESTAMP literal with `p` fractional-second digits, a CAST to `TIMESTAMP(p)`, and any of the four functions over a `TIMESTAMP(p)`, and a TIMESTAMP class of precision 0 to `ADD_HOURS` or `ADD_MINUTES` over a DATE
-* *AND* `MIN` and `MAX` SHALL keep the DATE or TIMESTAMP class of their argument, and a CASE whose other branches are NULL SHALL keep the class of its one non-NULL branch, so the four functions over them run in the scan
-* *AND* a CASE over two date values and a `TIMESTAMP WITH LOCAL TIME ZONE` value SHALL keep the class of a type the pass does not derive
+* *THEN* the typed pass SHALL derive DATE for a DATE column, a DATE literal, a CAST to DATE, `TO_DATE`, and `ADD_DAYS` or `ADD_WEEKS` over a DATE
+* *AND* it SHALL derive `TIMESTAMP(p)` for a `TIMESTAMP(p)` column, a TIMESTAMP literal that spells `p` fractional-second digits, trailing zeros included, a CAST to `TIMESTAMP(p)`, and any of the four functions over a `TIMESTAMP(p)`, and `TIMESTAMP(0)` for `ADD_HOURS` or `ADD_MINUTES` over a DATE
+* *AND* `MIN`, `MAX`, and `DATE_TRUNC` SHALL keep the type of their DATE or TIMESTAMP argument, and `NULLIF` the type of its first argument
+* *AND* a CASE, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps SHALL take the type both Exasol versions give it, NULL branches aside, and the scan SHALL compute its value at that type's precision
+* *AND* one over a DATE and a TIMESTAMP, `TO_TIMESTAMP`, and a `TIMESTAMP WITH LOCAL TIME ZONE` value SHALL get no DATE or TIMESTAMP type, because Exasol types the first two differently by version
 * *AND* a DATE or TIMESTAMP value converted to text SHALL still decline, because Exasol formats both by session settings (`pushdown-types/pushdown-planning-scan-text-conversion`)
 
 ### Scenario: ADD_DAYS and ADD_WEEKS over a DATE return a DATE from the scan
 
-* *GIVEN* a `function_scalar` node named `ADD_DAYS` or `ADD_WEEKS` whose first argument has the DATE class and whose second argument is a number
+* *GIVEN* a `function_scalar` node named `ADD_DAYS` or `ADD_WEEKS` whose first argument the typed pass derives as DATE and whose second argument is a number
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* the translator SHALL render `vs_add_days(CAST(<arg_sql> AS DATE), <count_sql>)` or `vs_add_weeks(CAST(<arg_sql> AS DATE), <count_sql>)`, which call functions that the scan session registers, so the scan function receives an Arrow `Date32` whatever Arrow type holds the argument
 * *AND* the scan SHALL return the date plus the rounded count of days, or plus seven days per rounded count of weeks, as a DATE
@@ -33,7 +37,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: ADD_HOURS and ADD_MINUTES over a DATE return a timestamp from the scan
 
-* *GIVEN* a `function_scalar` node named `ADD_HOURS` or `ADD_MINUTES` whose first argument has the DATE class and whose second argument is a number
+* *GIVEN* a `function_scalar` node named `ADD_HOURS` or `ADD_MINUTES` whose first argument the typed pass derives as DATE and whose second argument is a number
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* the translator SHALL render `vs_add_hours(CAST(<arg_sql> AS DATE), <count_sql>)` or `vs_add_minutes(CAST(<arg_sql> AS DATE), <count_sql>)`
 * *AND* the scan SHALL return midnight of the date plus the rounded count of hours or minutes, as a timestamp without fractional seconds, which equals Exasol's `TIMESTAMP(0)` result
@@ -42,7 +46,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument has the TIMESTAMP class
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument the typed pass derives as a TIMESTAMP
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* the translator SHALL render the function's `vs_add_*` call with the first argument as `CAST(<arg_sql> AS TIMESTAMP(6))` for a precision from 0 to 6 and `CAST(<arg_sql> AS TIMESTAMP(9))` for a precision from 7 to 9, so the scan function receives a microsecond or nanosecond timestamp without a time zone, which holds every fractional-second digit of the argument
 * *AND* the scan SHALL return a microsecond timestamp over a microsecond argument and a nanosecond timestamp over a nanosecond argument
@@ -80,15 +84,6 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *AND* the scan MUST NOT return a row, a NULL, or a wrapped value in place of the failure
 * *AND* `docs/semantic-differences.md` SHALL list this difference from native Exasol, which returns the timestamp, together with a comparison of such a call or a `TIMESTAMP(9)` column with a timestamp literal outside the nanosecond range, such as a 9999-12-31 sentinel, which fails in the scan
 
-### Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
-
-* *GIVEN* a comparison, `BETWEEN`, or `IN` of an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call over a DATE or a `TIMESTAMP(0)` to `TIMESTAMP(6)` with a TIMESTAMP literal of more than 6 significant fractional digits, with the literal on either side
-* *WHEN* the scan computes the filter
-* *THEN* the query SHALL return the rows native Exasol returns
-* *AND* the adapter SHALL rewrite each such comparison in the tree it renders for DataFusion as it rewrites a comparison with a column of 6 fractional digits (`pushdown-types/pushdown-planning-timestamp-literal-precision`), because the scan's result holds whole microseconds and DataFusion truncates the literal to microseconds before it compares
-* *AND* the adapter MUST NOT rewrite a comparison with a call over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, whose scan result holds nanoseconds, so a literal of up to 9 digits compares as written
-* *AND* a call that the typed pass declines SHALL take its path's fallback, which applies the comparison as Exasol received it, without the rewrite
-
 ### Scenario: A date before 1582-10-15 follows the proleptic Gregorian calendar in the scan
 
 * *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call that the scan computes, whose argument or result lies before 1582-10-15
@@ -99,7 +94,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: A form the scan cannot match runs in Exasol
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a DATE or TIMESTAMP class, such as a CASE over two dates, `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP`, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a derived DATE or TIMESTAMP type, such as `TO_TIMESTAMP` or a CASE over a DATE and a TIMESTAMP, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* `render_scan_expression` SHALL return `Err`, and the expression SHALL take its path's fallback, so Exasol computes the function
 * *AND* the query SHALL return the rows native Exasol returns

@@ -245,6 +245,21 @@ const CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(CASE WHEN ID > 2 THEN C_QTY ELSE ID END AS VARCHAR(21)) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(CASE WHEN ID > 2 THEN 7 ELSE -12 END AS VARCHAR(3)) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(GREATEST(7, ID) AS VARCHAR(2)) FROM {T}",
+        path: Lacks(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_BOOL AS VARCHAR(4)) FROM {T} WHERE C_BOOL",
         path: Lacks(SCAN_ITEM),
     },

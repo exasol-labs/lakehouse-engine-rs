@@ -449,7 +449,7 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
 }
 
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
-/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+/// Scenario: A timestamp filter compares at full precision
 #[test]
 fn date_addition_over_a_nanosecond_timestamp_runs_in_the_scan() {
     setup();
@@ -510,7 +510,7 @@ fn a_nanosecond_date_addition_outside_the_arrow_range_fails_in_the_scan() {
     let qualified = qualified_probe();
     create_native_copy(&mut conn, &qualified, "TS, TSTZ, TS_NS");
 
-    // docs/semantic-differences.md lists both: native Exasol returns rows for each.
+    // docs/semantic-differences.md lists both, and native Exasol returns rows for each.
     let cases = [
         (
             "SELECT ID, ADD_DAYS(TS_NS, 100000) FROM {T}",
@@ -522,6 +522,97 @@ fn a_nanosecond_date_addition_outside_the_arrow_range_fails_in_the_scan() {
         ),
     ];
     for (query, message) in cases {
+        let native = conn.query_columns(&query.replace("{T}", NATIVE_COPY));
+        assert!(!native[0].is_empty(), "`{query}` must return rows natively");
+        let error = error_text(&conn.try_execute(&query.replace("{T}", &qualified)), query);
+        assert!(
+            error.contains(message),
+            "`{query}` must fail in the scan with `{message}`, got: {error}"
+        );
+    }
+}
+
+/// Scenario: A timestamp filter compares at full precision
+#[test]
+fn a_derived_timestamp_operand_compares_with_a_finer_literal_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = qualified_probe();
+
+    // Every literal spells more digits than its operand's precision, so each case is floored
+    // except the DATE, which DataFusion compares in nanoseconds.
+    let filters = [
+        "COALESCE(TS, TIMESTAMP '2000-01-01 00:00:00') < TIMESTAMP '2024-01-01 00:00:00.1234565'",
+        "GREATEST(TS, TIMESTAMP '2000-01-01 00:00:00.1') = TIMESTAMP '2024-01-01 00:00:00.1234561'",
+        "LEAST(TS, TIMESTAMP '2099-01-01 00:00:00') BETWEEN TIMESTAMP '2024-01-01 00:00:00.0000015' AND TIMESTAMP '2024-01-01 00:00:00.1234565'",
+        "CASE WHEN ID > 0 THEN TS END >= TIMESTAMP '2024-01-01 00:00:00.0000015'",
+        "NULLIF(TS, TIMESTAMP '2024-01-01 00:00:00.000001') > TIMESTAMP '2024-01-01 00:00:00.0000015'",
+        "DATE_TRUNC('second', TS) <> TIMESTAMP '2024-01-01 00:00:00.0000005'",
+        "CAST(TS AS DATE) < TIMESTAMP '2024-01-01 00:00:00.5'",
+    ];
+    assert_filters_match_native_copy(&mut conn, &table, "TS", &filters);
+    for filter in filters {
+        let pushed = isolated_pushdown_statement(
+            &mut conn,
+            &format!("SELECT ID FROM {table} WHERE {filter}"),
+        );
+        assert!(
+            pushed.contains(SCAN_SCRIPT_NAME) && pushed.contains("\"filter\":\""),
+            "{filter} must stay in the scan's WHERE clause: {pushed}"
+        );
+    }
+}
+
+/// Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
+/// Scenario: A timestamp filter compares at full precision
+#[test]
+fn date_trunc_and_a_date_comparison_outside_the_nanosecond_range_fail_in_the_scan() {
+    setup();
+    let mut conn = exa_conn();
+    let qualified = qualified_probe();
+    create_native_copy(&mut conn, &qualified, "TS");
+
+    // ADD_DAYS moves each value to about 9964, which a column, unlike a literal, does not fold.
+    let row_cases = [
+        "SELECT ID, DATE_TRUNC('day', ADD_DAYS(TS, 2900000)) FROM {T}",
+        "SELECT ID, DATE_TRUNC('second', ADD_DAYS(TS, 2900000)) FROM {T}",
+        "SELECT ID, ADD_DAYS(DATE_TRUNC('month', CAST(TS AS DATE)), 1) FROM {T}",
+    ];
+    let failures: Vec<String> = row_cases
+        .iter()
+        .filter_map(|query| {
+            native_copy_mismatch(
+                &mut conn,
+                &qualified,
+                NATIVE_COPY,
+                query,
+                PathCheck::Has("date_trunc"),
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "DATE_TRUNC must run in the scan and match native:\n{}",
+        failures.join("\n")
+    );
+
+    // docs/semantic-differences.md lists each: native Exasol returns rows for all of them.
+    let error_cases = [
+        (
+            "SELECT ID, DATE_TRUNC('month', CASE WHEN ID > 0 THEN DATE '9999-12-31' END) FROM {T}",
+            "to Timestamp(ns)",
+        ),
+        (
+            "SELECT ID, DATE_TRUNC('month', ADD_DAYS(TS, 2900000)) FROM {T}",
+            "out of range",
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ADD_DAYS(CAST(TS AS DATE), 2900000) > TIMESTAMP '2024-01-01 00:00:00'",
+            "to Timestamp(ns)",
+        ),
+    ];
+    for (query, message) in error_cases {
         let native = conn.query_columns(&query.replace("{T}", NATIVE_COPY));
         assert!(!native[0].is_empty(), "`{query}` must return rows natively");
         let error = error_text(&conn.try_execute(&query.replace("{T}", &qualified)), query);
