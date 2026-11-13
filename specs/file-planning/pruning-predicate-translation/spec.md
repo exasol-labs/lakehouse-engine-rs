@@ -48,4 +48,4 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 * *WHEN* queries apply `=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `<>`, and `LIKE` to them, including literals the column's type cannot hold exactly and constant functions Exasol folds
 * *THEN* each query SHALL return the native oracle's rows, and each format SHALL scan exactly the files its partition and statistics evaluation keeps
 * *AND* direct storage SHALL skip the typed partition column, which it declares a string
-* *AND* an Iceberg `timestamp_ns` column SHALL prune by a literal with nine fraction digits
+* *AND* on an Exasol version with nanosecond timestamps, an Iceberg `timestamp_ns` column SHALL prune by a literal with nine fraction digits, and a microsecond column SHALL keep its file for a literal finer than its unit

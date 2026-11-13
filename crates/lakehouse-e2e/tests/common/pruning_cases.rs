@@ -382,9 +382,6 @@ const CASES: &[Case] = &[
     )
     .iceberg(&["b1"])
     .delta(&["b1"]),
-    Case::new("TZ <= TIMESTAMP '2024-01-01 00:05:00.0000001'", Scan)
-        .iceberg(ALL_FILES)
-        .delta(ALL_FILES),
     Case::new("K <> 10", Scan)
         .iceberg(ALL_FILES)
         .delta(NON_NULL_STATS),

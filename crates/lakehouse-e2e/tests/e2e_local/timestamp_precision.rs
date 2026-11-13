@@ -449,17 +449,24 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     assert_pushed_to_scan_udf(&mut conn, &distinct_sql, "the nanosecond distinct count");
 
     if expected_distinct == 2 {
-        for (literal, count) in [("000000002", 0), ("000000001", 2)] {
+        let ts_column = TSPRECISION_COL_TS.to_uppercase();
+        for (column, literal, count, scanned) in [
+            (&ts_ns_column, "000000002", 0, false),
+            (&ts_ns_column, "000000001", 2, true),
+            (&ts_column, "123457", 0, false),
+            (&ts_column, "1234575", 0, true),
+        ] {
             let sql = format!(
-                "SELECT COUNT(*) FROM {} WHERE {ts_ns_column} > TIMESTAMP '2024-01-01 00:00:00.{literal}'",
+                "SELECT COUNT(*) FROM {} WHERE {column} > TIMESTAMP '2024-01-01 00:00:00.{literal}'",
                 qualified_probe()
             );
             assert_eq!(conn.query_scalar_i64(&sql), count, "{sql}");
             let plan = isolated_pushdown_statement(&mut conn, &sql);
             assert_eq!(
                 plan.contains(SCAN_SCRIPT_NAME),
-                count > 0,
-                "a nanosecond literal must prune the file exactly when no row matches: {plan}"
+                scanned,
+                "a literal must prune the file exactly when its column's unit holds it and no \
+                 row matches: {plan}"
             );
         }
     }
