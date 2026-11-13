@@ -2746,6 +2746,84 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
     );
 }
 
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn overprecise_timestamp_literal_against_a_date_addition_is_floored() {
+    let col_types = vec![("D".to_string(), ExasolType::Date)];
+    let rewritten = |filter: &Json| {
+        rewrite_overprecise_timestamp_comparisons(filter, &column_types(&col_types))
+    };
+    let call = || scalar_fn("ADD_HOURS", [col("d"), num_lit(1)]);
+    let over = || timestamp_lit("2024-01-01 01:00:00.0000001");
+    let floor = || timestamp_lit("2024-01-01 01:00:00.000000");
+    let fits = || timestamp_lit("2024-01-02 01:00:00.123456");
+    let never_equal = || compare("predicate_notequal", call(), call());
+
+    for (shape, filter, expected) in [
+        ("=", predicate_equal(call(), over()), never_equal()),
+        ("= mirrored", predicate_equal(over(), call()), never_equal()),
+        (
+            ">=",
+            compare("predicate_greaterequal", call(), over()),
+            compare("predicate_greater", call(), floor()),
+        ),
+        (
+            ">= mirrored",
+            compare("predicate_greaterequal", over(), call()),
+            compare("predicate_lessequal", call(), floor()),
+        ),
+        (
+            "BETWEEN",
+            between(call(), over(), fits()),
+            and([
+                compare("predicate_greater", call(), floor()),
+                compare("predicate_lessequal", call(), fits()),
+            ]),
+        ),
+        (
+            "IN",
+            in_list(call(), [over(), fits()]),
+            or([never_equal(), predicate_equal(call(), fits())]),
+        ),
+    ] {
+        assert_eq!(rewritten(&filter), expected, "{shape}");
+    }
+
+    for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_MINUTES"] {
+        let call = scalar_fn(name, [col("d"), num_lit(1)]);
+        assert_eq!(
+            rewritten(&predicate_equal(call.clone(), over())),
+            compare("predicate_notequal", call.clone(), call),
+            "{name}"
+        );
+    }
+
+    let unchanged = [
+        predicate_equal(call(), fits()),
+        predicate_equal(fits(), call()),
+        predicate_equal(call(), timestamp_lit("2024-01-01 01:00:00.1234560")),
+        compare("predicate_greaterequal", call(), fits()),
+        between(call(), fits(), fits()),
+        in_list(call(), [fits()]),
+        predicate_equal(scalar_fn("ADD_MONTHS", [col("d"), num_lit(1)]), over()),
+    ];
+    for filter in unchanged {
+        assert_eq!(rewritten(&filter), filter, "{filter}");
+    }
+}
+
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn a_date_addition_over_a_nanosecond_timestamp_keeps_a_nanosecond_literal() {
+    let col_types = vec![("TS9".to_string(), ExasolType::timestamp(9))];
+    let call = scalar_fn("ADD_DAYS", [col("ts9"), num_lit(1)]);
+    let filter = predicate_equal(call, timestamp_lit("2024-01-02 00:00:00.000000001"));
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+        filter
+    );
+}
+
 #[test]
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");

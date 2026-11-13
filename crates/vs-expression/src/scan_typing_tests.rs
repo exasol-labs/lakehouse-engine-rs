@@ -6,6 +6,12 @@ fn columns() -> TypedColumns {
     typed_columns(&[
         ("D", ExasolType::Date),
         ("TS", ExasolType::timestamp(6)),
+        ("TS0", ExasolType::timestamp(0)),
+        ("TS9", ExasolType::timestamp(9)),
+        (
+            "LTZ",
+            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
+        ),
         ("B", ExasolType::Boolean),
         ("F", ExasolType::DoublePrecision),
         ("N", ExasolType::decimal(9, 2)),
@@ -726,4 +732,287 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
         scalar_fn("MULT", [col("I"), col("I")]),
     );
     assert!(render(&integer).is_ok(), "{integer} is integer text");
+}
+
+fn class_of(expr: &Json) -> TypeClass {
+    type_scan_tree(expr, &columns()).unwrap().1
+}
+
+const DATE: TypeClass = TypeClass::Date;
+
+const fn timestamp(precision: u8) -> TypeClass {
+    TypeClass::Timestamp { precision }
+}
+
+/// Scenario: The typed pass tells a DATE from a TIMESTAMP
+#[test]
+fn date_and_timestamp_classes_follow_their_source() {
+    let cases = [
+        ("DATE column", col("D"), DATE),
+        ("TIMESTAMP(6) column", col("TS"), timestamp(6)),
+        ("TIMESTAMP(0) column", col("TS0"), timestamp(0)),
+        ("TIMESTAMP(9) column", col("TS9"), timestamp(9)),
+        ("LTZ column", col("LTZ"), TypeClass::Other),
+        ("DATE literal", date_lit("2024-01-01"), DATE),
+        (
+            "TIMESTAMP literal without a fraction",
+            timestamp_lit("2024-01-01 00:00:00"),
+            timestamp(0),
+        ),
+        (
+            "TIMESTAMP literal with 3 digits",
+            timestamp_lit("2024-01-01 00:00:00.123"),
+            timestamp(3),
+        ),
+        (
+            "TIMESTAMP literal with 7 digits",
+            timestamp_lit("2024-01-01 00:00:00.1234567"),
+            timestamp(7),
+        ),
+        ("CAST to DATE", cast_to(ExasolType::Date, col("TS")), DATE),
+        (
+            "CAST to TIMESTAMP(3)",
+            cast_to(ExasolType::timestamp(3), col("D")),
+            timestamp(3),
+        ),
+        (
+            "ADD_DAYS over a DATE",
+            scalar_fn("ADD_DAYS", [col("D"), col("I")]),
+            DATE,
+        ),
+        (
+            "ADD_WEEKS over a DATE",
+            scalar_fn("ADD_WEEKS", [col("D"), num_lit(1)]),
+            DATE,
+        ),
+        (
+            "ADD_HOURS over a DATE",
+            scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]),
+            timestamp(0),
+        ),
+        (
+            "ADD_MINUTES over a DATE",
+            scalar_fn("ADD_MINUTES", [col("D"), num_lit(1)]),
+            timestamp(0),
+        ),
+        (
+            "ADD_DAYS over a TIMESTAMP(6)",
+            scalar_fn("ADD_DAYS", [col("TS"), num_lit(1)]),
+            timestamp(6),
+        ),
+        (
+            "ADD_HOURS over a TIMESTAMP(0)",
+            scalar_fn("ADD_HOURS", [col("TS0"), num_lit(1)]),
+            timestamp(0),
+        ),
+        (
+            "ADD_MINUTES over a TIMESTAMP(9)",
+            scalar_fn("ADD_MINUTES", [col("TS9"), num_lit(1)]),
+            timestamp(9),
+        ),
+        (
+            "ADD_DAYS over ADD_HOURS over a DATE",
+            scalar_fn(
+                "ADD_DAYS",
+                [scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]), num_lit(1)],
+            ),
+            timestamp(0),
+        ),
+        ("MIN of a DATE", agg_item_expr("MIN", col("D"), false), DATE),
+        (
+            "MAX of a TIMESTAMP",
+            agg_item_expr("MAX", col("TS"), false),
+            timestamp(6),
+        ),
+        (
+            "CASE with NULL branches over a DATE",
+            case_when([col("B"), col("B")], [col("D"), null_lit(), null_lit()]),
+            DATE,
+        ),
+        (
+            "CASE with a NULL branch over a TIMESTAMP",
+            case_when([col("B")], [null_lit(), col("TS")]),
+            timestamp(6),
+        ),
+        (
+            "CASE over two dates",
+            case_when([col("B")], [col("D"), col("D")]),
+            TypeClass::Other,
+        ),
+        (
+            "CASE over a TIMESTAMP and an LTZ",
+            case_when([col("B")], [col("TS"), col("LTZ")]),
+            TypeClass::Other,
+        ),
+        (
+            "GREATEST over two dates",
+            scalar_fn("GREATEST", [col("D"), col("D")]),
+            TypeClass::Other,
+        ),
+        (
+            "DATE_TRUNC",
+            scalar_fn("DATE_TRUNC", [str_lit("month"), col("D")]),
+            TypeClass::Other,
+        ),
+    ];
+    for (label, expr, expected) in cases {
+        assert_eq!(class_of(&expr), expected, "{label}");
+    }
+}
+
+/// Scenario: The typed pass tells a DATE from a TIMESTAMP
+#[test]
+fn date_and_timestamp_text_conversion_declines() {
+    let sources = [
+        col("D"),
+        col("TS"),
+        date_lit("2024-01-01"),
+        timestamp_lit("2024-01-01 00:00:00"),
+        scalar_fn("ADD_DAYS", [col("D"), num_lit(1)]),
+    ];
+    for source in sources {
+        for expr in [
+            cast_to(ExasolType::WIDEST_VARCHAR, source.clone()),
+            date_like(source.clone()),
+            scalar_fn("CONCAT", [source.clone(), str_lit("x")]),
+            scalar_fn("UPPER", [source.clone()]),
+        ] {
+            assert!(render(&expr).is_err(), "{expr} must decline");
+        }
+    }
+}
+
+/// Scenario: The scan rounds a fractional count as Exasol does
+#[test]
+fn a_boolean_date_addition_count_renders_as_one_or_zero() {
+    let expr = scalar_fn("ADD_DAYS", [col("D"), col("B")]);
+    assert_eq!(
+        render(&expr).unwrap(),
+        r#"vs_add_days(CAST("D" AS DATE), (CASE "B" WHEN TRUE THEN 1 WHEN FALSE THEN 0 END))"#
+    );
+}
+
+/// Scenario: A form the scan cannot match runs in Exasol
+#[test]
+fn unmatched_date_addition_forms_decline() {
+    let mut cases = Vec::new();
+    for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"] {
+        let first_arguments = [
+            ("TIMESTAMP WITH LOCAL TIME ZONE", col("LTZ")),
+            ("text", col("S")),
+            ("text literal", str_lit("2024-01-01")),
+            ("NULL literal", null_lit()),
+            ("a number", col("I")),
+            ("a BOOLEAN", col("B")),
+            (
+                "CASE over two dates",
+                case_when([col("B")], [col("D"), col("D")]),
+            ),
+            (
+                "DATE_TRUNC",
+                scalar_fn("DATE_TRUNC", [str_lit("month"), col("D")]),
+            ),
+            ("TO_DATE", scalar_fn("TO_DATE", [col("S")])),
+            ("TO_TIMESTAMP", scalar_fn("TO_TIMESTAMP", [col("S")])),
+            ("an unknown column", col("UNKNOWN")),
+        ];
+        for (label, first) in first_arguments {
+            cases.push((
+                format!("{name} over {label}"),
+                scalar_fn(name, [first, num_lit(1)]),
+            ));
+        }
+        for (label, count) in [
+            ("text", col("S")),
+            ("a DATE", col("D")),
+            ("a TIMESTAMP", col("TS")),
+            (
+                "an exact literal of 1e30",
+                lit("literal_exactnumeric", "1000000000000000000000000000000"),
+            ),
+            (
+                "a DOUBLE literal of 1e30",
+                lit("literal_double", "1.0000000000000000e+30"),
+            ),
+            (
+                "a DOUBLE literal of -1e30",
+                lit("literal_double", "-1.0000000000000000e+30"),
+            ),
+            (
+                "an exact literal just above 1e10",
+                lit("literal_exactnumeric", "10000000001"),
+            ),
+        ] {
+            cases.push((
+                format!("{name} with {label} as the count"),
+                scalar_fn(name, [col("D"), count]),
+            ));
+        }
+        cases.push((
+            format!("{name} with one argument"),
+            scalar_fn(name, [col("D")]),
+        ));
+        cases.push((
+            format!("{name} with three arguments"),
+            scalar_fn(name, [col("D"), num_lit(1), num_lit(2)]),
+        ));
+    }
+    for (label, expr) in cases {
+        assert!(
+            render(&expr).is_err(),
+            "{label} must decline, rendered {:?}",
+            render(&expr)
+        );
+    }
+}
+
+/// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
+#[test]
+fn a_date_addition_computes_in_the_unit_that_holds_its_argument() {
+    let cases = [
+        (col("TS0"), r#"vs_add_days(CAST("TS0" AS TIMESTAMP(6)), 1)"#),
+        (col("TS"), r#"vs_add_days(CAST("TS" AS TIMESTAMP(6)), 1)"#),
+        (col("TS9"), r#"vs_add_days(CAST("TS9" AS TIMESTAMP(9)), 1)"#),
+        (
+            timestamp_lit("2024-01-01 00:00:00.1000000"),
+            "vs_add_days(CAST(arrow_cast('2024-01-01 00:00:00.1000000', 'Timestamp(Microsecond, None)') AS TIMESTAMP(9)), 1)",
+        ),
+    ];
+    for (argument, expected) in cases {
+        assert_eq!(
+            render(&scalar_fn("ADD_DAYS", [argument, num_lit(1)])).unwrap(),
+            expected
+        );
+    }
+}
+
+/// Scenario: A comparison with a TIMESTAMP literal finer than a microsecond returns native rows
+#[test]
+fn date_addition_scan_digits_follow_the_computing_unit() {
+    let cases = [
+        (scalar_fn("ADD_DAYS", [col("D"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_DAYS", [col("TS0"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_WEEKS", [col("TS"), num_lit(1)]), Some(6)),
+        (scalar_fn("ADD_MINUTES", [col("TS9"), num_lit(1)]), Some(9)),
+        (scalar_fn("ADD_DAYS", [col("S"), num_lit(1)]), None),
+        (scalar_fn("UPPER", [col("S")]), None),
+        (col("TS"), None),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(
+            date_addition_scan_digits(&expr, &columns()),
+            expected,
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn a_constant_count_at_the_limit_renders() {
+    let expr = scalar_fn(
+        "ADD_MINUTES",
+        [col("D"), lit("literal_exactnumeric", "10000000000")],
+    );
+    assert!(render(&expr).is_ok(), "rendered {:?}", render(&expr));
 }

@@ -867,14 +867,15 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
     if resp["status"] == "error" {
         let text = error_text(&resp, sql);
         // A CAST Exasol evaluates over the scanned rows fails in a UDF VM, which prefixes the
-        // same error message.
+        // same error message. A scan function that fails in the scan UDF adds its own prefix.
         let text = text.strip_prefix("VM error: ").unwrap_or(&text);
-        return Err(text
-            .split([';', '('])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string());
+        let text = text
+            .strip_prefix("F-UDF-CL-RUST-9001: UDF error: ")
+            .unwrap_or(text);
+        // Exasol 8 appends `: value <v> is not in [<range>]` to a numeric range error.
+        let class = text.split([';', '(']).next().unwrap_or_default();
+        let class = class.split(": value ").next().unwrap_or_default();
+        return Err(class.trim().to_string());
     }
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let types = result_set["columns"]
