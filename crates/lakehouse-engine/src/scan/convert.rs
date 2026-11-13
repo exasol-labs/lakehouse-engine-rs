@@ -23,8 +23,8 @@ fn nan_domain_error() -> UdfError {
 
 /// Exasol's DATE range 0001-01-01 to 9999-12-31 as inclusive Date32 day counts from
 /// 1970-01-01, in Arrow's proleptic Gregorian calendar.
-const EXASOL_DATE_MIN_DAYS: i32 = -719_162;
-const EXASOL_DATE_MAX_DAYS: i32 = 2_932_896;
+pub(crate) const EXASOL_DATE_MIN_DAYS: i32 = -719_162;
+pub(crate) const EXASOL_DATE_MAX_DAYS: i32 = 2_932_896;
 const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 fn date_out_of_range_detail(days: i32) -> String {

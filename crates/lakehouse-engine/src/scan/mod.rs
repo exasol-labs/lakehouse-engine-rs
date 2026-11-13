@@ -33,6 +33,8 @@ mod sql_support;
 pub use sql_support::build_alias_items;
 
 mod checked_div;
+mod datetime_add;
+pub use datetime_add::CountArithmetic;
 mod exasol_numeric;
 mod json_value;
 mod raised_failure;
@@ -117,8 +119,12 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 }
 
 /// Any planning that derives the scan's result types must use this session too. Public so
-/// `tests/it` plans with the production functions.
+/// `tests/it` plans with the production functions. A [`CountArithmetic`] extension on `config`
+/// selects the Exasol version's `ADD_HOURS` and `ADD_MINUTES` count limit.
 pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
+    let count_arithmetic = config
+        .get_extension::<CountArithmetic>()
+        .map_or_else(CountArithmetic::default, |arithmetic| *arithmetic);
     let raised = Arc::new(raised_failure::RaisedFailure::default());
     let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
     let mut rules = Analyzer::new().rules;
@@ -138,7 +144,8 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     raw_scan::register_nested_json_render_udf(&ctx);
     binary_hex::register_binary_hex_udf(&ctx);
     binary_text::register_binary_text_udf(&ctx);
-    checked_div::register_checked_float_div_udf(&ctx, raised);
+    checked_div::register_checked_float_div_udf(&ctx, raised.clone());
+    datetime_add::register_datetime_add_udfs(&ctx, count_arithmetic, raised);
     json_value::register_json_value_udfs(&ctx);
     ctx
 }
@@ -208,12 +215,19 @@ pub async fn run_scan_one(
     ctx: &mut dyn UdfContext,
     spec: ScanSpec,
     storage: &ResolvedScanStorage,
-    build_session: impl Fn(&ScanSpec, &ResolvedScanStorage, u64) -> Result<SessionContext, UdfError>,
+    build_session: impl Fn(
+        &ScanSpec,
+        &ResolvedScanStorage,
+        u64,
+        CountArithmetic,
+    ) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
+    let count_arithmetic = CountArithmetic::from_database_version(&ctx.database_version());
     let secrets = storage.all_secret_values();
     let redact = |e| emit::redact_scan_error(e, &secrets);
-    let session_ctx = build_session(&spec, storage, memory_limit_bytes).map_err(redact)?;
+    let session_ctx =
+        build_session(&spec, storage, memory_limit_bytes, count_arithmetic).map_err(redact)?;
     run_scan_dispatch(ctx, &session_ctx, &spec, storage)
         .await
         .map_err(redact)?;

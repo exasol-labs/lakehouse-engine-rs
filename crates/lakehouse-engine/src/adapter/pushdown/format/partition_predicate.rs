@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::{non_null_partition_value, partition_scalar};
-use crate::types::mapping::timestamp_literal_digits;
+use crate::types::mapping::timestamp_unit;
+use vs_expression::timestamp::TimestampLiteral;
 
 use super::filter_json::{
     Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
@@ -313,13 +314,9 @@ fn exact_numeral(value: &Json, scale: i8) -> Option<String> {
 /// The string cast truncates a fraction finer than `unit`, so such a literal does not convert.
 fn exact_timestamp(value: &Json, unit: TimeUnit) -> Option<String> {
     let text = non_empty_str(value)?;
-    let unit_digits = match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 3,
-        TimeUnit::Microsecond => 6,
-        TimeUnit::Nanosecond => 9,
-    };
-    (timestamp_literal_digits(text) <= unit_digits).then(|| text.to_string())
+    TimestampLiteral(text)
+        .fits(timestamp_unit(unit))
+        .then(|| text.to_string())
 }
 
 #[cfg(test)]

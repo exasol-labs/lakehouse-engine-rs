@@ -9,13 +9,12 @@ use crate::scan::spec::{
     ScanStorage, StorageBackend, render_order_by_clause,
 };
 use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
-use crate::types::mapping::timestamp_literal_digits;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
-    render_scan_expression, render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, SqlFragment, render_scan_expression, render_scan_filter,
+    walk_column_nodes,
 };
 
 use super::RefusedColumn;
@@ -380,25 +379,6 @@ pub(super) fn involved_columns<'r>(
     })
 }
 
-/// Post-order over [`EXPR_ARRAY_FIELDS`] and [`EXPR_SINGLE_FIELDS`], so `f` sees rewritten
-/// children.
-fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Json) -> Json {
-    let mut out = node.clone();
-    for field in EXPR_ARRAY_FIELDS {
-        if let Some(Json::Array(children)) = node.get(field) {
-            out[field] = Json::Array(children.iter().map(|c| rewrite_expr_tree(c, f)).collect());
-        }
-    }
-    for field in EXPR_SINGLE_FIELDS {
-        if let Some(child) = node.get(field)
-            && child.is_object()
-        {
-            out[field] = rewrite_expr_tree(child, f);
-        }
-    }
-    f(&out)
-}
-
 /// The (relation alias, column) pair a `column` node names.
 pub(super) fn column_node_ref(node: &Json) -> Option<ColumnRef> {
     let column = ColumnNode::parse(node)?;
@@ -575,92 +555,6 @@ fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
         .map(|(_, column_type)| column_type.exa_type)
 }
 
-/// DataFusion truncates a timestamp literal to its column's unit, while Exasol compares at full
-/// precision (#461). Workaround for apache/datafusion#22142, fixed by apache/datafusion#22906.
-fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Json {
-    rewrite_expr_tree(node, &|out: &Json| {
-        rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone())
-    })
-}
-
-/// `None` leaves the node unchanged.
-fn rewrite_timestamp_comparison(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let compare = |op: &str, column: &Json, literal: &Json| {
-        let node = serde_json::json!({"type": op, "left": column, "right": literal});
-        rewrite_timestamp_comparison(&node, col_types).unwrap_or(node)
-    };
-    match node.get("type")?.as_str()? {
-        "predicate_between" => {
-            let column = node.get("expression")?;
-            let (low, high) = (node.get("left")?, node.get("right")?);
-            timestamp_literal_floor(column, low, col_types)
-                .or_else(|| timestamp_literal_floor(column, high, col_types))?;
-            Some(serde_json::json!({"type": "predicate_and", "expressions": [
-                compare("predicate_greaterequal", column, low),
-                compare("predicate_lessequal", column, high),
-            ]}))
-        }
-        "predicate_in_constlist" => {
-            let column = node.get("expression")?;
-            let values = node.get("arguments")?.as_array()?;
-            values
-                .iter()
-                .find_map(|value| timestamp_literal_floor(column, value, col_types))?;
-            let expressions: Vec<Json> = values
-                .iter()
-                .map(|value| compare("predicate_equal", column, value))
-                .collect();
-            Some(serde_json::json!({"type": "predicate_or", "expressions": expressions}))
-        }
-        op => {
-            let (left, right) = (node.get("left")?, node.get("right")?);
-            let (column, floor, mirrored) = match timestamp_literal_floor(left, right, col_types) {
-                Some(floor) => (left, floor, false),
-                None => (
-                    right,
-                    timestamp_literal_floor(right, left, col_types)?,
-                    true,
-                ),
-            };
-            let op = match (op, mirrored) {
-                ("predicate_less", true) => "predicate_greater",
-                ("predicate_lessequal", true) => "predicate_greaterequal",
-                ("predicate_greater", true) => "predicate_less",
-                ("predicate_greaterequal", true) => "predicate_lessequal",
-                (op, _) => op,
-            };
-            // `col <> col` and `col = col` keep a NULL column NULL, so an enclosing NOT stays exact.
-            let (op, right) = match op {
-                "predicate_equal" => ("predicate_notequal", column.clone()),
-                "predicate_notequal" => ("predicate_equal", column.clone()),
-                "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
-                "predicate_greater" | "predicate_greaterequal" => ("predicate_greater", floor),
-                _ => return None,
-            };
-            Some(serde_json::json!({"type": op, "left": column, "right": right}))
-        }
-    }
-}
-
-/// `None` when the literal fits the column's declared precision.
-fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let is = |node: &Json, kind: &str| node.get("type").and_then(|t| t.as_str()) == Some(kind);
-    if !is(column, "column") || !is(literal, "literal_timestamp") {
-        return None;
-    }
-    let digits = usize::from(column_exa_type(column, col_types)?.fractional_digits()?);
-    let value = literal.get("value")?.as_str()?;
-    if timestamp_literal_digits(value) <= digits {
-        return None;
-    }
-    let (instant, fraction) = value.split_once('.')?;
-    let floor = match digits {
-        0 => instant.to_string(),
-        d => format!("{instant}.{}", &fraction[..d]),
-    };
-    Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
-}
-
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps
 /// it off the per-shard scan.
 fn contains_aggregate_node(node: &Json) -> bool {
@@ -678,15 +572,6 @@ impl ColumnTypeLookup for ColumnTypes {
     fn column_type(&self, column: &Json) -> Option<ExasolType> {
         column_exa_type(column, self)
     }
-}
-
-/// The adapter's own rewrites of a tree the scan computes: the timestamp-literal floor (#461) and
-/// the binary byte comparison. They need the column types, so they run here, once.
-fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
-    compare_binary_bytes(
-        rewrite_overprecise_timestamp_comparisons(expr, col_types),
-        col_types,
-    )
 }
 
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
@@ -728,7 +613,11 @@ impl<'a> ScanTranslator<'a> {
 
     /// `None` declines: the caller applies the expression in Exasol or declines the shape.
     pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
-        render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
+        render_scan_expression(
+            &compare_binary_bytes(expr.clone(), self.columns),
+            self.columns,
+        )
+        .ok()
     }
 
     /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
@@ -737,7 +626,10 @@ impl<'a> ScanTranslator<'a> {
         let Some(raw) = filter else {
             return (None, None);
         };
-        match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
+        match render_scan_filter(
+            &compare_binary_bytes(raw.clone(), self.columns),
+            self.columns,
+        ) {
             Ok(sql) => (Some(sql), None),
             Err(_) => (None, Some(raw)),
         }

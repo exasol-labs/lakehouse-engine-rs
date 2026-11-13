@@ -6,6 +6,7 @@ use lakehouse_catalog::ColumnSourceType;
 
 use super::exasol_type::{Decimal, ExasolType, MAX_VARCHAR_SIZE};
 use super::hive_type::parse_hive_type;
+use vs_expression::timestamp::TimestampUnit;
 
 /// Returns `VARCHAR(2000000)` for every incompatible Arrow type rather than erroring;
 /// the scan serializes those values to JSON strings, and binary values to lowercase hex.
@@ -84,54 +85,36 @@ pub(crate) fn iceberg_decimal(precision: u32, scale: u32) -> Option<Decimal> {
 
 const FIRST_CALENDAR_VERSIONED_MAJOR: u32 = 2025;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimestampPrecision {
-    Millisecond,
-    Microsecond,
-    Nanosecond,
+/// Whether `version` is an Exasol 8.x or older release. An unparseable version reads as a newer
+/// one, because an unrecognised version is more likely a future release than an old one.
+pub(crate) fn predates_calendar_versions(version: &str) -> bool {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < FIRST_CALENDAR_VERSIONED_MAJOR)
 }
 
-/// Significant fraction digits of an Exasol timestamp literal; trailing zeros add no precision.
-pub fn timestamp_literal_digits(literal: &str) -> usize {
-    literal
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.trim_end_matches('0').len())
+pub(crate) fn arrow_time_unit(unit: TimestampUnit) -> TimeUnit {
+    match unit {
+        TimestampUnit::Second => TimeUnit::Second,
+        TimestampUnit::Millisecond => TimeUnit::Millisecond,
+        TimestampUnit::Microsecond => TimeUnit::Microsecond,
+        TimestampUnit::Nanosecond => TimeUnit::Nanosecond,
+    }
 }
 
-impl TimestampPrecision {
-    pub fn declaration(self) -> ExasolType {
-        ExasolType::timestamp(match self {
-            Self::Millisecond => 3,
-            Self::Microsecond => 6,
-            Self::Nanosecond => 9,
-        })
-    }
+/// No emit path feeds Arrow's `Second` unit, so a timestamp held in seconds emits in milliseconds.
+pub(crate) fn emitted_unit(unit: TimestampUnit) -> TimestampUnit {
+    unit.max(TimestampUnit::Millisecond)
+}
 
-    pub fn arrow_unit(self) -> TimeUnit {
-        match self {
-            Self::Millisecond => TimeUnit::Millisecond,
-            Self::Microsecond => TimeUnit::Microsecond,
-            Self::Nanosecond => TimeUnit::Nanosecond,
-        }
-    }
-
-    /// `Second` floors at millisecond like [`Self::from_declared_digits`].
-    pub fn from_arrow_unit(unit: TimeUnit) -> Self {
-        match unit {
-            TimeUnit::Second | TimeUnit::Millisecond => Self::Millisecond,
-            TimeUnit::Microsecond => Self::Microsecond,
-            TimeUnit::Nanosecond => Self::Nanosecond,
-        }
-    }
-
-    /// Rounds up to the coarsest width holding every declared digit, floored at millisecond
-    /// because no emit path feeds Arrow's `Second` unit.
-    pub fn from_declared_digits(digits: u32) -> Self {
-        match digits {
-            0..=3 => Self::Millisecond,
-            4..=6 => Self::Microsecond,
-            _ => Self::Nanosecond,
-        }
+pub(crate) fn timestamp_unit(unit: TimeUnit) -> TimestampUnit {
+    match unit {
+        TimeUnit::Second => TimestampUnit::Second,
+        TimeUnit::Millisecond => TimestampUnit::Millisecond,
+        TimeUnit::Microsecond => TimestampUnit::Microsecond,
+        TimeUnit::Nanosecond => TimestampUnit::Nanosecond,
     }
 }
 
@@ -144,24 +127,21 @@ pub enum EngineTimestampSupport {
 }
 
 impl EngineTimestampSupport {
-    /// An unparseable version maps to `DeclaredPrecision`: misdeclaring on 8.x is harmless,
-    /// whereas truncating on an unrecognised newer engine would lose data.
     pub fn from_database_version(version: &str) -> Self {
-        match version
-            .split('.')
-            .next()
-            .and_then(|major| major.parse::<u32>().ok())
-        {
-            Some(major) if major < FIRST_CALENDAR_VERSIONED_MAJOR => Self::MillisecondOnly,
-            _ => Self::DeclaredPrecision,
+        if predates_calendar_versions(version) {
+            Self::MillisecondOnly
+        } else {
+            Self::DeclaredPrecision
         }
     }
 
-    pub fn clamp(self, source: TimestampPrecision) -> TimestampPrecision {
-        match self {
-            Self::MillisecondOnly => TimestampPrecision::Millisecond,
-            Self::DeclaredPrecision => source,
-        }
+    /// The TIMESTAMP declaration of a column the scan holds in `source`.
+    pub fn declaration(self, source: TimestampUnit) -> ExasolType {
+        let unit = match self {
+            Self::MillisecondOnly => TimestampUnit::Millisecond,
+            Self::DeclaredPrecision => emitted_unit(source),
+        };
+        ExasolType::timestamp(unit.digits())
     }
 }
 
@@ -181,8 +161,8 @@ pub fn iceberg_primitive_to_exasol(
         Time => ExasolType::WIDEST_VARCHAR,
         // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; timestamptz is
         // a UTC instant, so plain TIMESTAMP emits it unchanged.
-        Timestamp | Timestamptz => engine.clamp(TimestampPrecision::Microsecond).declaration(),
-        TimestampNs | TimestamptzNs => engine.clamp(TimestampPrecision::Nanosecond).declaration(),
+        Timestamp | Timestamptz => engine.declaration(TimestampUnit::Microsecond),
+        TimestampNs | TimestamptzNs => engine.declaration(TimestampUnit::Nanosecond),
         String | Binary => ExasolType::WIDEST_VARCHAR,
         Fixed(width) => hex_varchar(*width),
         Uuid => hex_varchar(UUID_BYTES),
@@ -337,9 +317,7 @@ pub(crate) fn column_source_type_to_exasol(
             engine,
         ),
         ColumnSourceType::Parquet(tag) => match arrow_type_from_tag(tag) {
-            DataType::Timestamp(unit, _) => engine
-                .clamp(TimestampPrecision::from_arrow_unit(unit))
-                .declaration(),
+            DataType::Timestamp(unit, _) => engine.declaration(timestamp_unit(unit)),
             other => arrow_to_exasol_type(&other),
         },
         ColumnSourceType::Glue { hive_type } => {
@@ -382,7 +360,7 @@ fn spark_primitive_to_exasol(
         SparkPrimitive::Date => ExasolType::Date,
         // The Delta protocol defines no nanosecond timestamp type.
         SparkPrimitive::Timestamp | SparkPrimitive::TimestampNtz => {
-            engine.clamp(TimestampPrecision::Microsecond).declaration()
+            engine.declaration(TimestampUnit::Microsecond)
         }
         SparkPrimitive::Decimal(decimal) => Decimal::new(decimal.precision(), decimal.scale())
             .map_or(ExasolType::WIDEST_VARCHAR, ExasolType::Decimal),

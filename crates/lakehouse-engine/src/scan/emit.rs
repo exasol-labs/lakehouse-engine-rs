@@ -4,7 +4,7 @@ use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
 use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
-use crate::types::mapping::TimestampPrecision;
+use crate::types::mapping::{arrow_time_unit, emitted_unit};
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
@@ -18,6 +18,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use futures::StreamExt;
 use std::sync::Arc;
+use vs_expression::timestamp::TimestampUnit;
 
 /// Each batch is emitted then dropped before the next fetch, never collected. Every column is
 /// coerced to the Arrow type its declared `ExaType` accepts: the physical Parquet type can
@@ -209,7 +210,7 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
         ExasolType::Date => DataType::Date32,
         ExasolType::Timestamp { precision }
         | ExasolType::TimestampWithLocalTimeZone { precision } => DataType::Timestamp(
-            TimestampPrecision::from_declared_digits(precision.into()).arrow_unit(),
+            arrow_time_unit(emitted_unit(TimestampUnit::holding(precision))),
             None,
         ),
         _ => DataType::Utf8,

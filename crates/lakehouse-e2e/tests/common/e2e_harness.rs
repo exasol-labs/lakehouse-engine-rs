@@ -867,14 +867,15 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
     if resp["status"] == "error" {
         let text = error_text(&resp, sql);
         // A CAST Exasol evaluates over the scanned rows fails in a UDF VM, which prefixes the
-        // same error message.
+        // same error message. A scan function that fails in the scan UDF adds its own prefix.
         let text = text.strip_prefix("VM error: ").unwrap_or(&text);
-        return Err(text
-            .split([';', '('])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string());
+        let text = text
+            .strip_prefix("F-UDF-CL-RUST-9001: UDF error: ")
+            .unwrap_or(text);
+        // Exasol 8 appends `: value <v> is not in [<range>]` to a numeric range error.
+        let class = text.split([';', '(']).next().unwrap_or_default();
+        let class = class.split(": value ").next().unwrap_or_default();
+        return Err(class.trim().to_string());
     }
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let types = result_set["columns"]
@@ -1085,6 +1086,75 @@ pub fn assert_holds_rows(conn: &mut ExaConn, table: &str, query: &str, expected:
         0,
         "{table} misses rows that {query} returns"
     );
+}
+
+/// The text every row of [`failing_source`] raises when the export reads it.
+pub const SOURCE_READ_ERROR: &str = "division by zero";
+
+/// A source over `table`'s `ID` whose every row raises [`SOURCE_READ_ERROR`] when read, so an
+/// error without that text proves the export failed before reading the source.
+pub fn failing_source(table: &str) -> String {
+    format!("(SELECT 1 / (ID - ID) AS X FROM {table})")
+}
+
+/// The export script and the CONNECTION an export statement goes through.
+#[derive(Clone, Copy)]
+pub struct ExportRoute {
+    pub script_schema: &'static str,
+    pub connection: &'static str,
+}
+
+impl ExportRoute {
+    pub fn export_into(self, source: &str, tail: &str) -> String {
+        format!(
+            "EXPORT {source} INTO SCRIPT {}.{EXPORT_SCRIPT_NAME} {tail}",
+            self.script_schema
+        )
+    }
+
+    /// A valid export of `source` into `table` with `options`. The test stacks serve plain
+    /// HTTP, so it sets `ALLOW_HTTP = 'true'`.
+    pub fn export(self, source: &str, table: &str, options: &str) -> String {
+        self.export_into(
+            source,
+            &format!(
+                "WITH CATALOG_CONNECTION = '{}' TABLE_NAME = '{table}' ALLOW_HTTP = 'true' {options}",
+                self.connection
+            ),
+        )
+    }
+}
+
+/// The `secrets` argument of an export whose error has no secret to hide.
+pub const NO_SECRETS: &[&str] = &[];
+
+/// The error text of the failing export `sql`, checked to carry none of `secrets`.
+#[track_caller]
+pub fn export_error(conn: &mut ExaConn, sql: &str, secrets: &[impl AsRef<str>]) -> String {
+    let error = query_error(conn, sql);
+    for secret in secrets.iter().map(AsRef::as_ref).filter(|s| !s.is_empty()) {
+        assert!(!error.contains(secret), "a secret leaked: {error}");
+    }
+    error
+}
+
+/// The error of the export `sql`, asserted to name every one of `fragments`, to carry none of
+/// `secrets`, and to come before the export read the source.
+#[track_caller]
+pub fn assert_refused_before_reading(
+    label: &str,
+    conn: &mut ExaConn,
+    sql: &str,
+    fragments: &[&str],
+    secrets: &[impl AsRef<str>],
+) -> String {
+    let error = export_error(conn, sql, secrets);
+    assert!(
+        fragments.iter().all(|fragment| error.contains(fragment))
+            && !error.contains(SOURCE_READ_ERROR),
+        "{label}: {sql} must fail before reading the source, naming {fragments:?}: {error}"
+    );
+    error
 }
 
 #[track_caller]
