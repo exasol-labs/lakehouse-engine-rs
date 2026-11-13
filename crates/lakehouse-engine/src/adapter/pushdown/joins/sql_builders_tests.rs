@@ -2587,8 +2587,19 @@ fn join_block_names_the_dimension_legs_alias() {
     );
 }
 
-fn aggregating_broadcast_sql(request: &Json) -> String {
-    let sides = customer_orders_sides(request);
+/// The broadcast plan of `request` over one CUSTOMER and one ORDERS file of the given sizes.
+fn aggregating_broadcast_plan(
+    request: &Json,
+    customer_bytes: u64,
+    orders_bytes: u64,
+) -> Option<String> {
+    let sides = request_typed(
+        request,
+        &[
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
+        ],
+    );
     let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
     build_broadcast_plan_sql(
         &parsed_pushdown(request),
@@ -2599,8 +2610,13 @@ fn aggregating_broadcast_sql(request: &Json) -> String {
         "SCAN",
         "DISTRIBUTE",
     )
-    .expect("the aggregating broadcast must build")
-    .expect("a renderable aggregating join must stay on the broadcast path")
+    .expect("a declined broadcast is not an error")
+}
+
+/// [`aggregating_broadcast_plan`] with CUSTOMER the smaller side.
+fn aggregating_broadcast_sql(request: &Json) -> String {
+    aggregating_broadcast_plan(request, 10, 100)
+        .expect("a renderable aggregating join must stay on the broadcast path")
 }
 
 #[test]
@@ -2676,27 +2692,14 @@ fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only
             .count_star()
             .group_by(vec![table_col("CUSTOMER", "C_NAME")]),
     );
-    let plan_with = |customer_bytes: u64, orders_bytes: u64| {
-        let sides = request_typed(
-            &request,
-            &[
-                resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
-                resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
-            ],
-        );
-        let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
-        build_broadcast_plan_sql(
-            &parsed_pushdown(&request),
-            &detected_join(&request),
-            &sides,
-            &broadcast,
-            &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
-        )
-        .expect("a declined broadcast is not an error")
-    };
 
-    assert_eq!(plan_with(10, 100), None, "CUSTOMER is the dimension");
-    assert!(plan_with(100, 10).is_some(), "CUSTOMER is the fact side");
+    assert_eq!(
+        aggregating_broadcast_plan(&request, 10, 100),
+        None,
+        "CUSTOMER is the dimension"
+    );
+    assert!(
+        aggregating_broadcast_plan(&request, 100, 10).is_some(),
+        "CUSTOMER is the fact side"
+    );
 }

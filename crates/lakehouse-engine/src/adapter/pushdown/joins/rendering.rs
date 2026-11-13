@@ -262,14 +262,14 @@ pub(super) fn join_key_columns(
 /// Whether broadcasting `read`, leg `leg`'s columns that the aggregation reads, keeps each
 /// joined row narrow. The fan-out repeats them once per joined row, while the N-scan sends each
 /// of the leg's rows once. Every text column has the same declared length, so only a top-level
-/// WHERE that limits it to literals bounds its width.
+/// WHERE `filter` that limits it to literals bounds its width.
 pub(super) fn broadcast_width_bounded(
-    pushdown_req: &Json,
+    filter: Option<&Json>,
     legs: &JoinLegs,
     leg: usize,
     read: &ColumnTypes,
 ) -> bool {
-    let bounded_text = literal_bounded_columns(pushdown_req, legs, leg);
+    let bounded_text = literal_bounded_columns(filter, legs, leg);
     read.iter().all(|(column, column_type)| {
         matches!(
             column_type.exa_type,
@@ -285,7 +285,7 @@ pub(super) fn broadcast_width_bounded(
 /// Leg `leg`'s columns that a top-level WHERE conjunct `col = 'x'` or `col IN ('x', 'y')`
 /// limits to string literals.
 fn literal_bounded_columns(
-    pushdown_req: &Json,
+    filter: Option<&Json>,
     legs: &JoinLegs,
     leg: usize,
 ) -> std::collections::HashSet<String> {
@@ -297,7 +297,7 @@ fn literal_bounded_columns(
             .map(|column| column.ascii_upper_name())
     };
     let mut conjuncts = Vec::new();
-    if let Some(filter) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+    if let Some(filter) = filter {
         flatten_conjuncts(filter, &mut conjuncts);
     }
     conjuncts

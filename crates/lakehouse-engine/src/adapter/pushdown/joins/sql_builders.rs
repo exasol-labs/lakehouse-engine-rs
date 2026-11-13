@@ -646,7 +646,8 @@ fn aggregation_input_request(
         .enumerate()
         .map(|(leg, side)| aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types))
         .collect();
-    if !broadcast_width_bounded(pushdown_req, &legs, dimension_leg, &read[dimension_leg]) {
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    if !broadcast_width_bounded(filter, &legs, dimension_leg, &read[dimension_leg]) {
         return Ok(None);
     }
     if read.iter().all(ColumnTypes::is_empty) {
