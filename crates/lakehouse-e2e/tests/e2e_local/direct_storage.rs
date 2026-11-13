@@ -2880,6 +2880,19 @@ fn aggregation_that_reads_no_column_skips_a_refused_first_column() {
         assert_single_table_wrapper(&mut conn, &sql);
         assert_eq!(conn.query_scalar_i64(&sql), 1, "{sql}");
     }
+    // Exasol keeps a COUNT(*) it cannot push down and sends an empty select list.
+    for sql in [
+        format!("SELECT COUNT(*) FROM {fact} WHERE RANDOM() >= 0"),
+        format!("SELECT COUNT(*) FROM {fact} WHERE EXISTS (SELECT 1 FROM DUAL)"),
+        format!("SELECT COUNT(*) FROM {fact}, DUAL"),
+    ] {
+        let pushed = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed.contains(SCAN_SCRIPT_NAME) && !pushed.contains("COUNT("),
+            "{sql} must scan rows for Exasol to count: {pushed}"
+        );
+        assert_eq!(conn.query_scalar_i64(&sql), 4, "{sql}");
+    }
 }
 
 fn dimension_batch(id: i64) -> RecordBatch {

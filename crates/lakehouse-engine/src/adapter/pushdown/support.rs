@@ -659,7 +659,8 @@ pub(super) fn project_columns(
     let select_list = pushdown.json().get("selectList");
     let projection = match select_list {
         None | Some(Json::Null) => full_row(),
-        Some(Json::Array(list)) if list.is_empty() => full_row().into_iter().take(1).collect(),
+        // Exasol sends `[]` when it keeps an aggregate itself, so any one readable column will do.
+        Some(Json::Array(list)) if list.is_empty() => all_cols.first_readable().projection(),
         Some(Json::Array(list)) => {
             let mut projected = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
