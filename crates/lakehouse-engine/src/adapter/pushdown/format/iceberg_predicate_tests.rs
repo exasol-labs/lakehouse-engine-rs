@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
     nullable_field, num_lit, or, predicate_equal, str_lit, timestamp_lit,
@@ -7,6 +8,11 @@ use iceberg::expr::Bind;
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
 use std::sync::Arc;
+
+/// `literal` converted as the parse converts it for a column of `primitive`, then made a datum.
+fn literal_to_datum(literal: &Json, primitive: &PrimitiveType) -> Option<Datum> {
+    datum(&exact_literal(literal, &arrow_type(primitive)?)?, primitive)
+}
 
 fn test_schema() -> Schema {
     Schema::builder()
@@ -369,6 +375,18 @@ fn between_with_one_failing_bound_keeps_other() {
     let pred = translate(&node).expect("BETWEEN with one valid bound must return Some");
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
+}
+
+/// Exasol compares a string column with a BETWEEN of mixed kinds as a number, so the string
+/// bound's string order could prune a matching row.
+#[test]
+fn a_string_between_with_a_bound_of_another_kind_constrains_nothing() {
+    for node in [
+        between(col("NAME"), str_lit("a"), num_lit(5)),
+        between(col("NAME"), num_lit(5), str_lit("z")),
+    ] {
+        assert_eq!(translate(&node), None, "{node}");
+    }
 }
 
 fn amount_below(v: i64) -> Json {

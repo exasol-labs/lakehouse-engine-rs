@@ -1,10 +1,16 @@
 use super::*;
+use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
     and, between, binary_lit, bool_lit, by_name, col, compare, date_lit, in_list, is_not_null,
     is_null, like, not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
+
+/// `literal` converted as the parse converts it for a column of `primitive`, then made a scalar.
+fn literal_to_scalar(literal: &Json, primitive: &PrimitiveType) -> Option<Scalar> {
+    scalar(&exact_literal(literal, &arrow_type(primitive)?)?)
+}
 
 fn test_schema() -> StructType {
     StructType::try_new([StructField::not_null(

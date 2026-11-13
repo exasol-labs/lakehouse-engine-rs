@@ -30,7 +30,7 @@ mod iceberg_predicate;
 mod literal;
 mod parquet_directory_table;
 mod partition_predicate;
-mod pruning_translation;
+mod pruning_filter;
 mod unity_table_storage;
 
 pub(super) use catalog_parquet_table::CatalogParquetTable;

@@ -10,56 +10,49 @@ use serde_json::Value as Json;
 use crate::scan::spec::LogicalField;
 
 use super::filter_json::Comparison;
-use super::literal::{UTC, exact_literal};
-use super::pruning_translation::{PruningTarget, translate};
+use super::literal::UTC;
+use super::pruning_filter::{PruningFilter, StatisticsTarget};
 
-/// Resolves a filter column through its declared field id to the field the scanned schema carries
-/// under that id: bounds are stored by field id, so a rename must not prune by another's bounds.
-struct IcebergTarget<'a> {
-    declared: &'a [LogicalField],
-    scanned: &'a Schema,
-}
+/// Builds Iceberg predicates over the scanned schema's field names.
+struct IcebergTarget;
 
-impl<'a> PruningTarget for IcebergTarget<'a> {
+impl StatisticsTarget for IcebergTarget {
+    /// A field of the scanned schema, with its type.
+    type Column = (Reference, PrimitiveType);
     type Predicate = Predicate;
-    type Column = (&'a str, &'a PrimitiveType);
-    type Literal = Datum;
 
-    fn resolve(&self, column: &str) -> Option<Self::Column> {
-        let column = column.to_uppercase();
-        let is_column = |field: &&LogicalField| field.name.to_uppercase() == column;
-        let field_id = self.declared.iter().find(is_column)?.field_id?;
-        let name = self.scanned.name_by_field_id(field_id)?;
-        let field = self.scanned.field_by_id(field_id)?;
-        Some((name, field.field_type.as_primitive_type()?))
-    }
-
-    fn literal(&self, (_, primitive): Self::Column, literal: &Json) -> Option<Datum> {
-        literal_to_datum(literal, primitive)
-    }
-
-    fn is_string(&self, (_, primitive): Self::Column) -> bool {
-        *primitive == PrimitiveType::String
-    }
-
-    fn string(&self, value: String) -> Datum {
-        Datum::string(value)
-    }
-
-    fn compare(&self, (name, _): Self::Column, comparison: Comparison, datum: Datum) -> Predicate {
-        let reference = Reference::new(name);
-        match comparison {
+    fn compare(
+        &self,
+        (reference, primitive): &Self::Column,
+        comparison: Comparison,
+        literal: &ScalarValue,
+    ) -> Option<Predicate> {
+        let reference = reference.clone();
+        let datum = datum(literal, primitive)?;
+        Some(match comparison {
             Comparison::Equal => reference.equal_to(datum),
             Comparison::NotEqual => reference.not_equal_to(datum),
             Comparison::Less => reference.less_than(datum),
             Comparison::LessEqual => reference.less_than_or_equal_to(datum),
             Comparison::Greater => reference.greater_than(datum),
             Comparison::GreaterEqual => reference.greater_than_or_equal_to(datum),
-        }
+        })
     }
 
-    fn null_test(&self, (name, _): Self::Column, is_null: bool) -> Predicate {
-        let reference = Reference::new(name);
+    fn in_list(
+        &self,
+        (reference, primitive): &Self::Column,
+        literals: &[ScalarValue],
+    ) -> Option<Predicate> {
+        let datums = literals
+            .iter()
+            .map(|literal| datum(literal, primitive))
+            .collect::<Option<Vec<_>>>()?;
+        Some(reference.clone().is_in(datums))
+    }
+
+    fn null_test(&self, (reference, _): &Self::Column, is_null: bool) -> Predicate {
+        let reference = reference.clone();
         if is_null {
             reference.is_null()
         } else {
@@ -67,12 +60,8 @@ impl<'a> PruningTarget for IcebergTarget<'a> {
         }
     }
 
-    fn in_list(&self, (name, _): Self::Column, datums: Vec<Datum>) -> Predicate {
-        Reference::new(name).is_in(datums)
-    }
-
-    fn starts_with(&self, (name, _): Self::Column, prefix: String) -> Predicate {
-        Reference::new(name).starts_with(Datum::string(prefix))
+    fn starts_with(&self, (reference, _): &Self::Column, prefix: String) -> Predicate {
+        reference.clone().starts_with(Datum::string(prefix))
     }
 
     fn and(predicates: Vec<Predicate>) -> Predicate {
@@ -119,8 +108,8 @@ fn arrow_type(primitive: &PrimitiveType) -> Option<DataType> {
     })
 }
 
-fn literal_to_datum(literal: &Json, primitive: &PrimitiveType) -> Option<Datum> {
-    Some(match exact_literal(literal, &arrow_type(primitive)?)? {
+fn datum(literal: &ScalarValue, primitive: &PrimitiveType) -> Option<Datum> {
+    Some(match literal.clone() {
         ScalarValue::Boolean(Some(value)) => Datum::bool(value),
         ScalarValue::Int32(Some(value)) => Datum::int(value),
         ScalarValue::Int64(Some(value)) => Datum::long(value),
@@ -151,8 +140,23 @@ pub(super) fn to_iceberg_predicate(
     declared: &[LogicalField],
     scanned: &Schema,
 ) -> Option<Predicate> {
-    let target = IcebergTarget { declared, scanned };
-    translate(filter_json, &target).map(|translated| translated.predicate)
+    // Bounds are stored by field id, so a filter column resolves through its declared field id
+    // to the scanned field under that id: a rename must not prune by another field's bounds.
+    let resolve = |column: &str| {
+        let column = column.to_uppercase();
+        let is_column = |field: &&LogicalField| field.name.to_uppercase() == column;
+        let field_id = declared.iter().find(is_column)?.field_id?;
+        let name = scanned.name_by_field_id(field_id)?;
+        let primitive = scanned
+            .field_by_id(field_id)?
+            .field_type
+            .as_primitive_type()?;
+        let column = (Reference::new(name), primitive.clone());
+        Some((column, arrow_type(primitive)))
+    };
+    PruningFilter::parse(filter_json, &resolve)
+        .to_statistics(&IcebergTarget)
+        .map(|translated| translated.predicate)
 }
 
 #[cfg(test)]

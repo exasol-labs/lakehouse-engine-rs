@@ -471,6 +471,53 @@ fn partition_values_compare_under_their_declared_type() {
     );
 }
 
+/// SQL compares -0.0 equal to 0.0, while `ScalarValue` orders it below.
+#[test]
+fn a_negative_zero_float_partition_value_compares_equal_to_zero() {
+    let declared = [
+        ("pf".to_string(), DataType::Float32),
+        ("pd".to_string(), DataType::Float64),
+    ];
+    for key in ["pf", "pd"] {
+        let column = || sales_col(&key.to_uppercase());
+        let files = two_files(key, "-0.0", "0.5");
+        let cases = [
+            (
+                "= 0",
+                predicate_equal(column(), num_lit("0")),
+                [true, false],
+            ),
+            (
+                ">= 0",
+                compare("predicate_greaterequal", column(), num_lit("0")),
+                [true, true],
+            ),
+            (
+                "< 0",
+                compare("predicate_less", column(), num_lit("0")),
+                [false, false],
+            ),
+            (
+                "IN (0, 3)",
+                in_list(column(), [num_lit("0"), num_lit("3")]),
+                [true, false],
+            ),
+            (
+                "BETWEEN 0 AND 0.25",
+                between(column(), num_lit("0"), num_lit("0.25")),
+                [true, false],
+            ),
+        ];
+        for (label, filter, expected) in cases {
+            assert_eq!(
+                kept_under(&filter, &declared, &files),
+                expected,
+                "{key} {label}: kept per file [-0.0, 0.5]"
+            );
+        }
+    }
+}
+
 /// Scenario: A comparison the declared type cannot decide exactly keeps the file
 #[test]
 fn an_undecidable_comparison_keeps_the_file() {

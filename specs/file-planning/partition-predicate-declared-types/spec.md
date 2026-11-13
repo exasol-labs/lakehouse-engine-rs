@@ -13,7 +13,7 @@ Prunes the files or partitions of a Parquet table from a pushed filter by compar
 
 * *GIVEN* partition columns `year` (int32), `day` (date32), `amount` (decimal128(10,2)), `ts` (timestamp, microseconds), and `region` (utf8), and files whose `year` values are `9` and `10`
 * *WHEN* the predicate evaluates `year < 10`, `day = DATE '2024-03-01'`, `amount >= 1.50`, `ts < TIMESTAMP '2024-03-01 00:00:00'`, and `region = 'eu'`
-* *THEN* the predicate SHALL convert the partition value and the literal to the column's declared type and SHALL compare them in that type's order
+* *THEN* the predicate SHALL convert the partition value and the literal to the column's declared type and SHALL compare them in that type's order, a float or double by numeric value, so a `-0.0` partition value equals `0`
 * *AND* `year < 10` SHALL keep the `9` file and prune the `10` file, which a string comparison would get wrong
 * *AND* the literal set SHALL widen with the declared type: an integer or decimal column compares against an exact-numeric literal, a float or double column against a numeric literal it holds exactly, a date column against a date literal, a timestamp column against a timestamp literal, and a boolean column against a boolean literal
 * *AND* a utf8 column SHALL compare in codepoint order against a non-empty string literal only, per `direct-storage/direct-storage-hive-partitioning`

@@ -95,8 +95,9 @@ const PRUNING_PARQUET_BASE: &str = "s3://warehouse/parquet_pruning/";
 const TYPED_PARTITIONS_TABLE: &str = "typed_partitions";
 const TYPED_PARTITIONS_LOCATION: &str = "s3://warehouse/parquet_pruning/typed_partitions";
 /// Each file's label, `id` values, and Hive path. The partition columns are `pi` integer, `pdt`
-/// date, `pts` timestamp, `pf` float, `pd` double, and `pb` boolean.
-const TYPED_PARTITION_FILES: [(&str, &[i64], &str); 3] = [
+/// date, `pts` timestamp, `pf` float, `pd` double, and `pb` boolean. `t4` logs its float and
+/// double as `-0.0`, which compares equal to `0`.
+const TYPED_PARTITION_FILES: [(&str, &[i64], &str); 4] = [
     (
         "t1",
         &[1, 2],
@@ -113,6 +114,11 @@ const TYPED_PARTITION_FILES: [(&str, &[i64], &str); 3] = [
         "pi=__HIVE_DEFAULT_PARTITION__/pdt=__HIVE_DEFAULT_PARTITION__/\
          pts=__HIVE_DEFAULT_PARTITION__/pf=__HIVE_DEFAULT_PARTITION__/\
          pd=__HIVE_DEFAULT_PARTITION__/pb=__HIVE_DEFAULT_PARTITION__",
+    ),
+    (
+        "t4",
+        &[7],
+        "pi=11/pdt=2024-02-29/pts=2024-02-29 00:00:00/pf=-0.0/pd=-0.0/pb=true",
     ),
 ];
 /// Its own schema, so `VS_NAME` never enumerates the pruning table.
@@ -2803,8 +2809,8 @@ fn unity_parquet_partitions_compare_under_every_declared_type() {
     setup();
     let mut conn = exa_conn();
     let table = format!("{VS_UNITY}.{}", TYPED_PARTITIONS_TABLE.to_uppercase());
-    let every_file: &[&str] = &["t1", "t2", "t3"];
-    let cases: [(&str, &[&str], &[i64]); 9] = [
+    let every_file: &[&str] = &["t1", "t2", "t3", "t4"];
+    let cases: [(&str, &[&str], &[i64]); 14] = [
         // A string comparison would keep `pi=10`, since "10" < "9".
         ("PI < 10", &["t1"], &[1, 2]),
         ("PDT = DATE '2024-03-02'", &["t2"], &[3, 4, 5]),
@@ -2816,6 +2822,12 @@ fn unity_parquet_partitions_compare_under_every_declared_type() {
         // 1.4 has no exact 32-bit float, and 9.5 no exact integer.
         ("PF > 1.4", every_file, &[3, 4, 5]),
         ("PI = 9.5", every_file, &[]),
+        // A total float order would rank `-0.0` below `0` and prune `t4`.
+        ("PD = 0", &["t4"], &[7]),
+        ("PF = 0", &["t4"], &[7]),
+        ("PD >= 0", &["t1", "t2", "t4"], &[1, 2, 3, 4, 5, 7]),
+        ("PD IN (0, 3)", &["t4"], &[7]),
+        ("PD BETWEEN 0 AND 0.05", &["t4"], &[7]),
     ];
     for (predicate, files, ids) in cases {
         let sql = format!("SELECT ID FROM {table} WHERE {predicate} ORDER BY ID");

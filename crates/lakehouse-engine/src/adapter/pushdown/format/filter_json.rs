@@ -2,7 +2,7 @@ use serde_json::Value as Json;
 use std::cmp::Ordering;
 use vs_expression::ColumnNode;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(in crate::adapter::pushdown) enum Comparison {
     Equal,
     NotEqual,
