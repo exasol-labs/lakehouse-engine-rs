@@ -2607,14 +2607,14 @@ fn aggregating_broadcast_sql(request: &Json) -> String {
 fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
     let request = built_join(
         customer_orders_request(Json::Null, equi_condition())
-            .column(table_col("CUSTOMER", "C_NAME"))
+            .column(table_col("CUSTOMER", "C_CUSTKEY"))
             .item(
                 agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
                 ExasolType::Date,
             )
-            .group_by(vec![table_col("CUSTOMER", "C_NAME")])
+            .group_by(vec![table_col("CUSTOMER", "C_CUSTKEY")])
             .order_by(serde_json::json!([order_by_element(
-                table_col("CUSTOMER", "C_NAME"),
+                table_col("CUSTOMER", "C_CUSTKEY"),
                 false,
                 true
             )]))
@@ -2625,13 +2625,13 @@ fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
 
     assert!(
         sql.starts_with(
-            r#"SELECT "LHS_T0_C_NAME", CAST(MIN("LHS_T1_O_ORDERDATE") AS DATE) FROM (SELECT SCAN("#
+            r#"SELECT "LHS_T0_C_CUSTKEY", CAST(MIN("LHS_T1_O_ORDERDATE") AS DATE) FROM (SELECT SCAN("#
         ),
         "{sql}"
     );
     assert!(
         sql.ends_with(
-            r#") GROUP BY "LHS_T0_C_NAME" ORDER BY "LHS_T0_C_NAME" DESC NULLS LAST LIMIT 1"#
+            r#") GROUP BY "LHS_T0_C_CUSTKEY" ORDER BY "LHS_T0_C_CUSTKEY" DESC NULLS LAST LIMIT 1"#
         ),
         "{sql}"
     );
@@ -2664,4 +2664,39 @@ fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
         assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
         assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
     }
+}
+
+/// The fan-out repeats a dimension column once per joined row, so only an unbounded text column
+/// of the dimension, never of the fact side, keeps the N-scan.
+#[test]
+fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .count_star()
+            .group_by(vec![table_col("CUSTOMER", "C_NAME")]),
+    );
+    let plan_with = |customer_bytes: u64, orders_bytes: u64| {
+        let sides = request_typed(
+            &request,
+            &[
+                resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
+                resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
+            ],
+        );
+        let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
+        build_broadcast_plan_sql(
+            &parsed_pushdown(&request),
+            &detected_join(&request),
+            &sides,
+            &broadcast,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        )
+        .expect("a declined broadcast is not an error")
+    };
+
+    assert_eq!(plan_with(10, 100), None, "CUSTOMER is the dimension");
+    assert!(plan_with(100, 10).is_some(), "CUSTOMER is the fact side");
 }

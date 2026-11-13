@@ -21,9 +21,10 @@ use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
-    LegColumns, aggregated_leg_columns, conjoin_filters, cross_leg_residual_filter,
-    join_key_columns, leg_local_filter, projection_item_select_sql, referenced_clause_values,
-    referenced_leg_columns, render_expression_qualified, screen_leg_filter, select_item_type,
+    LegColumns, aggregated_leg_columns, broadcast_width_bounded, conjoin_filters,
+    cross_leg_residual_filter, join_key_columns, leg_local_filter, projection_item_select_sql,
+    referenced_clause_values, referenced_leg_columns, render_expression_qualified,
+    screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -584,7 +585,8 @@ pub(in super::super) fn build_broadcast_join_sql(
 /// The broadcast plan of an eligible two-leg join. An aggregating request broadcasts the plain
 /// columns its aggregation reads, and one outer Exasol SELECT aggregates, sorts, and applies the
 /// LIMIT over them, so no shard aggregates, sorts, or truncates. `None` falls through to the
-/// N-scan wrapper, as [`render_broadcast_join`] and [`build_broadcast_join_sql`] decide.
+/// N-scan wrapper, as [`aggregation_input_request`], [`render_broadcast_join`], and
+/// [`build_broadcast_join_sql`] decide.
 pub(in super::super) fn build_broadcast_plan_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
@@ -595,7 +597,12 @@ pub(in super::super) fn build_broadcast_plan_sql(
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
     let aggregation_input = match aggregation_type(pushdown.json()) {
-        Some(_) => Some(aggregation_input_request(pushdown, join, sides)?),
+        Some(_) => {
+            match aggregation_input_request(pushdown, join, sides, broadcast.dimension_leg)? {
+                Some(request) => Some(request),
+                None => return Ok(None),
+            }
+        }
         None => None,
     };
     let fan_out_request = aggregation_input.as_ref().unwrap_or(pushdown);
@@ -624,12 +631,14 @@ pub(in super::super) fn build_broadcast_plan_sql(
 /// and declaration order. A request without a select list returns the full row, which is valid
 /// only when every column is a GROUP BY key, so the keys already read it. When the aggregation
 /// reads no column, a join key of leg 0 keeps one row per joined pair: the scan reads it for the
-/// condition anyway, while the first declared column may be one the reader refuses.
+/// condition anyway, while the first declared column may be one the reader refuses. `None` when
+/// the dimension's read columns are not [`broadcast_width_bounded`], so the N-scan serves it.
 fn aggregation_input_request(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-) -> Result<PushdownRequest, UdfError> {
+    dimension_leg: usize,
+) -> Result<Option<PushdownRequest>, UdfError> {
     let pushdown_req = pushdown.json();
     let legs = join.legs();
     let mut read: Vec<ColumnTypes> = sides
@@ -637,6 +646,9 @@ fn aggregation_input_request(
         .enumerate()
         .map(|(leg, side)| aggregated_leg_columns(pushdown_req, &legs, leg, &side.column_types))
         .collect();
+    if !broadcast_width_bounded(pushdown_req, &legs, dimension_leg, &read[dimension_leg]) {
+        return Ok(None);
+    }
     if read.iter().all(ColumnTypes::is_empty) {
         read[0] = join_key_columns(&join.conditions, &legs, 0, &sides[0].column_types).first_only();
     }
@@ -662,7 +674,7 @@ fn aggregation_input_request(
     if let Some(filter) = pushdown_req.get("filter") {
         json["filter"] = filter.clone();
     }
-    PushdownRequest::parse(json)
+    PushdownRequest::parse(json).map(Some)
 }
 
 fn join_group_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {

@@ -259,6 +259,72 @@ pub(super) fn join_key_columns(
     full_cols.narrowed(|column| names.contains(&column.name))
 }
 
+/// Whether broadcasting `read`, leg `leg`'s columns that the aggregation reads, keeps each
+/// joined row narrow. The fan-out repeats them once per joined row, while the N-scan sends each
+/// of the leg's rows once. Every text column has the same declared length, so only a top-level
+/// WHERE that limits it to literals bounds its width.
+pub(super) fn broadcast_width_bounded(
+    pushdown_req: &Json,
+    legs: &JoinLegs,
+    leg: usize,
+    read: &ColumnTypes,
+) -> bool {
+    let bounded_text = literal_bounded_columns(pushdown_req, legs, leg);
+    read.iter().all(|(column, column_type)| {
+        matches!(
+            column_type.exa_type,
+            ExasolType::Boolean
+                | ExasolType::Decimal(_)
+                | ExasolType::DoublePrecision
+                | ExasolType::Date
+                | ExasolType::Timestamp { .. }
+        ) || (column_type.exa_type.is_character() && bounded_text.contains(&column.name))
+    })
+}
+
+/// Leg `leg`'s columns that a top-level WHERE conjunct `col = 'x'` or `col IN ('x', 'y')`
+/// limits to string literals.
+fn literal_bounded_columns(
+    pushdown_req: &Json,
+    legs: &JoinLegs,
+    leg: usize,
+) -> std::collections::HashSet<String> {
+    let is_literal =
+        |node: &Json| node.get("type").and_then(|t| t.as_str()) == Some("literal_string");
+    let leg_column = |node: &Json| {
+        ColumnNode::parse(node)
+            .filter(|column| legs.leg(*column) == leg)
+            .map(|column| column.ascii_upper_name())
+    };
+    let mut conjuncts = Vec::new();
+    if let Some(filter) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+        flatten_conjuncts(filter, &mut conjuncts);
+    }
+    conjuncts
+        .into_iter()
+        .filter_map(|conjunct| match conjunct.get("type")?.as_str()? {
+            "predicate_equal" => {
+                let (left, right) = (conjunct.get("left")?, conjunct.get("right")?);
+                if is_literal(right) {
+                    leg_column(left)
+                } else if is_literal(left) {
+                    leg_column(right)
+                } else {
+                    None
+                }
+            }
+            "predicate_in_constlist" => {
+                let values = conjunct.get("arguments")?.as_array()?;
+                if values.is_empty() || !values.iter().all(is_literal) {
+                    return None;
+                }
+                leg_column(conjunct.get("expression")?)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Drops columns the N-scan wrapper never references so each leg ships narrow rows. Kept:
 /// this leg's columns in SELECT, the join condition, the full WHERE (the wrapper renders
 /// all of it), GROUP BY, HAVING, and ORDER BY. An empty select list (`SELECT *`) or an empty

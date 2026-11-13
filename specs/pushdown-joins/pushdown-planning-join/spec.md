@@ -4,7 +4,8 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 ## Background
 
-* The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, and a condition, filter, and projection that `crates/vs-expression` can render. Any deviation takes the fallback.
+* The broadcast contract: exactly two join legs, `join_type = "inner"`, an equi-join condition, and a condition, filter, and projection that `crates/vs-expression` can render. A request that requires Exasol postprocessing also needs every dimension column its aggregation reads to be width-bounded. Any deviation takes the fallback.
+* A width-bounded column has a fixed-width type (`DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`), or is a text column that a top-level WHERE conjunct limits to string literals (`col = 'x'` or `col IN ('x', 'y')`). Every text column the adapter declares has the same declared length, so the type alone cannot tell a short code from a long description.
 * Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it.
 * The dimension side rides in the shard-invariant common spec. Only the fact side's per-shard file subset flows through the `LAKEHOUSE_DISTRIBUTE_FILES` distributor.
 * A join leg is one occurrence of a table in the FROM tree. `pushdown-joins/pushdown-planning-join-fallback-self-join` owns the one binding that resolves a `column` node to its leg.
@@ -36,9 +37,20 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 ### Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 
 * *GIVEN* a `pushdown` request that meets the broadcast contract and requires Exasol postprocessing
+* *AND* every dimension column that its select list, `GROUP BY`, `HAVING`, and `ORDER BY` read is width-bounded
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, and one join-key column of the first leg when they read none
 * *AND* one outer Exasol `SELECT` SHALL render the select list, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` over the fan-out's `<alias>_<column>` output names, so no shard aggregates, sorts, or truncates
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query
+
+### Scenario: An aggregating join that reads an unbounded text column of the small side keeps the N-scan
+
+* *GIVEN* a two-leg inner equi-join `pushdown` request that requires Exasol postprocessing, whose smaller side is at or below the broadcast threshold
+* *AND* its select list, `GROUP BY`, `HAVING`, or `ORDER BY` reads a dimension column that is not width-bounded, such as `GROUP BY d.DESCRIPTION` or `MAX(d.DESCRIPTION)` with no literal condition on it
+* *WHEN* the adapter plans the request, after the size check
+* *THEN* the adapter SHALL route the request to the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`), because the broadcast fan-out repeats that column once per joined row while the fallback sends each dimension row once
+* *AND* a column the request wraps in an expression, such as `SUBSTR(d.DESCRIPTION, 1, 3)`, SHALL count as read, because the fan-out emits only plain columns
+* *AND* a fact column of any type SHALL NOT keep the fallback, because both plans send each fact row once
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
 ### Scenario: A bare LIMIT over a broadcast-eligible join is served by the broadcast path with a per-shard post-join cap

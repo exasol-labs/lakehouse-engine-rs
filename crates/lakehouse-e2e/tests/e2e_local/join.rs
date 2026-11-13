@@ -479,58 +479,66 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
     let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
     let self_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
     let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    // A literal list bounds the text column's width, so the join stays broadcast.
+    let named = "c.C_NAME IN ('customer-01', 'customer-02', 'customer-03')";
     let having_only = format!(
         "SELECT c.C_NAME FROM {orders} WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
-         GROUP BY c.C_NAME HAVING SUM(o.O_TOTALPRICE) > 100"
+         AND {named} GROUP BY c.C_NAME HAVING SUM(o.O_TOTALPRICE) > 100"
     );
     let broadcast = [
-        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
         format!(
-            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
-             '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_NAME HAVING COUNT(*) > 1 \
-             ORDER BY COUNT(*) DESC, c.C_NAME LIMIT 2"
+            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} WHERE {named} GROUP BY c.C_NAME"
+        ),
+        format!(
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
+             '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_CUSTKEY HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, c.C_CUSTKEY LIMIT 2"
         ),
         format!(
             "SELECT c.C_NAME, o.O_ORDERDATE, MAX(c.C_CUSTKEY), MIN(o.O_TOTALPRICE) \
-             FROM {orders} GROUP BY c.C_NAME, o.O_ORDERDATE"
+             FROM {orders} WHERE c.C_NAME = 'customer-02' GROUP BY c.C_NAME, o.O_ORDERDATE"
         ),
         format!(
-            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE * c.C_CUSTKEY) FROM {orders} GROUP BY c.C_NAME"
+            "SELECT c.C_CUSTKEY, SUM(o.O_TOTALPRICE * c.C_CUSTKEY) FROM {orders} \
+             GROUP BY c.C_CUSTKEY"
         ),
         format!(
-            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME \
-             ORDER BY SUM(o.O_TOTALPRICE) DESC, c.C_NAME LIMIT 1"
+            "SELECT c.C_CUSTKEY, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_CUSTKEY \
+             ORDER BY SUM(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 1"
         ),
         format!("SELECT COUNT(*), SUM(o.O_TOTALPRICE) FROM {orders}"),
         format!(
-            "SELECT COUNT(*), MAX(c.C_NAME) FROM {orders} WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0"
+            "SELECT COUNT(*), MAX(c.C_NAME) FROM {orders} \
+             WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0 AND {named}"
         ),
-        format!("SELECT COUNT(DISTINCT c.C_NAME) FROM {orders}"),
+        format!("SELECT COUNT(DISTINCT c.C_CUSTKEY) FROM {orders}"),
         format!("SELECT COUNT(*) FROM (SELECT SUM(o.O_TOTALPRICE) FROM {orders})"),
         format!(
             "SELECT a.O_CUSTKEY, COUNT(*), SUM(b.O_TOTALPRICE) FROM {self_join} GROUP BY a.O_CUSTKEY"
         ),
-        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
+        format!(
+            "SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} \
+             WHERE l.SCORE IN ('score-01', 'score-07') GROUP BY l.SCORE"
+        ),
         format!("SELECT e.ID, MIN(l.ID) FROM {events_labels} GROUP BY e.ID HAVING MIN(l.ID) > 3"),
-        format!("SELECT COUNT(*) FROM {orders} GROUP BY c.C_NAME"),
+        format!("SELECT COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY"),
         having_only.clone(),
         format!(
-            "SELECT c.C_NAME, COUNT(*) FROM {orders} GROUP BY c.C_NAME \
-             ORDER BY MAX(o.O_TOTALPRICE) DESC, c.C_NAME LIMIT 2"
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY \
+             ORDER BY MAX(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 2"
         ),
-        format!("SELECT DISTINCT * FROM {orders}"),
+        format!("SELECT DISTINCT * FROM {orders} WHERE {named}"),
     ];
     let n_scan = [
         format!(
             "SELECT c.C_NAME, COUNT(*) FROM {orders} AND o.O_ORDERKEY > c.C_CUSTKEY \
-             GROUP BY c.C_NAME"
+             WHERE {named} GROUP BY c.C_NAME"
         ),
         format!(
             "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE SECOND(o.O_ORDERDATE, 3) = 0 \
-             GROUP BY c.C_NAME"
+             AND {named} GROUP BY c.C_NAME"
         ),
     ];
-
     let mut failures = Vec::new();
     for query in &broadcast {
         for (vs_name, path) in [
@@ -577,6 +585,45 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
             "the fan-out must not emit {unread}:\n{pushed}"
         );
     }
+}
+
+/// Scenario: An aggregating join that reads an unbounded text column of the small side keeps the N-scan
+#[test]
+fn e2e_aggregating_join_reading_a_wide_dimension_text_column_keeps_the_n_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
+    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    let n_scan = [
+        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
+        format!("SELECT COUNT(*), MAX(c.C_NAME) FROM {orders}"),
+        format!("SELECT COUNT(DISTINCT c.C_NAME) FROM {orders}"),
+        format!(
+            "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(*) FROM {orders} \
+             GROUP BY SUBSTR(c.C_NAME, 1, 10)"
+        ),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE c.C_NAME LIKE 'customer-0%' \
+             GROUP BY c.C_NAME"
+        ),
+        format!("SELECT DISTINCT * FROM {orders}"),
+        // LABELS, the smaller side, declares SCORE as text, while EVENTS declares it DOUBLE.
+        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
+    ];
+
+    let mut failures = Vec::new();
+    for query in &n_scan {
+        failures.extend(native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            query,
+            PathCheck::NScan(2),
+            Expect::Rows,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Scenario: Aggregate over a join routes through the unified qualified wrapper

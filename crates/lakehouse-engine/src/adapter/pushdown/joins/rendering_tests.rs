@@ -985,3 +985,115 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }
+
+fn wide_read_request(filter: Json) -> Json {
+    serde_json::json!({ "filter": filter })
+}
+
+#[test]
+fn fixed_width_columns_bound_the_broadcast_width() {
+    let read = column_types(&[
+        ("C_KEY", ExasolType::decimal(18, 0)),
+        ("C_SCORE", ExasolType::DoublePrecision),
+        ("C_SINCE", ExasolType::Date),
+        ("C_SEEN", ExasolType::BARE_TIMESTAMP),
+        ("C_ACTIVE", ExasolType::Boolean),
+    ]);
+    let legs = customer_orders_legs();
+    assert!(broadcast_width_bounded(
+        &wide_read_request(Json::Null),
+        &legs,
+        0,
+        &read
+    ));
+    assert!(broadcast_width_bounded(
+        &wide_read_request(Json::Null),
+        &legs,
+        0,
+        &column_types(NO_COLUMNS)
+    ));
+}
+
+#[test]
+fn an_unfiltered_text_column_keeps_the_n_scan() {
+    let legs = customer_orders_legs();
+    for exa_type in [
+        ExasolType::WIDEST_VARCHAR,
+        ExasolType::char(10),
+        ExasolType::IntervalYearToMonth { precision: 2 },
+    ] {
+        let read = column_types(&[("C_KEY", ExasolType::decimal(18, 0)), ("C_NAME", exa_type)]);
+        assert!(
+            !broadcast_width_bounded(&wide_read_request(Json::Null), &legs, 0, &read),
+            "{exa_type:?}"
+        );
+    }
+}
+
+#[test]
+fn a_top_level_literal_condition_bounds_a_text_column() {
+    let legs = customer_orders_legs();
+    let read = column_types(&[("C_NAME", ExasolType::WIDEST_VARCHAR)]);
+    let date = compare(
+        "predicate_greater",
+        table_col("ORDERS", "O_ORDERDATE"),
+        date_lit("1995-01-01"),
+    );
+    for filter in [
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
+        predicate_equal(str_lit("ACME"), table_col("CUSTOMER", "C_NAME")),
+        in_list(
+            table_col("CUSTOMER", "C_NAME"),
+            [str_lit("ACME"), str_lit("GLOBEX")],
+        ),
+        and([date, string_equal("CUSTOMER", "C_NAME", "ACME")]),
+    ] {
+        assert!(
+            broadcast_width_bounded(&wide_read_request(filter.clone()), &legs, 0, &read),
+            "{filter}"
+        );
+    }
+}
+
+#[test]
+fn a_condition_that_does_not_limit_the_column_to_literals_keeps_the_n_scan() {
+    let legs = customer_orders_legs();
+    let read = column_types(&[("C_NAME", ExasolType::WIDEST_VARCHAR)]);
+    for filter in [
+        or([
+            string_equal("CUSTOMER", "C_NAME", "ACME"),
+            string_equal("CUSTOMER", "C_NAME", "GLOBEX"),
+        ]),
+        in_list(
+            table_col("CUSTOMER", "C_NAME"),
+            [str_lit("ACME"), table_col("CUSTOMER", "C_CITY")],
+        ),
+        predicate_equal(
+            table_col("CUSTOMER", "C_NAME"),
+            table_col("ORDERS", "O_COMMENT"),
+        ),
+        compare(
+            "predicate_less",
+            table_col("CUSTOMER", "C_NAME"),
+            str_lit("B"),
+        ),
+        string_equal("CUSTOMER", "C_CITY", "BERLIN"),
+    ] {
+        assert!(
+            !broadcast_width_bounded(&wide_read_request(filter.clone()), &legs, 0, &read),
+            "{filter}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_condition_bounds_only_its_own_self_join_leg() {
+    let legs = self_join_legs();
+    let read = column_types(&[("O_COMMENT", ExasolType::WIDEST_VARCHAR)]);
+    let filter = wide_read_request(predicate_equal(
+        aliased_col("FACT_ORDERS", "A", "O_COMMENT"),
+        str_lit("rush"),
+    ));
+    assert!(broadcast_width_bounded(&filter, &legs, 0, &read));
+    assert!(!broadcast_width_bounded(&filter, &legs, 1, &read));
+}
