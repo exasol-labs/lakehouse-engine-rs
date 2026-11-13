@@ -64,21 +64,6 @@ pub struct PruningFile {
     rows: &'static [PruningRow],
 }
 
-impl PruningFile {
-    /// Row by row, so a caller derives per-file statistics from the rows, not from a footer.
-    pub fn k_values(&self) -> Vec<Option<i64>> {
-        self.rows.iter().map(|row| row.k).collect()
-    }
-
-    pub fn s_values(&self) -> Vec<Option<&'static str>> {
-        self.rows.iter().map(|row| row.s).collect()
-    }
-
-    pub fn x_values(&self) -> Vec<Option<f64>> {
-        self.rows.iter().map(|row| row.x).collect()
-    }
-}
-
 /// The `k` boundary of the `NOT (k < 30 AND u)` cases.
 pub const K_SPLIT: i64 = 30;
 /// Files whose row groups a wrong `k >= 30` would skip in part.
@@ -237,19 +222,19 @@ fn derived<T: 'static>(
     rows.iter().map(move |r| r.k.map(derive))
 }
 
-pub fn d_unscaled(k: i64) -> i128 {
+fn d_unscaled(k: i64) -> i128 {
     i128::from(k) * 100 + 25
 }
 
-pub fn f_value(k: i64) -> f32 {
+fn f_value(k: i64) -> f32 {
     f32::from(i16::try_from(k).expect("fixture k fits i16")) / 100.0
 }
 
-pub fn dt_days(k: i64) -> i32 {
+fn dt_days(k: i64) -> i32 {
     BASE_DAYS + i32::try_from(k).expect("fixture k fits i32")
 }
 
-pub fn tz_micros(k: i64) -> i64 {
+fn tz_micros(k: i64) -> i64 {
     BASE_TS_MICROS + k * 60_000_000
 }
 
@@ -286,13 +271,18 @@ pub fn iceberg_file_prefix(file: &PruningFile) -> String {
     format!("pc_{}", file.label)
 }
 
+/// Whether `text` names the Hive-style data file `<label>.parquet`, as a Hive or Delta key does.
+pub fn names_data_file(text: &str, label: &str) -> bool {
+    text.contains(&format!("/{label}.parquet"))
+}
+
 /// The Iceberg file name carries `<prefix>-`, and the Hive and Delta keys `/<label>.parquet`.
 pub fn labels_named(text: &str) -> BTreeSet<String> {
     PRUNING_FILES
         .iter()
         .filter(|file| {
             text.contains(&format!("{}-", iceberg_file_prefix(file)))
-                || text.contains(&format!("/{}.parquet", file.label))
+                || names_data_file(text, file.label)
         })
         .map(|file| file.label.to_string())
         .collect()

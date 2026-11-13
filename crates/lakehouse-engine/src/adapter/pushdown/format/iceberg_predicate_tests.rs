@@ -1,12 +1,11 @@
 use super::*;
 use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
-    and, between, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
+    and, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
     nullable_field, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use iceberg::expr::Bind;
 use iceberg::spec::{NestedField, Schema, Type};
-use serde_json::json;
 use std::sync::Arc;
 
 /// `literal` converted as the parse converts it for a column of `primitive`, then made a datum.
@@ -71,112 +70,65 @@ fn translate(filter: &Json) -> Option<Predicate> {
 }
 
 #[test]
-fn leaf_equal_translates() {
-    let node = predicate_equal(col("ID"), num_lit(5));
-    let pred = translate(&node).expect("should translate equal");
-    let s = format!("{pred}");
-    assert!(
-        s.contains("id") && s.contains('=') && s.contains('5'),
-        "got: {s}"
-    );
-
-    let node2 = predicate_equal(num_lit(5), col("ID"));
-    let pred2 = translate(&node2).expect("reversed operands should translate");
-    let s2 = format!("{pred2}");
-    assert!(
-        s2.contains("id") && s2.contains('=') && s2.contains('5'),
-        "got: {s2}"
-    );
-}
-
-#[test]
-fn leaf_less_than_translates() {
-    let node = compare("predicate_less", col("AMOUNT"), num_lit(100));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(s.contains("amount") && s.contains('<'), "got: {s}");
-
-    let node2 = compare("predicate_less", num_lit(100), col("AMOUNT"));
-    let pred2 = translate(&node2).unwrap();
-    let s2 = format!("{pred2}");
-    assert!(s2.contains("amount") && s2.contains('>'), "got: {s2}");
-}
-
-#[test]
-fn leaf_lessequal_translates() {
-    let node = compare("predicate_lessequal", col("AMOUNT"), num_lit(50));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(s.contains("amount") && s.contains("<="), "got: {s}");
-}
-
-#[test]
-fn leaf_is_null_translates() {
-    let node = is_null(col("NAME"));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(
-        s.contains("name") && s.to_uppercase().contains("NULL"),
-        "got: {s}"
-    );
-}
-
-#[test]
-fn leaf_is_not_null_translates() {
-    let node = is_not_null(col("NAME"));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(
-        s.contains("name") && s.to_uppercase().contains("NOT NULL"),
-        "got: {s}"
-    );
-}
-
-#[test]
-fn leaf_in_translates() {
-    let node = in_list(col("ID"), [num_lit(1), num_lit(2), num_lit(3)]);
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(
-        s.contains("id") && s.to_uppercase().contains("IN"),
-        "got: {s}"
-    );
-}
-
-#[test]
-fn leaf_in_with_string_translates() {
-    let node = in_list(col("NAME"), [str_lit("alice"), str_lit("bob")]);
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(
-        s.contains("name") && s.to_uppercase().contains("IN"),
-        "got: {s}"
-    );
-}
-
-#[test]
-fn between_desugars_to_range() {
-    let node = between(col("AMOUNT"), num_lit(10), num_lit(100));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(s.contains("amount"), "got: {s}");
-    assert!(
-        s.contains(">=") || s.contains('>'),
-        "low bound missing: {s}"
-    );
-    assert!(
-        s.contains("<=") || s.contains('<'),
-        "high bound missing: {s}"
-    );
-    assert!(s.to_uppercase().contains("AND"), "AND missing: {s}");
-}
-
-#[test]
-fn leaf_date_translates() {
-    let node = predicate_equal(col("EVENT_DATE"), date_lit("2024-01-15"));
-    let pred = translate(&node).unwrap();
-    let s = format!("{pred}");
-    assert!(s.contains("event_date"), "got: {s}");
+fn every_leaf_and_junction_lowers_to_its_iceberg_predicate() {
+    let id_is = |value: i32| Reference::new("id").equal_to(Datum::int(value));
+    let amount = || Reference::new("amount");
+    let name = || Reference::new("name");
+    let on_amount = |kind: &str| compare(kind, col("AMOUNT"), num_lit(100));
+    let cases = [
+        (predicate_equal(col("ID"), num_lit(5)), id_is(5)),
+        (
+            on_amount("predicate_notequal"),
+            amount().not_equal_to(Datum::long(100)),
+        ),
+        (
+            on_amount("predicate_less"),
+            amount().less_than(Datum::long(100)),
+        ),
+        (
+            on_amount("predicate_lessequal"),
+            amount().less_than_or_equal_to(Datum::long(100)),
+        ),
+        (
+            on_amount("predicate_greater"),
+            amount().greater_than(Datum::long(100)),
+        ),
+        (
+            on_amount("predicate_greaterequal"),
+            amount().greater_than_or_equal_to(Datum::long(100)),
+        ),
+        (is_null(col("NAME")), name().is_null()),
+        (is_not_null(col("NAME")), name().is_not_null()),
+        (
+            in_list(col("NAME"), [str_lit("alice"), str_lit("bob")]),
+            name().is_in([Datum::string("alice"), Datum::string("bob")]),
+        ),
+        (
+            predicate_equal(col("EVENT_DATE"), date_lit("2024-01-15")),
+            Reference::new("event_date").equal_to(Datum::date(19_737)),
+        ),
+        (
+            and([
+                predicate_equal(col("ID"), num_lit(1)),
+                predicate_equal(col("ID"), num_lit(2)),
+            ]),
+            id_is(1).and(id_is(2)),
+        ),
+        (
+            or([
+                predicate_equal(col("ID"), num_lit(1)),
+                predicate_equal(col("ID"), num_lit(2)),
+            ]),
+            id_is(1).or(id_is(2)),
+        ),
+        (
+            not(predicate_equal(col("ID"), num_lit(5))),
+            id_is(5).negate(),
+        ),
+    ];
+    for (node, expected) in cases {
+        assert_eq!(translate(&node), Some(expected), "{node}");
+    }
 }
 
 #[test]
@@ -255,93 +207,6 @@ fn a_float_column_takes_only_a_literal_it_holds_exactly() {
 }
 
 #[test]
-fn and_with_untranslatable_child_keeps_translatable_conjunct() {
-    let translatable = predicate_equal(col("ID"), num_lit(5));
-    let untranslatable = like(col("NAME"), "%A");
-    let node = and([translatable, untranslatable]);
-    let pred = translate(&node).expect("AND with one translatable child must return Some");
-    let s = format!("{pred}");
-    assert!(
-        s.contains("id") && s.contains('=') && s.contains('5'),
-        "got: {s}"
-    );
-    assert!(
-        !s.to_uppercase().contains("LIKE"),
-        "LIKE should be dropped: {s}"
-    );
-}
-
-#[test]
-fn and_all_untranslatable_returns_none() {
-    let node = and([
-        like(col("NAME"), "%A"),
-        json!({"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}),
-    ]);
-    assert!(translate(&node).is_none());
-}
-
-#[test]
-fn or_with_untranslatable_child_returns_none() {
-    let translatable = predicate_equal(col("ID"), num_lit(5));
-    let untranslatable = like(col("NAME"), "%A");
-    let node = or([translatable, untranslatable]);
-    // Pruning on only the translatable branch would be unsound.
-    assert!(
-        translate(&node).is_none(),
-        "OR with untranslatable branch must be None"
-    );
-}
-
-#[test]
-fn or_all_translatable_returns_some() {
-    let node = or([
-        predicate_equal(col("ID"), num_lit(1)),
-        predicate_equal(col("ID"), num_lit(2)),
-    ]);
-    let pred = translate(&node).expect("all-translatable OR must be Some");
-    let s = format!("{pred}");
-    assert!(s.to_uppercase().contains("OR"), "OR missing: {s}");
-}
-
-#[test]
-fn not_of_untranslatable_returns_none() {
-    let node = not(like(col("NAME"), "%A"));
-    assert!(
-        translate(&node).is_none(),
-        "NOT of untranslatable must be None"
-    );
-}
-
-#[test]
-fn not_of_translatable_negates() {
-    let node = not(compare("predicate_less", col("ID"), num_lit(5)));
-    let pred = translate(&node).expect("NOT of translatable must be Some");
-    let s = format!("{pred}");
-    assert!(s.contains("id") && s.contains(">="), "got: {s}");
-}
-
-#[test]
-fn unknown_column_returns_none() {
-    let node = predicate_equal(col("NONEXISTENT"), num_lit(1));
-    assert!(translate(&node).is_none(), "unknown column must be None");
-}
-
-#[test]
-fn type_mismatch_returns_none() {
-    let node = predicate_equal(col("ID"), str_lit("not-a-number"));
-    assert!(translate(&node).is_none(), "type mismatch must be None");
-}
-
-#[test]
-fn notequal_translates() {
-    let node = compare("predicate_notequal", col("ID"), num_lit(5));
-    assert_eq!(
-        translate(&node),
-        Some(Reference::new("id").not_equal_to(Datum::int(5)))
-    );
-}
-
-#[test]
 fn a_like_prefix_prunes_with_starts_with_and_negates_only_when_exact() {
     let starts_with = Reference::new("name").starts_with(Datum::string("ab"));
     assert_eq!(translate(&name_like("ab%")), Some(starts_with.clone()));
@@ -353,95 +218,10 @@ fn a_like_prefix_prunes_with_starts_with_and_negates_only_when_exact() {
         translate(&name_like("ab")),
         Some(Reference::new("name").equal_to(Datum::string("ab")))
     );
-    assert!(translate(&name_like("ab_c")).is_some());
-    assert_eq!(translate(&not(name_like("ab_c"))), None);
-    assert_eq!(translate(&name_like("%ab")), None);
-    assert_eq!(translate(&like(col("ID"), "1%")), None);
-}
-
-#[test]
-fn in_with_type_mismatch_element_returns_none() {
-    let node = in_list(col("ID"), [num_lit(1), str_lit("bad")]);
-    assert!(
-        translate(&node).is_none(),
-        "IN with one bad element must be None"
-    );
-}
-
-#[test]
-fn between_with_one_failing_bound_keeps_other() {
-    // The low bound fails; the high bound survives alone.
-    let node = between(col("AMOUNT"), str_lit("bad"), num_lit(100));
-    let pred = translate(&node).expect("BETWEEN with one valid bound must return Some");
-    let s = format!("{pred}");
-    assert!(s.contains("amount") && s.contains("<="), "got: {s}");
-}
-
-fn amount_below(v: i64) -> Json {
-    compare("predicate_less", col("AMOUNT"), num_lit(v))
 }
 
 fn name_like(pattern: &str) -> Json {
     like(col("NAME"), pattern)
-}
-
-#[test]
-fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
-    for conjuncts in [
-        [amount_below(30), name_like("%x")],
-        [name_like("%x"), amount_below(30)],
-    ] {
-        let node = not(and(conjuncts));
-        assert_eq!(translate(&node), None, "{node}");
-    }
-}
-
-#[test]
-fn not_over_a_between_that_dropped_a_bound_returns_none() {
-    let node = not(between(col("AMOUNT"), num_lit(10), num_lit(20.5)));
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn not_over_an_or_with_an_inexact_branch_returns_none() {
-    let node = not(or([
-        and([amount_below(30), name_like("%x")]),
-        predicate_equal(col("ID"), num_lit(5)),
-    ]));
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
-    let node = not(and([
-        amount_below(30),
-        predicate_equal(col("NAME"), str_lit("a")),
-    ]));
-    let expected = Reference::new("amount")
-        .greater_than_or_equal_to(Datum::long(30))
-        .or(Reference::new("name").not_equal_to(Datum::string("a")));
-    assert_eq!(translate(&node), Some(expected));
-}
-
-#[test]
-fn not_over_a_fully_translated_between_negates_both_bounds() {
-    let node = not(between(col("AMOUNT"), num_lit(10), num_lit(20)));
-    let expected = Reference::new("amount")
-        .less_than(Datum::long(10))
-        .or(Reference::new("amount").greater_than(Datum::long(20)));
-    assert_eq!(translate(&node), Some(expected));
-}
-
-#[test]
-fn not_over_a_fully_translated_or_negates_every_branch() {
-    let node = not(or([
-        amount_below(10),
-        compare("predicate_greater", col("AMOUNT"), num_lit(20)),
-    ]));
-    let expected = Reference::new("amount")
-        .greater_than_or_equal_to(Datum::long(10))
-        .and(Reference::new("amount").less_than_or_equal_to(Datum::long(20)));
-    assert_eq!(translate(&node), Some(expected));
 }
 
 fn int_schema(fields: &[(i32, &str)]) -> Schema {

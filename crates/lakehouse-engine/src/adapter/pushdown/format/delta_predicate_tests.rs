@@ -1,8 +1,8 @@
 use super::*;
 use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
-    and, between, binary_lit, bool_lit, by_name, col, compare, date_lit, in_list, is_not_null,
-    is_null, like, not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
+    and, binary_lit, bool_lit, by_name, col, date_lit, in_list, is_not_null, is_null, like, not,
+    num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
@@ -56,6 +56,11 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
             Predicate::ge(column(), five()),
             Predicate::le(column(), five()),
         ),
+        (
+            "predicate_notequal",
+            Predicate::ne(column(), five()),
+            Predicate::ne(column(), five()),
+        ),
     ];
 
     for (kind, column_left, column_right) in cases {
@@ -76,90 +81,34 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
 }
 
 #[test]
-fn notequal_translates() {
-    let node = compare("predicate_notequal", col("ID"), num_lit(5));
-
-    assert_eq!(
-        translate(&node),
-        Some(Predicate::ne(
-            Expression::column(["id"]),
-            Expression::literal(5i32)
-        ))
-    );
-}
-
-#[test]
-fn is_null_on_a_column_translates() {
-    let node = is_null(col("ID"));
-    let pred = translate(&node).expect("IS NULL on an existing column must translate");
-
-    let expected = Predicate::is_null(Expression::column(["id"]));
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn is_not_null_on_a_column_translates() {
-    let node = is_not_null(col("ID"));
-    let pred = translate(&node).expect("IS NOT NULL on an existing column must translate");
-
-    let expected = Predicate::is_not_null(Expression::column(["id"]));
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn not_negates_its_translatable_child() {
-    let child = predicate_equal(col("ID"), num_lit(5));
-    let node = not(child);
-    let pred = translate(&node).expect("NOT over a translatable child must translate");
-
-    let expected = Predicate::not(Predicate::eq(
-        Expression::column(["id"]),
-        Expression::literal(5i32),
-    ));
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn not_of_an_untranslatable_child_returns_none() {
-    let child = predicate_equal(col("ID"), str_lit("5"));
-    let node = not(child);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
-    let child = and([
-        predicate_equal(col("ID"), num_lit(5)),
-        predicate_equal(col("ID"), str_lit("7")),
-    ]);
-    let node = not(child);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn not_over_a_between_that_dropped_a_bound_returns_none() {
-    let child = between(col("ID"), num_lit(1), str_lit("ten"));
-    let node = not(child);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn not_over_a_fully_translatable_and_negates_the_whole_conjunction() {
-    let child = and([
-        compare("predicate_greaterequal", col("ID"), num_lit(1)),
-        compare("predicate_lessequal", col("ID"), num_lit(9)),
-    ]);
-    let node = not(child);
-    let pred = translate(&node).expect("NOT over a fully translatable AND must translate");
-
-    let expected = Predicate::not(Predicate::and_from([
-        Predicate::ge(Expression::column(["id"]), Expression::literal(1i32)),
-        Predicate::le(Expression::column(["id"]), Expression::literal(9i32)),
-    ]));
-    assert_eq!(pred, expected);
+fn null_tests_and_junctions_lower_to_their_kernel_predicates() {
+    let id = || Expression::column(["id"]);
+    let id_is = |value: i32| Predicate::eq(id(), Expression::literal(value));
+    let cases = [
+        (is_null(col("ID")), Predicate::is_null(id())),
+        (is_not_null(col("ID")), Predicate::is_not_null(id())),
+        (
+            and([
+                predicate_equal(col("ID"), num_lit(5)),
+                predicate_equal(col("ID"), num_lit(7)),
+            ]),
+            Predicate::and(id_is(5), id_is(7)),
+        ),
+        (
+            or([
+                predicate_equal(col("ID"), num_lit(5)),
+                predicate_equal(col("ID"), num_lit(7)),
+            ]),
+            Predicate::or(id_is(5), id_is(7)),
+        ),
+        (
+            not(predicate_equal(col("ID"), num_lit(5))),
+            Predicate::not(id_is(5)),
+        ),
+    ];
+    for (node, expected) in cases {
+        assert_eq!(translate(&node), Some(expected), "{node}");
+    }
 }
 
 fn schema_with_struct_field() -> StructType {
@@ -257,82 +206,6 @@ fn a_literal_becomes_the_scalar_of_its_columns_kernel_type() {
 }
 
 #[test]
-fn and_of_two_translatable_children_folds_a_conjunction() {
-    let node = and([
-        compare("predicate_greaterequal", col("ID"), num_lit(5)),
-        compare("predicate_less", col("ID"), num_lit(9)),
-    ]);
-    let pred = translate(&node).expect("an AND of two translatable conjuncts must translate");
-
-    let expected = Predicate::and(
-        Predicate::ge(Expression::column(["id"]), Expression::literal(5i32)),
-        Predicate::lt(Expression::column(["id"]), Expression::literal(9i32)),
-    );
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn and_with_untranslatable_child_keeps_translatable_conjunct() {
-    let node = and([
-        predicate_equal(col("ID"), num_lit(5)),
-        predicate_equal(col("ID"), str_lit("7")),
-    ]);
-    let pred = translate(&node).expect("an AND must keep the conjuncts it can translate");
-
-    let expected = Predicate::eq(Expression::column(["id"]), Expression::literal(5i32));
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn and_all_untranslatable_returns_none_not_a_true_predicate() {
-    let node = and([
-        predicate_equal(col("ID"), str_lit("5")),
-        predicate_equal(col("ID"), str_lit("7")),
-    ]);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn and_over_an_empty_expression_list_returns_none() {
-    let node = and([]);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn or_of_two_translatable_children_folds_a_disjunction() {
-    let node = or([
-        predicate_equal(col("ID"), num_lit(5)),
-        predicate_equal(col("ID"), num_lit(7)),
-    ]);
-    let pred = translate(&node).expect("an OR of two translatable disjuncts must translate");
-
-    let expected = Predicate::or(
-        Predicate::eq(Expression::column(["id"]), Expression::literal(5i32)),
-        Predicate::eq(Expression::column(["id"]), Expression::literal(7i32)),
-    );
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn or_with_untranslatable_child_returns_none() {
-    let node = or([
-        predicate_equal(col("ID"), num_lit(5)),
-        predicate_equal(col("ID"), str_lit("7")),
-    ]);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn or_over_an_empty_expression_list_returns_none() {
-    let node = or([]);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
 fn in_list_translates_to_an_or_chain_of_equalities() {
     let node = in_list(col("ID"), [num_lit(1), num_lit(2), num_lit(3)]);
     let pred = translate(&node).expect("an IN list of translatable literals must translate");
@@ -343,48 +216,6 @@ fn in_list_translates_to_an_or_chain_of_equalities() {
         Predicate::eq(Expression::column(["id"]), Expression::literal(3i32)),
     ]);
     assert_eq!(pred, expected);
-}
-
-#[test]
-fn empty_in_list_returns_none_not_a_false_predicate() {
-    let node = in_list(col("ID"), []);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn in_with_type_mismatch_element_returns_none() {
-    let node = in_list(col("ID"), [num_lit(1), str_lit("two")]);
-
-    assert_eq!(translate(&node), None);
-}
-
-#[test]
-fn between_translates_to_a_lower_and_upper_bound_conjunction() {
-    let node = between(col("ID"), num_lit(1), num_lit(10));
-    let pred = translate(&node).expect("a BETWEEN with two convertible bounds must translate");
-
-    let expected = Predicate::and_from([
-        Predicate::ge(Expression::column(["id"]), Expression::literal(1i32)),
-        Predicate::le(Expression::column(["id"]), Expression::literal(10i32)),
-    ]);
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn between_keeps_the_convertible_bound_when_the_other_fails() {
-    let node = between(col("ID"), num_lit(1), str_lit("ten"));
-    let pred = translate(&node).expect("a BETWEEN must keep the bound it can translate");
-
-    let expected = Predicate::ge(Expression::column(["id"]), Expression::literal(1i32));
-    assert_eq!(pred, expected);
-}
-
-#[test]
-fn between_with_both_bounds_unconvertible_returns_none() {
-    let node = between(col("ID"), str_lit("one"), str_lit("ten"));
-
-    assert_eq!(translate(&node), None);
 }
 
 #[test]

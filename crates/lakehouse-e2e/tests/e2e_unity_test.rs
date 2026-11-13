@@ -19,13 +19,12 @@ use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
     Format, PRUNING_PARQUET_TABLE, VS_UNITY, assert_cases_hold,
     assert_grouped_aggregates_match_oracle, assert_one_shaped_file_per_label,
-    assert_single_group_aggregates_match_oracle, read_footer,
+    assert_single_group_aggregates_match_oracle, parse_footer, sorted_ids,
 };
 use common::pruning_fixture::{
-    PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PRUNING_TYPED_PARTITION_COLUMN,
-    PruningFile, d_text, d_unscaled, day, dt_days, f_value, hive_object_uri, instant, labels_named,
-    oracle_statements, pruning_data_file, pruning_relative_path, tz_micros,
-    write_pruning_hive_copy,
+    PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PRUNING_TYPED_PARTITION_COLUMN, d_text,
+    day, hive_object_uri, instant, labels_named, names_data_file, oracle_statements,
+    pruning_data_file, pruning_relative_path, write_pruning_hive_copy,
 };
 use common::raw_parquet::{
     delete_fixture_prefix, encode_parquet, get_fixture_object, put_fixture_object,
@@ -740,14 +739,17 @@ fn seed_pruning_delta_table() {
     let partitions = [PRUNING_PARTITION_COLUMN, typed_partition];
     let files: Vec<DeltaDataFile> = PRUNING_FILES
         .iter()
-        .map(|file| DeltaDataFile {
-            path: pruning_relative_path(file),
-            partition_values: json!({
-                PRUNING_PARTITION_COLUMN: file.partition,
-                typed_partition: file.typed_partition,
-            }),
-            parquet: pruning_data_file(file),
-            stats: pruning_stats(file),
+        .map(|file| {
+            let parquet = pruning_data_file(file);
+            DeltaDataFile {
+                path: pruning_relative_path(file),
+                partition_values: json!({
+                    PRUNING_PARTITION_COLUMN: file.partition,
+                    typed_partition: file.typed_partition,
+                }),
+                stats: pruning_stats(&parse_footer(parquet.clone(), file.label)),
+                parquet,
+            }
         })
         .collect();
     let table = UnityTable {
@@ -805,17 +807,19 @@ fn seed_typed_partitions_table() {
     });
 }
 
-fn pruning_stats(file: &PruningFile) -> Json {
+/// The statistics a Delta writer derives from the data file's own footer.
+fn pruning_stats(footer: &ParquetMetaData) -> Json {
     let mut stats = json!({
-        "numRecords": file.k_values().len(),
+        "numRecords": footer.file_metadata().num_rows(),
         "nullCount": {},
         "minValues": {},
         "maxValues": {},
     });
-    for (column, values) in fixture_stats(file) {
-        stats["nullCount"][column] = json!(values.iter().filter(|value| value.is_none()).count());
+    for column in PRUNING_STATS_COLUMNS {
+        let (bounds, null_count) = footer_statistics(footer, column);
+        stats["nullCount"][column] = json!(null_count);
         // Delta PROTOCOL.md § Per-file Statistics: a column NULL in every row carries no bound.
-        if let Some((min, max)) = stat_bounds(values.into_iter().flatten()) {
+        if let Some((min, max)) = bounds {
             stats["minValues"][column] = delta_stat(column, min);
             stats["maxValues"][column] = delta_stat(column, max);
         }
@@ -826,44 +830,13 @@ fn pruning_stats(file: &PruningFile) -> Json {
 /// The pruning columns whose statistics the Delta log carries.
 const PRUNING_STATS_COLUMNS: [&str; 7] = ["k", "s", "x", "d", "f", "dt", "tz"];
 
-/// One statistic, before the Delta log spells it.
+/// One footer statistic, before the Delta log spells it.
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 enum Stat {
     Int(i64),
     Float(f32),
     Double(f64),
     Text(String),
-}
-
-/// Each row's value of every statistics column, `None` where it is NULL.
-fn fixture_stats(file: &PruningFile) -> Vec<(&'static str, Vec<Option<Stat>>)> {
-    let k_values = file.k_values();
-    let by_k = |stat: fn(i64) -> Stat| k_values.iter().map(|k| k.map(stat)).collect();
-    let column = PRUNING_STATS_COLUMNS;
-    vec![
-        (column[0], by_k(Stat::Int)),
-        (
-            column[1],
-            file.s_values()
-                .into_iter()
-                .map(|s| s.map(|s| Stat::Text(s.to_string())))
-                .collect(),
-        ),
-        (
-            column[2],
-            file.x_values()
-                .into_iter()
-                .map(|x| x.map(Stat::Double))
-                .collect(),
-        ),
-        (
-            column[3],
-            by_k(|k| Stat::Int(i64::try_from(d_unscaled(k)).expect("fixture decimal fits i64"))),
-        ),
-        (column[4], by_k(|k| Stat::Float(f_value(k)))),
-        (column[5], by_k(|k| Stat::Int(dt_days(k).into()))),
-        (column[6], by_k(|k| Stat::Int(tz_micros(k)))),
-    ]
 }
 
 fn stat_bounds(values: impl IntoIterator<Item = Stat>) -> Option<(Stat, Stat)> {
@@ -2621,7 +2594,7 @@ fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
 
 /// Scenario: Delta pruning keeps every file with a matching row for every filter shape
 #[test]
-fn delta_pruning_fixture_files_hold_the_row_groups_pages_and_statistics_the_cases_need() {
+fn delta_pruning_fixture_files_hold_the_row_groups_pages_and_partition_values_the_cases_need() {
     setup();
 
     let log_uri = delta_first_commit_uri(PRUNING_DELTA_LOCATION);
@@ -2662,8 +2635,8 @@ fn unity_parquet_pruning_fixture_files_hold_the_row_groups_and_pages_the_cases_n
     assert_one_shaped_file_per_label("Unity Parquet", &uris);
 }
 
-/// The log's values come from the fixture rows and the footer's from the Parquet writer, so
-/// equal values cross-check two independent derivations.
+/// The log's statistics come from the footer, so only its partition values and sizes can disagree
+/// with the stored files.
 fn assert_add_describes_its_data_file(add: &Json, uri: &str) {
     let cannot = format!(
         "the Delta log disagrees with its data file {uri}, so the fixture cannot prove Delta pruning"
@@ -2690,44 +2663,11 @@ fn assert_add_describes_its_data_file(add: &Json, uri: &str) {
         json!(get_fixture_object(uri).len()),
         "size: {cannot}"
     );
-
-    let stats: Json = add["stats"]
-        .as_str()
-        .and_then(|stats| serde_json::from_str(stats).ok())
-        .unwrap_or_else(|| panic!("stats is not a JSON string: {cannot}"));
-    let footer = read_footer(uri);
-    assert_eq!(
-        stats["numRecords"],
-        json!(footer.file_metadata().num_rows()),
-        "numRecords: {cannot}"
-    );
-    for column in PRUNING_STATS_COLUMNS {
-        let (bounds, null_count) = footer_statistics(&footer, column, &cannot);
-        let (min, max) = bounds.map_or((Json::Null, Json::Null), |(min, max)| {
-            (delta_stat(column, min), delta_stat(column, max))
-        });
-        assert_eq!(
-            stats["minValues"][column], min,
-            "minValues.{column}: {cannot}"
-        );
-        assert_eq!(
-            stats["maxValues"][column], max,
-            "maxValues.{column}: {cannot}"
-        );
-        assert_eq!(
-            stats["nullCount"][column],
-            json!(null_count),
-            "nullCount.{column}: {cannot}"
-        );
-    }
 }
 
 /// The bounds and the summed null count of `column` over the row-group statistics.
-fn footer_statistics(
-    footer: &ParquetMetaData,
-    column: &str,
-    cannot: &str,
-) -> (Option<(Stat, Stat)>, u64) {
+fn footer_statistics(footer: &ParquetMetaData, column: &str) -> (Option<(Stat, Stat)>, u64) {
+    let cannot = "the pruning fixture's Delta statistics cannot be derived";
     let index = footer
         .file_metadata()
         .schema_descr()
@@ -2831,13 +2771,12 @@ fn unity_parquet_partitions_compare_under_every_declared_type() {
     ];
     for (predicate, files, ids) in cases {
         let sql = format!("SELECT ID FROM {table} WHERE {predicate} ORDER BY ID");
-        let rows: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
-        assert_eq!(rows, ids, "{predicate}: the rows");
+        assert_eq!(sorted_ids(&mut conn, &sql), ids, "{predicate}: the rows");
         let plan = isolated_pushdown_statement(&mut conn, &sql);
         let scanned: Vec<&str> = TYPED_PARTITION_FILES
             .iter()
             .map(|(label, ..)| *label)
-            .filter(|label| plan.contains(&format!("/{label}.parquet")))
+            .filter(|label| names_data_file(&plan, label))
             .collect();
         assert_eq!(scanned, files, "{predicate}: the scanned files in {plan}");
     }

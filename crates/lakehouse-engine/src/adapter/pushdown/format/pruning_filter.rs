@@ -191,3 +191,7 @@ impl<C> PruningFilter<C> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pruning_filter_tests.rs"]
+mod tests;
