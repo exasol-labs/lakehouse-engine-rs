@@ -55,7 +55,7 @@ This property sizes the HTTP client connection pool of the object store for the 
 
 The property has no hard cap on in-flight request concurrency. It only bounds how many established connections stay open for reuse. Without reuse, the client tears down a connection and negotiates a new one. The property therefore improves connection reuse on a best-effort basis. It is not a guaranteed ceiling on concurrent data-file fetches.
 
-One read path does have a hard cap. When a scan instance reads a table with deletes, it first fetches the positional-delete files, the deletion vectors, and the Parquet footers of the data files they apply to. The instance keeps at most this many of those reads in flight at once, across both sides of a join.
+One read path does have a hard cap. When a scan instance opens a data file with deletes, it fetches the positional-delete files and the deletion vectors that apply to it. The instance keeps at most this many of those reads in flight at once.
 
 The property says nothing about how many shards run (`PARALLELISM_FACTOR`). It also says nothing about how many CPU threads decode them (`DATAFUSION_THREADING_MODE`). Those two axes stay separate and orthogonal.
 

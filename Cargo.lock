@@ -3526,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.58.4"
+version = "0.58.5"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3535,6 +3535,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "datafusion-datasource",
  "delta_kernel",
  "delta_kernel_default_engine",
  "exasol-udf-macros",

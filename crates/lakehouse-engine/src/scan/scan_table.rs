@@ -1,47 +1,39 @@
-//! The table provider every Parquet scan registers, whatever format planned it. It attaches each
-//! data file's row-position deletes from [`row_deletes`](super::row_deletes) as a base access
-//! plan, so a delete-free file and a delete-carrying one go through the same provider.
+//! The table provider every Parquet scan registers, whatever format planned it. A delete-free
+//! file and a delete-carrying one go through the same provider.
 
-use crate::scan::diagnostics;
+use crate::scan::delete_source::DeleteApplyingSource;
 use crate::scan::parquet_reader::object_meta_for;
 use crate::scan::partition_values::PartitionedScanGroups;
 use crate::scan::raw_scan::scan_table_parquet_format;
-use crate::scan::row_deletes::{
-    ShardDeletes, access_plan_bytes, build_access_plan, join_spawned, redact, reserve,
-};
+use crate::scan::row_deletes::{ShardDeletes, redact};
+use crate::scan::shared_files::{SMALL_FILE_BYTES, ScanFiles, SharedReaderFactory};
 use crate::scan::spec::{FileEntry, StorageBackend};
 use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::DataFusionError;
 use datafusion::datasource::TableType;
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
+};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
 use exasol_udf_sdk::error::UdfError;
-use parquet::file::metadata::PageIndexPolicy;
-use roaring::RoaringTreemap;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// Files with the same partition columns go into ONE `FileGroup`, which DataFusion's file-scan
-/// repartitioning splits into byte ranges up to `target_partitions`. Each plan is built
-/// through [`ParquetFormat::create_physical_plan`], which applies THIS provider's Parquet
-/// options (making row-filter pushdown per table) and a `CachedParquetFileReaderFactory` over
-/// the session [`FileMetadataCache`]. Access-plan construction reads through that same cache
-/// with the same [`ParquetFormat::metadata_size_hint`], so a footer parses once. That holds only
-/// because access-plan construction is the FIRST footer reader: the adapter always supplies a
-/// `logical_schema`, keeping `register_file_list` off the `infer_schema` fallback.
-///
-/// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
+/// DataFusion cuts no file below this many bytes per range (`repartition_file_min_size`).
+const MIN_RANGE_BYTES: u64 = 1024 * 1024;
+
+/// Files with the same partition columns form one file scan. The provider builds each scan's
+/// file groups itself and reads every file through one [`ScanFiles`]. `scan()` issues no request.
 #[derive(Debug)]
 pub(crate) struct ParquetScanTable {
     object_store_url: ObjectStoreUrl,
@@ -55,8 +47,34 @@ pub(crate) struct ParquetScanTable {
     /// Shared by every provider of one invocation (both join sides included), so the whole
     /// instance stays within one N-permit budget.
     delete_path_read_limiter: Arc<Semaphore>,
-    /// Held as long as the provider, because the access plans live until the scan finishes.
-    delete_state_reservations: Mutex<Vec<Arc<MemoryReservation>>>,
+}
+
+/// At most `target` groups, one per stream. A file up to [`SMALL_FILE_BYTES`] stays whole, and a
+/// larger file is cut into byte ranges of about an even share of the scan's bytes.
+fn file_groups(files: Vec<PartitionedFile>, target: usize) -> Vec<FileGroup> {
+    let target = target.max(1) as u64;
+    let total: u64 = files.iter().map(|file| file.object_meta.size).sum();
+    let range_bytes = total.div_ceil(target).max(MIN_RANGE_BYTES);
+    let mut pieces = Vec::new();
+    for file in files {
+        let size = file.object_meta.size;
+        if size <= SMALL_FILE_BYTES {
+            pieces.push(file);
+            continue;
+        }
+        let ranges = size.div_ceil(range_bytes).min(target);
+        let step = size.div_ceil(ranges);
+        for start in (0..size).step_by(step as usize) {
+            let end = (start + step).min(size);
+            pieces.push(file.clone().with_range(start as i64, end as i64));
+        }
+    }
+    let mut groups = vec![Vec::new(); (target as usize).min(pieces.len()).max(1)];
+    let count = groups.len();
+    for (index, piece) in pieces.into_iter().enumerate() {
+        groups[index % count].push(piece);
+    }
+    groups.into_iter().map(FileGroup::new).collect()
 }
 
 impl ParquetScanTable {
@@ -90,146 +108,67 @@ impl ParquetScanTable {
             secrets,
             format,
             delete_path_read_limiter,
-            delete_state_reservations: Mutex::new(Vec::new()),
         }
     }
 
-    /// Partition values convert first, so a spec-content failure precedes every fetch.
-    ///
-    /// Only delete-carrying entries take a limiter permit, fetching their own footer through the
-    /// shared session [`FileMetadataCache`] with the opener's size hint and page index skipped
-    /// ([`build_access_plan`] needs only row counts), so the footer parses once for both. Each
-    /// fetched footer is recorded via [`diagnostics::record_access_plan_cached_footer`] so a
-    /// cache eviction is observable.
-    ///
-    /// The position sets are reserved in the session memory pool as they decode, and the access
-    /// plans as they are built, so a shard whose delete state outgrows the pool fails mid-build.
-    ///
-    /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
-    async fn partitioned_files(
-        &self,
-        state: &dyn Session,
-    ) -> Result<Vec<PartitionedFile>, UdfError> {
-        let partition_values = self
-            .files
+    fn partitioned_files(&self) -> Result<Vec<PartitionedFile>, UdfError> {
+        self.files
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                self.schema.groups()[self.schema.group_of(index)].partition_values_for(entry)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| UdfError::User(redact(e, &self.secrets)))?;
-
-        let store = state
-            .runtime_env()
-            .object_store(&self.object_store_url)
-            .map_err(|e| {
-                UdfError::User(redact(
-                    format!("scan object store unavailable: {e}"),
-                    &self.secrets,
-                ))
-            })?;
-        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
-
-        let abs_paths: Vec<String> = self
-            .files
-            .iter()
-            .map(|entry| reconstruct_abs_uri(&entry.path, &self.table_root))
-            .collect();
-        let mut files = self
-            .files
-            .iter()
-            .zip(&abs_paths)
-            .zip(partition_values)
-            .map(|((entry, abs), values)| {
-                let meta = object_meta_for(abs, entry.size)?;
+                let values = self.schema.groups()[self.schema.group_of(index)]
+                    .partition_values_for(entry)
+                    .map_err(|e| UdfError::User(redact(e, &self.secrets)))?;
+                let meta = object_meta_for(
+                    &reconstruct_abs_uri(&entry.path, &self.table_root),
+                    entry.size,
+                )?;
                 Ok(PartitionedFile::from(meta).with_partition_values(values))
             })
-            .collect::<Result<Vec<_>, UdfError>>()?;
+            .collect()
+    }
 
-        if self.files.iter().all(|entry| entry.deletes.is_empty()) {
-            return Ok(files);
-        }
-        let reservation = Arc::new(
-            MemoryConsumer::new("row-position deletes").register(&state.runtime_env().memory_pool),
-        );
-        let size_hint = self.format.metadata_size_hint();
-        let delete_positions = ShardDeletes {
+    /// The scan's shared file state, with the shard's delete payloads planned but not read.
+    fn scan_files(
+        &self,
+        state: &dyn Session,
+        files: &[PartitionedFile],
+    ) -> Result<ScanFiles, UdfError> {
+        let runtime = state.runtime_env();
+        let store = runtime.object_store(&self.object_store_url).map_err(|e| {
+            UdfError::User(redact(
+                format!("scan object store unavailable: {e}"),
+                &self.secrets,
+            ))
+        })?;
+        let metadata_size_hint = self.format.metadata_size_hint();
+        let deletes = ShardDeletes {
             files: &self.files,
             table_root: &self.table_root,
             secrets: Arc::clone(&self.secrets),
             limiter: Arc::clone(&self.delete_path_read_limiter),
-            reservation: Arc::clone(&reservation),
-            metadata_size_hint: size_hint,
+            reservation: Arc::new(
+                MemoryConsumer::new("row-position deletes").register(&runtime.memory_pool),
+            ),
+            metadata_size_hint,
         }
-        .collect_positions(&store)
-        .await?;
-        if delete_positions.is_empty() {
-            return Ok(files);
-        }
-
-        let positions_bytes = reservation.size();
-        let delete_positions: HashMap<String, Arc<RoaringTreemap>> = delete_positions
-            .into_iter()
-            .filter(|(_, positions)| !positions.is_empty())
-            .map(|(path, positions)| (path, Arc::new(positions)))
-            .collect();
-
-        let builds = files
-            .iter()
-            .zip(&abs_paths)
-            .enumerate()
-            .filter_map(|(idx, (file, abs))| {
-                let deletes = Arc::clone(delete_positions.get(abs.as_str())?);
-                let abs = abs.clone();
-                let meta = file.object_meta.clone();
-                let store = Arc::clone(&store);
-                let metadata_cache = Arc::clone(&metadata_cache);
-                let limiter = Arc::clone(&self.delete_path_read_limiter);
-                let secrets = Arc::clone(&self.secrets);
-                let reservation = Arc::clone(&reservation);
-                Some(async move {
-                    let permit = limiter.acquire_owned().await.map_err(|e| {
-                        UdfError::User(redact(
-                            format!(
-                                "delete_path_read_limiter permit unavailable for data-file footer fetch of {abs}: {e}"
-                            ),
-                            &secrets,
-                        ))
-                    })?;
-                    let parquet_metadata = DFParquetMetadata::new(store.as_ref(), &meta)
-                        .with_file_metadata_cache(Some(metadata_cache))
-                        .with_metadata_size_hint(size_hint)
-                        .with_page_index_policy(Some(PageIndexPolicy::Skip))
-                        .fetch_metadata()
-                        .await
-                        .map_err(|e| {
-                            UdfError::User(redact(
-                                format!(
-                                    "failed to read data-file metadata for delete application: {e}"
-                                ),
-                                &secrets,
-                            ))
-                        })?;
-                    diagnostics::record_access_plan_cached_footer(&meta.location);
-                    drop(permit);
-
-                    let access_plan = build_access_plan(parquet_metadata.row_groups(), &deletes);
-                    reserve(&reservation, access_plan_bytes(&access_plan), &secrets)?;
-                    Ok((idx, access_plan))
-                })
-            })
-            .collect::<Vec<_>>();
-        for (idx, access_plan) in join_spawned(builds).await? {
-            files[idx].extensions.insert(access_plan);
-        }
-
-        drop(delete_positions);
-        reservation.shrink(positions_bytes);
-        if let Ok(mut held) = self.delete_state_reservations.lock() {
-            held.push(reservation);
-        }
-        Ok(files)
+        .plan(&store)?;
+        let shared = files.iter().zip(&self.files).map(|(file, entry)| {
+            let delete_key = (!entry.deletes.is_empty())
+                .then(|| reconstruct_abs_uri(&entry.path, &self.table_root));
+            (
+                file.object_meta.location.clone(),
+                file.object_meta.size,
+                delete_key,
+            )
+        });
+        Ok(ScanFiles::new(
+            store,
+            metadata_size_hint,
+            &runtime.memory_pool,
+            shared,
+            deletes,
+        ))
     }
 }
 
@@ -251,19 +190,30 @@ impl TableProvider for ParquetScanTable {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let files = self
-            .partitioned_files(state)
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let external = |e: UdfError| DataFusionError::External(Box::new(e));
+        let files = self.partitioned_files().map_err(external)?;
+        let scan_files = Arc::new(self.scan_files(state, &files).map_err(external)?);
 
         let mut files_by_group = vec![Vec::new(); self.schema.groups().len()];
         for (index, file) in files.into_iter().enumerate() {
             files_by_group[self.schema.group_of(index)].push(file);
         }
 
+        let target_partitions = state.config().target_partitions();
         let mut plans = Vec::with_capacity(files_by_group.len());
         for (schema, files) in self.schema.groups().iter().zip(files_by_group) {
-            let file_source = self.format.file_source(schema.file_source_schema().clone());
+            let source: Arc<dyn FileSource> = Arc::new(
+                ParquetSource::new(schema.file_source_schema().clone())
+                    .with_table_parquet_options(self.format.options().clone())
+                    .with_parquet_file_reader_factory(Arc::new(SharedReaderFactory(Arc::clone(
+                        &scan_files,
+                    )))),
+            );
+            let source = if scan_files.applies_deletes() {
+                DeleteApplyingSource::wrap(source, &scan_files)
+            } else {
+                source
+            };
             let expr_adapter = self.use_field_id_adapter.then(|| {
                 Arc::new(FieldIdExprAdapterFactory {
                     resolution: self.field_id_resolution.clone(),
@@ -271,15 +221,13 @@ impl TableProvider for ParquetScanTable {
                 }) as Arc<_>
             });
 
-            // DataFusion splits each file group into `target_partitions` byte ranges, and each
-            // range keeps its file's base access plan.
-            let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
-                .with_file_group(FileGroup::new(files))
+            let config = FileScanConfigBuilder::new(self.object_store_url.clone(), source)
+                .with_file_groups(file_groups(files, target_partitions))
                 .with_projection_indices(schema.remap_projection(projection))?
                 .with_limit(limit)
                 .with_expr_adapter(expr_adapter)
                 .build();
-            plans.push(self.format.create_physical_plan(state, config).await?);
+            plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
         }
         // A single group returns its own plan, so a scan without unlisted keys is unchanged.
         UnionExec::try_new(plans)

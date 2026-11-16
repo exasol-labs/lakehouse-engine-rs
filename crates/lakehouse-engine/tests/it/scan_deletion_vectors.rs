@@ -357,6 +357,8 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
 
     let mut spec = scan_spec(entries, &dir_url(dir), None, None);
     spec.common.s3_max_connections = BUDGET;
+    // A file's vector loads when its stream opens it, so more streams than permits are needed.
+    spec.common.df_target_partitions = UNIQUE_SIDECARS;
 
     let (probe, peak) = ConcurrencyProbe::new(needles, BUDGET);
     let store = Arc::new(TrackingStore {

@@ -1,10 +1,9 @@
 use super::*;
 use crate::scan::ObjectLocation;
 use crate::scan::spec::DeltaDeletionVectorStorage;
-use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
+use crate::scan::test_support::{CountingObjectStore, current_thread_runtime, parquet_bytes};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
-use async_trait::async_trait;
 use chrono::TimeZone;
 use object_store::GetRange;
 use object_store::PutPayload;
@@ -557,7 +556,7 @@ fn merged_puffin_requests_respect_the_gap_and_the_size_cap() {
 
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
-fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
+fn delete_reads_reserve_the_serialized_size_of_the_sets_they_return() {
     let data_file = "memory:///db/t/data/x.parquet";
     let first = positional_delete_file_bytes(&[(data_file, 3), (data_file, 7)], None);
     let second = positional_delete_file_bytes(&[(data_file, 7), (data_file, 9)], None);
@@ -609,7 +608,7 @@ fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
 
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
-fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
+fn delete_reads_fail_as_soon_as_their_sets_outgrow_the_pool() {
     const ROWS: i64 = 300_000;
     let data_file = "memory:///db/t/data/x.parquet";
     let rows: Vec<(&str, i64)> = (0..ROWS).map(|pos| (data_file, pos)).collect();
@@ -698,7 +697,7 @@ fn footer_bytes_of_many_small_delete_files_leave_the_pool_to_the_sets() {
     assert_eq!(positions.len(), DELETE_FILES);
 }
 
-/// Phase A's positional-delete steps over one delete file.
+/// The positional-delete steps over one delete file.
 async fn read_positions(
     store: Arc<dyn ObjectStore>,
     meta: ObjectMeta,
@@ -720,18 +719,18 @@ async fn read_positions(
     });
     let opened = ctx.open_delete_file(meta).await.unwrap();
     let row_groups = join_spawned(opened.row_group_reads(&ctx)).await.unwrap();
-    let positions = ctx
-        .union_by_data_file(row_groups.into_iter().flatten())
-        .await
-        .unwrap();
+    let sets: Vec<(String, RoaringTreemap)> = row_groups.into_iter().flatten().collect();
     assert_eq!(
         ctx.reservation.size(),
-        positions
-            .values()
-            .map(RoaringTreemap::serialized_size)
+        sets.iter()
+            .map(|(_, set)| set.serialized_size())
             .sum::<usize>(),
         "the reservation holds the position sets and nothing else"
     );
+    let mut positions: HashMap<String, RoaringTreemap> = HashMap::new();
+    for (data_file, set) in sets {
+        *positions.entry(data_file).or_default() |= set;
+    }
     positions
 }
 
@@ -778,7 +777,7 @@ fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
     }
 }
 
-/// Phase A over `files`, under a limiter of `permits`.
+/// Every data file's positions over `files`, under a limiter of `permits`.
 async fn collect_positions(
     files: &[FileEntry],
     table_root: &str,
@@ -795,7 +794,7 @@ async fn collect_positions_within(
     store: &Arc<dyn ObjectStore>,
     reservation: Arc<MemoryReservation>,
 ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
-    ShardDeletes {
+    let Some(loads) = ShardDeletes {
         files,
         table_root,
         secrets: Arc::from([]),
@@ -803,8 +802,24 @@ async fn collect_positions_within(
         reservation,
         metadata_size_hint: Some(DEFAULT_METADATA_SIZE_HINT),
     }
-    .collect_positions(store)
-    .await
+    .plan(store)?
+    else {
+        return Ok(HashMap::new());
+    };
+    let data_files: Vec<String> = files
+        .iter()
+        .filter(|entry| !entry.deletes.is_empty())
+        .map(|entry| reconstruct_abs_uri(&entry.path, table_root))
+        .collect();
+    futures::future::try_join_all(data_files.iter().map(|data_file| loads.load(data_file))).await?;
+    let mut positions = HashMap::new();
+    for data_file in data_files {
+        let taken = loads.take(&data_file)?;
+        if !taken.is_empty() {
+            positions.insert(data_file, taken);
+        }
+    }
+    Ok(positions)
 }
 
 fn field_id_meta(id: i32) -> HashMap<String, String> {
@@ -875,7 +890,7 @@ fn puffin_file_with_two_vectors() -> (Vec<u8>, [DeleteMechanism; 2]) {
     (file, vectors)
 }
 
-/// Scenario: All delete mechanisms converge on one position map and one access-plan pipeline
+/// Scenario: All delete mechanisms converge on one access-plan pipeline
 /// Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
 #[test]
 fn all_delete_mechanisms_converge_on_one_position_map() {
@@ -1095,126 +1110,4 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
         "the shard fails on the unapplicable mechanism: {err}"
     );
     assert_eq!(reads, 0, "no body is fetched once the backstop has refused");
-}
-
-/// Records every forwarded data read, with its range, so a test can count storage trips per
-/// object. Each read yields once while in flight, so concurrent reads overlap observably.
-#[derive(Debug)]
-struct CountingObjectStore {
-    inner: Arc<dyn ObjectStore>,
-    reads: std::sync::Mutex<Vec<(String, Option<GetRange>)>>,
-    in_flight: AtomicUsize,
-    max_in_flight: AtomicUsize,
-}
-
-impl CountingObjectStore {
-    fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            inner,
-            reads: std::sync::Mutex::new(Vec::new()),
-            in_flight: AtomicUsize::new(0),
-            max_in_flight: AtomicUsize::new(0),
-        }
-    }
-
-    fn reads_of(&self, name: &str) -> usize {
-        self.ranges_of(name).len()
-    }
-
-    fn ranges_of(&self, name: &str) -> Vec<Option<GetRange>> {
-        self.reads
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(location, _)| location.ends_with(name))
-            .map(|(_, range)| range.clone())
-            .collect()
-    }
-
-    fn total_reads(&self) -> usize {
-        self.reads.lock().unwrap().len()
-    }
-
-    fn max_in_flight(&self) -> usize {
-        self.max_in_flight.load(Ordering::SeqCst)
-    }
-}
-
-impl std::fmt::Display for CountingObjectStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CountingObjectStore({})", self.inner)
-    }
-}
-
-#[async_trait]
-impl ObjectStore for CountingObjectStore {
-    async fn put_opts(
-        &self,
-        location: &object_store::path::Path,
-        payload: object_store::PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &object_store::path::Path,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &object_store::path::Path,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        if options.head {
-            return self.inner.get_opts(location, options).await;
-        }
-        self.reads
-            .lock()
-            .unwrap()
-            .push((location.to_string(), options.range.clone()));
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        let result = self.inner.get_opts(location, options).await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        result
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<
-            'static,
-            object_store::Result<object_store::path::Path>,
-        >,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
-        self.inner.delete_stream(locations)
-    }
 }

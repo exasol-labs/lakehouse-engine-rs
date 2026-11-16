@@ -7,20 +7,16 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * `ctx.memory_limit()` returns the per-instance limit in bytes, with `0` meaning unknown. For a positive limit the pool is `fraction × (limit − overhead_bytes)`, floored at a minimum non-zero budget, which leaves headroom below the Exasol engine's 80% concurrency-stall threshold. For `0`, the UDF uses a conservative default budget and ignores the fraction and overhead.
 * The memory-pool fraction (default `0.6`) and the per-instance container overhead in megabytes (default `200`) are VS properties carried in the scan spec. A spec without them deserializes to those defaults.
 * The DataFusion memory pool bounds aggregation, sort, and join, but not the Parquet-to-Arrow decode and scan buffers. The scan spec's `batch_size` bounds that working set. A spec without it deserializes to a built-in default, and a value below 1 is clamped to 1.
-* The row-position delete state (`scan-read-path/scan-execution-row-position-deletes`) is built before the first row is emitted. The deleted-position sets live until the access plans are built, and the access plans live until the scan finishes. Their size is a non-spillable reservation in the memory pool, so a large delete set shrinks the pool left for aggregation, sort, and join, and a delete set larger than the pool fails the scan instead of exhausting the instance.
+* The row-position delete state (`scan-read-path/scan-execution-row-position-deletes`) is built as data files are opened. A data file's deleted positions live until its access plan is built, and the plan lives while the file is read. Their size is a non-spillable reservation in the memory pool, so a large delete set shrinks the pool left for aggregation, sort, and join, and a delete set larger than the pool fails the scan instead of exhausting the instance.
+* The bytes fetched with a data file's footer, a whole small file among them, and its page index are held while the file is read (`datafusion-scan/scan-execution-file-metadata`). They are reserved in the pool. Bytes that do not fit are not held and are read from the store when needed, so they never fail a scan. A file's held bytes and its parsed footer are dropped once no reader of the file is open and its finished byte ranges cover it.
 * The deleted-position sets are reserved as they grow. Each decoded batch of a positional-delete file joins its set before the next batch decodes, so no unreserved copy of the positions outlives one batch. The reservation equals the sets' serialized size. A decoded deletion vector is reserved once it is decoded.
 * The Arrow decode batch stays outside the pool, like any decode buffer. So do a delete file's footer bytes, at most the metadata size hint: the row groups inside them decode in the footer read's own task, and the bytes drop before that task ends.
 * Row-group pruning, page-index pruning, and filter pushdown into the `ParquetExec` are DataFusion session and Parquet scan options. They differ from Iceberg file-level pruning (`file-planning/pushdown-file-pruning`), which drops whole files before the reader opens them.
-* A delete-carrying data file needs its Parquet footer for access-plan construction and again in the opener. A shared reader factory or cached metadata reader avoids parsing it twice.
 * The common spec carries, per side, a reference to the Exasol CONNECTION that supplies the storage credentials, or a sealed envelope with the backend the planning layer vended. `storage-access/scan-spec-credential-reference` owns the wire contract, the sealed envelope, the required grant, and the rotation consequence. `storage-access/storage-backend-enum` owns how the registered store derives from the backend.
 * The UDF resolves the spec's storage blocks once at the top of the invocation, not at each store-construction site. A join spec has a block per side, so the result is a pair. `ctx.connection()` is engine-local, so it does not contact the table catalog.
 * Each side has one registered object store. It serves that side's data files and every delete payload they reference: positional-delete files, Puffin deletion-vector files, and Delta deletion-vector sidecars. The single-table path registers one store over one backend.
 * Each side's store answers per-file metadata lookups from a size index over that side's files only. A routing decorator wraps one spec-sized store per side, so every operation is routed before the sized-`head` shortcut can answer it (`scan-aggregation/scan-execution-join`).
 * Every scan-path site that builds a value-based redaction secret set takes it from the resolved storage backends: on the raw-scan path, the partial-aggregate path, the join path, and in the scan's Parquet table provider. A spec that carries only a connection name has no secret to yield. The wire wrapper exposes no secret accessor, so a site that still reads the unresolved value fails to compile. The redaction set for a routed store is the union of every side's `secret_values()`.
-* DataFusion's `FileMetadataCache` keys entries by object-store path. It admits a stored entry only when the requesting `ObjectMeta` has the same byte size and the same `last_modified`. Access-plan construction and the opener agree because the access plan builds one `ObjectMeta` (spec-supplied size, fixed epoch timestamp) and clones it onto the file's `PartitionedFile`. A re-derived `ObjectMeta` would miss on every lookup and restore the duplicate footer fetch.
-* The per-side store split does not change cache reuse, because the cache is keyed by path. Both join sides share one bounded cache.
-* The default `FileMetadataCache` holds 50 MiB (`DEFAULT_METADATA_CACHE_LIMIT`) and evicts least-recently-used entries. An entry larger than the limit is never cached. Entry size scales with a file's `columns × row_groups`, so no fixed shard-file count is safe for every table. The access-plan fetch requests row-group metadata only, with no page index, which keeps entries small.
-
 ## Scenarios
 
 ### Scenario: Scan sizes its memory pool from the reported per-instance limit
@@ -79,10 +75,10 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 ### Scenario: Row-position delete state is reserved in the memory pool
 
 * *GIVEN* a shard whose data files carry row-position deletes
-* *WHEN* the scan UDF builds the deleted-position sets and the base access plans
-* *THEN* the UDF SHALL reserve the deleted-position sets in the DataFusion memory pool until the access plans are built, and the access plans until the scan finishes
+* *WHEN* the scan UDF builds a data file's deleted-position set and its base access plan
+* *THEN* the UDF SHALL reserve the deleted positions in the DataFusion memory pool until the file's access plan is built, and the access plan while the file is read
 * *AND* the UDF SHALL reserve each deleted-position set as it grows, batch by batch, so a delete set larger than the pool fails while it is read rather than after it is fully built
-* *AND* a shard whose delete state does not fit the pool SHALL fail with an error naming the memory pool before any row is emitted
+* *AND* planning SHALL reserve nothing, and a scan whose delete state does not fit the pool SHALL fail with an error naming the memory pool
 
 ### Scenario: Scan bounds the Parquet decode working set via a configured batch size
 
@@ -110,21 +106,10 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *AND* the UDF MUST NOT re-authenticate to the catalog, re-request vended credentials, or resolve the referenced CONNECTION a second time to read a delete file, because the one per-invocation resolution already supplied it
 * *AND* a credential value MUST NOT appear in any error message the UDF returns while reading a delete file, for whichever side's delete file failed
 
-### Scenario: A shared Parquet metadata reader avoids a duplicate footer parse
+### Scenario: Held file bytes are reserved in the memory pool
 
-* *GIVEN* a data file that carries positional deletes, whose Parquet footer is needed both to build the base `ParquetAccessPlan` and by the Parquet opener
-* *WHEN* the scan UDF configures the `ParquetSource` for its assigned files
-* *THEN* the UDF SHOULD install a `ParquetFileReaderFactory` (or an equivalent cached metadata reader) so the data file's footer metadata parsed for access-plan construction is reused by the opener rather than parsed a second time
-* *AND* the `ObjectMeta` the UDF fetches the footer with SHALL be the SAME value it attaches to that file's `PartitionedFile`, because the metadata cache admits a stored entry only when the requesting `ObjectMeta`'s byte size and last-modified timestamp both match the stored entry's
-* *AND* the reuse SHALL hold at SHARD SCALE, not only for one file: a shard of K delete-carrying data files SHALL issue the same total number of object-store requests against its data files as a shard of the same K data files with no deletes attached, so no footer cached during access-plan construction is evicted before the opener reads it
-* *AND* if no shared reader is installed, the UDF MAY accept one additional footer range GET per delete-carrying data file, but MUST NOT issue a HEAD request in either case
-* *AND* the configured batch size and Parquet row-group / page pruning SHALL apply unchanged whether or not a shared reader is installed
-
-### Scenario: A metadata-cache eviction that re-fetches a footer is observable
-
-* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so a footer that access-plan construction fetched is not available from that cache when the Parquet opener reads it, because the entry was evicted, or because it exceeded the cache limit and was never admitted
-* *WHEN* the opener fetches that data file's footer a second time within the same scan invocation
-* *THEN* the UDF SHALL count that second footer fetch as a metadata-cache re-fetch, per scan invocation
-* *AND* the UDF SHALL surface the accumulated re-fetch count on its debug diagnostic channel, so an operator running the scan at debug level observes the double-fetch directly instead of inferring it from object-store request volume
-* *AND* a scan whose footers all stay cached SHALL report a re-fetch count of ZERO, so the signal distinguishes eviction from normal operation rather than firing on every delete-carrying scan
-* *AND* the observable MUST stay inert otherwise: at the production default debug level it MUST NOT emit output, it MUST NOT alter the scan's result rows, it MUST NOT fail the scan (an eviction is a cost signal, not an error), and its record MUST NOT contain a storage credential
+* *GIVEN* a data file whose footer bytes, whole content, or page index the scan holds in memory
+* *WHEN* the scan reads the file
+* *THEN* the UDF SHALL reserve the held bytes in the DataFusion memory pool
+* *AND* the UDF SHALL release them once no reader of the file is open and the finished byte ranges cover the file
+* *AND* bytes that do not fit the pool SHALL NOT be held, and the scan SHALL read them from the store and return the same rows

@@ -3,11 +3,7 @@
 //! panicking thread before that abort, so it is the only seam that can capture it; the hook logs
 //! to stderr and [`PANIC_LOG_PATH`], then chains the previous hook.
 
-use datafusion::execution::cache::CacheEntryInfo;
-use datafusion::execution::cache::cache_manager::CachedFileMetadataEntry;
-use object_store::path::Path;
 use std::backtrace::Backtrace;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::panic::PanicHookInfo;
@@ -48,62 +44,6 @@ fn debug_writer() -> &'static Mutex<Option<File>> {
 
 pub fn debug_set_rows(total: u64) {
     DEBUG_ROWS.store(total, Ordering::Relaxed);
-}
-
-// Footer re-fetch observable (#165): data-file footers cached during access-plan construction
-// are recorded here and compared against the session `FileMetadataCache` at scan end.
-// `reset_access_plan_cached_footers` MUST run at the start of every invocation, because a pooled
-// UDF process serves many invocations in sequence.
-
-fn access_plan_cached_footers() -> &'static Mutex<HashSet<Path>> {
-    static PATHS: OnceLock<Mutex<HashSet<Path>>> = OnceLock::new();
-    PATHS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Called right after the `fetch_metadata()` that cached the entry, the only site that knows.
-pub fn record_access_plan_cached_footer(path: &Path) {
-    if let Ok(mut paths) = access_plan_cached_footers().lock() {
-        paths.insert(path.clone());
-    }
-}
-
-/// MUST run at the start of every scan invocation; see the section note above.
-pub fn reset_access_plan_cached_footers() {
-    if let Ok(mut paths) = access_plan_cached_footers().lock() {
-        paths.clear();
-    }
-}
-
-/// Decides whether a cached entry's `hits == 0` is readable as a re-fetch (see [`footer_refetch_count`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenerCoverage {
-    /// No pushed LIMIT can end the stream early and no join can leave one side unpolled.
-    EveryAssignedFile,
-    MayStopEarly,
-}
-
-/// A recorded path absent from `entries` is always a re-fetch (evicted or never admitted).
-///
-/// A present path with `hits == 0` is ambiguous: `put` counts no hit
-/// (`datafusion-execution` `src/cache/default_cache.rs`), so it is both a
-/// looked-up-missed-re-put entry and one the opener never opened. A pushed LIMIT ends the stream
-/// before later files open (`datafusion-datasource` `src/file_stream/scan_state.rs`)
-/// and an inner join with an empty build side never polls the probe side, so `hits == 0` counts
-/// only under [`OpenerCoverage::EveryAssignedFile`].
-pub fn footer_refetch_count(
-    entries: &datafusion::common::HashMap<Path, CacheEntryInfo<CachedFileMetadataEntry>>,
-    coverage: OpenerCoverage,
-) -> u64 {
-    let Ok(paths) = access_plan_cached_footers().lock() else {
-        return 0;
-    };
-    paths
-        .iter()
-        .filter(|path| match entries.get(*path) {
-            Some(entry) => entry.hits == 0 && coverage == OpenerCoverage::EveryAssignedFile,
-            None => true,
-        })
-        .count() as u64
 }
 
 /// Field 1 of `/proc/self/statm` is the resident page count. Page size is fixed at 4096 on the

@@ -23,6 +23,7 @@ arrow   = { version = "59.3.2", default-features = false }
 parquet = { version = "59.3.2", features = ["async"] }
 
 datafusion = { version = "55.2", default-features = false, features = ["parquet", "sql"] }
+datafusion-datasource = { version = "55.2", default-features = false }
 
 object_store = { version = "0.13.2", features = ["aws"] }
 

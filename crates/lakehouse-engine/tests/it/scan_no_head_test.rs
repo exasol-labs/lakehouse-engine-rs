@@ -21,10 +21,7 @@ use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
     StorageBackend, StorageProps,
 };
-use lakehouse_engine::scan::{
-    build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
-    session_config_for_spec,
-};
+use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
@@ -785,9 +782,9 @@ fn scan_reads_footer_via_range_get_once() {
     );
 }
 
+/// Scenario: A small data file is read in one request
 #[test]
-fn scan_access_plan_footer_fetch_is_one_range_get() {
-    // More than one request means Phase B lost the metadata size hint or `PageIndexPolicy::Skip`.
+fn scan_reads_a_small_delete_carrying_file_in_one_get() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let data_url = write_local_parquet(dir, "data.parquet", 200);
@@ -819,26 +816,8 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
         ]),
         log: Arc::clone(&log),
     });
-
-    let session = SessionContext::new_with_config(session_config_for_spec(&spec));
-    session
-        .runtime_env()
-        .register_object_store(&Url::parse(&data_url).expect("register url"), store);
-
-    block_on(async {
-        register_files(
-            &session,
-            "scan_target",
-            &spec,
-            &scan_fixture::resolved_storage(&spec),
-        )
-        .await
-        .expect("register_files must succeed on the delete-carrying data file");
-        // Never execute: the opener's reads would contaminate the log.
-        build_raw_scan_physical_plan(&session, &spec)
-            .await
-            .expect("physical plan must build");
-    });
+    let rows = block_on(run_scan_with_store(&spec, &data_url, store));
+    assert_eq!(rows_of(&rows).len(), 199, "one of the 200 rows is deleted");
 
     let data_key = head_key(&data_url);
     let data_calls: Vec<Option<GetRange>> = log
@@ -850,41 +829,20 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
         .collect();
 
     assert_eq!(
-        data_calls.len(),
-        1,
-        "plan construction alone must fetch the delete-carrying data file's footer with \
-         EXACTLY ONE non-HEAD request, not an unhinted probe-then-metadata(-then-page-index) \
-         sequence: {data_calls:?}"
+        data_calls,
+        [Some(GetRange::Bounded(0..data_size))],
+        "the whole scan must read the data file with one request for the whole file"
     );
-    match &data_calls[0] {
-        Some(GetRange::Bounded(range)) => {
-            assert_eq!(
-                range.end, data_size,
-                "the single footer fetch must be a suffix range ending at the file size"
-            );
-            assert!(
-                range.end - range.start > 8,
-                "must be the hinted suffix range, not the 8-byte footer-length probe: {range:?}"
-            );
-        }
-        other => panic!("expected a bounded suffix range for the footer fetch, got {other:?}"),
-    }
 }
 
 #[test]
-fn scan_footer_reuse_holds_at_shard_scale() {
-    // The fixture is calibrated (decision-log [6]) so 22 footers of 64 columns × 64 row groups
-    // fill ~78% of `DEFAULT_METADATA_CACHE_LIMIT`; at 29 files the cache evicts and the GET
-    // equality fails. The band assertion catches drift in the limit or `memory_size()`.
-    use datafusion::execution::cache::cache_manager::DEFAULT_METADATA_CACHE_LIMIT;
+fn scan_reads_each_small_file_once_at_shard_scale() {
     use std::collections::HashSet;
 
     const COLUMNS: usize = 64;
     const ROW_GROUPS: usize = 64;
     const ROWS_PER_ROW_GROUP: usize = 4;
     const SHARD_FILE_COUNT: usize = 22;
-    const BAND_LOW_PERCENT: usize = 70;
-    const BAND_HIGH_PERCENT: usize = 90;
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -969,59 +927,21 @@ fn scan_footer_reuse_holds_at_shard_scale() {
         sizes,
         log: Arc::clone(&delta_log),
     });
-    let (delta_rows, delta_session) = block_on(run_scan_capturing_session(
-        &delta_spec,
-        &register_url,
-        delta_store,
-    ));
+    let delta_rows = block_on(run_scan_with_store(&delta_spec, &register_url, delta_store));
     assert_eq!(
         rows_of(&delta_rows).len(),
         SHARD_FILE_COUNT * (rows_per_file - 1),
         "one position deleted per data file"
     );
 
-    let entries = delta_session
-        .runtime_env()
-        .cache_manager
-        .get_file_metadata_cache()
-        .list_entries();
-    let cached: Vec<(usize, usize)> = data_keys
-        .iter()
-        .filter_map(|key| entries.get(key).map(|e| (e.size_bytes, e.hits)))
-        .collect();
-    let aggregate: usize = cached.iter().map(|(size, _)| size).sum();
-    let per_entry_bytes = cached.first().map(|(size, _)| *size).unwrap_or(0);
-
+    assert_eq!(
+        data_file_gets(&free_log),
+        SHARD_FILE_COUNT,
+        "a delete-free shard must read each small data file with one request"
+    );
     assert_eq!(
         data_file_gets(&delta_log),
-        data_file_gets(&free_log),
-        "a delete-carrying shard must issue the SAME number of non-HEAD data-file GETs as the \
-         delete-free shard over the same {SHARD_FILE_COUNT} files: any excess is a footer that \
-         access-plan construction cached and the opener could not read back"
-    );
-
-    assert_eq!(
-        cached.len(),
         SHARD_FILE_COUNT,
-        "every data-file footer access-plan construction cached must still be cached after the \
-         scan; a missing one was evicted (or never admitted) and re-fetched"
-    );
-    assert!(
-        cached.iter().all(|(_, hits)| *hits >= 1),
-        "each cached footer must have been READ BACK at least once — the opener's own lookup; \
-         a zero-hit entry means the opener missed and re-`put` it: {cached:?}"
-    );
-
-    let band_low = DEFAULT_METADATA_CACHE_LIMIT * BAND_LOW_PERCENT / 100;
-    let band_high = DEFAULT_METADATA_CACHE_LIMIT * BAND_HIGH_PERCENT / 100;
-    assert!(
-        aggregate >= band_low && aggregate <= band_high,
-        "the fixture is calibrated so the {SHARD_FILE_COUNT} cached footers occupy \
-         {BAND_LOW_PERCENT}-{BAND_HIGH_PERCENT}% of DEFAULT_METADATA_CACHE_LIMIT \
-         ({DEFAULT_METADATA_CACHE_LIMIT} bytes) — near enough the eviction cliff for the reuse \
-         assertion above to be able to fail for eviction. Measured {aggregate} bytes \
-         ({per_entry_bytes} per entry × {SHARD_FILE_COUNT}), expected {band_low}..={band_high}. \
-         Re-calibrate COLUMNS / ROW_GROUPS / SHARD_FILE_COUNT against a fresh `list_entries()` \
-         measurement and record the new numbers in decision-log [6]"
+        "a delete-carrying shard must read each small data file with one request"
     );
 }

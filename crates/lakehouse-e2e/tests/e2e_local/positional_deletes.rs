@@ -25,6 +25,8 @@ const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
 /// Equals the data-file count of `mor_pos_partition` and `mor_dv`, so a 1-node cluster
 /// gets exactly one file per shard.
 const SPLIT_PARALLELISM_FACTOR: usize = 4;
+/// One shard read by more streams than it has files, so every file is opened by its own stream.
+const STREAMS_VS_NAME: &str = "POSDEL_STREAMS_VS";
 
 fn setup_e2e() {
     static DONE: OnceLock<()> = OnceLock::new();
@@ -39,6 +41,13 @@ fn setup_e2e() {
             &mut conn,
             &VsProps::new(SPLITSHARD_VS_NAME, NAMESPACE)
                 .with_parallelism_factor(SPLIT_PARALLELISM_FACTOR),
+        );
+        create_virtual_schema(
+            &mut conn,
+            &VsProps::new(STREAMS_VS_NAME, NAMESPACE)
+                .with_parallelism_factor(1)
+                .with_property("DATAFUSION_THREADING_MODE", "FIXED")
+                .with_property("DATAFUSION_TARGET_PARTITIONS", "16"),
         );
     });
 }
@@ -335,6 +344,54 @@ fn e2e_partition_delete_invariant_across_fanout() {
         "post-delete result must be invariant to shard placement: \
          same-shard={same_ids:?} vs split-shard={split_ids:?}"
     );
+}
+
+/// Scenario: Row-position deletes apply to files opened by concurrent streams
+#[test]
+fn e2e_deletes_hold_under_many_streams_top_n_limit_and_join() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let partitioned = vs_table(STREAMS_VS_NAME, PARTITION_GRANULARITY_TABLE);
+    let vectors = vs_table(STREAMS_VS_NAME, DELETION_VECTOR_TABLE);
+
+    let deleted: HashSet<i64> = PARTITION_GRANULARITY_DELETED_IDS.iter().copied().collect();
+    let remaining: Vec<i64> = (1..=PARTITION_GRANULARITY_TOTAL_ROWS as i64)
+        .filter(|id| !deleted.contains(id))
+        .collect();
+
+    let all = ids_column(&conn.query_columns(&format!("SELECT id FROM {partitioned} ORDER BY id")));
+    assert_eq!(all, remaining, "every stream applies its file's deletes");
+
+    let top = ids_column(&conn.query_columns(&format!(
+        "SELECT id FROM {partitioned} ORDER BY id DESC LIMIT 3"
+    )));
+    let expected_top: Vec<i64> = remaining.iter().rev().take(3).copied().collect();
+    assert_eq!(top, expected_top, "top-N over delete-carrying files");
+
+    let limited = ids_column(&conn.query_columns(&format!("SELECT id FROM {partitioned} LIMIT 2")));
+    assert_eq!(limited.len(), 2);
+    assert!(
+        limited.iter().all(|id| remaining.contains(id)),
+        "a LIMIT that stops the scan early returns no deleted row: {limited:?}"
+    );
+
+    let vector_ids: HashSet<i64> = deletion_vector_remaining_ids().collect();
+    let joined = ids_column(&conn.query_columns(&format!(
+        "SELECT p.id FROM {partitioned} p JOIN {vectors} v ON p.id = v.id ORDER BY p.id"
+    )));
+    let expected_joined: Vec<i64> = remaining
+        .iter()
+        .copied()
+        .filter(|id| vector_ids.contains(id))
+        .collect();
+    assert!(!expected_joined.is_empty() && expected_joined.len() < remaining.len());
+    assert_eq!(
+        joined, expected_joined,
+        "both join sides apply their deletes"
+    );
+
+    let vector_rows = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {vectors}"));
+    assert_eq!(vector_rows as usize, vector_ids.len(), "deletion vectors");
 }
 
 /// Scenario: Positional deletes compose with projection, filter, LIMIT, and pruning

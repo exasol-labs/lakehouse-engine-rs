@@ -1,18 +1,18 @@
 //! Applies row-position deletes: Iceberg positional-delete files, Iceberg deletion vectors, and
 //! Delta deletion vectors.
-//! Phase A ([`ShardDeletes::collect_positions`]) reads every unique delete payload once within one
-//! shared connection budget and merges positions into one `HashMap<data_file_path,
-//! RoaringTreemap>`, mechanism-agnostic. Phase B ([`build_access_plan`]) turns each set into a base
-//! [`ParquetAccessPlan`], so DataFusion's opener intersects predicate/row-group/page pruning on top
-//! and deletes compose with pushdown. Every read and decode is a top-level [`join_spawned`] task,
-//! so a multi-thread runtime spreads the work across its workers. Only the orchestrating call awaits
-//! tasks, so no permit holder ever waits on another task. Phase A reserves each set in the memory
-//! pool as it grows, so no unreserved copy of the positions outlives one decoded batch.
+//! [`ShardDeletes::plan`] groups the shard's delete payloads without I/O. Each payload loads once,
+//! when the first data file that needs it is opened, within one shared connection budget, and
+//! yields positions per data file, mechanism-agnostic. [`build_access_plan`] turns a data file's
+//! positions into a base [`ParquetAccessPlan`], so DataFusion's opener intersects
+//! predicate/row-group/page pruning on top and deletes compose with pushdown. No permit holder
+//! ever waits on another read. Each set is reserved in the memory pool as it grows, so no
+//! unreserved copy of the positions outlives one decoded batch.
 
 use crate::scan::deletion_vectors::{
     DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
 };
 use crate::scan::parquet_reader::{SizedParquetReader, object_meta_for};
+use crate::scan::shared_files::{HeldBytes, Reserved, read_footer};
 use crate::scan::spec::{DeleteMechanism, FileEntry};
 use crate::scan::{ObjectLocation, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
@@ -21,7 +21,7 @@ use bytes::Bytes;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::execution::memory_pool::MemoryReservation;
 use exasol_udf_sdk::error::UdfError;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use object_store::{OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ProjectionMask;
@@ -30,14 +30,13 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
-use parquet::file::FOOTER_SIZE;
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 use url::Url;
@@ -53,6 +52,9 @@ const PUFFIN_MAX_MERGED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 type Positions = Vec<(String, RoaringTreemap)>;
 
 type Read<T> = BoxFuture<'static, Result<T, UdfError>>;
+
+/// A payload's read, with the absolute URIs of the data files it can hold deletes of.
+type PayloadRead = (Vec<String>, Read<Positions>);
 
 pub(super) fn redact(msg: String, secrets: &[String]) -> String {
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
@@ -93,17 +95,21 @@ async fn acquire(limiter: &Semaphore) -> Result<SemaphorePermit<'_>, UdfError> {
         .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))
 }
 
-pub(super) fn reserve(
+fn does_not_fit(e: impl std::fmt::Display, secrets: &[String]) -> UdfError {
+    UdfError::User(redact(
+        format!("the row-position delete state does not fit the memory pool: {e}"),
+        secrets,
+    ))
+}
+
+fn reserve(
     reservation: &MemoryReservation,
     bytes: usize,
     secrets: &[String],
 ) -> Result<(), UdfError> {
-    reservation.try_grow(bytes).map_err(|e| {
-        UdfError::User(redact(
-            format!("the row-position delete state does not fit the memory pool: {e}"),
-            secrets,
-        ))
-    })
+    reservation
+        .try_grow(bytes)
+        .map_err(|e| does_not_fit(e, secrets))
 }
 
 /// Moves `reservation` from the `before` bytes it holds for a set to the set's `after` size.
@@ -262,22 +268,15 @@ struct OpenedDeleteFile {
 
 /// Serves reads from the footer GET's bytes only, so decoding from them can never issue a request
 /// outside the connection budget.
-struct FooterBytes {
-    start: u64,
-    bytes: Bytes,
-}
+struct FooterBytes(HeldBytes);
 
 impl FooterBytes {
     fn slice(&self, range: &Range<u64>) -> parquet::errors::Result<Bytes> {
-        let end = self.start + self.bytes.len() as u64;
-        if range.start < self.start || range.end > end {
-            return Err(ParquetError::General(format!(
+        self.0.slice(range).ok_or_else(|| {
+            ParquetError::General(format!(
                 "range {range:?} lies outside the delete file's footer bytes"
-            )));
-        }
-        Ok(self
-            .bytes
-            .slice((range.start - self.start) as usize..(range.end - self.start) as usize))
+            ))
+        })
     }
 }
 
@@ -374,7 +373,7 @@ fn add_positions(
 
 /// One pass over `deletes`, cut at row-group boundaries as it goes, so the cost does not grow
 /// with the row-group count. Untouched row groups stay `Scan`, fully deleted ones are skipped.
-pub(super) fn build_access_plan(
+fn build_access_plan(
     row_groups: &[RowGroupMetaData],
     deletes: &RoaringTreemap,
 ) -> ParquetAccessPlan {
@@ -410,7 +409,7 @@ pub(super) fn build_access_plan(
 }
 
 /// Bytes the plan's row selections hold, for memory-pool accounting.
-pub(super) fn access_plan_bytes(plan: &ParquetAccessPlan) -> usize {
+fn access_plan_bytes(plan: &ParquetAccessPlan) -> usize {
     use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
     plan.inner()
         .iter()
@@ -454,22 +453,19 @@ pub(super) struct ShardDeletes<'a> {
     /// Shared by every provider of one invocation (both join sides included), so the whole
     /// instance stays within one N-permit budget.
     pub(super) limiter: Arc<Semaphore>,
-    /// Grown as positions decode, so it holds the returned sets' serialized size.
+    /// Holds the serialized size of every decoded set, then the size of every built access plan.
     pub(super) reservation: Arc<MemoryReservation>,
     pub(super) metadata_size_hint: Option<usize>,
 }
 
 impl ShardDeletes<'_> {
-    /// Every mechanism passes [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable
-    /// one fails before anything is fetched. Delete-file footers are read before their row groups,
-    /// alongside the deletion vectors. Every read shares one limiter; `RoaringTreemap` union is
-    /// commutative, so completion order cannot change the result. Keyed by absolute data-file URI.
-    /// On return, [`Self::reservation`] holds the serialized size of every returned set.
-    pub(super) async fn collect_positions(
+    /// Every mechanism passes [`applicable_delete_mechanism`] here, so an unapplicable one fails
+    /// before anything is fetched. Issues no request. `None` when the shard carries no delete.
+    pub(super) fn plan(
         &self,
         store: &Arc<dyn ObjectStore>,
-    ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
-        let mut delete_files: HashMap<&str, u64> = HashMap::new();
+    ) -> Result<Option<DeleteLoads>, UdfError> {
+        let mut delete_files: HashMap<&str, (u64, Vec<String>)> = HashMap::new();
         let mut delta_vectors: Vec<(&str, DeltaDeletionVector)> = Vec::new();
         let mut iceberg_vectors: Vec<(&str, IcebergDeletionVector)> = Vec::new();
         for entry in self.files {
@@ -481,7 +477,8 @@ impl ShardDeletes<'_> {
                     &self.secrets,
                 )? {
                     ApplicableDelete::PositionalDeleteFile { path, size } => {
-                        delete_files.entry(path).or_insert(size);
+                        let (_, data_files) = delete_files.entry(path).or_insert((size, vec![]));
+                        data_files.push(reconstruct_abs_uri(&entry.path, self.table_root));
                     }
                     ApplicableDelete::DeltaDeletionVector(vector) => {
                         delta_vectors.push((entry.path.as_str(), vector));
@@ -491,6 +488,9 @@ impl ShardDeletes<'_> {
                     }
                 }
             }
+        }
+        if delete_files.is_empty() && delta_vectors.is_empty() && iceberg_vectors.is_empty() {
+            return Ok(None);
         }
 
         let ctx = Arc::new(DeleteReadContext {
@@ -512,27 +512,123 @@ impl ShardDeletes<'_> {
             reservation: Arc::clone(&self.reservation),
             metadata_size_hint: self.metadata_size_hint,
         });
-        let mut vector_reads = ctx.delta_vector_reads(delta_vectors);
-        vector_reads.extend(ctx.iceberg_vector_reads(iceberg_vectors));
-        let (opened, vector_positions) = futures::future::try_join(
-            join_spawned(ctx.delete_file_opens(delete_files)?),
-            join_spawned(vector_reads),
-        )
-        .await?;
-        let row_groups = join_spawned(
-            opened
-                .into_iter()
-                .flat_map(|file| file.row_group_reads(&ctx)),
-        )
-        .await?;
+        let mut reads = ctx.delete_file_reads(delete_files)?;
+        reads.extend(ctx.delta_vector_reads(delta_vectors));
+        reads.extend(ctx.iceberg_vector_reads(iceberg_vectors));
 
-        ctx.union_by_data_file(
-            vector_positions
-                .into_iter()
-                .flatten()
-                .chain(row_groups.into_iter().flatten()),
-        )
-        .await
+        let mut payloads = Vec::with_capacity(reads.len());
+        let mut pending: HashMap<String, Vec<usize>> = HashMap::new();
+        for (data_files, read) in reads {
+            for data_file in data_files {
+                pending.entry(data_file).or_default().push(payloads.len());
+            }
+            payloads.push(shared_payload(read));
+        }
+        Ok(Some(DeleteLoads {
+            payloads,
+            pending: Mutex::new(pending),
+            reservation: Arc::clone(&self.reservation),
+            secrets: Arc::clone(&self.secrets),
+        }))
+    }
+}
+
+/// One delete payload's positions per data file, loaded by the first data file that awaits it.
+/// A positional-delete file, a Delta sidecar, and a merged Puffin request are one payload each.
+type Payload =
+    Shared<BoxFuture<'static, Result<Arc<Mutex<HashMap<String, Vec<RoaringTreemap>>>>, String>>>;
+
+fn shared_payload(read: Read<Positions>) -> Payload {
+    async move {
+        let mut sets: HashMap<String, Vec<RoaringTreemap>> = HashMap::new();
+        for (data_file, positions) in read.await.map_err(|e| e.to_string())? {
+            sets.entry(data_file).or_default().push(positions);
+        }
+        Ok(Arc::new(Mutex::new(sets)))
+    }
+    .boxed()
+    .shared()
+}
+
+/// One shard's delete payloads, keyed by absolute data-file URI.
+pub(super) struct DeleteLoads {
+    payloads: Vec<Payload>,
+    /// A data file's payloads, removed when its access plan is built.
+    pending: Mutex<HashMap<String, Vec<usize>>>,
+    reservation: Arc<MemoryReservation>,
+    secrets: Arc<[String]>,
+}
+
+impl DeleteLoads {
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<usize>>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn already_applied(data_file: &str) -> UdfError {
+        UdfError::User(format!(
+            "data file '{data_file}': its row-position deletes were already applied"
+        ))
+    }
+
+    /// Loads every payload that can hold deletes of `data_file`.
+    pub(super) async fn load(&self, data_file: &str) -> Result<(), UdfError> {
+        let payloads = self
+            .pending()
+            .get(data_file)
+            .cloned()
+            .ok_or_else(|| Self::already_applied(data_file))?;
+        futures::future::try_join_all(payloads.into_iter().map(|idx| self.payloads[idx].clone()))
+            .await
+            .map_err(UdfError::User)?;
+        Ok(())
+    }
+
+    /// Takes the loaded positions of `data_file`, so a second call fails instead of applying no
+    /// deletes. The reservation keeps the union's size.
+    fn take(&self, data_file: &str) -> Result<RoaringTreemap, UdfError> {
+        let payloads = self
+            .pending()
+            .remove(data_file)
+            .ok_or_else(|| Self::already_applied(data_file))?;
+        let mut positions = RoaringTreemap::new();
+        let mut reserved = 0;
+        for idx in payloads {
+            let Some(Ok(sets)) = self.payloads[idx].peek() else {
+                return Err(UdfError::User(format!(
+                    "data file '{data_file}': its row-position deletes are not loaded"
+                )));
+            };
+            let sets = sets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(data_file);
+            for set in sets.into_iter().flatten() {
+                reserved += set.serialized_size();
+                positions |= set;
+            }
+        }
+        track(
+            &self.reservation,
+            reserved,
+            positions.serialized_size(),
+            &self.secrets,
+        )?;
+        Ok(positions)
+    }
+
+    /// Replaces the reserved positions of `data_file` by its plan, which stays reserved until
+    /// the returned guard drops.
+    pub(super) fn access_plan(
+        &self,
+        data_file: &str,
+        row_groups: &[RowGroupMetaData],
+    ) -> Result<(ParquetAccessPlan, Reserved), UdfError> {
+        let positions = self.take(data_file)?;
+        let plan = build_access_plan(row_groups, &positions);
+        let reserved = Reserved::try_new(&self.reservation, access_plan_bytes(&plan))
+            .map_err(|e| does_not_fit(e, &self.secrets))?;
+        self.reservation.shrink(positions.serialized_size());
+        Ok((plan, reserved))
     }
 }
 
@@ -566,29 +662,16 @@ impl DeleteReadContext {
             ))
         };
         let size = delete_meta.size;
-        let (tail_start, tail, parquet_metadata) = {
+        let (tail, parquet_metadata) = {
             let _permit = acquire(&self.limiter).await?;
-            let mut want = self.metadata_size_hint.unwrap_or(0).max(FOOTER_SIZE) as u64;
-            loop {
-                let start = size.saturating_sub(want);
-                let tail = self
-                    .store
-                    .get_range(&delete_meta.location, start..size)
-                    .await
-                    .map_err(|e| failed(e.to_string()))?;
-                let mut parser = ParquetMetaDataReader::new();
-                match parser.try_parse_sized(&tail, size) {
-                    Ok(()) => {
-                        let parsed = parser.finish().map_err(|e| failed(e.to_string()))?;
-                        break (start, tail, parsed);
-                    }
-                    // A footer larger than the hint costs one more GET, still under this permit.
-                    Err(ParquetError::NeedMoreData(needed)) if needed as u64 > want => {
-                        want = needed as u64;
-                    }
-                    Err(e) => return Err(failed(e.to_string())),
-                }
-            }
+            read_footer(
+                self.store.as_ref(),
+                &delete_meta.location,
+                size,
+                self.metadata_size_hint.unwrap_or(0) as u64,
+            )
+            .await
+            .map_err(|e| failed(e.to_string()))?
         };
         let metadata =
             ArrowReaderMetadata::try_new(Arc::new(parquet_metadata), ArrowReaderOptions::new())
@@ -616,19 +699,20 @@ impl DeleteReadContext {
                 let row_group = metadata.metadata().row_group(idx);
                 projected_leaves
                     .iter()
-                    .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start)
+                    .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail.start)
             });
         // Decoded before the bytes drop, so they never outlive this task, stay a transient read
         // buffer like any decode buffer, and cannot crowd the pool while other files load.
         let decoded = if in_tail.is_empty() {
             HashMap::new()
         } else {
-            let footer_bytes = FooterBytes {
-                start: tail_start,
-                bytes: tail,
-            };
-            self.decode_row_groups(footer_bytes, metadata.clone(), projection.clone(), in_tail)
-                .await?
+            self.decode_row_groups(
+                FooterBytes(tail),
+                metadata.clone(),
+                projection.clone(),
+                in_tail,
+            )
+            .await?
         };
         Ok(OpenedDeleteFile {
             reader: SizedParquetReader::new(Arc::clone(&self.store), delete_meta.location, size),
@@ -747,54 +831,26 @@ impl DeleteReadContext {
         Ok(positions_by_data_file)
     }
 
-    /// Unions each data file's sets, one task per data file.
-    async fn union_by_data_file(
+    /// One read per delete file: its footer, then its row groups, each under its own permit. No
+    /// HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
+    fn delete_file_reads(
         self: &Arc<Self>,
-        sets: impl IntoIterator<Item = (String, RoaringTreemap)>,
-    ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
-        let mut sets_by_data_file: HashMap<String, Vec<RoaringTreemap>> = HashMap::new();
-        for (path, positions) in sets {
-            sets_by_data_file.entry(path).or_default().push(positions);
-        }
-        let unions = join_spawned(sets_by_data_file.into_iter().map(|(path, sets)| {
-            let ctx = Arc::clone(self);
-            async move {
-                let before = sets.iter().map(RoaringTreemap::serialized_size).sum();
-                let union = sets
-                    .into_iter()
-                    .fold(RoaringTreemap::new(), |mut union, set| {
-                        union |= set;
-                        union
-                    });
-                track(
-                    &ctx.reservation,
-                    before,
-                    union.serialized_size(),
-                    &ctx.secrets,
-                )?;
-                Ok((path, union))
-            }
-        }))
-        .await?;
-        Ok(unions.into_iter().collect())
-    }
-
-    /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
-    fn delete_file_opens(
-        self: &Arc<Self>,
-        delete_files: HashMap<&str, u64>,
-    ) -> Result<Vec<Read<OpenedDeleteFile>>, UdfError> {
+        delete_files: HashMap<&str, (u64, Vec<String>)>,
+    ) -> Result<Vec<PayloadRead>, UdfError> {
         delete_files
             .into_iter()
-            .map(|(delete_path, delete_size)| {
+            .map(|(delete_path, (delete_size, data_files))| {
                 let delete_meta = object_meta_for(
                     &reconstruct_abs_uri(delete_path, &self.table_root),
                     delete_size,
                 )?;
                 let ctx = Arc::clone(self);
-                let open: Read<_> =
-                    Box::pin(async move { ctx.open_delete_file(delete_meta).await });
-                Ok(open)
+                let read: Read<_> = Box::pin(async move {
+                    let opened = ctx.open_delete_file(delete_meta).await?;
+                    let row_groups = join_spawned(opened.row_group_reads(&ctx)).await?;
+                    Ok(row_groups.into_iter().flatten().collect())
+                });
+                Ok((data_files, read))
             })
             .collect()
     }
@@ -830,6 +886,13 @@ impl DeleteReadContext {
         body.map_err(|e| unreadable(e.to_string()))
     }
 
+    fn data_file_uris<V>(&self, members: &[(String, V)]) -> Vec<String> {
+        members
+            .iter()
+            .map(|(data_file, _)| reconstruct_abs_uri(data_file, &self.table_root))
+            .collect()
+    }
+
     /// Reserves each member's decoded set and keys it by absolute data-file URI.
     fn decode_vectors<V>(
         &self,
@@ -857,7 +920,7 @@ impl DeleteReadContext {
     fn delta_vector_reads(
         self: &Arc<Self>,
         vectors: Vec<(&str, DeltaDeletionVector)>,
-    ) -> Vec<Read<Positions>> {
+    ) -> Vec<PayloadRead> {
         let mut by_sidecar: HashMap<Url, Vec<(String, DeltaDeletionVector)>> = HashMap::new();
         let mut inline = Vec::new();
         for (data_file, vector) in vectors {
@@ -874,6 +937,7 @@ impl DeleteReadContext {
             .chain(inline.into_iter().map(|member| (None, vec![member])))
             .map(|(sidecar, members)| {
                 let ctx = Arc::clone(self);
+                let data_files = self.data_file_uris(&members);
                 let read: Read<_> = Box::pin(async move {
                     // A shared sidecar is named by its first referrer.
                     let body = match &sidecar {
@@ -887,7 +951,7 @@ impl DeleteReadContext {
                         vector.decode(body.clone(), data_file, &ctx.secrets)
                     })
                 });
-                read
+                (data_files, read)
             })
             .collect()
     }
@@ -898,7 +962,7 @@ impl DeleteReadContext {
     fn iceberg_vector_reads(
         self: &Arc<Self>,
         vectors: Vec<(&str, IcebergDeletionVector)>,
-    ) -> Vec<Read<Positions>> {
+    ) -> Vec<PayloadRead> {
         let mut by_puffin_file: HashMap<String, Vec<(String, IcebergDeletionVector)>> =
             HashMap::new();
         for (data_file, vector) in vectors {
@@ -923,7 +987,8 @@ impl DeleteReadContext {
                     members.by_ref().take(blob_count).collect();
                 let ctx = Arc::clone(self);
                 let url = url.clone();
-                reads.push(Box::pin(async move {
+                let data_files = self.data_file_uris(&blobs);
+                let read: Read<_> = Box::pin(async move {
                     // A shared Puffin request is named by its first referrer.
                     let body = ctx
                         .read_deletion_vector_payload(&url, Some(request.clone()), &blobs[0].0)
@@ -935,7 +1000,8 @@ impl DeleteReadContext {
                         );
                         vector.decode(&blob, data_file, &ctx.secrets)
                     })
-                }) as Read<_>);
+                });
+                reads.push((data_files, read));
             }
         }
         reads

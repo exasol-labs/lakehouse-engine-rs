@@ -6,6 +6,8 @@ The raw-row scan path keeps a lean single-partition DataFusion physical plan. Th
 
 * The raw-row pipeline is `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec → emit`. A repartition, coalesce-partitions, global sort, or global aggregate stage on this path adds CPU and latency without changing the result.
 
+* The scan table builds its own file groups, at most `target_partitions` per file scan, and DataFusion's file-scan repartitioning is off. Each group is one stream.
+
 ## Scenarios
 
 ### Scenario: Raw-scan physical plan carries no needless repartition or coalesce-partitions stage
@@ -24,3 +26,29 @@ The raw-row scan path keeps a lean single-partition DataFusion physical plan. Th
 * *THEN* the UDF SHALL apply `ORDER BY <keys> LIMIT n` in its DataFusion scan query so it emits at most `n` rows, its own local top-N over only its assigned files
 * *AND* the rendered `ORDER BY` SHALL preserve each key's requested direction (`ASC`/`DESC`) and NULL placement (`NULLS FIRST`/`NULLS LAST`)
 * *AND* the bounded sort SHALL be a top-N (retaining only the `n` extreme rows) rather than a full materialised global sort of the shard's rows
+
+
+### Scenario: A small data file is never cut into byte ranges
+
+* *GIVEN* a file scan whose data files are each at most 8 MiB
+* *WHEN* the scan table builds its file groups
+* *THEN* every file SHALL sit whole in one group
+* *AND* the files SHALL be spread over `target_partitions` groups, or over one group per file when there are fewer files
+
+### Scenario: A shard of tiny files is read by several streams
+
+* *GIVEN* a file scan whose files total less than 1 MiB
+* *WHEN* the scan table builds its file groups
+* *THEN* the scan table SHALL build one group per file, up to `target_partitions`
+
+### Scenario: A large data file is cut into byte ranges
+
+* *GIVEN* a data file larger than 8 MiB
+* *WHEN* the scan table builds its file groups
+* *THEN* the scan table SHALL cut the file into at most `target_partitions` contiguous byte ranges that cover it exactly once, each about an even share of the scan's bytes
+
+### Scenario: Every pushed plan shape keeps the scan's file groups
+
+* *GIVEN* scans with a filter, a LIMIT, a top-N, an aggregate, and a broadcast join
+* *WHEN* DataFusion optimizes each physical plan
+* *THEN* every file scan SHALL keep the groups the scan table built, and no small file SHALL carry a byte range

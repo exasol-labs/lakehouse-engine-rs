@@ -6,6 +6,8 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -17,7 +19,7 @@ use lakehouse_engine::scan::spec::{
     ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_raw_scan_physical_plan, register_files, session_config_for_spec,
+    build_join_physical_plan, build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
 use lakehouse_engine::types::exasol_type::ExasolType;
 
@@ -311,6 +313,109 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
         !rendered.contains("SortExec: expr=["),
         "ordered top-N plan must not contain an unbounded global SortExec:\n{rendered}"
     );
+}
+
+/// Per scan leaf: its group count, and whether any of its files carries a byte range.
+fn leaf_file_groups(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(usize, bool)>) {
+    if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
+        let config = exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .expect("a scan leaf reads files");
+        let cut = config
+            .file_groups
+            .iter()
+            .any(|group| group.iter().any(|file| file.range.is_some()));
+        out.push((config.file_groups.len(), cut));
+    }
+    for child in plan.children() {
+        leaf_file_groups(child, out);
+    }
+}
+
+/// Scenario: Every pushed plan shape keeps the scan's file groups
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_plan_shape_keeps_the_file_groups_the_scan_built() {
+    const TARGET: usize = 4;
+    const UNCUT: (usize, bool) = (TARGET, false);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let files: Vec<FileEntry> = (0..6)
+        .map(|i| {
+            let dir = tmp.path().join(format!("f{i}"));
+            std::fs::create_dir(&dir).unwrap();
+            let url = write_local_parquet(&dir);
+            FileEntry::new(url.clone(), local_size(&url))
+        })
+        .collect();
+    let mut base = single_partition_spec(files[0].path.clone());
+    base.files = files.clone();
+    base.common.df_target_partitions = TARGET;
+
+    let mut limited = base.clone();
+    limited.common.limit = Some(5);
+    let mut top_n = limited.clone();
+    top_n.common.order_by = vec![SortKey {
+        column: "ID".into(),
+        ascending: false,
+        nulls_last: true,
+    }];
+    for (shape, spec) in [("filter", &base), ("limit", &limited), ("top-N", &top_n)] {
+        let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
+        register_files(
+            &ctx,
+            "scan_target",
+            spec,
+            &scan_fixture::resolved_storage(spec),
+        )
+        .await
+        .expect("register the scan");
+        let plan = build_raw_scan_physical_plan(&ctx, spec)
+            .await
+            .expect("build the raw plan");
+        let mut leaves = Vec::new();
+        leaf_file_groups(&plan, &mut leaves);
+        assert_eq!(leaves, [UNCUT], "{shape}");
+    }
+
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&base));
+    register_files(
+        &ctx,
+        "scan_target",
+        &base,
+        &scan_fixture::resolved_storage(&base),
+    )
+    .await
+    .expect("register the scan");
+    let aggregate = ctx
+        .sql(r#"SELECT "name", COUNT(*) FROM scan_target WHERE "id" > 3 GROUP BY "name""#)
+        .await
+        .expect("plan the aggregate")
+        .create_physical_plan()
+        .await
+        .expect("build the aggregate plan");
+    let mut leaves = Vec::new();
+    leaf_file_groups(&aggregate, &mut leaves);
+    assert_eq!(leaves, [UNCUT], "aggregate");
+
+    let mut join = base.clone();
+    join.common.filter = None;
+    join.common.projection = vec![
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "ID")),
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "NAME")),
+    ];
+    join.common.join = Some(JoinSpec {
+        files,
+        condition: r#""LHS_T0"."ID" = "LHS_T1"."ID""#.into(),
+        ..scan_fixture::join_spec(join.common.storage.clone())
+    });
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&join));
+    let plan = build_join_physical_plan(&ctx, &join, &scan_fixture::resolved_storage(&join))
+        .await
+        .expect("build the join plan");
+    let mut leaves = Vec::new();
+    leaf_file_groups(&plan, &mut leaves);
+    assert_eq!(leaves, [UNCUT, UNCUT], "both join sides");
 }
 
 fn row_scan_spec() -> ScanSpec {
