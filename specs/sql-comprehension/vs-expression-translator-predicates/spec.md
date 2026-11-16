@@ -51,8 +51,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: LIKE predicate translates with optional escape character
 
-* *GIVEN* a VS expression node of type `predicate_like` with `expression` and `pattern` children
-* *WHEN* `render_expression` processes the node
-* *AND* an `escape_char` field is absent or empty
-* *THEN* the translator SHALL return `(<expr> LIKE <pattern>)`
-* *AND* when `escape_char` is present and non-empty the translator SHALL return `(<expr> LIKE <pattern> ESCAPE '<ch>')`
+* *GIVEN* a VS expression node of type `predicate_like` with `expression` and `pattern` children, and for a query that says `ESCAPE` an `escapeChar` child, which Exasol sends as a string literal
+* *WHEN* the translator renders the node
+* *THEN* without `escapeChar` it SHALL return `(<expr> LIKE <pattern>)`, which Exasol and DataFusion both read with `\` as the escape character
+* *AND* in the Exasol dialect it SHALL return `(<expr> LIKE <pattern> ESCAPE <escape>)`
+* *AND* in the DataFusion dialect, whose `LIKE` accepts only `\` as the escape character (apache/datafusion#13291), it SHALL rewrite the pattern to escape with `\`, and SHALL decline a pattern that is not a string literal, an escape that is not one character, or an escape that ends the pattern

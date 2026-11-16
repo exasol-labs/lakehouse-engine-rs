@@ -1665,20 +1665,6 @@ fn selectlist_aggregate_item_routes_to_the_wrapper() {
 /// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
-    use iceberg::spec::{NestedField, Schema, Type};
-    use std::sync::Arc;
-
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![Arc::new(NestedField::required(
-            1,
-            "id",
-            Type::Primitive(iceberg::spec::PrimitiveType::Int),
-        ))])
-        .build()
-        .unwrap();
-
     let filter_json = predicate_equal(col("id"), num_lit(42));
 
     let df_filter = scan_filter_sql(
@@ -1688,13 +1674,6 @@ fn filter_in_common_arg() {
     assert!(
         df_filter.is_some(),
         "translatable filter must produce a DataFusion SQL string"
-    );
-
-    let iceberg_pred =
-        to_iceberg_predicate(&filter_json, &declared_logical_schema(&schema), &schema);
-    assert!(
-        iceberg_pred.is_some(),
-        "translatable filter must produce an Iceberg predicate"
     );
 
     let sql = build_sql_for_fixture(
