@@ -6,7 +6,7 @@ A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal fi
 
 * Exasol compares a `TIMESTAMP(p)` value with a timestamp literal at the literal's full precision. A bare `TIMESTAMP` declaration holds 3 fractional digits.
 * DataFusion truncates the literal to the unit of the TIMESTAMP it compares with (apache/datafusion#22142). It compares a DATE with a timestamp in nanoseconds and truncates nothing. The upstream fix, apache/datafusion#22906, is not in a released DataFusion version.
-* Iceberg and Delta file pruning parse a timestamp literal into microseconds.
+* File pruning converts a timestamp literal at the column's unit, which is nanoseconds only for an Iceberg `timestamp_ns` or `timestamptz_ns` column.
 * On Exasol 8.x every timestamp column is declared at milliseconds, so a native table cannot hold a finer source value. A filter there compares at the source unit. This is the named Exasol 8.x target-type limitation, and this feature does not cover that engine arm.
 
 ## Scenarios
@@ -21,4 +21,4 @@ A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal fi
 * *AND* a DATE operand SHALL compare with the literal as written, because DataFusion converts both to nanoseconds
 * *AND* a DATE outside 1677-09-21 to 2262-04-11 compared with a TIMESTAMP SHALL fail in the scan, which `docs/semantic-differences.md` lists
 * *AND* the DataFusion dialect SHALL render a literal with more than 6 significant fractional digits at nanosecond precision
-* *AND* Iceberg and Delta file pruning SHALL derive no bound from a literal with more than 6 significant fractional digits
+* *AND* file pruning SHALL derive no bound from a literal with more significant fractional digits than the column's unit holds
