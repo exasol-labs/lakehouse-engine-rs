@@ -26,9 +26,9 @@ pub(crate) fn strftime_pattern(format: &str, target: FormatTarget) -> Option<Str
         end = part.end();
         let part = part.as_str().to_ascii_uppercase();
         pattern.push_str(match part.as_str() {
-            ".FF3" => "%.3f",
-            ".FF6" => "%.6f",
-            ".FF9" => "%.9f",
+            // Exasol reads one or more digits for `.FFn` and cuts them to n, which the scan
+            // function does after `%.f` reads up to 9.
+            ".FF3" | ".FF6" | ".FF9" => "%.f",
             "FF3" => "%3f",
             "FF6" => "%6f",
             "FF9" => "%9f",
@@ -43,6 +43,19 @@ pub(crate) fn strftime_pattern(format: &str, target: FormatTarget) -> Option<Str
         counts.add(&part);
     }
     (end == format.len() && counts.is_supported(target)).then_some(pattern)
+}
+
+/// The fractional-second digits a `TO_TIMESTAMP` over `format` keeps, 0 without an `FF` part.
+/// `None` when [`strftime_pattern`] does not translate `format`.
+pub(crate) fn fraction_digits(format: &str) -> Option<u8> {
+    strftime_pattern(format, FormatTarget::Timestamp)?;
+    Some(
+        PARTS
+            .find_iter(format)
+            .map(|part| part.as_str().trim_start_matches('.').to_ascii_uppercase())
+            .find_map(|part| part.strip_prefix("FF")?.parse().ok())
+            .unwrap_or(0),
+    )
 }
 
 #[derive(Default)]

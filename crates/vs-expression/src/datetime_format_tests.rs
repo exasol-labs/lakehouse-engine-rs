@@ -24,12 +24,12 @@ fn translates_supported_formats() {
         ("YYYY-MM-DD HH24:MI", "%Y-%m-%d %H:%M", &TIMESTAMP_ONLY),
         (
             "YYYY-MM-DD HH24:MI:SS.FF3",
-            "%Y-%m-%d %H:%M:%S%.3f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
         (
             "YYYY-MM-DD HH24:MI:ss.ff9",
-            "%Y-%m-%d %H:%M:%S%.9f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
         (
@@ -44,7 +44,7 @@ fn translates_supported_formats() {
         ),
         (
             "YYYY-MM-DD HH24:MI:SS.FF6",
-            "%Y-%m-%d %H:%M:%S%.6f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
     ];
@@ -88,5 +88,21 @@ fn declines_unsupported_formats() {
             None,
             "{format} for {target:?}"
         );
+    }
+}
+
+#[test]
+fn fraction_digits_follow_the_ff_part_of_a_translated_format() {
+    let cases = [
+        ("YYYY-MM-DD", Some(0)),
+        ("YYYY-MM-DD HH24:MI:SS", Some(0)),
+        ("YYYY-MM-DD HH24:MI:SS.FF3", Some(3)),
+        ("YYYY-MM-DD HH24:MI:ss.ff6", Some(6)),
+        ("YYYY-MM-DD HH24:MI:SSFF9", Some(9)),
+        ("YYYY-MM-DD HH24:MI:SS.FF", None),
+        ("YYYY-MM-DD HH24:MI:SS.FF2", None),
+    ];
+    for (format, expected) in cases {
+        assert_eq!(fraction_digits(format), expected, "{format}");
     }
 }

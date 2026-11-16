@@ -11,7 +11,7 @@ mod scan_typing;
 pub mod timestamp;
 mod version;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-use datetime_format::{FormatTarget, strftime_pattern};
+use datetime_format::{FormatTarget, fraction_digits, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use json_value::{Fallback, JsonValueCall, Returning};
@@ -19,7 +19,7 @@ pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, pa
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
-    seconds_type,
+    seconds_type, timestamp_digits,
 };
 pub use scan_typing::{ColumnTypeLookup, exact_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
@@ -160,15 +160,17 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
 }
 
 /// Renders only a `literal_string` format the translation covers, and errs otherwise so the
-/// caller declines.
+/// caller declines. `digits` are the fractional digits a `TO_TIMESTAMP` keeps, which the typed
+/// pass annotates and the format gives otherwise.
 fn render_to_datetime(
     target: FormatTarget,
     args: Option<&Vec<Json>>,
+    digits: Option<u8>,
     dialect: Dialect,
 ) -> Result<Option<String>, UdfError> {
-    let (node, function) = match target {
-        FormatTarget::Date => ("TO_DATE", "to_date"),
-        FormatTarget::Timestamp => ("TO_TIMESTAMP", "to_timestamp"),
+    let node = match target {
+        FormatTarget::Date => "TO_DATE",
+        FormatTarget::Timestamp => "TO_TIMESTAMP",
     };
     let args =
         args.ok_or_else(|| UdfError::User(format!("function_scalar {node} missing 'arguments'")))?;
@@ -180,11 +182,12 @@ fn render_to_datetime(
             "function_scalar {node} without a format parses by the session's NLS settings"
         ))),
         [source, format] => {
-            let pattern = format
+            let model = format
                 .get("type")
                 .and_then(Json::as_str)
                 .filter(|kind| *kind == "literal_string")
-                .and_then(|_| format.get("value").and_then(Json::as_str))
+                .and_then(|_| format.get("value").and_then(Json::as_str));
+            let pattern = model
                 .and_then(|model| strftime_pattern(model, target))
                 .ok_or_else(|| {
                     UdfError::User(format!(
@@ -192,10 +195,16 @@ fn render_to_datetime(
                     ))
                 })?;
             let source = render_conversion_source(node, source, dialect)?;
-            Ok(Some(format!(
-                "{function}(nullif({source}, ''), '{}')",
-                sql_escape(&pattern)
-            )))
+            let pattern = sql_escape(&pattern);
+            Ok(Some(match target {
+                FormatTarget::Date => format!("to_date(nullif({source}, ''), '{pattern}')"),
+                FormatTarget::Timestamp => {
+                    let digits = digits
+                        .or_else(|| model.and_then(fraction_digits))
+                        .unwrap_or(0);
+                    format!("{TO_TIMESTAMP_FN}(nullif({source}, ''), '{pattern}', {digits})")
+                }
+            }))
         }
         _ => Err(UdfError::User(format!(
             "function_scalar {node} accepts at most 2 arguments, got {}",
@@ -307,6 +316,11 @@ pub const ADD_WEEKS_FN: &str = "vs_add_weeks";
 pub const ADD_HOURS_FN: &str = "vs_add_hours";
 /// See [`ADD_DAYS_FN`].
 pub const ADD_MINUTES_FN: &str = "vs_add_minutes";
+
+/// The scalar UDF the DataFusion dialect renders `TO_TIMESTAMP(text, format)` as, registered by
+/// `lakehouse-engine`. It takes the text, a strftime pattern, and the fractional digits to keep,
+/// and returns `Timestamp(Microsecond, None)` for up to 6 digits, else nanoseconds.
+pub const TO_TIMESTAMP_FN: &str = "vs_to_timestamp";
 
 fn render_cast(
     args: Option<&Vec<Json>>,
@@ -1044,8 +1058,13 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
                     Ok(Some(format!("date_trunc({unit}, {src})")))
                 }
-                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, dialect),
-                "TO_TIMESTAMP" => render_to_datetime(FormatTarget::Timestamp, args, dialect),
+                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, None, dialect),
+                "TO_TIMESTAMP" => render_to_datetime(
+                    FormatTarget::Timestamp,
+                    args,
+                    timestamp_digits(expr),
+                    dialect,
+                ),
                 "ADD_DAYS" | "ADD_WEEKS" | "ADD_HOURS" | "ADD_MINUTES" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))

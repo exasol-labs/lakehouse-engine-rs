@@ -9,7 +9,9 @@ use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT_TRAILING_SPACE, ExpectedValue,
     TYPED_TABLE_TOTAL_ROWS,
 };
-use crate::common::timestamp_precision::expected_timestamp_precision;
+use crate::common::timestamp_precision::{
+    engine_honors_declared_precision, expected_timestamp_precision,
+};
 use crate::fixtures::{
     TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
     echoed_pushdown_requests, events_table, lakehouse_vs, typed_table, vs_char_pad_table,
@@ -3374,6 +3376,17 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         PathCheck::Split,
     ),
     ("SELECT SUM(SECOND(C_DATE)) + 1 FROM {T}", PathCheck::Split),
+    // TO_TIMESTAMP holds values beyond 2262 and reads text that ends before its format.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY TO_TIMESTAMP(CASE WHEN ID > 2 \
+         THEN '9999-12-30' ELSE '2024-01-31 10' END, 'YYYY-MM-DD HH24:MI:SS')",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT MAX(TO_TIMESTAMP(CASE WHEN ID > 2 THEN '9999-12-30 10:11:12.1234567' \
+         ELSE '0001-01-01 10:11:12.5' END, 'YYYY-MM-DD HH24:MI:SS.FF6')) FROM {T}",
+        PathCheck::Split,
+    ),
     (
         "SELECT COUNT(*) FROM {T} GROUP BY SECOND(C_DATE)",
         PathCheck::Split,
@@ -3475,6 +3488,9 @@ fn first_cell(conn: &mut ExaConn, sql: &str) -> serde_json::Value {
     conn.query_columns(sql)[0][0].clone()
 }
 
+/// The scan function `TO_TIMESTAMP` renders as.
+const TO_TIMESTAMP_SCAN_FUNCTION: &str = "vs_to_timestamp(";
+
 fn assert_pushed_into_scan(conn: &mut ExaConn, sql: &str, pattern: &str) {
     let statement = isolated_pushdown_statement(conn, sql);
     assert!(
@@ -3527,7 +3543,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
 
     assert_pushed_into_scan(&mut conn, &date_sql, "%Y-%m-%d");
     assert_pushed_into_scan(&mut conn, &timestamp_sql, "%Y-%m-%d %H:%M:%S");
-    assert_pushed_into_scan(&mut conn, &filter_sql, "%H:%M:%S%.3f");
+    assert_pushed_into_scan(&mut conn, &filter_sql, "%H:%M:%S%.f");
 
     assert_eq!(
         first_cell(&mut conn, "SELECT TO_DATE('', 'YYYY-MM-DD')"),
@@ -3552,13 +3568,71 @@ fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
          'YYYY-MM-DD HH24:MI:SS.FF6') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
         events_table()
     );
-    // The scan filters at full precision on every engine; 8.x only renders the output in
-    // milliseconds, because a native 8.x table cannot hold the microseconds to filter on.
+    // Exasol 8 cuts the microseconds, so 10:11:12.000500 is not after 10:11:12.000 there.
+    let first = if engine_honors_declared_precision(&mut conn) {
+        15
+    } else {
+        16
+    };
     assert_eq!(
         ids_of_first_column(&mut conn, &sql),
-        (15..=20).collect::<Vec<i64>>()
+        (first..=20).collect::<Vec<i64>>()
     );
-    assert_pushed_into_scan(&mut conn, &sql, "%H:%M:%S%.6f");
+    assert_pushed_into_scan(&mut conn, &sql, "%H:%M:%S%.f");
+}
+
+/// `TO_TIMESTAMP` inputs the scan once read differently: values outside 1677 to 2262, text that
+/// ends before its format, and fractions shorter or longer than `FFn`.
+const TO_TIMESTAMP_CASES: &[&str] = &[
+    "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '9999-12-31' WHEN 2 THEN '0001-01-01' \
+     ELSE '1600-01-01' END, 'YYYY-MM-DD') FROM {T}",
+    "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31' WHEN 2 THEN '2024-01-31 10' \
+     ELSE '2024-01-31 10:11:' END, 'YYYY-MM-DD HH24:MI:SS') FROM {T}",
+    "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31 10:11:12.5' \
+     WHEN 2 THEN '2024-01-31 10:11:12.1234567' ELSE '1960-01-01 00:00:00.999999' END, \
+     'YYYY-MM-DD HH24:MI:SS.FF6') FROM {T}",
+    "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31 10:11:12.123456789' \
+     ELSE '1960-01-01 00:00:00.5' END, 'YYYY-MM-DD HH24:MI:SS.FF9') FROM {T}",
+    "SELECT ID, ADD_DAYS(TO_TIMESTAMP(CASE ID WHEN 1 THEN '9999-12-30' ELSE '2024-01-31' END, \
+     'YYYY-MM-DD'), 1) FROM {T}",
+    "SELECT ID, ADD_HOURS(TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31' \
+     ELSE '0001-01-01 10:11' END, 'YYYY-MM-DD HH24:MI:SS'), 1) FROM {T}",
+    "SELECT ID, CASE WHEN ID > 1 THEN TO_TIMESTAMP(CASE ID WHEN 2 THEN '9999-12-30 10' \
+     ELSE '0001-01-01 1' END, 'YYYY-MM-DD HH24:MI') ELSE C_DATE END FROM {T}",
+    "SELECT ID FROM {T} WHERE TO_TIMESTAMP(CASE ID WHEN 1 THEN '9999-12-31' ELSE '2024-01-31' END, \
+     'YYYY-MM-DD') > TIMESTAMP '2262-04-12 00:00:00'",
+];
+
+/// Scenario: The scan reads a TO_TIMESTAMP string as Exasol does
+/// Scenario: A TIMESTAMP computes at the unit of the digits its values hold
+/// Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
+#[test]
+fn e2e_to_timestamp_reads_text_as_native_does() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+
+    let failures: Vec<String> = TO_TIMESTAMP_CASES
+        .iter()
+        .filter_map(|query| {
+            native_copy_mismatch(
+                &mut conn,
+                &typed,
+                NATIVE_COPY,
+                query,
+                PathCheck::Has(TO_TIMESTAMP_SCAN_FUNCTION),
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ:\n{}",
+        failures.len(),
+        TO_TIMESTAMP_CASES.len(),
+        failures.join("\n")
+    );
 }
 
 /// Scenario: A string Exasol rejects for a translated format fails the query
@@ -3574,6 +3648,14 @@ fn e2e_to_date_translated_format_fails_on_rejected_input() {
         events_table()
     );
     assert_query_fails(&mut conn, &select_sql, &["event-01", "%Y-%m-%d"]);
+    assert_query_fails(
+        &mut conn,
+        &format!(
+            "SELECT TO_TIMESTAMP(name, 'YYYY-MM-DD') FROM {} WHERE id = 1",
+            events_table()
+        ),
+        &["event-01", "TO_TIMESTAMP"],
+    );
     assert_query_fails(
         &mut conn,
         &format!(

@@ -943,6 +943,11 @@ fn typed(expr: &Json) -> Json {
         .0
 }
 
+/// A `TIMESTAMP(precision)` whose values hold `digits` fractional digits.
+const fn coarse(precision: u8, digits: u8) -> Inferred {
+    Inferred::CoarseTimestamp { precision, digits }
+}
+
 const fn timestamp(precision: u8) -> Inferred {
     Inferred::Exact(ExasolType::timestamp(precision))
 }
@@ -1138,6 +1143,22 @@ fn version_dependent_forms_take_each_versions_type() {
         (
             "TO_TIMESTAMP over text",
             scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")]),
+            [coarse(3, 0), coarse(9, 0), partial],
+        ),
+        (
+            "TO_TIMESTAMP over text with FF6",
+            scalar_fn(
+                "TO_TIMESTAMP",
+                [col("S"), str_lit("YYYY-MM-DD HH24:MI:SS.FF6")],
+            ),
+            [timestamp(3), coarse(9, 6), partial],
+        ),
+        (
+            "TO_TIMESTAMP over text with FF9",
+            scalar_fn(
+                "TO_TIMESTAMP",
+                [col("S"), str_lit("YYYY-MM-DD HH24:MI:SS.FF9")],
+            ),
             [timestamp(3), timestamp(9), partial],
         ),
         (
@@ -1739,5 +1760,55 @@ fn an_aggregate_over_an_argument_without_an_exact_type_has_no_exact_type() {
     for name in ["MAX", "SUM"] {
         let aggregate = agg_item_expr(name, sum.clone(), false);
         assert_eq!(type_of(&aggregate).exact(), None, "{name}");
+    }
+}
+
+/// A `TO_TIMESTAMP` computes at the unit of the digits its values hold, not of its declared
+/// `TIMESTAMP(9)`, and keeps 3 digits on Exasol 8.
+#[test]
+fn to_timestamp_computes_at_the_unit_of_its_digits() {
+    use ExasolVersion::{Exasol8, Exasol2025, Unknown};
+    let parsed = |format| scalar_fn("TO_TIMESTAMP", [col("S"), str_lit(format)]);
+    let fraction = "YYYY-MM-DD HH24:MI:SS.FF6";
+    let cases = [
+        (
+            Exasol2025,
+            scalar_fn("ADD_DAYS", [parsed("YYYY-MM-DD"), num_lit(1)]),
+            r#"vs_add_days(CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0) AS TIMESTAMP(6)), 1)"#,
+        ),
+        (
+            Exasol2025,
+            scalar_fn(
+                "ADD_DAYS",
+                [parsed("YYYY-MM-DD HH24:MI:SS.FF9"), num_lit(1)],
+            ),
+            r#"vs_add_days(CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 9) AS TIMESTAMP(9)), 1)"#,
+        ),
+        (
+            Exasol2025,
+            case_when([col("B")], [parsed("YYYY-MM-DD"), col("D")]),
+            r#"(CASE WHEN "B" THEN CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0) AS TIMESTAMP(0)) ELSE CAST("D" AS TIMESTAMP(0)) END)"#,
+        ),
+        (
+            Exasol2025,
+            case_when([col("B")], [parsed(fraction), col("TS0")]),
+            r#"(CASE WHEN "B" THEN CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 6) AS TIMESTAMP(6)) ELSE CAST("TS0" AS TIMESTAMP(6)) END)"#,
+        ),
+        (
+            Exasol8,
+            parsed(fraction),
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 3)"#,
+        ),
+        (
+            Unknown,
+            parsed(fraction),
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 6)"#,
+        ),
+    ];
+    for (version, expr, sql) in cases {
+        let rendered = render_scan_expression(&expr, &columns(), version)
+            .unwrap()
+            .sql;
+        assert_eq!(rendered, sql, "{expr} on {version:?}");
     }
 }

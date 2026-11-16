@@ -67,15 +67,13 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
 
-## TO_DATE and TO_TIMESTAMP with a format
+## TO_DATE with a format
 
-For a few input strings the scan fails where native Exasol parses the value:
+For one kind of input string the scan fails where native Exasol parses the value:
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
 | `TO_DATE('2024-01-01 ', 'YYYY-MM-DD')` (trailing space) | error | `2024-01-01` |
-| `TO_TIMESTAMP('2024-01-01', 'YYYY-MM-DD HH24:MI:SS')` (input shorter than the format) | error | `2024-01-01 00:00:00` |
-| `TO_TIMESTAMP('1600-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` | error | `1600-01-01 00:00:00` |
 
 ## CAST of text to a shorter VARCHAR
 
@@ -102,8 +100,8 @@ The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses 
 
 ## Nanosecond timestamps outside 1677 to 2262
 
-The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
-in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
+The scan holds an Iceberg `timestamp_ns` column, any other `TIMESTAMP(7)` to `TIMESTAMP(9)` value
+with digits below the microsecond, and a `TO_TIMESTAMP` with an `FF9` format in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
 a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
 `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. The scan also converts to
 nanoseconds a DATE that `DATE_TRUNC` truncates, and a TIMESTAMP that `DATE_TRUNC` truncates to

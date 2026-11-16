@@ -1276,7 +1276,7 @@ fn renders_to_date_to_timestamp() {
     let expr4 = scalar_fn("TO_TIMESTAMP", [col("s"), str_lit("YYYY-MM-DD HH24:MI:SS")]);
     assert_eq!(
         render_expression(&expr4).unwrap(),
-        r#"to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S')"#
+        r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S', 0)"#
     );
 }
 
@@ -1850,7 +1850,13 @@ fn renders_date_trunc_verbatim_in_exasol_dialect() {
 
 #[test]
 fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
-    for (exasol_name, df_name) in [("TO_DATE", "to_date"), ("TO_TIMESTAMP", "to_timestamp")] {
+    for (exasol_name, df_call) in [
+        ("TO_DATE", r#"to_date(nullif("S", ''), '%Y-%m-%d')"#),
+        (
+            "TO_TIMESTAMP",
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0)"#,
+        ),
+    ] {
         let bare = scalar_fn(exasol_name, [col("s")]);
         assert_eq!(
             render_expression_exasol(&bare),
@@ -1870,7 +1876,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
         );
         assert_eq!(
             render_expression(&formatted).unwrap(),
-            format!(r#"{df_name}(nullif("S", ''), '%Y-%m-%d')"#),
+            df_call,
             "the DataFusion dialect must translate the format of {exasol_name}"
         );
     }

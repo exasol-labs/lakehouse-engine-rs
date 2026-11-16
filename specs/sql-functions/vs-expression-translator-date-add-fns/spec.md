@@ -12,6 +12,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * Exasol sends `COALESCE` and `NULLIF` as CASE expressions.
 * Exasol 8 and 2025 give a CASE, `GREATEST`, or `LEAST` over only dates a DATE, and one over a `TIMESTAMP(p)` and a `TIMESTAMP(q)` a `TIMESTAMP(max(p, q))`. Over a DATE and a TIMESTAMP, Exasol 2025 gives the TIMESTAMP's type and Exasol 8 the type of the first branch that is not NULL.
 * Exasol 2025 types `TO_TIMESTAMP` over text as `TIMESTAMP(9)`, over a DATE as `TIMESTAMP(0)`, and over a `TIMESTAMP(p)` as `TIMESTAMP(p)`. Exasol 8 has only `TIMESTAMP(3)`, so it types every TIMESTAMP result, a TIMESTAMP literal, and `ADD_HOURS` and `ADD_MINUTES` over a DATE as `TIMESTAMP(3)`, and cuts the digits beyond the millisecond.
+* The typed pass also tracks the fractional digits a TIMESTAMP's values hold, and the scan computes the value at the unit that holds them, so microseconds unless they exceed 6. A `TO_TIMESTAMP` holds the `n` of its format's `FFn`, or 0, at most its type's precision. A branch form holds the most digits among its branches, and every other form the digits of its argument.
 * Exasol 2026.1.1 types each of these forms as Exasol 2025.1.16 does. The pushdown reads the version from its UDF context: a major below 2025 is Exasol 8, any other numeric major is Exasol 2025.
 
 ## Scenarios
@@ -26,6 +27,13 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *AND* a CASE, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps SHALL take the type both Exasol versions give it, NULL branches aside, and the scan SHALL compute its value at that type's precision
 * *AND* a `TIMESTAMP WITH LOCAL TIME ZONE` value SHALL get no DATE or TIMESTAMP type
 * *AND* a DATE or TIMESTAMP value converted to text SHALL still decline, because Exasol formats both by session settings (`pushdown-types/pushdown-planning-scan-text-conversion`)
+
+### Scenario: A TIMESTAMP computes at the unit of the digits its values hold
+
+* *GIVEN* a scan expression over a `TO_TIMESTAMP` whose format has no `FF9`, such as `ADD_DAYS(TO_TIMESTAMP(s, 'YYYY-MM-DD'), 1)`, a CASE over it and a DATE, or a comparison of it with a TIMESTAMP literal
+* *WHEN* `render_scan_expression` types it on Exasol 2025, which types `TO_TIMESTAMP` `TIMESTAMP(9)`
+* *THEN* the typed pass SHALL keep `TIMESTAMP(9)` as its type, and SHALL cast it and every operand it meets to the unit holding the digits its values hold, never to nanoseconds
+* *AND* the query SHALL return the rows native Exasol returns for a value such as `9999-12-30`
 
 ### Scenario: The typed pass derives each version's type for a version-dependent date form
 

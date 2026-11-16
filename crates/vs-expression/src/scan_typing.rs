@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use crate::datetime_format::fraction_digits;
 use crate::exasol_type::{
     Decimal, ExasolType, MAX_DECIMAL_PRECISION, MAX_FRACTIONAL_DIGITS, exasol_type_from_json,
     exasol_type_to_json,
@@ -33,6 +34,13 @@ pub(crate) enum Inferred {
     /// A NULL literal, NULL in every type.
     Null,
     Unknown,
+    /// `TIMESTAMP(precision)` whose values hold at most `digits < precision` fractional digits,
+    /// such as a `TO_TIMESTAMP` that Exasol 2025 types `TIMESTAMP(9)` over a format without
+    /// `FF9`. The scan computes it at the unit holding `digits`, so no nanosecond range applies.
+    CoarseTimestamp {
+        precision: u8,
+        digits: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +62,24 @@ impl Inferred {
     pub(crate) fn exact(self) -> Option<ExasolType> {
         match self {
             Self::Exact(ty) => Some(ty),
+            Self::CoarseTimestamp { precision, .. } => Some(ExasolType::timestamp(precision)),
             _ => None,
+        }
+    }
+
+    /// `self` with values of at most `digits` fractional digits.
+    fn holding(self, digits: u8) -> Self {
+        match self.timestamp_precision() {
+            Some(precision) if digits < precision => Self::CoarseTimestamp { precision, digits },
+            _ => self,
+        }
+    }
+
+    /// The fractional digits a TIMESTAMP's values hold, which pick the unit the scan computes in.
+    fn value_digits(self) -> Option<u8> {
+        match self {
+            Self::CoarseTimestamp { digits, .. } => Some(digits),
+            other => other.timestamp_precision(),
         }
     }
 
@@ -93,7 +118,8 @@ impl Inferred {
 
     fn timestamp_precision(self) -> Option<u8> {
         match self {
-            Self::Exact(ExasolType::Timestamp { precision }) => Some(precision),
+            Self::Exact(ExasolType::Timestamp { precision })
+            | Self::CoarseTimestamp { precision, .. } => Some(precision),
             _ => None,
         }
     }
@@ -107,6 +133,14 @@ impl Inferred {
                     ExasolVersion::Exasol8 => self,
                     ExasolVersion::Exasol2025 => timestamp,
                     ExasolVersion::Unknown => Self::Unknown,
+                };
+            }
+            (Self::CoarseTimestamp { .. }, _) | (_, Self::CoarseTimestamp { .. }) => {
+                let declared = |ty: Self| ty.exact().map_or(ty, Self::Exact);
+                let union = declared(self).union(declared(other), version);
+                return match self.value_digits().max(other.value_digits()) {
+                    Some(digits) => union.holding(digits),
+                    None => union,
                 };
             }
             (Self::Exact(a), Self::Exact(b)) => unified_type(a, b),
@@ -218,6 +252,14 @@ impl Seconds {
 
 const SECOND_FRACTION: &str = "fraction";
 
+/// Set on a `TO_TIMESTAMP` node: the fractional digits it keeps, which only this pass knows.
+const TIMESTAMP_DIGITS: &str = "scanDigits";
+
+/// The fractional digits a `TO_TIMESTAMP` node keeps, when the typed pass derived them.
+pub(crate) fn timestamp_digits(node: &Json) -> Option<u8> {
+    u8::try_from(node.get(TIMESTAMP_DIGITS)?.as_u64()?).ok()
+}
+
 /// The fractional digits a [`SECOND_NODE`] keeps.
 pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
     let fraction = node.get(SECOND_FRACTION)?.as_u64()?;
@@ -248,15 +290,13 @@ fn second_call(node: &Json, children: &ChildTypes, version: ExasolVersion) -> Se
         return SecondCall::NotSecond;
     }
     match children.of("arguments") {
-        [Inferred::Exact(ExasolType::Timestamp { precision })]
-            if *precision <= MAX_FRACTIONAL_DIGITS =>
-        {
-            SecondCall::Of(Seconds::OfTimestamp {
-                fraction: *precision,
-            })
-        }
         [Inferred::Exact(ExasolType::Date)] if !extract => SecondCall::Of(Seconds::OfDate(version)),
-        [_] => SecondCall::Unsupported,
+        [argument] => match argument.timestamp_precision() {
+            Some(fraction) if fraction <= MAX_FRACTIONAL_DIGITS => {
+                SecondCall::Of(Seconds::OfTimestamp { fraction })
+            }
+            _ => SecondCall::Unsupported,
+        },
         _ => SecondCall::NotSecond,
     }
 }
@@ -577,11 +617,27 @@ fn node_type(node: &Json, children: &ChildTypes, version: ExasolVersion) -> Infe
         "function_scalar_json_value" => json_value_type(node),
         _ if is_cast(node) => cast_target(node).map_or(Inferred::Unknown, Inferred::Exact),
         "function_scalar" => {
-            typed_function(&upper_name(node)).result_type(children.of("arguments"), version)
+            let name = upper_name(node);
+            let ty = typed_function(&name).result_type(children.of("arguments"), version);
+            match format_model(node)
+                .filter(|_| name == "TO_TIMESTAMP")
+                .and_then(fraction_digits)
+            {
+                Some(digits) => ty.holding(digits),
+                None => ty,
+            }
         }
         "function_aggregate" => aggregate_type(&upper_name(node), children.of("arguments")),
         _ => Inferred::Unknown,
     }
+}
+
+/// The format model of a `TO_DATE` or `TO_TIMESTAMP` call, when it is a string literal.
+fn format_model(node: &Json) -> Option<&str> {
+    let format = node.get("arguments")?.get(1)?;
+    (kind(format) == "literal_string")
+        .then(|| format.get("value")?.as_str())
+        .flatten()
 }
 
 /// Declines what the scan cannot compute as Exasol does, and rewrites `out` for DataFusion.
@@ -692,6 +748,11 @@ fn rewrite_scalar_function(
     if function.result == ResultRule::Unified {
         return unify_branches(node, out, "arguments", args, ty);
     }
+    if function.result == ResultRule::Timestamp
+        && let Some(digits) = ty.value_digits()
+    {
+        out[TIMESTAMP_DIGITS] = digits.into();
+    }
     if let ResultRule::DateAddition(_) = function.result {
         check_date_addition(node, out, args)?;
     } else {
@@ -743,9 +804,9 @@ fn check_date_addition(node: &Json, out: &mut Json, args: &[Inferred]) -> Result
     refuse_implicit_text(node, args)?;
     let cast_target = if first == DATE {
         ExasolType::Date
-    } else if let Some(precision) = first.timestamp_precision() {
+    } else if let Some(digits) = first.value_digits() {
         ExasolType::timestamp(
-            TimestampUnit::holding(precision)
+            TimestampUnit::holding(digits)
                 .max(TimestampUnit::Microsecond)
                 .digits(),
         )
@@ -1002,7 +1063,7 @@ fn rewrite_operands(
 /// at full precision (#461, apache/datafusion#22142, fixed by apache/datafusion#22906). A DATE
 /// needs no floor, because it compares at the unit that holds the literal.
 fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
-    let precision = |field: &str| children.one(field)?.timestamp_precision();
+    let precision = |field: &str| children.one(field)?.value_digits();
     let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
     match kind(node) {
         "predicate_between" => {
@@ -1173,7 +1234,7 @@ fn common_timestamp(types: &[Inferred]) -> Option<ExasolType> {
         .iter()
         .filter(|ty| !matches!(**ty, Inferred::Null | DATE))
         .try_fold(None, |finest: Option<u8>, ty| {
-            Some(finest.max(Some(ty.timestamp_precision()?)))
+            Some(finest.max(Some(ty.value_digits()?)))
         })??;
     Some(ExasolType::timestamp(
         TimestampUnit::holding(finest).digits(),
