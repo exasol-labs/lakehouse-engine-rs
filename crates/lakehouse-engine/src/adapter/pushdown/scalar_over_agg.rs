@@ -35,8 +35,10 @@ pub(super) fn fold_aggregate_plan(
     }
 }
 
-/// A slot a top-level item declares keeps that type; a nested-only slot takes
-/// [`nested_aggregate_type`], so the outcome does not depend on select-list order.
+/// A slot a top-level item declares keeps that type; a nested-only slot takes Exasol's result
+/// type of its aggregate, so the outcome does not depend on select-list order. A slot stays
+/// untyped when that type depends on an argument without an exact type: a guessed partial type
+/// breaks the merge (#476).
 pub(super) fn fold_nested_plans(
     plans: &mut Vec<AggregatePlan>,
     plan_types: &mut Vec<Option<ExasolType>>,
@@ -46,15 +48,9 @@ pub(super) fn fold_nested_plans(
     for (plan, agg) in nested {
         let slot = fold_aggregate_plan(plans, plan_types, plan.clone(), None);
         if plan_types[slot].is_none() {
-            plan_types[slot] = nested_aggregate_type(agg, scan);
+            plan_types[slot] = exact_type(agg, scan.columns());
         }
     }
-}
-
-/// Exasol's result type of an aggregate the select list does not type. `None` when it depends on
-/// an argument without an exact type: a guessed partial type breaks the merge (#476).
-pub(super) fn nested_aggregate_type(agg: &Json, scan: ScanTranslator<'_>) -> Option<ExasolType> {
-    exact_type(agg, scan.columns())
 }
 
 /// Already uppercase so it survives the translator's column uppercasing, and
@@ -118,7 +114,7 @@ pub(super) fn sentinelize_aggregates(
     })
 }
 
-/// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
+/// Each plan comes with its aggregate node, which [`fold_nested_plans`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
     scan: ScanTranslator<'_>,

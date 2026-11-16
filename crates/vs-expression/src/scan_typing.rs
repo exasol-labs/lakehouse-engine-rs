@@ -191,30 +191,41 @@ pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
     u8::try_from(fraction).ok()
 }
 
-/// What a one-argument `SECOND(x)` or `EXTRACT(SECOND FROM x)` computes. `None` for any other
-/// node, `SECOND(x, n)` included, and `Some(None)` for an argument the scan cannot take. Exasol
-/// itself fails `EXTRACT(SECOND)` of a DATE.
-fn seconds_of(node: &Json, children: &ChildTypes) -> Option<Option<Seconds>> {
+/// How a node relates to the one-argument `SECOND(x)` and `EXTRACT(SECOND FROM x)`.
+enum SecondCall {
+    /// Any other node, `SECOND(x, n)` included.
+    NotSecond,
+    /// An argument the scan cannot take. Exasol itself fails `EXTRACT(SECOND)` of a DATE.
+    Unsupported,
+    Of(Seconds),
+}
+
+fn second_call(node: &Json, children: &ChildTypes) -> SecondCall {
     let (name, extract) = match kind(node) {
-        "function_scalar_extract" => (node.get("toExtract")?.as_str()?.to_uppercase(), true),
-        "function_scalar" => (upper_name(node), false),
-        _ => return None,
+        "function_scalar_extract" => (
+            node.get("toExtract")
+                .and_then(Json::as_str)
+                .map(str::to_uppercase),
+            true,
+        ),
+        "function_scalar" => (Some(upper_name(node)), false),
+        _ => (None, false),
     };
-    if name != "SECOND" {
-        return None;
+    if name.as_deref() != Some("SECOND") {
+        return SecondCall::NotSecond;
     }
-    Some(match children.of("arguments") {
+    match children.of("arguments") {
         [Inferred::Exact(ExasolType::Timestamp { precision })]
             if *precision <= MAX_FRACTIONAL_DIGITS =>
         {
-            Some(Seconds::OfTimestamp {
+            SecondCall::Of(Seconds::OfTimestamp {
                 fraction: *precision,
             })
         }
-        [Inferred::Exact(ExasolType::Date)] if !extract => Some(Seconds::OfDate),
-        [_] => None,
-        _ => return None,
-    })
+        [Inferred::Exact(ExasolType::Date)] if !extract => SecondCall::Of(Seconds::OfDate),
+        [_] => SecondCall::Unsupported,
+        _ => SecondCall::NotSecond,
+    }
 }
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
@@ -490,8 +501,10 @@ impl ChildTypes {
 
 /// Exasol's type of a non-column `node` whose children are typed.
 fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
-    if let Some(seconds) = seconds_of(node, children) {
-        return seconds.map_or(Inferred::Unknown, Seconds::inferred);
+    match second_call(node, children) {
+        SecondCall::Of(seconds) => return seconds.inferred(),
+        SecondCall::Unsupported => return Inferred::Unknown,
+        SecondCall::NotSecond => {}
     }
     match kind(node) {
         "literal_null" => Inferred::Null,
@@ -527,15 +540,18 @@ fn rewrite_for_scan(
     children: &ChildTypes,
     ty: Inferred,
 ) -> Result<(), UdfError> {
-    if let Some(seconds) = seconds_of(node, children) {
-        let seconds = seconds.ok_or_else(|| {
-            decline(format!(
+    match second_call(node, children) {
+        SecondCall::Of(seconds) => {
+            *out = seconds.node(out["arguments"][0].take());
+            return Ok(());
+        }
+        SecondCall::Unsupported => {
+            return Err(decline(format!(
                 "SECOND needs an argument of the exact type TIMESTAMP(p), or DATE outside EXTRACT: {}",
                 short(node)
-            ))
-        })?;
-        *out = seconds.node(out["arguments"][0].take());
-        return Ok(());
+            )));
+        }
+        SecondCall::NotSecond => {}
     }
     match kind(node) {
         "predicate_like" => {

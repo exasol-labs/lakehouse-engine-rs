@@ -1500,3 +1500,54 @@ fn a_constant_count_at_the_limit_renders() {
     );
     assert!(render(&expr).is_ok(), "rendered {:?}", render(&expr));
 }
+
+#[test]
+fn an_aggregate_takes_exasols_result_type() {
+    let wide = || cast_to(ExasolType::decimal(30, 2), col("N"));
+    let cases = [
+        ("COUNT(*)", count_star(), integer(18)),
+        (
+            "SUM over DECIMAL(9,2) widens by 11 digits",
+            agg_item("SUM", Some("N"), false),
+            Inferred::Exact(ExasolType::decimal(20, 2)),
+        ),
+        (
+            "SUM over DECIMAL(30,2) caps at precision 36",
+            agg_item_expr("SUM", wide(), false),
+            Inferred::Exact(ExasolType::decimal(36, 2)),
+        ),
+        (
+            "SUM over DOUBLE stays DOUBLE",
+            agg_item("SUM", Some("F"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "AVG over a DECIMAL is DOUBLE",
+            agg_item("AVG", Some("N"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "STDDEV over a DECIMAL is DOUBLE",
+            agg_item("STDDEV", Some("N"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "MAX over a CAST takes the CAST's type, not the column's",
+            agg_item_expr("MAX", cast_to(ExasolType::decimal(5, 1), col("N")), false),
+            Inferred::Exact(ExasolType::decimal(5, 1)),
+        ),
+    ];
+    for (label, aggregate, expected) in cases {
+        assert_eq!(type_of(&aggregate), expected, "{label}");
+    }
+}
+
+/// A guessed type would break the merge of a split aggregate (#476).
+#[test]
+fn an_aggregate_over_an_argument_without_an_exact_type_has_no_exact_type() {
+    let sum = scalar_fn("ADD", [col("N"), num_lit(1)]);
+    for name in ["MAX", "SUM"] {
+        let aggregate = agg_item_expr(name, sum.clone(), false);
+        assert_eq!(type_of(&aggregate).exact(), None, "{name}");
+    }
+}
