@@ -3,7 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment};
+use vs_expression::{ColumnNode, SqlFragment, infer_type, render_exasol_fragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -62,7 +62,7 @@ pub(super) fn nested_aggregate_type(
         AggKind::Count | AggKind::CountCol => Some(ExasolType::decimal(18, 0)),
         AggKind::Sum | AggKind::Min | AggKind::Max => {
             let arg = agg.get("arguments")?.as_array()?.first()?;
-            let arg_type = exact_expression_type(arg, scan.columns())?;
+            let arg_type = infer_type(arg, scan.columns()).exact()?;
             if plan.kind == AggKind::Sum {
                 sum_result_type(arg_type)
             } else {

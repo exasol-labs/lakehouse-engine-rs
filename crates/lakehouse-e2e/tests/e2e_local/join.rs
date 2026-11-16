@@ -576,6 +576,19 @@ fn e2e_aggregate_over_join_result_correct() {
         assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
         assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
     }
+
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let union_items = format!(
+        "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
+         MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {} o JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
+        vs_fact_table("{T}"),
+        vs_dim_table("{T}")
+    );
+    let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME, &union_items);
+    assert!(
+        !pushed.contains("AS DATE)"),
+        "a select item of an exact DATE type needs no CAST: {pushed}"
+    );
 }
 
 // Every line item references exactly one order and one supplier, so the 3- and 4-table

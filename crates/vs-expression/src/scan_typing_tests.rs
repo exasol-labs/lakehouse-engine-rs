@@ -743,39 +743,42 @@ fn text_where_exasol_takes_text_keeps_its_pushdown() {
 }
 
 #[test]
-fn exact_expression_type_is_the_type_the_request_states() {
-    let sum = scalar_fn("ADD", [col("I"), num_lit(1)]);
+fn infer_type_types_what_the_scan_declines() {
+    let date_text = scalar_fn("UPPER", [col("D")]);
     let cases = [
         (
-            "CAST",
-            cast_to(ExasolType::varchar(10), col("I")),
-            Some(ExasolType::varchar(10)),
-        ),
-        ("column", col("N"), Some(ExasolType::decimal(9, 2))),
-        ("other node", sum, None),
-        (
-            "SECOND of a TIMESTAMP(6)",
-            second(col("TS")),
-            Some(ExasolType::decimal(8, 6)),
+            "CAST of a DATE to text",
+            cast_to(ExasolType::varchar(30), col("D")),
+            Some(ExasolType::varchar(30)),
         ),
         (
-            "EXTRACT SECOND of a TIMESTAMP(9)",
-            extract("SECOND", timestamp_cast(9)),
-            Some(ExasolType::decimal(11, 9)),
+            "CASE of dates under a text condition",
+            case_when(
+                [predicate_equal(date_text.clone(), str_lit("X"))],
+                [col("D"), date_lit("2024-01-01")],
+            ),
+            Some(ExasolType::Date),
         ),
-        ("SECOND of a DATE", second(col("D")), None),
         (
-            "SECOND of a computed timestamp",
-            second(scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")])),
+            "MAX over that CASE",
+            agg_item_expr(
+                "MAX",
+                case_when([date_like(col("D"))], [col("TS3"), col("TS")]),
+                false,
+            ),
+            Some(ExasolType::timestamp(6)),
+        ),
+        ("SUM over text", agg_item_expr("SUM", col("S"), false), None),
+        (
+            "EXTRACT SECOND of a DATE",
+            extract("SECOND", col("D")),
             None,
         ),
+        ("text of a DATE", date_text, None),
     ];
     for (label, node, expected) in cases {
-        assert_eq!(
-            exact_expression_type(&node, &columns()),
-            expected,
-            "{label}"
-        );
+        assert!(render(&node).is_err(), "{label} must decline in the scan");
+        assert_eq!(infer_type(&node, &columns()).exact(), expected, "{label}");
     }
 }
 

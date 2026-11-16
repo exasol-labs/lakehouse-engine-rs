@@ -167,15 +167,33 @@ pub fn detect_group_by_aggregates(
     })
 }
 
-/// A projected key takes its `selectListDataTypes` entry, an unprojected one its exact type
-/// (`exact_expression_type`), a constant [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any other key
-/// (#476, #551).
+/// A projected key takes its `selectListDataTypes` entry, an unprojected constant
+/// [`CONSTANT_KEY_EMIT_TYPE`], any other unprojected key its exact type (`infer_type`). `None`
+/// for a key without one (#476, #551).
 fn group_key_exasol_types(
     pushdown: &PushdownRequest,
     group_keys: &[SqlFragment],
     select_items: &[GroupedSelectItem],
 ) -> Option<Vec<ExasolType>> {
-    let mut types: Vec<Option<ExasolType>> = group_keys.iter().map(|key| key.ty).collect();
+    let group_by = pushdown.json().get("groupBy").and_then(|v| v.as_array());
+    let is_constant = |slot: usize| {
+        group_by
+            .and_then(|keys| keys.get(slot))
+            .and_then(|node| node.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(is_literal_selectlist_item)
+    };
+    let mut types: Vec<Option<ExasolType>> = group_keys
+        .iter()
+        .enumerate()
+        .map(|(slot, key)| {
+            if is_constant(slot) {
+                Some(CONSTANT_KEY_EMIT_TYPE)
+            } else {
+                key.ty
+            }
+        })
+        .collect();
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,
@@ -187,21 +205,7 @@ fn group_key_exasol_types(
             *slot = Some(ty);
         }
     }
-    let group_by = pushdown.json().get("groupBy").and_then(|v| v.as_array());
-    types
-        .into_iter()
-        .enumerate()
-        .map(|(slot, typed)| {
-            typed.or_else(|| {
-                let node = group_by?.get(slot)?;
-                let constant = node
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(is_literal_selectlist_item);
-                constant.then_some(CONSTANT_KEY_EMIT_TYPE)
-            })
-        })
-        .collect()
+    types.into_iter().collect()
 }
 
 /// What HAVING and ORDER BY over the merge can reference: the merged aggregates and the `GK_*`

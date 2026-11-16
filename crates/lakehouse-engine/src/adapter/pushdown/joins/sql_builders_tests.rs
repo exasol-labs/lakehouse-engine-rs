@@ -973,7 +973,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     );
     assert!(
         sql.starts_with(
-            r#"SELECT CAST(COUNT(*) AS DECIMAL(18,0)), CAST(MIN("LHS_T1"."O_ORDERDATE") AS DATE) FROM"#
+            r#"SELECT CAST(COUNT(*) AS DECIMAL(18,0)), MIN("LHS_T1"."O_ORDERDATE") FROM"#
         ),
         "the outer SELECT must be exactly the two aggregate columns: {sql}"
     );
