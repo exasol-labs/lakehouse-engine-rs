@@ -760,7 +760,7 @@ fn infer_type_types_what_the_scan_declines() {
             Some(ExasolType::Date),
         ),
         (
-            "MAX over that CASE",
+            "MAX over a CASE of timestamps under a text condition",
             agg_item_expr(
                 "MAX",
                 case_when([date_like(col("D"))], [col("TS3"), col("TS")]),
@@ -877,7 +877,9 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
 }
 
 fn type_of(expr: &Json) -> Inferred {
-    type_scan_tree(expr, &columns()).unwrap().1
+    let ty = type_scan_tree(expr, &columns()).unwrap().1;
+    assert_eq!(infer_type(expr, &columns()), ty, "{expr}");
+    ty
 }
 
 fn typed(expr: &Json) -> Json {

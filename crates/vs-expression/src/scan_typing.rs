@@ -165,22 +165,6 @@ enum Seconds {
 }
 
 impl Seconds {
-    /// Classifies a [`second_call`] by its argument's type. Exasol itself fails
-    /// `EXTRACT(SECOND)` of a DATE.
-    fn of(extract: bool, argument: Inferred) -> Option<Self> {
-        match argument {
-            Inferred::Exact(ExasolType::Timestamp { precision })
-                if precision <= MAX_FRACTIONAL_DIGITS =>
-            {
-                Some(Self::OfTimestamp {
-                    fraction: precision,
-                })
-            }
-            Inferred::Exact(ExasolType::Date) if !extract => Some(Self::OfDate),
-            _ => None,
-        }
-    }
-
     /// A DATE's seconds are no integer for the text rule: their text form differs by version.
     fn inferred(self) -> Inferred {
         match self {
@@ -206,9 +190,10 @@ pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
     u8::try_from(fraction).ok()
 }
 
-/// The argument of a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)`, and whether it is
-/// the EXTRACT form. `None` for any other node, `SECOND(x, n)` included.
-fn second_call(node: &Json) -> Option<(&Json, bool)> {
+/// What a one-argument `SECOND(x)` or `EXTRACT(SECOND FROM x)` computes. `None` for any other
+/// node, `SECOND(x, n)` included, and `Some(None)` for an argument the scan cannot take. Exasol
+/// itself fails `EXTRACT(SECOND)` of a DATE.
+fn seconds_of(node: &Json, children: &ChildTypes) -> Option<Option<Seconds>> {
     let (name, extract) = match kind(node) {
         "function_scalar_extract" => (node.get("toExtract")?.as_str()?.to_uppercase(), true),
         "function_scalar" => (upper_name(node), false),
@@ -217,10 +202,18 @@ fn second_call(node: &Json) -> Option<(&Json, bool)> {
     if name != "SECOND" {
         return None;
     }
-    let [argument] = node.get("arguments")?.as_array()?.as_slice() else {
-        return None;
-    };
-    Some((argument, extract))
+    Some(match children.of("arguments") {
+        [Inferred::Exact(ExasolType::Timestamp { precision })]
+            if *precision <= MAX_FRACTIONAL_DIGITS =>
+        {
+            Some(Seconds::OfTimestamp {
+                fraction: *precision,
+            })
+        }
+        [Inferred::Exact(ExasolType::Date)] if !extract => Some(Seconds::OfDate),
+        [_] => None,
+        _ => return None,
+    })
 }
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
@@ -466,12 +459,11 @@ impl ChildTypes {
         Ok(children)
     }
 
-    fn of(&self, field: &str) -> Vec<Inferred> {
+    fn of(&self, field: &str) -> &[Inferred] {
         self.arrays
             .iter()
             .find(|(f, _)| *f == field)
-            .map(|(_, c)| c.clone())
-            .unwrap_or_default()
+            .map_or(&[], |(_, c)| c.as_slice())
     }
 
     fn one(&self, field: &str) -> Option<Inferred> {
@@ -488,20 +480,12 @@ impl ChildTypes {
             .chain(self.singles.iter().map(|(_, c)| *c))
             .collect()
     }
-
-    fn only_argument(&self) -> Inferred {
-        match self.of("arguments").as_slice() {
-            [ty] => *ty,
-            _ => Inferred::Unknown,
-        }
-    }
 }
 
 /// Exasol's type of a non-column `node` whose children are typed.
 fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
-    if let Some((_, extract)) = second_call(node) {
-        return Seconds::of(extract, children.only_argument())
-            .map_or(Inferred::Unknown, Seconds::inferred);
+    if let Some(seconds) = seconds_of(node, children) {
+        return seconds.map_or(Inferred::Unknown, Seconds::inferred);
     }
     match kind(node) {
         "literal_null" => Inferred::Null,
@@ -518,14 +502,13 @@ fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
             .map_or(Inferred::Unknown, |field| {
                 typed_function(field).result_type(&[])
             }),
-        "function_scalar_case" => union_of(&children.of("results")),
+        "function_scalar_case" => union_of(children.of("results")),
         "function_scalar_json_value" => json_value_type(node),
-        "function_scalar_cast" => cast_type(node),
-        "function_scalar" if upper_name(node) == "CAST" => cast_type(node),
+        _ if is_cast(node) => cast_target(node).map_or(Inferred::Unknown, Inferred::Exact),
         "function_scalar" => {
-            typed_function(&upper_name(node)).result_type(&children.of("arguments"))
+            typed_function(&upper_name(node)).result_type(children.of("arguments"))
         }
-        "function_aggregate" => aggregate_type(&upper_name(node), &children.of("arguments")),
+        "function_aggregate" => aggregate_type(&upper_name(node), children.of("arguments")),
         _ => Inferred::Unknown,
     }
 }
@@ -538,8 +521,8 @@ fn rewrite_for_scan(
     children: &ChildTypes,
     ty: Inferred,
 ) -> Result<(), UdfError> {
-    if let Some((_, extract)) = second_call(node) {
-        let seconds = Seconds::of(extract, children.only_argument()).ok_or_else(|| {
+    if let Some(seconds) = seconds_of(node, children) {
+        let seconds = seconds.ok_or_else(|| {
             decline(format!(
                 "SECOND needs an argument of the exact type TIMESTAMP(p), or DATE outside EXTRACT: {}",
                 short(node)
@@ -573,14 +556,14 @@ fn rewrite_for_scan(
             if children.one("basis").is_some() {
                 type_comparison(node, out, children)?;
             } else {
-                refuse_implicit_text(node, &children.of("arguments"))?;
+                refuse_implicit_text(node, children.of("arguments"))?;
             }
-            unify_branches(node, out, "results", &children.of("results"), ty)?;
+            unify_branches(node, out, "results", children.of("results"), ty)?;
         }
-        "function_scalar_json_value" => check_json_value(node, &children.of("arguments"))?,
-        "function_scalar_cast" => rewrite_cast(out, &children.of("arguments"))?,
-        "function_scalar" => rewrite_scalar_function(node, out, &children.of("arguments"), ty)?,
-        "function_aggregate" => check_aggregate(node, &children.of("arguments"))?,
+        "function_scalar_json_value" => check_json_value(node, children.of("arguments"))?,
+        _ if is_cast(node) => rewrite_cast(out, children.of("arguments"))?,
+        "function_scalar" => rewrite_scalar_function(node, out, children.of("arguments"), ty)?,
+        "function_aggregate" => check_aggregate(node, children.of("arguments"))?,
         _ => refuse_implicit_text(node, &children.all())?,
     }
     Ok(())
@@ -628,11 +611,7 @@ fn rewrite_scalar_function(
     args: &[Inferred],
     ty: Inferred,
 ) -> Result<(), UdfError> {
-    let fn_name = upper_name(node);
-    if fn_name == "CAST" {
-        return rewrite_cast(out, args);
-    }
-    let function = typed_function(&fn_name);
+    let function = typed_function(&upper_name(node));
     let text_positions = function.string_positions(args.len());
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
@@ -739,23 +718,26 @@ fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> 
     )))
 }
 
-const NUMERIC_AGGREGATES: [&str; 8] = [
-    "SUM",
-    "AVG",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "VARIANCE",
-    "VAR_POP",
-    "VAR_SAMP",
-];
+fn is_numeric_aggregate(name: &str) -> bool {
+    matches!(
+        name,
+        "SUM"
+            | "AVG"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+    )
+}
 
 fn aggregate_type(name: &str, args: &[Inferred]) -> Inferred {
     match name {
         "COUNT" => Inferred::Partial(Partial::Integer),
         "MIN" | "MAX" => args.first().copied().unwrap_or(Inferred::Unknown),
         "SUM" if args.iter().all(|ty| ty.is_integer()) => Inferred::Partial(Partial::Integer),
-        _ if NUMERIC_AGGREGATES.contains(&name) && args.iter().all(|ty| ty.is_numeric()) => {
+        _ if is_numeric_aggregate(name) && args.iter().all(|ty| ty.is_numeric()) => {
             Inferred::Partial(Partial::Number)
         }
         _ => Inferred::Unknown,
@@ -766,7 +748,7 @@ fn check_aggregate(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {
     let name = upper_name(node);
     match name.as_str() {
         "COUNT" | "MIN" | "MAX" => Ok(()),
-        n if NUMERIC_AGGREGATES.contains(&n) => check_numeric_aggregate(node, n, args),
+        n if is_numeric_aggregate(n) => check_numeric_aggregate(node, n, args),
         _ => refuse_implicit_text(node, args),
     }
 }
@@ -819,7 +801,7 @@ fn type_comparison(node: &Json, out: &mut Json, children: &ChildTypes) -> Result
         .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
         .collect();
     if let Some(Json::Array(args)) = node.get("arguments") {
-        operands.extend(args.iter().zip(children.of("arguments")));
+        operands.extend(args.iter().zip(children.of("arguments").iter().copied()));
     }
     compare_without_session_parse(node, out, &operands)?;
     compare_booleans_as_numbers(node, out, children, &operands)
@@ -901,8 +883,8 @@ fn compare_booleans_as_numbers(
             out[field] = wrap(BOOLEAN_NUMBER_NODE, out[field].take());
         }
     }
-    for (i, ty) in children.of("arguments").into_iter().enumerate() {
-        if ty == BOOLEAN {
+    for (i, ty) in children.of("arguments").iter().enumerate() {
+        if *ty == BOOLEAN {
             out["arguments"][i] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][i].take());
         }
     }
@@ -1079,15 +1061,19 @@ fn union_of(branches: &[Inferred]) -> Inferred {
         .unwrap_or(Inferred::Unknown)
 }
 
+fn is_cast(node: &Json) -> bool {
+    match kind(node) {
+        "function_scalar_cast" => true,
+        "function_scalar" => upper_name(node) == "CAST",
+        _ => false,
+    }
+}
+
 fn cast_target(node: &Json) -> Result<ExasolType, UdfError> {
     node.get("dataType")
         .map(exasol_type_from_json)
         .transpose()?
         .ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))
-}
-
-fn cast_type(node: &Json) -> Inferred {
-    cast_target(node).map_or(Inferred::Unknown, Inferred::Exact)
 }
 
 fn rewrite_cast(out: &mut Json, args: &[Inferred]) -> Result<(), UdfError> {

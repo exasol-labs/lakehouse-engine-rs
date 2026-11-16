@@ -586,7 +586,7 @@ fn e2e_aggregate_over_join_result_correct() {
     );
     let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME, &union_items);
     assert!(
-        !pushed.contains("AS DATE)"),
+        !pushed.contains("CAST(MAX("),
         "a select item of an exact DATE type needs no CAST: {pushed}"
     );
 }

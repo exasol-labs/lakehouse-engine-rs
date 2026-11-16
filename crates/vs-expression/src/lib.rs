@@ -20,7 +20,7 @@ use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
     seconds_type,
 };
-pub use scan_typing::{ColumnTypeLookup, Inferred, Partial, infer_type};
+pub use scan_typing::{ColumnTypeLookup, infer_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
