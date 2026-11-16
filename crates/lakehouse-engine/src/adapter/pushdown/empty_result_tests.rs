@@ -1,3 +1,4 @@
+use super::super::joins::single_table_emission;
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
@@ -9,15 +10,24 @@ fn empty_sql(
     request: &Json,
     proj: &[ProjectionItem],
     proj_types: &[ExasolType],
-    widened: bool,
+    wrapped: bool,
 ) -> String {
     let scan = scan_of(request);
+    let pushdown = parsed_pushdown(request);
+    let projection = if wrapped {
+        RowProjection::Wrapped
+    } else {
+        RowProjection::Direct(projected_columns(proj, proj_types))
+    };
+    // The dispatcher's own emission, so the empty wrapper is the one it builds.
+    let emitted = single_table_emission(request, &pushdown, scan.columns())
+        .expect("the fixture names no refused column");
     empty_result_sql(
-        &parsed_pushdown(request),
-        &projected_columns(proj, proj_types),
-        widened,
+        &pushdown,
+        &pushdown,
+        &projection,
         scan,
-        &EmptyRelation::single_scan(request, scan.columns()),
+        &EmptyRelation::single_scan(request, emitted),
     )
     .expect("the empty result must build")["sql"]
         .as_str()
@@ -30,7 +40,7 @@ fn empty_file_list_returns_empty_select() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
     let types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
     let resp = empty_pushdown_sql(&projected_columns(&proj, &types));
-    let sql = resp["sql"].as_str().unwrap();
+    let sql = resp.as_str();
     assert!(sql.contains("WHERE 1=0"));
     assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
 }
@@ -48,7 +58,7 @@ fn empty_pushdown_sql_repeated_literals_unique_aliases() {
         ExasolType::decimal(18, 0),
     ];
     let resp = empty_pushdown_sql(&projected_columns(&proj_cols, &proj_types));
-    let sql = resp["sql"].as_str().unwrap();
+    let sql = resp.as_str();
 
     assert_eq!(
         sql.matches("CAST(NULL AS").count(),
@@ -81,7 +91,7 @@ fn empty_select_list_casts_a_null_to_each_declared_type_in_order() {
         ExasolType::decimal(18, 0),
     ]);
     assert_eq!(
-        resp["sql"],
+        resp,
         "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS BOOLEAN), CAST(NULL AS DECIMAL(18,0)) \
          FROM DUAL WHERE 1=0"
     );
@@ -213,7 +223,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 }
 
 #[test]
-fn empty_result_sql_widened_row_scan_uses_select_list_types() {
+fn empty_result_sql_wrapped_row_scan_uses_select_list_types() {
     let col_types = [
         ("ID", ExasolType::decimal(20, 0)),
         ("NAME", ExasolType::WIDEST_VARCHAR),
@@ -235,23 +245,20 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         "the fixture must classify as RowScan for this test to exercise its arm"
     );
 
-    let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into(), "SCORE".into()];
-    let proj_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-
-    let widened = empty_sql(&request, &proj, &proj_types, true);
+    let wrapped = empty_sql(&request, &[], &[], true);
     assert_eq!(
-        widened, "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
-        "a widened row-scan projection over zero files must produce ONE \
-         selectListDataTypes-typed column, not the 3-column base row: {widened}"
+        wrapped, "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
+        "a wrapper-routed row scan over zero files must produce ONE \
+         selectListDataTypes-typed column, not the 3-column base row: {wrapped}"
     );
 
-    let not_widened = empty_sql(&request, &proj, &proj_types, false);
+    let proj: Vec<ProjectionItem> = vec!["SCORE".into()];
+    let proj_types = [ExasolType::DoublePrecision];
+    let unwrapped = empty_sql(&request, &proj, &proj_types, false);
     assert_eq!(
-        not_widened,
-        empty_pushdown_sql(&projected_columns(&proj, &proj_types))["sql"]
-            .as_str()
-            .unwrap(),
-        "the non-widened path must stay byte-identical to the full-row empty \
-         shape: {not_widened}"
+        unwrapped,
+        empty_pushdown_sql(&projected_columns(&proj, &proj_types)),
+        "a direct projection must stay byte-identical to the projected empty \
+         shape: {unwrapped}"
     );
 }

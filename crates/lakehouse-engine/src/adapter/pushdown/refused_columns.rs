@@ -4,20 +4,13 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::RefusedColumn;
-use super::support::collect_all_column_names;
-use crate::scan::spec::ProjectionItem;
+use super::support::{OutputContract, collect_all_column_names};
 
-/// Columns are collected by one blind recursive walk over the whole `request`,
-/// so a later pushdown capability is gated automatically; pass the OUTERMOST
-/// request value.
-///
-/// `emitted_projection` is `Some` only for a `SELECT *` projection, which the walk
-/// would miss. A widened aggregate projection must be `None`: it is a synthetic
-/// placeholder, and unioning it would refuse every aggregate (even `COUNT(*)`)
-/// over a table with a refused column.
+/// Columns are collected by one blind recursive walk over the whole `request`, so a later
+/// pushdown capability is gated automatically. `SELECT *` names no column, so it charges every one.
 pub(super) fn ensure_no_refused_column_referenced(
     request: &Json,
-    emitted_projection: Option<&[ProjectionItem]>,
+    output: OutputContract,
     refused: &[RefusedColumn],
 ) -> Result<(), UdfError> {
     if refused.is_empty() {
@@ -26,11 +19,15 @@ pub(super) fn ensure_no_refused_column_referenced(
 
     let mut touched: HashSet<String> = HashSet::new();
     collect_all_column_names(request, &mut touched);
-    if let Some(projection) = emitted_projection {
-        touched.extend(projection.iter().filter_map(|item| match item {
-            ProjectionItem::Column(column) => Some(column.name.to_uppercase()),
-            ProjectionItem::Expr { .. } => None,
-        }));
+    match output {
+        OutputContract::WholeRow => {
+            touched.extend(
+                refused
+                    .iter()
+                    .map(|column| column.column_name.to_uppercase()),
+            );
+        }
+        OutputContract::AnyOneColumn | OutputContract::Items => {}
     }
 
     ensure_no_touched_column_is_refused(&touched, refused)
