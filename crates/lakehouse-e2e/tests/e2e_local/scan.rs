@@ -3083,6 +3083,27 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
 }
 
 #[test]
+fn offset_without_order_by_is_rejected_by_exasol() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT * FROM {} LIMIT 3 OFFSET 2", events_table());
+    let resp = conn.try_execute(&sql);
+
+    let msg = error_text(&resp, &format!("LIMIT ... OFFSET with no ORDER BY ({sql})"));
+    assert_eq!(
+        resp["exception"]["sqlCode"].as_str(),
+        Some("42000"),
+        "expected sqlCode 42000, got: {resp}"
+    );
+    assert!(
+        msg.contains("OFFSET") && msg.contains("ORDER BY"),
+        "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \
+         message, got: {msg}"
+    );
+}
+
+#[test]
 fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     lakehouse_vs();
     let mut conn = exa_conn();

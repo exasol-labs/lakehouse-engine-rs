@@ -4,8 +4,9 @@
 
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
-    request_typed, round_of, sample_scan_storage, sample_storage, scan_for, with_identifier_notes,
+    count_star, float_div, full_row_n_scan_sql, parsed_pushdown, pd, projected_columns,
+    pushdown_request, request_sides, request_typed, round_of, sample_scan_storage, sample_storage,
+    scan_for, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -121,7 +122,7 @@ pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
         .build()
 }
 
-/// An inner `DISTINCT` declines the decomposition, so the projection widens (#194).
+/// An inner `DISTINCT` declines the decomposition, so the projection wraps (#194).
 fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
         .single_group()
@@ -181,8 +182,14 @@ fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
         .build()
 }
 
+/// The dispatcher's own emission: a golden pins the SQL the dispatcher generates, fan-out included.
+fn golden_emission(request: &Json, pushdown: &PushdownRequest, columns: &ColumnTypes) -> Emitted {
+    super::joins::single_table_emission(request, pushdown, columns)
+        .expect("a golden fixture names no refused column")
+}
+
 /// Every golden shape has no ORDER BY and derives one projection item per
-/// select-list item, so `has_order_by` and the widening flag are always `false`.
+/// select-list item, so `has_order_by` and the wrapping flag are always `false`.
 fn dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
@@ -203,22 +210,24 @@ fn dispatch_sql(
 }
 
 /// Derives the projection through `project_columns`, so the golden proves the
-/// fixture itself widens.
-fn dispatch_sql_widened(request: &Json) -> String {
+/// fixture itself wraps.
+fn dispatch_sql_wrapped(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
     let columns = column_types(&base_col_types());
-    let (projection, widened) =
-        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()))
+    let emitted = golden_emission(request, &pushdown, &columns);
+    let projection =
+        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()), &emitted)
             .expect("the fixture must project");
-    assert!(
-        widened,
-        "this fixture must exercise the widening guard, not a per-item projection"
+    assert_eq!(
+        projection,
+        RowProjection::Wrapped,
+        "this fixture must exercise the wrapping guard, not a per-item projection"
     );
     let result = build_dispatch_sql(
         request,
         &pushdown,
         projection,
-        widened,
+        &emitted,
         scan_for(&columns, pushdown.json()),
         None,
         None,
@@ -258,13 +267,15 @@ fn dispatch_sql_with_pushdown_req(
     filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
+    let pushdown = PushdownRequest::parse(pushdown_req.clone())
+        .expect("the fixture declares a valid selectListDataTypes");
+    let columns = column_types(&col_types);
     let result = build_dispatch_sql(
         request,
-        &PushdownRequest::parse(pushdown_req.clone())
-            .expect("the fixture declares a valid selectListDataTypes"),
-        projected_columns(&proj_cols, &proj_types),
-        false,
-        scan_for(&column_types(&col_types), pushdown_req),
+        &pushdown,
+        RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
+        &golden_emission(request, &pushdown, &columns),
+        scan_for(&columns, pushdown_req),
         filter,
         None,
         limit,
@@ -293,12 +304,14 @@ fn dispatch_sql_with_pushdown_req(
 }
 
 fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolType]) -> String {
+    let pushdown = parsed_pushdown(request);
+    let columns = column_types(&base_col_types());
     let result = empty_result_sql(
-        &parsed_pushdown(request),
-        &projected_columns(proj_cols, proj_types),
-        false,
-        scan_for(&column_types(&base_col_types()), &pd(request)),
-        &EmptyRelation::single_scan(request, &column_types(&base_col_types())),
+        &pushdown,
+        &pushdown,
+        &RowProjection::Direct(projected_columns(proj_cols, proj_types)),
+        scan_for(&columns, &pd(request)),
+        &EmptyRelation::single_scan(request, golden_emission(request, &pushdown, &columns)),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
@@ -375,7 +388,7 @@ fn single_group_row_scan_matches_golden() {
 
 #[test]
 fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
-    let actual = dispatch_sql_widened(&nested_aggregate_decline_request().0);
+    let actual = dispatch_sql_wrapped(&nested_aggregate_decline_request().0);
     let expected = include_str!("testdata/dispatch_golden/nested_aggregate_decline.sql");
     assert_eq!(actual, expected);
 }
@@ -680,7 +693,7 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql};
+use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql};
 
 fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
     let mut request = pushdown_request(
@@ -782,6 +795,8 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
         s3_max_connections: 1,
         binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
+        udf_name: SCAN_UDF_NAME,
+        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
     }
 }
 
@@ -804,28 +819,20 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = build_n_scan_join_sql(
+    let n_scan_sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
         &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(
@@ -860,28 +867,20 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = build_n_scan_join_sql(
+    let n_scan_sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
         &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(

@@ -347,7 +347,7 @@ const COMBINATIONS: &[Combination] = &[
                       WHERE o.O_ORDERKEY > 100",
                 pushdown: Pushdown::One(&[
                     PathCheck::Has("WHERE 1=0"),
-                    PathCheck::Has(r#"AS "O_TOTALPRICE""#),
+                    PathCheck::Has(r#"AS "LHS_T0_O_TOTALPRICE""#),
                 ]),
             },
         ],

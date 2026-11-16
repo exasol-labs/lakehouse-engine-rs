@@ -5,7 +5,7 @@ use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
-    ColumnTypes, InvolvedColumns, aggregation_type, extract_limit, extract_offset, involved_columns,
+    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
@@ -145,8 +145,8 @@ impl ResolvedJoinSide {
     }
 }
 
-/// Both sides stay fully resolved because the N-scan fallback scans both;
-/// `broadcast_eligible` only routes between the two builders and is never an error.
+/// Both sides stay fully resolved because the N-scan fallback scans both. The roles say nothing
+/// about whether the join is broadcast: `broadcast_policy` decides that.
 ///
 /// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
 /// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
@@ -158,7 +158,6 @@ pub(crate) struct JoinSides {
     pub fact: ResolvedJoinSide,
     /// Smaller side by bytes, the broadcast candidate.
     pub dimension: ResolvedJoinSide,
-    pub broadcast_eligible: bool,
     /// The dimension's leg in FROM-tree order, which names its relation alias.
     pub dimension_leg: usize,
 }
@@ -172,21 +171,15 @@ impl JoinSides {
 
 /// `a` is leg 0 and `b` leg 1. On an exact byte tie `a`, the first leg in FROM-tree order,
 /// becomes the dimension, so the choice of the sharded occurrence is deterministic.
-pub(super) fn select_broadcast_sides(
-    a: ResolvedJoinSide,
-    b: ResolvedJoinSide,
-    join_broadcast_max_bytes: u64,
-) -> JoinSides {
+pub(super) fn select_broadcast_sides(a: ResolvedJoinSide, b: ResolvedJoinSide) -> JoinSides {
     let (dimension, fact, dimension_leg) = if a.total_bytes <= b.total_bytes {
         (a, b, 0)
     } else {
         (b, a, 1)
     };
-    let broadcast_eligible = dimension.total_bytes <= join_broadcast_max_bytes;
     JoinSides {
         fact,
         dimension,
-        broadcast_eligible,
         dimension_leg,
     }
 }
@@ -224,7 +217,8 @@ pub(in super::super) fn involved_table<'r>(
     })
 }
 
-/// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
+/// The window of a request that does not aggregate. [`Self::BroadcastUnservable`] falls through
+/// to the fallback, never an error.
 #[derive(Debug, Clone, PartialEq)]
 pub(in super::super) enum JoinWindowPlan {
     Unbounded,
@@ -237,18 +231,13 @@ pub(in super::super) enum JoinWindowPlan {
         limit: Option<u64>,
         offset: u64,
     },
-    ExasolPostProcessed,
+    BroadcastUnservable,
 }
 
-/// Whether the projection can bind an `Ordered` key is decided at construction: rendering
-/// a projection here would let an aggregate-carrying join reach a render that can `Err` on
-/// absent column metadata.
+/// Whether the projection can bind an `Ordered` key is decided at construction, once the broadcast
+/// render has built that projection. An aggregating request never reaches here: Exasol renders
+/// its window over the fan-out.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    // The broadcast in-UDF join renders only projection, filter, and join condition, so
-    // Exasol aggregates over the materialized join instead.
-    if aggregation_type(pushdown_req).is_some() {
-        return JoinWindowPlan::ExasolPostProcessed;
-    }
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     let Some(order_by) = pushdown_req
@@ -258,7 +247,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     else {
         // Exasol rejects OFFSET without ORDER BY and a per-shard offset does not compose.
         if offset != 0 {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         }
         return match limit {
             Some(n) => JoinWindowPlan::BareLimit(n),
@@ -271,7 +260,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
         // The wrapper binds ORDER BY against emitted columns and appends no hidden ones, so
         // only a flagged plain column, never an expression, is servable.
         let Some(key) = parse_sort_key_element(element) else {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         };
         keys.push(ParsedSortKey::Column(key));
     }
