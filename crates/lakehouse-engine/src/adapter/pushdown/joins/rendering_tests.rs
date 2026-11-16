@@ -807,8 +807,6 @@ fn side_fan_out_pushes_side_local_filter_into_common_blob() {
             &emitting(&column_types(&cols)),
             filter,
             &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
         )
         .expect("selecting the wire storage must succeed");
         common_arg_literal(&sql).to_string()
@@ -835,15 +833,8 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_side_fan_out_sql(
-        &side,
-        &emitting(&column_types(&cols)),
-        None,
-        &tuning,
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed");
+    let sql = build_side_fan_out_sql(&side, &emitting(&column_types(&cols)), None, &tuning)
+        .expect("selecting the wire storage must succeed");
 
     assert!(
         !sql.contains("SELECT * FROM ("),
@@ -880,7 +871,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE")
+    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning)
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
 
@@ -1018,8 +1009,6 @@ fn unified_join_pushes_each_leg_local_filter_into_its_fan_out() {
         &detected_join(&request),
         &customer_orders_sides(&request, 10, 100),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("unified wrapper must build");
 

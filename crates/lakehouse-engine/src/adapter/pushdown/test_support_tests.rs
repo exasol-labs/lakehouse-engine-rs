@@ -618,22 +618,12 @@ pub(super) fn full_row_n_scan_sql(
     join: &joins::DetectedJoin,
     sides: &[joins::ResolvedJoinSide],
     inputs: &joins::JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let emitted: Vec<Emitted> = sides
         .iter()
         .map(|side| emitting(&side.column_types))
         .collect();
-    joins::build_n_scan_join_sql(
-        pushdown,
-        join,
-        sides,
-        &emitted,
-        inputs,
-        udf_name,
-        distribute_udf_name,
-    )
+    joins::build_n_scan_join_sql(pushdown, join, sides, &emitted, inputs)
 }
 
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that

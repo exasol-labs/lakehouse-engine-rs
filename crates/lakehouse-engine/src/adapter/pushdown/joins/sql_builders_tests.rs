@@ -21,8 +21,6 @@ fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
         &detected_join(request),
         &customer_orders_sides(request, 10, 100),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
 }
 
@@ -321,8 +319,6 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the qualified unified fallback must build despite the column-name collision");
 
@@ -355,8 +351,6 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("an all-inner N-scan wrapper must build, never Err");
 
@@ -402,8 +396,6 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
 
@@ -441,8 +433,6 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
 
@@ -529,8 +519,6 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("three tables sharing an ID column must still build, never Err");
 
@@ -561,8 +549,6 @@ fn self_join_renders_each_occurrence_as_its_own_leg() {
             &detected_join(&request),
             &request_typed(&request, &sides),
             &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
         )
         .expect("a two-leg self-join must build through the unified fallback, never Err");
 
@@ -593,8 +579,6 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("a three-leg self-join must build through the unified fallback, never Err");
 
@@ -650,8 +634,6 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("every clause must render against its own occurrence's leg");
 
@@ -691,8 +673,6 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("a fully leg-partitioned self-join filter must build");
 
@@ -768,8 +748,6 @@ fn three_table_join_inner_join_on_chain() {
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the three-table inner-join chain must build");
 
@@ -849,8 +827,6 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the star-shape greedy-attach fallback must build");
 
@@ -1264,10 +1240,9 @@ fn golden_broadcast_join_sql_unchanged() {
             ],
         )
     };
-    let actual =
-        build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
-            .expect("selecting the wire storage must succeed")
-            .expect("an unbounded broadcast join must build");
+    let actual = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
         r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":[{"relation":"LHS_T0","name":"L_ORDERKEY"},{"relation":"LHS_T1","name":"O_ORDERDATE"}],"filter":"(\"LHS_T0\".\"L_QUANTITY\" > 5)","logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","fact_alias":"LHS_T0","dimension_alias":"LHS_T1","condition":"(\"LHS_T0\".\"L_ORDERKEY\" = \"LHS_T1\".\"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("LHS_T0_L_ORDERKEY" DECIMAL(20,0), "LHS_T1_O_ORDERDATE" DATE)"#
@@ -1309,8 +1284,6 @@ fn broadcast_carries_each_sides_own_storage() {
             connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
             ..two_scan_tuning()
         },
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
@@ -1375,7 +1348,7 @@ fn broadcast_sql_projecting(
             projection,
         )
     };
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -2392,7 +2365,7 @@ fn shared_names_broadcast_sql_over(
         render_broadcast_join(&parsed_pushdown(request), &detected_join(request), &typed)
             .expect("a well-formed request renders without error")?;
     let sides = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -2576,7 +2549,7 @@ fn join_block_names_the_dimension_legs_alias() {
             .try_into()
             .expect("two sides");
         let sides = select_broadcast_sides(customer, orders);
-        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "S", "D")
+        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
             .expect("selecting the wire storage must succeed")
             .expect("an unbounded join builds");
         let join = broadcast_common_blob(&sql)["join"].clone();
@@ -2607,8 +2580,6 @@ fn aggregating_broadcast_plan(
         &sides,
         u64::MAX,
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("a declined broadcast is not an error")
 }

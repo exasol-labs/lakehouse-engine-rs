@@ -216,29 +216,17 @@ pub(super) async fn plan_join(
         s3_max_connections,
         binary_as_string: resolve_binary_as_string(props),
         connection: statement.connection(),
+        udf_name: &udf_name,
+        distribute_udf_name: &distribute_udf_name,
     };
 
-    if let Some(sql) = plan_broadcast_join(
-        pushdown,
-        join,
-        &sides,
-        join_broadcast_max_bytes,
-        &inputs,
-        &udf_name,
-        &distribute_udf_name,
-    )? {
+    if let Some(sql) =
+        plan_broadcast_join(pushdown, join, &sides, join_broadcast_max_bytes, &inputs)?
+    {
         return Ok(pushdown_response(sql));
     }
 
-    let sql = build_n_scan_join_sql(
-        pushdown,
-        join,
-        &sides,
-        &emitted,
-        &inputs,
-        &udf_name,
-        &distribute_udf_name,
-    )?;
+    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, &inputs)?;
     Ok(pushdown_response(sql))
 }
 
@@ -251,8 +239,6 @@ fn plan_broadcast_join(
     sides: &[ResolvedJoinSide],
     join_broadcast_max_bytes: u64,
     inputs: &JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
     let pushdown_req = pushdown.json();
     let is_equi =
@@ -282,16 +268,7 @@ fn plan_broadcast_join(
     if n_scan_reason(&facts).is_some() {
         return Ok(None);
     }
-    build_broadcast_plan_sql(
-        pushdown,
-        join,
-        sides,
-        &candidate,
-        reads,
-        inputs,
-        udf_name,
-        distribute_udf_name,
-    )
+    build_broadcast_plan_sql(pushdown, join, sides, &candidate, reads, inputs)
 }
 
 #[cfg(test)]

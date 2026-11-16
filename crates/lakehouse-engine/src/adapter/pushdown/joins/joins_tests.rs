@@ -375,6 +375,8 @@ pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
         s3_max_connections: 1,
         binary_as_string: false,
         connection: &crate::adapter::pushdown::test_support::TEST_CONNECTION,
+        udf_name: "SCAN",
+        distribute_udf_name: "DISTRIBUTE",
     }
 }
 

@@ -57,6 +57,17 @@ pub(crate) fn render_broadcast_join(
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
+    let emitted = broadcast_emission(pushdown, join, sides)?;
+    render_broadcast_join_emitting(pushdown, join, sides, &emitted)
+}
+
+/// [`render_broadcast_join`] of a fan-out that emits `emitted` per leg.
+fn render_broadcast_join_emitting(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    emitted: &[Emitted],
+) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let legs = join.legs();
     let condition_tree = legs.qualify(&join.conditions[0]);
     let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs));
@@ -85,7 +96,7 @@ pub(crate) fn render_broadcast_join(
         return Ok(None);
     }
 
-    let emitted = broadcast_emission(pushdown, join, sides)?;
+    let emitted = qualified_emission(&legs, emitted);
     let RowProjection::Direct(projection) = project_columns(&qualified, scan, &emitted)? else {
         return Ok(None);
     };
@@ -104,19 +115,25 @@ pub(crate) fn render_broadcast_join(
     }))
 }
 
-/// What the broadcast fan-out emits, each column qualified with its leg's alias: the columns the
-/// select list names. The scan reads a join key anyway, so one serves a list that names none.
+/// What the broadcast fan-out emits per leg: the columns the select list names.
 fn broadcast_emission(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-) -> Result<Emitted, UdfError> {
-    let legs = join.legs();
+) -> Result<Vec<Emitted>, UdfError> {
     let above: Vec<&Json> = pushdown.json().get("selectList").into_iter().collect();
-    let scanned = scanned_legs(sides);
-    let keys = leg_columns_named_in(&join.conditions, &legs, 0, &sides[0].column_types);
-    let per_leg = fan_out_emission(pushdown.output(), &above, &legs, &scanned, &keys)?;
-    Ok(qualified_emission(&legs, &per_leg))
+    fan_out_emission(
+        pushdown.output(),
+        &above,
+        &join.legs(),
+        &scanned_legs(sides),
+        &first_leg_join_keys(join, sides),
+    )
+}
+
+/// The scan reads a join key anyway, so one serves a fan-out whose clauses name no column.
+fn first_leg_join_keys(join: &DetectedJoin, sides: &[ResolvedJoinSide]) -> ColumnTypes {
+    leg_columns_named_in(&join.conditions, &join.legs(), 0, &sides[0].column_types)
 }
 
 fn scanned_legs(sides: &[ResolvedJoinSide]) -> Vec<(usize, &ColumnTypes)> {
@@ -349,15 +366,12 @@ pub(in super::super) fn single_table_emission(
 
 /// The sole unaccelerated fallback: Exasol rebuilds the join over one fan-out per leg. A declined
 /// or cross-leg conjunct goes to the outer WHERE, so it applies once, after the fan-outs.
-#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_n_scan_join_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     emitted: &[Emitted],
     inputs: &JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let cols_per_side: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
 
@@ -387,8 +401,6 @@ pub(in super::super) fn build_n_scan_join_sql(
             &emitted[i],
             side_filter,
             inputs,
-            udf_name,
-            distribute_udf_name,
         )?);
     }
 
@@ -423,6 +435,8 @@ pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) s3_max_connections: usize,
     pub(in super::super) binary_as_string: bool,
     pub(in super::super) connection: &'a ResolvedConnectionConfig,
+    pub(in super::super) udf_name: &'a str,
+    pub(in super::super) distribute_udf_name: &'a str,
 }
 
 fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<FileEntry> {
@@ -488,8 +502,6 @@ pub(super) fn build_side_fan_out_sql(
     columns: &Emitted,
     filter: Option<String>,
     inputs: &JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let projection = columns.projection();
 
@@ -501,8 +513,8 @@ pub(super) fn build_side_fan_out_sql(
         &projection,
         None,
         None,
-        udf_name,
-        distribute_udf_name,
+        inputs.udf_name,
+        inputs.distribute_udf_name,
     ))
 }
 
@@ -582,8 +594,6 @@ pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
     inputs: &JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
     let Some(placement) = place_broadcast_window(rendered.window.clone(), &rendered.projection)
     else {
@@ -618,8 +628,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         &rendered.projection,
         placement.merge_cap,
         None,
-        udf_name,
-        distribute_udf_name,
+        inputs.udf_name,
+        inputs.distribute_udf_name,
     );
 
     let Some((keys, limit, offset)) = placement.wrapper else {
@@ -638,7 +648,6 @@ pub(in super::super) fn build_broadcast_join_sql(
 /// The broadcast plan of a two-leg join. `aggregation_reads` is [`aggregation_reads`] of the
 /// request: an aggregating request is aggregated, sorted, and limited only by an outer Exasol
 /// SELECT, never per shard. `None` is a render decline and falls through to the N-scan.
-#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_broadcast_plan_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
@@ -646,21 +655,18 @@ pub(in super::super) fn build_broadcast_plan_sql(
     broadcast: &JoinSides,
     aggregation_reads: Option<Vec<Emitted>>,
     inputs: &JoinScanRequestConfig<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
     let aggregation_input = aggregation_reads
         .map(|read| aggregation_input_request(pushdown, join, sides, read))
         .transpose()?;
-    let fan_out_request = aggregation_input
-        .as_ref()
-        .map_or(pushdown, |(request, _)| request);
-    let Some(rendered) = render_broadcast_join(fan_out_request, join, sides)? else {
+    let rendered = match &aggregation_input {
+        Some((request, emitted)) => render_broadcast_join_emitting(request, join, sides, emitted)?,
+        None => render_broadcast_join(pushdown, join, sides)?,
+    };
+    let Some(rendered) = rendered else {
         return Ok(None);
     };
-    let Some(sql) =
-        build_broadcast_join_sql(broadcast, &rendered, inputs, udf_name, distribute_udf_name)?
-    else {
+    let Some(sql) = build_broadcast_join_sql(broadcast, &rendered, inputs)? else {
         return Ok(None);
     };
     let Some((_, emitted)) = aggregation_input else {
@@ -700,11 +706,11 @@ fn aggregation_input_request(
     read: Vec<Emitted>,
 ) -> Result<(PushdownRequest, Vec<Emitted>), UdfError> {
     let pushdown_req = pushdown.json();
-    let legs = join.legs();
-    let scanned = scanned_legs(sides);
-    // The scan reads a join key anyway, so one serves an aggregation that reads no column.
-    let keys = leg_columns_named_in(&join.conditions, &legs, 0, &sides[0].column_types);
-    let read = with_placeholder(read, &scanned, &keys)?;
+    let read = with_placeholder(
+        read,
+        &scanned_legs(sides),
+        &first_leg_join_keys(join, sides),
+    )?;
     let (select_list, select_types): (Vec<Json>, Vec<Json>) = join
         .tables
         .iter()

@@ -1744,16 +1744,12 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         s3_max_connections: 8,
         binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
+        udf_name: SCAN_UDF_NAME,
+        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
     };
-    let join_sql = super::joins::build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &tuning,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("a broadcast-eligible plan with an unbounded window must render");
+    let join_sql = super::joins::build_broadcast_join_sql(&sides, &rendered, &tuning)
+        .expect("selecting the wire storage must succeed")
+        .expect("a broadcast-eligible plan with an unbounded window must render");
     assert!(
         join_sql.contains(r#""partition_columns":["REGION"]"#),
         "the dimension side's OWN partition columns must reach JoinSpec, independent of \

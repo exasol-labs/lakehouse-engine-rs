@@ -795,6 +795,8 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
         s3_max_connections: 1,
         binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
+        udf_name: SCAN_UDF_NAME,
+        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
     }
 }
 
@@ -817,15 +819,9 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
@@ -837,8 +833,6 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         &join,
         &request_typed(&request, &sides),
         &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(
@@ -873,15 +867,9 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")
@@ -893,8 +881,6 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         &join,
         &request_typed(&request, &sides),
         &join_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(
