@@ -3,8 +3,8 @@ use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, conjoin_scan_filters, exact_expression_type,
-    render_expression_exasol, strip_table_alias, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, conjoin_scan_filters, exact_type, render_expression_exasol,
+    strip_table_alias, walk_column_nodes,
 };
 
 use super::super::support::{ColumnTypes, Emitted, OutputContract, ScanTranslator, quote_ident};
@@ -31,7 +31,7 @@ pub(super) fn select_item_type(
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
 ) -> Option<ExasolType> {
-    exact_expression_type(item, &LegColumnTypes { legs, cols_per_leg })
+    exact_type(item, &LegColumnTypes { legs, cols_per_leg })
 }
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {

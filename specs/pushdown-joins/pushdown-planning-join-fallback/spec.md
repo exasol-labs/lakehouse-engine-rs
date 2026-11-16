@@ -73,6 +73,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *AND* a bare `LIMIT` alone, and a bare-projected-column `ORDER BY` alone, SHALL NOT force this route
 * *AND* the fallback wrapper SHALL render the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (side-0 fan-out) "LHS_T0", (side-1 fan-out) "LHS_T1", … WHERE <conditions> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), splicing Exasol's own aggregate function name verbatim while table-qualifying only its column argument(s)
 * *AND* a select-list item that is a SCALAR FUNCTION WRAPPING one or more aggregates (e.g. `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`) SHALL be rendered by recursing through the `crates/vs-expression` translator, which renders nested `function_aggregate` nodes by splicing the aggregate name verbatim and rendering the argument(s), NOT declined
+* *AND* each select-list item SHALL be cast to its `selectListDataTypes` type, except an item whose exact type (`pushdown-aggregates/pushdown-planning-split-aggregate-types`) already equals it, such as `COUNT(*)` or a `MAX` over a CASE of dates
 * *AND* the returned result SHALL equal the result of evaluating the same select list over the same inner join on a single node
 
 ### Scenario: A fallback leg's fan-out scan spec never carries a row limit

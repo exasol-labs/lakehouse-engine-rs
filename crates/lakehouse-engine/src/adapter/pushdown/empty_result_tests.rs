@@ -150,7 +150,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let sql = empty_sql(&request, &[], &[], false);
     assert_eq!(
         sql,
-        "SELECT CAST('X' AS VARCHAR(2000000)), CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT \
+        "SELECT CAST('X' AS VARCHAR(2000000)), COUNT(*) FROM (SELECT \
          CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
          WHERE 1=0) AS \"LHS_T0\" GROUP BY () HAVING (COUNT(*) = 0)"
     );

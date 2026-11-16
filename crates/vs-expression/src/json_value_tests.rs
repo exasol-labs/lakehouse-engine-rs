@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::*;
-use crate::{exact_expression_type, render_expression_exasol, render_scan_expression};
+use crate::{exact_type, render_expression_exasol, render_scan_expression};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -185,7 +185,7 @@ fn the_returning_type_is_the_exact_type() {
         null(),
     );
     assert_eq!(
-        exact_expression_type(&call, &columns()),
+        exact_type(&call, &columns()),
         Some(ExasolType::decimal(18, 0))
     );
 }

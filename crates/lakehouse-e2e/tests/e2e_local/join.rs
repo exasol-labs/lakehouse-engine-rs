@@ -489,6 +489,11 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
         format!(
             "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} WHERE {named} GROUP BY c.C_NAME"
         ),
+        // Select items whose exact type the typed pass derives.
+        format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
+             MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {orders}"
+        ),
         format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
              '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_CUSTKEY HAVING COUNT(*) > 1 \
@@ -678,6 +683,19 @@ fn e2e_aggregate_over_join_result_correct() {
     let cols = conn.query_columns(&nested);
     assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
     assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
+
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let union_items = format!(
+        "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
+         MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {} o JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
+        vs_fact_table("{T}"),
+        vs_dim_table("{T}")
+    );
+    let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME_LOW, &union_items);
+    assert!(
+        !pushed.contains("CAST(MAX("),
+        "a select item of an exact DATE type needs no CAST: {pushed}"
+    );
 }
 
 // Every line item references exactly one order and one supplier, so the 3- and 4-table

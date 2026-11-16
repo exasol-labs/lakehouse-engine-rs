@@ -20,7 +20,7 @@ use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
     seconds_type,
 };
-pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
+pub use scan_typing::{ColumnTypeLookup, exact_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
@@ -1178,12 +1178,7 @@ pub fn render_scan_expression(
     columns: &dyn ColumnTypeLookup,
 ) -> Result<SqlFragment, UdfError> {
     let (typed, inferred) = scan_typing::type_scan_tree(expr, columns)?;
-    let stated = if scan_typing::kind(&typed) == SECOND_NODE {
-        inferred.exact()
-    } else {
-        exact_expression_type(expr, columns)
-    };
-    let ty = stated.map(|ty| {
+    let ty = inferred.exact().map(|ty| {
         if ty.is_character() {
             ExasolType::WIDEST_VARCHAR
         } else {
@@ -1239,13 +1234,9 @@ pub fn render_expression_exasol(expr: &Json) -> String {
 
 const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
-/// [`render_expression_exasol`] for an output select item, typed where the request states the
-/// type: the Exasol dialect renders a CAST's target and a column as they are.
+/// [`render_expression_exasol`] for an output select item, with its [`exact_type`].
 pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
-    SqlFragment::new(
-        render_expression_exasol(expr),
-        exact_expression_type(expr, columns),
-    )
+    SqlFragment::new(render_expression_exasol(expr), exact_type(expr, columns))
 }
 
 #[cfg(test)]
