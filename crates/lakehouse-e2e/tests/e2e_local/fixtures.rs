@@ -8,7 +8,7 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_JSON_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, build_seed_catalog, seed_all_types,
+    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, build_seed_catalog, seed_all_types,
     seed_complex_types_probe, seed_distinct_probe, seed_events, seed_high_card_probe,
     seed_ident_part_bytes, seed_json_docs, seed_typed_distinct_probe,
 };
@@ -121,6 +121,15 @@ pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
 
 pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
+}
+
+/// `SELECT <select> FROM <events> e JOIN <labels> l ON e.ID = l.ID <tail>` over one virtual schema.
+pub fn events_labels_join(vs_name: &str, select: &str, tail: &str) -> String {
+    format!(
+        "SELECT {select} FROM {} e JOIN {} l ON e.ID = l.ID {tail}",
+        vs_table(vs_name, E2E_TABLE),
+        vs_table(vs_name, E2E_TABLE_2)
+    )
 }
 
 pub fn events_table() -> String {

@@ -834,6 +834,39 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
+/// Exasol rejects `OFFSET` without `ORDER BY` but accepts `ORDER BY FALSE`, which no select-list
+/// position can name, so a windowed all-constant `orderBy` keeps one `FALSE` key.
+fn drop_constant_sort_keys(json: &mut Json) {
+    let offset = extract_offset(json);
+    let Some(keys) = json.get_mut("orderBy").and_then(Json::as_array_mut) else {
+        return;
+    };
+    let Some(first) = keys.first().cloned() else {
+        return;
+    };
+    keys.retain(|key| !is_constant_sort_key(key));
+    if !keys.is_empty() {
+        return;
+    }
+    if offset == 0 {
+        if let Some(request) = json.as_object_mut() {
+            request.remove("orderBy");
+        }
+        return;
+    }
+    let mut false_key = first;
+    false_key["expression"] = serde_json::json!({"type": "literal_bool", "value": false});
+    keys.push(false_key);
+}
+
+/// Every `literal_*` node is constant, including types the select list cannot project.
+fn is_constant_sort_key(key: &Json) -> bool {
+    key.get("expression")
+        .and_then(|expression| expression.get("type"))
+        .and_then(Json::as_str)
+        .is_some_and(|node_type| node_type.starts_with("literal_"))
+}
+
 /// Exasol's `aggregationType`, which it sets on every request that aggregates, including one whose
 /// select list it stripped of every aggregate (#627).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -853,6 +886,10 @@ pub(super) fn aggregation_type(pushdown_req: &Json) -> Option<AggregationType> {
 /// A `pushdownRequest` paired with the type Exasol declares for each of its select-list items.
 /// [`PushdownRequest::parse`] is the only constructor, so every holder has passed the strict type
 /// and count check, and no consumer re-reads `selectListDataTypes` to turn an error into no type.
+///
+/// Its `orderBy` holds no constant key that Exasol pushed, because a constant does not change the order
+/// and Exasol reads a bare number there as a select-list position. An `orderBy` of constants only with
+/// a non-zero offset holds one `FALSE` key instead.
 #[derive(Debug, Clone)]
 pub struct PushdownRequest {
     json: Json,
@@ -863,7 +900,7 @@ impl PushdownRequest {
     /// Fails when the list is absent, holds an invalid entry, or holds another number of entries
     /// than a `selectList` with items. An absent or JSON-null `selectList` is Exasol's `SELECT *`,
     /// whose list holds one entry per table column, so it skips the count check.
-    pub fn parse(json: Json) -> Result<Self, UdfError> {
+    pub fn parse(mut json: Json) -> Result<Self, UdfError> {
         let entries = json
             .get("selectListDataTypes")
             .and_then(Json::as_array)
@@ -888,10 +925,12 @@ impl PushdownRequest {
                 items.len()
             )));
         }
+        drop_constant_sort_keys(&mut json);
         Ok(Self { json, select_types })
     }
 
-    /// The `pushdownRequest` object as Exasol sent it, or as a rewrite kept it.
+    /// The `pushdownRequest` object as Exasol sent it, or as a rewrite kept it, minus its constant
+    /// sort keys (see [`PushdownRequest`]).
     pub fn json(&self) -> &Json {
         &self.json
     }

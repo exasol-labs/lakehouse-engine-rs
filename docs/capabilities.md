@@ -34,7 +34,7 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 
 `ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
 or a broadcast join, no aggregation, and every sort key must be a bare projected column that is not
-JSON-fallback typed. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local
+JSON-fallback typed, or a constant. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local
 top-`n` rows. Exasol SQL then merges the `shard_count × n` rows with a final `ORDER BY ... LIMIT n`.
 The per-shard bounded top-N never carries an offset. A non-zero offset always
 declines to the row-scan wrapper. That wrapper renders the full `ORDER BY ... LIMIT n OFFSET m`
@@ -54,7 +54,10 @@ result in the correct order:
   because it already qualifies column references.
 
 Exasol does not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`,
-so the adapter renders every sort key Exasol pushes in Exasol SQL.
+so the adapter renders every sort key Exasol pushes in Exasol SQL, except a constant. Exasol reads a
+bare number in `ORDER BY` as a select-list position, and a constant does not change the order, so
+the adapter drops it. An `ORDER BY` of constants only with no `OFFSET` runs as a bare `LIMIT`. With
+an `OFFSET` it orders by one `FALSE` key, because Exasol rejects `OFFSET` without `ORDER BY`.
 
 The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
 
@@ -149,7 +152,7 @@ Exasol SQL combines these partial values into the final result.
 |---|---|---|
 | Inner equi-join | `JOIN`, `JOIN_TYPE_INNER`, `JOIN_CONDITION_EQUI` | `FROM a JOIN b ON a.id = b.id` |
 
-A two-table inner equi-join, or a table joined to itself, whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them. Broadcast also requires, among other conditions, no aggregation, sort keys that are projected columns, and a join condition and filter that DataFusion can render. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
+A two-table inner equi-join, or a table joined to itself, whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them. Broadcast also requires, among other conditions, no aggregation, sort keys that are projected columns or constants, and a join condition and filter that DataFusion can render. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
 
 ## Handled by Exasol
 

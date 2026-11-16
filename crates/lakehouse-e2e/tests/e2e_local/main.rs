@@ -19,6 +19,7 @@ mod int96_timestamp;
 mod join;
 mod name_mapping;
 mod non_ascii_identifier;
+mod order_by_constant;
 mod positional_deletes;
 mod property_validation;
 mod proxy;
