@@ -751,7 +751,7 @@ fn a_derived_timestamp_operand_compares_with_a_finer_literal_like_native() {
     let table = qualified_probe();
 
     // Every literal spells more digits than its operand's precision, so each case is floored
-    // except the DATE, which DataFusion compares in nanoseconds.
+    // except the DATE, which compares at the literal's unit.
     let filters = [
         "COALESCE(TS, TIMESTAMP '2000-01-01 00:00:00') < TIMESTAMP '2024-01-01 00:00:00.1234565'",
         "GREATEST(TS, TIMESTAMP '2000-01-01 00:00:00.1') = TIMESTAMP '2024-01-01 00:00:00.1234561'",
@@ -775,9 +775,8 @@ fn a_derived_timestamp_operand_compares_with_a_finer_literal_like_native() {
 }
 
 /// Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
-/// Scenario: A timestamp filter compares at full precision
 #[test]
-fn date_trunc_and_a_date_comparison_outside_the_nanosecond_range_fail_in_the_scan() {
+fn date_trunc_outside_the_nanosecond_range_fails_in_the_scan() {
     setup();
     let mut conn = exa_conn();
     let qualified = qualified_probe();
@@ -817,10 +816,6 @@ fn date_trunc_and_a_date_comparison_outside_the_nanosecond_range_fail_in_the_sca
         (
             "SELECT ID, DATE_TRUNC('month', ADD_DAYS(TS, 2900000)) FROM {T}",
             "out of range",
-        ),
-        (
-            "SELECT ID FROM {T} WHERE ADD_DAYS(CAST(TS AS DATE), 2900000) > TIMESTAMP '2024-01-01 00:00:00'",
-            "to Timestamp(ns)",
         ),
     ];
     for (query, message) in error_cases {
