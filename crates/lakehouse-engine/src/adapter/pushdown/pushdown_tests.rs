@@ -130,37 +130,14 @@ fn grouped_scan_spec_carries_group_keys() {
 }
 
 #[test]
-fn like_filter_yields_df_string_and_no_iceberg_predicate() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
-    use iceberg::spec::{NestedField, Schema, Type};
-    use std::sync::Arc;
-
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![Arc::new(NestedField::optional(
-            1,
-            "name",
-            Type::Primitive(iceberg::spec::PrimitiveType::String),
-        ))])
-        .build()
-        .unwrap();
-
-    let filter_json = like(col("name"), "A%");
-
+fn leading_wildcard_like_yields_df_string() {
     let df_filter = scan_filter_sql(
-        &filter_json,
+        &like(col("name"), "%A"),
         &column_types(&[("NAME", ExasolType::WIDEST_VARCHAR)]),
     );
     assert!(
         df_filter.is_some(),
         "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
-    );
-
-    let iceberg_pred =
-        to_iceberg_predicate(&filter_json, &declared_logical_schema(&schema), &schema);
-    assert!(
-        iceberg_pred.is_none(),
-        "LIKE filter must produce no Iceberg predicate"
     );
 }
 
@@ -861,27 +838,7 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
 }
 
 #[test]
-fn iceberg_pruning_input_unchanged_when_df_render_declines() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use std::sync::Arc;
-
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![
-            Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                2,
-                "ts",
-                Type::Primitive(PrimitiveType::Timestamp),
-            )),
-        ])
-        .build()
-        .unwrap();
+fn pruning_input_unchanged_when_df_render_declines() {
     // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
     // is rewritten, so the equality assertion distinguishes original from rewritten.
     let filter = and([
@@ -909,13 +866,6 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         Some(&filter),
         "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
              tree the resolver prunes with"
-    );
-    let pred = to_iceberg_predicate(&filter, &declared_logical_schema(&schema), &schema)
-        .expect("the prunable conjunct must still yield an Iceberg predicate");
-    assert!(
-        format!("{pred}").contains("id"),
-        "pruning must keep the prunable conjunct even though the sibling conjunct \
-             declined: {pred}"
     );
 }
 

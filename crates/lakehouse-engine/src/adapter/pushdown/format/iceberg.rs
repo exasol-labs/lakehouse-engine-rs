@@ -15,11 +15,11 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
+use super::iceberg_predicate::to_iceberg_predicate;
 use super::{ConnectionStorage, LoadedTable, PlannedFiles, UdfFuture};
 use crate::adapter::column_notes::{
     ColumnDeclaration, DeclaredSchema, column_refusal, unread_type_cause, variant_cause,
 };
-use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::ObjectLocation;
 use crate::scan::spec::{

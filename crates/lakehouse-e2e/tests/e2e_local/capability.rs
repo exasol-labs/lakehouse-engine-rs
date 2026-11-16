@@ -1352,9 +1352,6 @@ fn e2e_week_in_filter() {
     }
 }
 
-// Only the four *_BETWEEN functions are advertised: ADD_HOURS/ADD_MINUTES over a DATE
-// would render TIMESTAMP(3) where Exasol infers TIMESTAMP(0), so Exasol rejects them.
-
 fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str) {
     let pushed = explain_virtual_sql(conn, query_sql);
     assert!(

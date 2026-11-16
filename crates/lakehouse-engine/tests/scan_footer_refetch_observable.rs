@@ -27,7 +27,8 @@ use lakehouse_engine::scan::spec::{
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    ResolvedScanStorage, run_raw_scan_with_session, run_scan_one, session_config_for_spec,
+    CountArithmetic, ResolvedScanStorage, run_raw_scan_with_session, run_scan_one,
+    session_config_for_spec,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
@@ -536,20 +537,22 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     let captured: std::sync::Mutex<Vec<SessionContext>> = std::sync::Mutex::new(Vec::new());
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store_url = Url::parse(&data_a).expect("register url");
-    let build_session =
-        |spec: &ScanSpec, _storage: &ResolvedScanStorage, _memory_limit_bytes: u64| {
-            let session = SessionContext::new_with_config(session_config_for_spec(spec));
-            session.runtime_env().register_object_store(
-                &store_url,
-                Arc::new(RequestLoggingStore {
-                    inner: Arc::new(LocalFileSystem::new()),
-                    sizes: sizes.clone(),
-                    log: Arc::clone(&log),
-                }),
-            );
-            captured.lock().unwrap().push(session.clone());
-            Ok(session)
-        };
+    let build_session = |spec: &ScanSpec,
+                         _storage: &ResolvedScanStorage,
+                         _memory_limit_bytes: u64,
+                         _count_arithmetic: CountArithmetic| {
+        let session = SessionContext::new_with_config(session_config_for_spec(spec));
+        session.runtime_env().register_object_store(
+            &store_url,
+            Arc::new(RequestLoggingStore {
+                inner: Arc::new(LocalFileSystem::new()),
+                sizes: sizes.clone(),
+                log: Arc::clone(&log),
+            }),
+        );
+        captured.lock().unwrap().push(session.clone());
+        Ok(session)
+    };
 
     let spec_for = |data_url: &str, delete_url: &str| {
         let mut spec = raw_spec_with_logical_schema(String::new());

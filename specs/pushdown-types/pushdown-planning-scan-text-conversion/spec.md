@@ -26,6 +26,7 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *WHEN* the adapter plans the request
 * *THEN* the scan SHALL compute it, writing an integer in plain digits and a BOOLEAN as `TRUE` or `FALSE`
 * *AND* a CAST to a text type too short for the source's widest text, such as an integer of precision 9 into `VARCHAR(5)` or a BOOLEAN into `VARCHAR(4)`, SHALL run in Exasol
+* *AND* a CASE, `COALESCE`, `GREATEST`, or `LEAST` over integers SHALL take the widest branch precision, as Exasol does, so `CAST(CASE WHEN c THEN 7 ELSE -12 END AS VARCHAR(3))` runs in the scan
 
 ### Scenario: A digits-only literal compares with an integer as a number
 

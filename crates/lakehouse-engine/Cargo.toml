@@ -13,6 +13,7 @@ exasol-udf-macros = { workspace = true }
 
 vs-expression     = { path = "../vs-expression" }
 lakehouse-catalog = { path = "../lakehouse-catalog" }
+lakehouse-catalog-write = { path = "../lakehouse-catalog-write" }
 
 arrow      = { workspace = true, features = ["json"] }
 parquet    = { workspace = true }
@@ -72,6 +73,8 @@ rand    = "0.8"
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 vs-expression       = { path = "../vs-expression", features = ["test-support"] }
+lakehouse-catalog   = { path = "../lakehouse-catalog", features = ["test-support"] }
+lakehouse-catalog-write = { path = "../lakehouse-catalog-write", features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 tempfile            = { version = "3" }

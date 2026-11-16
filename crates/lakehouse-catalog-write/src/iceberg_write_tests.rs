@@ -353,6 +353,7 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
     assert_eq!(secrets, RECORDED_PLACEHOLDERS[..3]);
 }
 
+/// Scenario: A table location outside S3-compatible storage is refused
 #[tokio::test]
 async fn an_abfss_stage_answer_is_refused_naming_the_table_and_the_scheme() {
     let abfss = STAGE_TABLE.replace(

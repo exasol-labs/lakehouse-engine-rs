@@ -6,7 +6,6 @@ pub mod column_notes;
 pub mod connection;
 pub mod direct_storage;
 pub mod direct_storage_properties;
-pub mod iceberg_predicate;
 pub mod parquet_directory;
 mod permission;
 mod properties;

@@ -3545,6 +3545,7 @@ dependencies = [
  "iceberg",
  "jiter",
  "lakehouse-catalog",
+ "lakehouse-catalog-write",
  "minijinja",
  "object_store",
  "parquet",

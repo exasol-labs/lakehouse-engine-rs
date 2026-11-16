@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 name = "lakehouse_catalog_write"
 
+# Exposes the fake catalog and recorded answers of `exported_test_support` to dependent crates'
+# tests. Never enabled outside `[dev-dependencies]`.
+[features]
+test-support = ["lakehouse-catalog/test-support"]
+
 [dependencies]
 lakehouse-catalog = { path = "../lakehouse-catalog" }
 exasol-udf-sdk    = { workspace = true }

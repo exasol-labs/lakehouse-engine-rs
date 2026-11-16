@@ -348,8 +348,9 @@ vended.
   read, at any depth, unless a path segment starts with `_` or `.`. A zero-length object is never
   a data file.
 - No Parquet footer is read at plan time. A predicate on a partition column prunes files under the
-  column's declared type. String, integer, decimal, date, timestamp, and boolean partition columns
-  compare in their own type, so `year < 10` keeps `year=9` and prunes `year=10`. A partition
+  column's declared type. String, integer, decimal, float, double, date, timestamp, and boolean
+  partition columns compare in their own type, so `year < 10` keeps `year=9` and prunes `year=10`.
+  A `LIKE` on a string partition column matches each partition value against its pattern. A partition
   column of any other declared type prunes no file. A literal of another type than the column's, or
   one the type cannot represent exactly, also prunes no file. A predicate on a data column narrows
   the rows returned but not the files read.
@@ -526,7 +527,7 @@ A refused column fails only the queries that read or emit it. The refusal reason
 - A zero-length object is not read.
 - A partition outside the table location in the same bucket is read, and its files carry absolute paths. The scheme `s3a://` addresses the same store as `s3://`.
 
-**Partition pruning.** The adapter prunes partitions on their Glue values before it lists their locations. The shared partition predicate compares each value under the partition key's declared type. String, integer, decimal, date, timestamp, and boolean keys compare in their own type. A key of any other type, a literal of another type than the key's, and a literal the type cannot represent exactly prune nothing. The adapter does not send the predicate to Glue in the `Expression` of `GetPartitions`. The full predicate still applies above the scan, so pruned and unpruned queries return the same rows.
+**Partition pruning.** The adapter prunes partitions on their Glue values before it lists their locations. The shared partition predicate compares each value under the partition key's declared type. String, integer, decimal, float, double, date, timestamp, and boolean keys compare in their own type, and a `LIKE` on a string key matches each value against its pattern. A key of any other type, a literal of another type than the key's, and a literal the type cannot represent exactly prune nothing. The adapter does not send the predicate to Glue in the `Expression` of `GetPartitions`. The full predicate still applies above the scan, so pruned and unpruned queries return the same rows.
 
 **Failures.** A kept partition that the adapter cannot read faithfully fails the query. The error names the partition's values and location and states the cause. The adapter never skips such a partition, because a skipped partition returns wrong rows.
 

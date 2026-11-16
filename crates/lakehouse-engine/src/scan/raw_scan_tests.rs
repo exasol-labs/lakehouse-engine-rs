@@ -1087,7 +1087,9 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     )]);
     let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
 
-    let session = build_session_context(&spec, &storage, 0).expect("the session must build");
+    let session =
+        build_session_context(&spec, &storage, 0, crate::scan::CountArithmetic::default())
+            .expect("the session must build");
     let mut ctx = SinkCtx;
     let mut timers = diagnostics::PhaseTimers::start();
     let error = run_raw_scan_with_session(&mut ctx, &session, &spec, &storage, &mut timers)
