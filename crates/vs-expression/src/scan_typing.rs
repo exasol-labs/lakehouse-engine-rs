@@ -3,7 +3,9 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::exasol_type::{Decimal, ExasolType, exasol_type_from_json, exasol_type_to_json};
+use crate::exasol_type::{
+    Decimal, ExasolType, MAX_FRACTIONAL_DIGITS, exasol_type_from_json, exasol_type_to_json,
+};
 use crate::json_value::{JsonValueCall, Returning};
 use crate::scalar_functions::{
     DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
@@ -44,6 +46,13 @@ const BOOLEAN: Inferred = Inferred::Exact(ExasolType::Boolean);
 const DATE: Inferred = Inferred::Exact(ExasolType::Date);
 
 impl Inferred {
+    pub(crate) fn exact(self) -> Option<ExasolType> {
+        match self {
+            Self::Exact(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
     fn is_text(self) -> bool {
         match self {
             Self::Exact(ty) => ty.is_character(),
@@ -134,6 +143,92 @@ pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
 /// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
 /// (apache/datafusion#16797).
 pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
+/// Synthetic node: the seconds of its argument with `fraction` fractional digits, which only this
+/// pass knows.
+pub(crate) const SECOND_NODE: &str = "scan_second";
+
+/// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
+pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
+    ExasolType::decimal(2 + fraction, fraction)
+}
+
+/// What the scan computes for a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)`.
+#[derive(Clone, Copy)]
+enum Seconds {
+    /// The seconds of a `TIMESTAMP(p)` with its first p fractional digits.
+    OfTimestamp { fraction: u8 },
+    /// 0, which Exasol types `DECIMAL(2,0)` on 2025.1 and `DECIMAL(5,3)` on 8.29.
+    OfDate,
+}
+
+impl Seconds {
+    fn exact_type(self) -> Option<ExasolType> {
+        match self {
+            Self::OfTimestamp { fraction } => Some(seconds_type(fraction)),
+            Self::OfDate => None,
+        }
+    }
+
+    /// A DATE's seconds are no integer for the text rule: their text form differs by version.
+    fn inferred(self) -> Inferred {
+        self.exact_type()
+            .map_or(Inferred::Partial(Partial::Number), Inferred::Exact)
+    }
+
+    fn node(self, argument: Json) -> Json {
+        let fraction = match self {
+            Self::OfTimestamp { fraction } => fraction,
+            Self::OfDate => 0,
+        };
+        serde_json::json!({"type": SECOND_NODE, SECOND_FRACTION: fraction, "arguments": [argument]})
+    }
+}
+
+const SECOND_FRACTION: &str = "fraction";
+
+/// The fractional digits a [`SECOND_NODE`] keeps.
+pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
+    let fraction = node.get(SECOND_FRACTION)?.as_u64()?;
+    u8::try_from(fraction).ok()
+}
+
+/// The argument of a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)`, and whether it is
+/// the EXTRACT form. `None` for any other node, `SECOND(x, n)` included.
+fn second_call(node: &Json) -> Option<(&Json, bool)> {
+    let (name, extract) = match kind(node) {
+        "function_scalar_extract" => (node.get("toExtract")?.as_str()?.to_uppercase(), true),
+        "function_scalar" => (upper_name(node), false),
+        _ => return None,
+    };
+    if name != "SECOND" {
+        return None;
+    }
+    let [argument] = node.get("arguments")?.as_array()?.as_slice() else {
+        return None;
+    };
+    Some((argument, extract))
+}
+
+/// Classifies a [`second_call`] by its argument's exact type. Exasol itself fails
+/// `EXTRACT(SECOND)` of a DATE, so that declines.
+fn classify_second(
+    node: &Json,
+    extract: bool,
+    argument: Option<ExasolType>,
+) -> Result<Seconds, UdfError> {
+    match argument {
+        Some(ExasolType::Timestamp { precision }) if precision <= MAX_FRACTIONAL_DIGITS => {
+            Ok(Seconds::OfTimestamp {
+                fraction: precision,
+            })
+        }
+        Some(ExasolType::Date) if !extract => Ok(Seconds::OfDate),
+        _ => Err(decline(format!(
+            "SECOND needs an argument of the exact type TIMESTAMP(p), or DATE outside EXTRACT: {}",
+            short(node)
+        ))),
+    }
+}
 
 /// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
 /// a `name` identifier to its visitor.
@@ -313,6 +408,14 @@ pub(crate) fn type_scan_tree(
         return Ok((node.clone(), ty));
     }
     let (mut out, children) = type_children(node, columns)?;
+    if let Some((_, extract)) = second_call(node) {
+        let argument = match children.of("arguments").as_slice() {
+            [Inferred::Exact(ty)] => Some(*ty),
+            _ => None,
+        };
+        let seconds = classify_second(node, extract, argument)?;
+        return Ok((seconds.node(out["arguments"][0].take()), seconds.inferred()));
+    }
     let ty = node_type(node, &mut out, &children)?;
     Ok((out, ty))
 }
@@ -626,14 +729,20 @@ fn json_value_type(node: &Json, args: &[Inferred]) -> Result<Inferred, UdfError>
 }
 
 /// The type the request states for `node`: a CAST's `dataType`, a `JSON_VALUE`'s
-/// `returningDataType`, or a column's type. `None` otherwise, because Exasol's expression typing
-/// depends on values, session, and version (#476).
+/// `returningDataType`, a column's type, or the type of `SECOND` over a `TIMESTAMP(p)`, which
+/// depends on p alone. `None` otherwise, because Exasol's expression typing depends on values,
+/// session, and version (#476).
 pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
     if let Some(data_type) = node
         .get("dataType")
         .or_else(|| node.get("returningDataType"))
     {
         return exasol_type_from_json(data_type).ok();
+    }
+    // The split aggregates and joins still type SECOND here; #635 moves them to the typed pass.
+    if let Some((argument, extract)) = second_call(node) {
+        let argument = exact_expression_type(argument, columns);
+        return classify_second(node, extract, argument).ok()?.exact_type();
     }
     if kind(node) == "column" {
         columns.column_type(node)
