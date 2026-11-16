@@ -113,3 +113,26 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *THEN* the UDF SHALL reserve the held bytes in the DataFusion memory pool
 * *AND* the UDF SHALL release them once no reader of the file is open and the finished byte ranges cover the file
 * *AND* bytes that do not fit the pool SHALL NOT be held, and the scan SHALL read them from the store and return the same rows
+
+### Scenario: Row-group reads wait on the read budget
+
+* *GIVEN* a scan invocation whose streams fetch row groups from object storage
+* *WHEN* a stream fetches the bytes of a row group
+* *THEN* the UDF SHALL reserve the fetched bytes in the DataFusion memory pool until that stream fetches its next row group or closes the file
+* *AND* a stream SHALL start fetching a row group only when the bytes held by all streams of the invocation, both join sides included, fit a read budget of a quarter of the memory pool
+* *AND* a fetch that does not fit SHALL wait in arrival order for other streams to release bytes, and SHALL NOT fail the query
+* *AND* a later fetch for a row group already admitted SHALL NOT wait
+* *AND* bytes served from held file bytes SHALL NOT count against the read budget
+
+### Scenario: A row group larger than the read budget still reads
+
+* *GIVEN* a row group whose fetched bytes exceed the read budget
+* *WHEN* no stream of the invocation holds row-group bytes
+* *THEN* the UDF SHALL admit the fetch
+* *AND* no other row group SHALL be admitted until those bytes are released
+
+### Scenario: No pushed plan shape waits forever on the read budget
+
+* *GIVEN* a read budget smaller than one row group
+* *WHEN* the UDF runs a filter scan, a LIMIT scan, a top-N scan, an aggregate, or a join
+* *THEN* the scan SHALL complete and return the rows it returns without a budget

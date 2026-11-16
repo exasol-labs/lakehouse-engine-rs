@@ -56,3 +56,32 @@ The scan table builds its own file groups and turns DataFusion's file-scan repar
 - Storage requests no longer grow with `DATAFUSION_TARGET_PARTITIONS`.
 - A small file read for a few columns moves its unprojected columns too, in exchange for one request.
 - Shared state is released once a file's finished ranges cover it. A file reopened after that is fetched again, which changes no row.
+
+## ADR: Row-group reads wait on a byte budget
+
+**ID:** row-group-read-byte-budget
+**Plan:** fix-scan-read-path
+**Status:** Accepted
+
+### Context
+
+DataFusion's Parquet reader holds the fetched bytes of each stream's current row group and reserves nothing for them. Scan memory was the stream count times the projected row group, outside the memory pool: 2.7 GB at 192 streams with 16 MB row groups.
+
+### Decision
+
+The shared reader admits the first fetch of a row group against one byte budget per invocation, a quarter of the memory pool. The bytes stay reserved in the pool until the reader fetches its next row group or drops. A fetch that does not fit waits in arrival order. A fetch is admitted when nothing else is held, and a later fetch of an admitted row group never waits.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Cap the stream count | Rejected: it bounds memory for one row-group size only, and it lowers small-file concurrency |
+| Fail a read that does not fit | Rejected: a query that ran before would fail, where waiting only slows it |
+| Count held file bytes against the same budget | Rejected: a file's footer bytes stay held until all its ranges finish, so they could block the reads that release them |
+
+### Consequences
+
+- Scan read memory follows the budget, not the stream count: 263 MB from 32 to 192 streams with a 1 GiB pool, at the same run time.
+- Row-group bytes now count in the pool, so operators get that much less of it. The reservation never fails, so a row group larger than the free pool can make an operator's reservation fail.
+- The budget counts fetched bytes. Decoded batches are bounded per stream by the batch size.
+- A waiting reader holds no row-group bytes. This is deadlock-free only while no plan makes one scan stream wait for another, which a host test checks for every pushed plan shape.
