@@ -1760,15 +1760,85 @@ fn rendered_initdef_column(
 
 /// Not idempotent: drops and recreates `initdef` so every run starts clean.
 pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &str) -> Result<()> {
-    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-initdef").await?;
+    seed_v3_added_columns(
+        catalog_url,
+        warehouse,
+        EVO_INITDEF_TABLE,
+        initdef_post_add_schema,
+        Some(make_initdef_full_batch),
+    )
+    .await
+}
+
+pub const EVO_INITDEF_REFUSED_TABLE: &str = "initdef_refused";
+/// Readable sibling of the refused column, so a query that skips the refused column still reads.
+pub const EVO_INITDEF_REFUSED_COL_OK: &str = "c_ok";
+/// `decimal(5,10)`: Arrow holds no decimal whose scale exceeds its precision, so its default
+/// cannot be read at the declared type and the adapter refuses the column.
+pub const EVO_INITDEF_REFUSED_COL_BAD: &str = "c_bad";
+
+/// One pre-add file of ids 1 to 3, then `c_ok` and `c_bad` added with an `initial-default`. No
+/// post-add file, because Arrow cannot write a `decimal(5,10)` value.
+pub async fn seed_unreadable_initial_default(catalog_url: &str, warehouse: &str) -> Result<()> {
+    seed_v3_added_columns(
+        catalog_url,
+        warehouse,
+        EVO_INITDEF_REFUSED_TABLE,
+        |schema_id| {
+            IcebergSchema::builder()
+                .with_schema_id(schema_id)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        2,
+                        EVO_INITDEF_REFUSED_COL_OK,
+                        Type::Primitive(PrimitiveType::Int),
+                    )
+                    .with_initial_default(Literal::int(42))
+                    .into(),
+                    NestedField::optional(
+                        3,
+                        EVO_INITDEF_REFUSED_COL_BAD,
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 5,
+                            scale: 10,
+                        }),
+                    )
+                    .with_initial_default(Literal::decimal(1234))
+                    .into(),
+                ])
+                .build()
+                .context("build initdef_refused post-add Iceberg schema")
+        },
+        None,
+    )
+    .await
+}
+
+/// A format-version 3 table (non-null `initial-default` values need v3) whose first file holds
+/// only `id` 1 to 3, after which `post_add_schema` becomes current and `post_add_batch`, when
+/// given, lands as a second file. Drops and recreates the table so every run starts clean.
+async fn seed_v3_added_columns(
+    catalog_url: &str,
+    warehouse: &str,
+    table_name: &str,
+    post_add_schema: impl Fn(i32) -> Result<IcebergSchema>,
+    post_add_batch: Option<fn(i64, i64) -> RecordBatch>,
+) -> Result<()> {
+    let catalog = build_seed_catalog(
+        catalog_url,
+        warehouse,
+        &format!("lakehouse-e2e-seed-{table_name}"),
+    )
+    .await?;
 
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let ident = TableIdent::new(ns.clone(), EVO_INITDEF_TABLE.to_string());
+    let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
     if !catalog
         .namespace_exists(&ns)
         .await
-        .context("check namespace for initdef")?
+        .with_context(|| format!("check namespace for {table_name}"))?
     {
         let _ = catalog.create_namespace(&ns, HashMap::new()).await;
     }
@@ -1776,20 +1846,19 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     if catalog
         .table_exists(&ident)
         .await
-        .context("check initdef table exists")?
+        .with_context(|| format!("check {table_name} table exists"))?
     {
         catalog
             .drop_table(&ident)
             .await
-            .context("drop existing initdef table")?;
+            .with_context(|| format!("drop existing {table_name} table"))?;
     }
 
-    // Iceberg requires v3 for non-null `initial-default` values. The REST catalog takes the
-    // format version only from the `format-version` property, so it is set there and
-    // asserted below.
+    // The REST catalog takes the format version only from the `format-version` property, so it
+    // is set there and asserted below.
     let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
     let creation = TableCreation::builder()
-        .name(EVO_INITDEF_TABLE.to_string())
+        .name(table_name.to_string())
         .schema(initdef_pre_add_schema()?)
         .partition_spec(partition_spec)
         .properties(HashMap::from([(
@@ -1801,11 +1870,11 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     let table = catalog
         .create_table(&ns, creation)
         .await
-        .context("create initdef table")?;
+        .with_context(|| format!("create {table_name} table"))?;
     assert_eq!(
         table.metadata().format_version(),
         FormatVersion::V3,
-        "initdef table was not created at format-version 3 (non-null initial-default \
+        "{table_name} table was not created at format-version 3 (non-null initial-default \
          requires v3); the REST catalog ignored the format-version request"
     );
 
@@ -1813,49 +1882,44 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     write_one_file_append(
         &catalog,
         &table,
-        EVO_INITDEF_TABLE,
+        table_name,
         [make_initdef_id_only_batch(a0, a1)],
     )
     .await
-    .context("append initdef file A (pre-add)")?;
+    .with_context(|| format!("append {table_name} file A (pre-add)"))?;
 
     let table = catalog
         .load_table(&ident)
         .await
-        .context("reload initdef before add-columns")?;
+        .with_context(|| format!("reload {table_name} before add-columns"))?;
     let current_schema_id = table.metadata().current_schema_id();
+    let new_schema = post_add_schema(current_schema_id + 1)?;
+    let added_fields = new_schema.as_struct().fields().len();
     rest_replace_current_schema(
         catalog_url,
         E2E_NAMESPACE,
-        EVO_INITDEF_TABLE,
+        table_name,
         current_schema_id,
-        initdef_post_add_schema(current_schema_id + 1)?,
+        new_schema,
     )
     .await
-    .context("REST add-columns commit for initdef")?;
+    .with_context(|| format!("REST add-columns commit for {table_name}"))?;
 
     let table = catalog
         .load_table(&ident)
         .await
-        .context("reload initdef after add-columns")?;
+        .with_context(|| format!("reload {table_name} after add-columns"))?;
     assert_eq!(
-        table
-            .metadata()
-            .current_schema()
-            .field_by_id(2)
-            .map(|f| f.name.as_str()),
-        Some(EVO_INITDEF_COL_BOOL),
-        "REST add-columns did not take effect: field-id 2 is not '{EVO_INITDEF_COL_BOOL}'"
+        table.metadata().current_schema().as_struct().fields().len(),
+        added_fields,
+        "REST add-columns did not take effect on {table_name}"
     );
-    let (b0, b1) = EVO_INITDEF_POST_ADD_IDS;
-    write_one_file_append(
-        &catalog,
-        &table,
-        EVO_INITDEF_TABLE,
-        [make_initdef_full_batch(b0, b1)],
-    )
-    .await
-    .context("append initdef file B (post-add)")?;
+    if let Some(post_add_batch) = post_add_batch {
+        let (b0, b1) = EVO_INITDEF_POST_ADD_IDS;
+        write_one_file_append(&catalog, &table, table_name, [post_add_batch(b0, b1)])
+            .await
+            .with_context(|| format!("append {table_name} file B (post-add)"))?;
+    }
 
     Ok(())
 }
