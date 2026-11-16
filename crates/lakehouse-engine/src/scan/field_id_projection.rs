@@ -1121,7 +1121,8 @@ pub(super) fn build_logical_arrow_schema(
 
 /// The scan-side inverse of the VS layer's `encode_initial_default`. The tag fixes the variant
 /// via [`arrow_type_from_tag`], matching [`build_logical_arrow_schema`]; the encoded text is the
-/// raw primitive (days/micros/nanos, or an `i128` decimal mantissa). Errors, never panics.
+/// raw primitive (days/micros/nanos, or an `i128` decimal mantissa), or lowercase hex for a binary
+/// tag. Errors, never panics.
 pub(crate) fn reconstruct_initial_default(
     arrow_type_tag: &str,
     encoded: &str,
@@ -1155,6 +1156,10 @@ pub(crate) fn reconstruct_initial_default(
             precision,
             scale,
         ),
+        binary @ (DataType::Binary | DataType::FixedSizeBinary(_)) => {
+            crate::scan::hex_scalar(encoded, &binary)
+                .map_err(|cause| format!("initial-default '{encoded}' {cause}"))?
+        }
         other => {
             return Err(format!(
                 "initial-default reconstruction unsupported for arrow type '{other}' (tag '{arrow_type_tag}')"

@@ -1601,6 +1601,13 @@ pub const EVO_INITDEF_COL_DATE: &str = "c_date";
 pub const EVO_INITDEF_COL_TS: &str = "c_ts";
 pub const EVO_INITDEF_COL_DECIMAL: &str = "c_decimal";
 pub const EVO_INITDEF_COL_TSTZ: &str = "c_tstz";
+pub const EVO_INITDEF_COL_TIME: &str = "c_time";
+/// Added REQUIRED-with-default of a type whose Arrow tag is `utf8`.
+pub const EVO_INITDEF_COL_TIME_REQ: &str = "c_time_req";
+pub const EVO_INITDEF_COL_DEC38: &str = "c_dec38";
+pub const EVO_INITDEF_COL_BINARY: &str = "c_binary";
+pub const EVO_INITDEF_COL_FIXED: &str = "c_fixed";
+pub const EVO_INITDEF_COL_UUID: &str = "c_uuid";
 
 /// Greater than `i32::MAX`, so a Long/Int mix-up is caught.
 const INITDEF_LONG_DEFAULT: i64 = 4_200_000_000;
@@ -1615,6 +1622,12 @@ const INITDEF_REAL_TS_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 *
 /// Deliberately the same UTC instant as `c_ts`'s default.
 const INITDEF_DEFAULT_TSTZ_MICROS: i64 = BASE_TS_MICROS + 12 * MICROS_PER_HOUR;
 const INITDEF_REAL_TSTZ_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 * MICROS_PER_HOUR;
+/// 22:31:08.123456. A rendered-default column stores its default as the post-add value too, so
+/// one expected text proves a pre-add row reads exactly as a stored value of the column.
+const INITDEF_TIME_MICROS: i64 = (22 * 3600 + 31 * 60 + 8) * 1_000_000 + 123_456;
+const INITDEF_BINARY: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+const INITDEF_FIXED: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+const INITDEF_UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
 pub enum ExpectedValue {
     Bool(bool),
@@ -1719,7 +1732,30 @@ pub fn initdef_columns() -> Vec<InitDefColumn> {
             default: ExpectedValue::DatePrefix("2024-01-01"),
             real: ExpectedValue::DatePrefix("2024-07-01"),
         },
+        rendered_initdef_column(EVO_INITDEF_COL_TIME, false, "22:31:08.123456"),
+        rendered_initdef_column(EVO_INITDEF_COL_TIME_REQ, true, "22:31:08.123456"),
+        rendered_initdef_column(EVO_INITDEF_COL_DEC38, false, "123.45"),
+        rendered_initdef_column(EVO_INITDEF_COL_BINARY, false, "deadbeef"),
+        rendered_initdef_column(EVO_INITDEF_COL_FIXED, false, "01020304"),
+        rendered_initdef_column(
+            EVO_INITDEF_COL_UUID,
+            false,
+            "0123456789abcdef0123456789abcdef",
+        ),
     ]
+}
+
+fn rendered_initdef_column(
+    name: &'static str,
+    required: bool,
+    text: &'static str,
+) -> InitDefColumn {
+    InitDefColumn {
+        name,
+        required,
+        default: ExpectedValue::Text(text),
+        real: ExpectedValue::Text(text),
+    }
 }
 
 /// Not idempotent: drops and recreates `initdef` so every run starts clean.
@@ -1909,6 +1945,53 @@ fn initdef_post_add_schema(schema_id: i32) -> Result<IcebergSchema> {
             )
             .with_initial_default(Literal::timestamptz(INITDEF_DEFAULT_TSTZ_MICROS))
             .into(),
+            NestedField::optional(
+                12,
+                EVO_INITDEF_COL_TIME,
+                Type::Primitive(PrimitiveType::Time),
+            )
+            .with_initial_default(Literal::time(INITDEF_TIME_MICROS))
+            .into(),
+            NestedField::required(
+                13,
+                EVO_INITDEF_COL_TIME_REQ,
+                Type::Primitive(PrimitiveType::Time),
+            )
+            .with_initial_default(Literal::time(INITDEF_TIME_MICROS))
+            .into(),
+            NestedField::optional(
+                14,
+                EVO_INITDEF_COL_DEC38,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                }),
+            )
+            .with_initial_default(Literal::decimal(INITDEF_DECIMAL_DEFAULT_UNSCALED))
+            .into(),
+            NestedField::optional(
+                15,
+                EVO_INITDEF_COL_BINARY,
+                Type::Primitive(PrimitiveType::Binary),
+            )
+            .with_initial_default(Literal::binary(INITDEF_BINARY))
+            .into(),
+            NestedField::optional(
+                16,
+                EVO_INITDEF_COL_FIXED,
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            )
+            .with_initial_default(Literal::fixed(INITDEF_FIXED))
+            .into(),
+            NestedField::optional(
+                17,
+                EVO_INITDEF_COL_UUID,
+                Type::Primitive(PrimitiveType::Uuid),
+            )
+            .with_initial_default(
+                Literal::uuid_from_str(INITDEF_UUID).context("parse initdef uuid default")?,
+            )
+            .into(),
         ])
         .build()
         .context("build initdef post-add Iceberg schema")
@@ -1953,7 +2036,28 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             true,
         ),
+        Field::new(
+            EVO_INITDEF_COL_TIME,
+            DataType::Time64(TimeUnit::Microsecond),
+            true,
+        ),
+        Field::new(
+            EVO_INITDEF_COL_TIME_REQ,
+            DataType::Time64(TimeUnit::Microsecond),
+            false,
+        ),
+        Field::new(EVO_INITDEF_COL_DEC38, DataType::Decimal128(38, 2), true),
+        Field::new(EVO_INITDEF_COL_BINARY, DataType::LargeBinary, true),
+        Field::new(EVO_INITDEF_COL_FIXED, DataType::FixedSizeBinary(4), true),
+        Field::new(EVO_INITDEF_COL_UUID, DataType::FixedSizeBinary(16), true),
     ]));
+
+    let uuid_bytes = u128::from_str_radix(&INITDEF_UUID.replace('-', ""), 16)
+        .expect("initdef uuid is hex")
+        .to_be_bytes();
+    let dec38 = Decimal128Array::from(vec![INITDEF_DECIMAL_DEFAULT_UNSCALED; n])
+        .with_precision_and_scale(38, 2)
+        .expect("initdef decimal(38,2) precision/scale is valid");
 
     let decimals = Decimal128Array::from(vec![INITDEF_DECIMAL_REAL_UNSCALED; n])
         .with_precision_and_scale(9, 2)
@@ -1978,6 +2082,18 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             Arc::new(
                 TimestampMicrosecondArray::from(vec![INITDEF_REAL_TSTZ_MICROS; n])
                     .with_timezone("+00:00"),
+            ),
+            Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
+            Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
+            Arc::new(dec38),
+            Arc::new(LargeBinaryArray::from_iter_values(vec![INITDEF_BINARY; n])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(vec![INITDEF_FIXED; n].into_iter())
+                    .expect("initdef fixed(4) values"),
+            ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(vec![uuid_bytes; n].into_iter())
+                    .expect("initdef uuid values"),
             ),
         ],
     )

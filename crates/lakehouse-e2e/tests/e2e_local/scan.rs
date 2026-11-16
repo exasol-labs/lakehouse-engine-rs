@@ -659,6 +659,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
 }
 
 /// Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
+/// Scenario: An initial-default of a type without a native Arrow tag reads as a stored value of its column reads
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     lakehouse_vs();

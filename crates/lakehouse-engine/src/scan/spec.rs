@@ -345,7 +345,7 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 ///
 /// # `initial_default`
 ///
-/// The Iceberg `initial-default` (column-projection rule 3), encoded as the RAW primitive per tag:
+/// The Iceberg `initial-default` (column-projection rule 3), encoded per tag:
 ///
 /// | `arrow_type` | encoded text of `initial_default` |
 /// |---|---|
@@ -354,14 +354,14 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 /// | `"int64"` | decimal `i64` |
 /// | `"float32"` | `f32` in Rust `Display` form (round-trippable) |
 /// | `"float64"` | `f64` in Rust `Display` form (round-trippable) |
-/// | `"utf8"` | the string value verbatim |
+/// | `"utf8"` | a `string` verbatim; a `time` or out-of-domain `decimal` as the text a stored value reads as |
 /// | `"date32"` | `i32` days since the Unix epoch |
 /// | `"timestamp_us"` / `"timestamptz_us"` | `i64` microseconds |
 /// | `"timestamp_ns"` / `"timestamptz_ns"` | `i64` nanoseconds |
 /// | `"decimal128(p,s)"` | `i128` unscaled mantissa |
+/// | `"binary"` / `"fixed_size_binary(L)"` | lowercase hex of the bytes (`fixed` and `uuid`) |
 ///
-/// Non-primitive defaults and primitives reaching only the JSON-fallback `"utf8"` path encode
-/// `None` and fall through to NULL / required-error.
+/// A non-primitive default encodes `None` and falls through to NULL or the required-absent error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalField {
     /// Declared FIRST so a field-id-bound column serializes `"field_id":N` as its leading key.

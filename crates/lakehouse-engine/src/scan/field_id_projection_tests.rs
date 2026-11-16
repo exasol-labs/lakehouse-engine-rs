@@ -1005,6 +1005,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     );
 }
 
+/// Scenario: Every supported primitive initial-default survives the scan-spec serialization round-trip
 #[test]
 fn initial_default_round_trips_across_full_type_vocabulary() {
     use crate::scan::spec::LogicalField;
@@ -1051,6 +1052,16 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             "1234567",
             ScalarValue::Decimal128(Some(1_234_567), 18, 4),
         ),
+        (
+            "binary",
+            "deadbeef",
+            ScalarValue::Binary(Some(vec![0xde, 0xad, 0xbe, 0xef])),
+        ),
+        (
+            "fixed_size_binary(4)",
+            "01020304",
+            ScalarValue::FixedSizeBinary(4, Some(vec![1, 2, 3, 4])),
+        ),
     ];
 
     let mut spec = minimal_spec();
@@ -1086,6 +1097,14 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             "tag '{tag}' must reconstruct to the originally encoded value"
         );
     }
+
+    // The VS refuses a wrong-length `fixed` default; this guards a scan spec it did not write.
+    let wrong_length = reconstruct_initial_default("fixed_size_binary(4)", "010203")
+        .expect_err("a fixed(4) default of 3 bytes must not reconstruct");
+    assert!(
+        wrong_length.contains("4 bytes") && !wrong_length.contains("partition"),
+        "the error must name the width and no partition: {wrong_length}"
+    );
 
     // Defaults are bare scalars, so the serialized logical schema holds no storage secret.
     let logical_json = serde_json::to_string(&back.common.logical_schema).unwrap();
