@@ -21,8 +21,9 @@ use crate::common::seed::{
     typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, exasol_container, iceberg_catalog_url,
-    iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, ExasolFlavor, build_create_connection_sql, exasol_container,
+    exasol_flavor, iceberg_catalog_url, iceberg_catalog_url_internal,
+    local_stack_connection_password,
 };
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
@@ -1284,6 +1285,9 @@ fn docker_update_cpuset(container: &str, cpus: &str) -> Result<(), String> {
 }
 
 fn exasol_container_cpuset(container: &str) -> String {
+    if exasol_flavor() == ExasolFlavor::Nano {
+        return nano_container_cpuset(container);
+    }
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";
     let out = std::process::Command::new("docker")
         .args(["exec", container, "cat", path])
@@ -1301,6 +1305,37 @@ fn exasol_container_cpuset(container: &str) -> String {
         "{path} in {container} is empty, so the container is pinned to no CPU at all"
     );
     raw
+}
+
+/// Nano's image has no `cat`, so the CPU set comes from Docker: the configured set, or every
+/// CPU of the Docker host when none is configured.
+fn nano_container_cpuset(container: &str) -> String {
+    let docker = |args: &[&str]| {
+        let out = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "docker {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let configured = docker(&[
+        "inspect",
+        "--format",
+        "{{.HostConfig.CpusetCpus}}",
+        container,
+    ]);
+    if !configured.is_empty() {
+        return configured;
+    }
+    let cpus: usize = docker(&["info", "--format", "{{.NCPU}}"])
+        .parse()
+        .unwrap_or_else(|e| panic!("docker info reports no CPU count: {e}"));
+    format!("0-{}", cpus - 1)
 }
 
 fn cpu_ids(list: &str) -> Vec<usize> {
