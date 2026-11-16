@@ -9,8 +9,8 @@ use super::super::tests::{
     self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
-use crate::adapter::Tuning;
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::tuning::Tuning;
 use crate::scan::spec::{ColumnRef, ScanStorage, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
@@ -1973,7 +1973,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &request,
         &pushdown,
         &base,
-        (None, None),
+        &ScanWhere::Absent,
         &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
         &emitting(&first_table_column_types(&request)),
         ExasolVersion::Exasol2025,

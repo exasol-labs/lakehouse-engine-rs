@@ -21,6 +21,16 @@ fn microsecond_ts() -> TypedColumns {
     typed_columns(&[("ts", ExasolType::timestamp(6))])
 }
 
+/// The DataFusion dialect of `expr` over a TIMESTAMP(6) `ts` and a VARCHAR `s`, through the typed
+/// pass, which alone knows SECOND's fraction and TO_TIMESTAMP's digits.
+fn typed_scan(expr: &Json) -> Result<String, UdfError> {
+    let columns = typed_columns(&[
+        ("ts", ExasolType::timestamp(6)),
+        ("s", ExasolType::WIDEST_VARCHAR),
+    ]);
+    render_scan_expression(expr, &columns, ExasolVersion::Exasol2025).map(|fragment| fragment.sql)
+}
+
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
     let expr = col("region");
@@ -1275,7 +1285,7 @@ fn renders_to_date_to_timestamp() {
 
     let expr4 = scalar_fn("TO_TIMESTAMP", [col("s"), str_lit("YYYY-MM-DD HH24:MI:SS")]);
     assert_eq!(
-        render_expression(&expr4).unwrap(),
+        typed_scan(&expr4).unwrap(),
         r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S', 0)"#
     );
 }
@@ -1875,7 +1885,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
             "the Exasol dialect must forward {exasol_name}'s format model verbatim"
         );
         assert_eq!(
-            render_expression(&formatted).unwrap(),
+            typed_scan(&formatted).unwrap(),
             df_call,
             "the DataFusion dialect must translate the format of {exasol_name}"
         );
@@ -2138,11 +2148,9 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             .find(|f| f.name == *declared_name)
             .expect("fixture completeness is asserted above");
         // The only call that reaches the per-name arms: Exasol `VerbatimCall`s return
-        // ahead of them. SECOND renders only from the typed scan pass, which knows its
-        // argument's precision.
-        let datafusion = if *declared_name == "SECOND" {
-            render_scan_expression(&fixture.node, &microsecond_ts(), ExasolVersion::Exasol2025)
-                .map(|fragment| fragment.sql)
+        // ahead of them. SECOND and TO_TIMESTAMP render only from the typed scan pass.
+        let datafusion = if matches!(*declared_name, "SECOND" | "TO_TIMESTAMP") {
+            typed_scan(&fixture.node)
         } else {
             render_expression(&fixture.node)
         };

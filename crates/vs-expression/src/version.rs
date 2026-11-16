@@ -1,12 +1,13 @@
-/// The Exasol release a request runs on, as far as the type Exasol gives an expression depends on
-/// it. Exasol 2026 types every form the typed pass covers as Exasol 2025 does.
+/// The Exasol release a request runs on, the one reader of the database version string. Exasol
+/// 2026 behaves as Exasol 2025 in every respect the adapter and the scan depend on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExasolVersion {
     /// Exasol 8 or older, where every TIMESTAMP holds 3 fractional digits.
     Exasol8,
     /// Exasol 2025 or a later calendar-versioned release.
     Exasol2025,
-    /// A version string that names no release. Only the types both releases share apply.
+    /// A version string that names no release. The typed pass proves only the types both releases
+    /// share, while column declarations and the scan's arithmetic take it for the likelier 2025.
     Unknown,
 }
 

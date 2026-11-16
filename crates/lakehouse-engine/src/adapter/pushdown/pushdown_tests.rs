@@ -1,6 +1,6 @@
 use super::test_support::*;
 use super::*;
-use crate::adapter::Tuning;
+use crate::adapter::tuning::Tuning;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
@@ -628,7 +628,7 @@ fn guard_dispatch_sql(
             RowProjection::Direct(projected_columns(&proj_cols, &proj_types))
         },
         &column_types(&guard_col_types()),
-        (None, None),
+        ScanWhere::Absent,
         limit,
         logical_schema,
         &sample_scan_storage(),
@@ -646,7 +646,7 @@ fn dispatch_with(
     request: &Json,
     projection: RowProjection,
     col_types: &ColumnTypes,
-    (filter, declined_filter): (Option<String>, Option<&Json>),
+    scan_where: ScanWhere<'_>,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
     scan_storage: &ScanStorage,
@@ -660,7 +660,7 @@ fn dispatch_with(
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
         &single_table_emission(request, &pushdown, col_types)?,
         scan_for(col_types, &pushdown_req),
-        (filter, declined_filter),
+        scan_where,
         limit,
         order_by_present(&pushdown_req),
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
@@ -850,16 +850,13 @@ fn pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    let (scan_filter, declined) = scan_over(&column_types(&col_types)).split_where(Some(&filter));
+    let scan_where = scan_over(&column_types(&col_types)).split_where(Some(&filter));
 
-    assert!(
-        scan_filter.is_none(),
-        "the DataFusion render must decline this filter: {scan_filter:?}"
-    );
     assert_eq!(
-        declined,
-        Some(&filter),
-        "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
+        scan_where,
+        ScanWhere::Declined(&filter),
+        "the DataFusion render must decline this filter, handing back the ORIGINAL, un-rewritten \
+         filter — the same \
              tree the resolver prunes with"
     );
 }
@@ -1662,7 +1659,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection,
         &emitting(&columns),
         scan_for(&columns, &pushdown_req),
-        (None, None),
+        ScanWhere::Absent,
         None,
         false,
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),

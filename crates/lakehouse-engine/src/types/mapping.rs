@@ -84,12 +84,6 @@ pub(crate) fn iceberg_decimal(precision: u32, scale: u32) -> Option<Decimal> {
     Decimal::new(u8::try_from(precision).ok()?, u8::try_from(scale).ok()?)
 }
 
-/// Whether `version` is an Exasol 8.x or older release. An unparseable version reads as a newer
-/// one, because an unrecognised version is more likely a future release than an old one.
-pub(crate) fn predates_calendar_versions(version: &str) -> bool {
-    ExasolVersion::of(version) == ExasolVersion::Exasol8
-}
-
 pub(crate) fn arrow_time_unit(unit: TimestampUnit) -> TimeUnit {
     match unit {
         TimestampUnit::Second => TimeUnit::Second,
@@ -121,15 +115,17 @@ pub enum EngineTimestampSupport {
     DeclaredPrecision,
 }
 
-impl EngineTimestampSupport {
-    pub fn from_database_version(version: &str) -> Self {
-        if predates_calendar_versions(version) {
-            Self::MillisecondOnly
-        } else {
-            Self::DeclaredPrecision
+/// An unknown version declares as Exasol 2025 does, the likelier release.
+impl From<ExasolVersion> for EngineTimestampSupport {
+    fn from(version: ExasolVersion) -> Self {
+        match version {
+            ExasolVersion::Exasol8 => Self::MillisecondOnly,
+            ExasolVersion::Exasol2025 | ExasolVersion::Unknown => Self::DeclaredPrecision,
         }
     }
+}
 
+impl EngineTimestampSupport {
     /// The TIMESTAMP declaration of a column the scan holds in `source`.
     pub fn declaration(self, source: TimestampUnit) -> ExasolType {
         let unit = match self {

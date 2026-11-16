@@ -1,5 +1,6 @@
+use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::sharding::partition_files_by_bytes;
-use crate::adapter::{ResolvedConnectionConfig, Tuning};
+use crate::adapter::tuning::Tuning;
 use crate::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanStorage, StorageBackend,
 };

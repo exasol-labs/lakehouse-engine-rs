@@ -11,9 +11,9 @@ use super::super::context::{PushdownContext, Shards};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     AggregationType, ColumnTypes, Emitted, OutputContract, ProjectedColumn, PushdownRequest,
-    RowProjection, ScanTranslator, aggregation_type, build_scan_driving_sql, extract_limit,
-    extract_offset, output_select_list, project_columns, projection_items, pushdown_response,
-    quote_ident, render_limit_offset,
+    RowProjection, ScanTranslator, ScanWhere, aggregation_type, build_scan_driving_sql,
+    extract_limit, extract_offset, output_select_list, project_columns, projection_items,
+    pushdown_response, quote_ident, render_limit_offset,
 };
 use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
 use super::attribution::JoinLegs;
@@ -94,10 +94,11 @@ fn render_broadcast_join_emitting(
         return Ok(None);
     };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = scan.split_where(filter_json);
-    if declined.is_some() {
-        return Ok(None);
-    }
+    let filter = match scan.split_where(filter_json) {
+        ScanWhere::Absent => None,
+        ScanWhere::Pushed(sql) => Some(sql),
+        ScanWhere::Declined(_) => return Ok(None),
+    };
 
     let emitted = qualified_emission(&legs, emitted);
     let RowProjection::Direct(projection) = project_columns(&qualified, scan, &emitted)? else {
@@ -786,20 +787,20 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     Ok(sql)
 }
 
-/// `(filter, declined_filter)` are exclusive, as [`ScanTranslator::split_where`] returns them. The
-/// emission is decided by the request's clauses, not the decline, so a declined filter over a real
-/// select list keeps the narrowing (#160), which matters here since the fan-out ships every row.
+/// The emission is decided by the request's clauses, not the decline, so a declined filter over a
+/// real select list keeps the narrowing (#160), which matters here since the fan-out ships every
+/// row.
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
     request: &Json,
     pushdown: &PushdownRequest,
     base: &CommonScanSpec,
-    (filter, declined_filter): (Option<String>, Option<&Json>),
+    scan_where: &ScanWhere<'_>,
     shards: &Shards,
     emitted: &Emitted,
     version: ExasolVersion,
 ) -> Result<Json, UdfError> {
     let fan_out = CommonScanSpec {
-        filter,
+        filter: scan_where.pushed(),
         limit: None,
         order_by: Vec::new(),
         aggregates: None,
@@ -813,7 +814,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
         fan_out,
         emitted,
         shards,
-        declined_filter,
+        scan_where.declined(),
         version,
     )?;
     Ok(pushdown_response(sql))

@@ -6,7 +6,8 @@ use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::properties::{Check, VsProperties};
 use crate::adapter::table_identity::encode_identifier_note;
-use crate::adapter::{ResolvedConnectionConfig, Tuning, get_properties};
+use crate::adapter::tuning::Tuning;
+use crate::adapter::{ResolvedConnectionConfig, get_properties};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
 use crate::scan::spec::{
@@ -90,7 +91,7 @@ pub(crate) fn scan_distribute_shards<E>(files: Vec<Vec<E>>) -> Shards<E> {
 
 /// The scan's typed filter SQL, `None` when it declines.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
-    scan_over(col_types).split_where(Some(filter)).0
+    scan_over(col_types).split_where(Some(filter)).pushed()
 }
 
 /// The deduplicated partial plans of a single-group select list, whatever their types.
@@ -699,13 +700,10 @@ pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
 /// since a fixture whose filter renders would assert nothing.
 pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
-    let (scan_filter, declined) = scan_of(request).split_where(pushdown.json().get("filter"));
-    assert!(
-        scan_filter.is_none(),
-        "fixture precondition: a declining filter must never reach the scan spec: {scan_filter:?}"
-    );
-    let declined = declined
-        .expect("fixture precondition: a declining filter must be handed back for self-applying");
+    let scan_where = scan_of(request).split_where(pushdown.json().get("filter"));
+    let ScanWhere::Declined(declined) = scan_where else {
+        panic!("fixture precondition: the filter must decline, got {scan_where:?}");
+    };
     joins::build_qualified_single_table_fallback_sql(
         request,
         &pushdown,
@@ -1462,7 +1460,7 @@ pub(crate) fn resolved_connection(
         catalog_kind: kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        metadata_read_concurrency: crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
+        metadata_read_concurrency: crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY,
     }
 }
 

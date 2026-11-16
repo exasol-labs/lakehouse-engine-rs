@@ -5,7 +5,6 @@
 use super::convert::{EXASOL_DATE_MAX_DAYS, EXASOL_DATE_MIN_DAYS};
 use super::exasol_numeric::numeric_overflow;
 use super::raised_failure::RaisedFailure;
-use crate::types::mapping::predates_calendar_versions;
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Float64Array, TimestampMicrosecondArray,
     TimestampNanosecondArray,
@@ -24,6 +23,7 @@ use datafusion::logical_expr::{
 };
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use vs_expression::ExasolVersion;
 use vs_expression::{ADD_DAYS_FN, ADD_HOURS_FN, ADD_MINUTES_FN, ADD_WEEKS_FN};
 
 const TIMESTAMP_MICROS: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
@@ -56,15 +56,17 @@ pub enum CountArithmetic {
     Nanoseconds,
 }
 
-impl CountArithmetic {
-    pub fn from_database_version(version: &str) -> Self {
-        if predates_calendar_versions(version) {
-            Self::Milliseconds
-        } else {
-            Self::Nanoseconds
+/// An unknown version adds as Exasol 2025 does, the likelier release.
+impl From<ExasolVersion> for CountArithmetic {
+    fn from(version: ExasolVersion) -> Self {
+        match version {
+            ExasolVersion::Exasol8 => Self::Milliseconds,
+            ExasolVersion::Exasol2025 | ExasolVersion::Unknown => Self::Nanoseconds,
         }
     }
+}
 
+impl CountArithmetic {
     /// The largest whole count of `nanos_per_count` nanoseconds the arithmetic holds.
     fn count_limit(self, nanos_per_count: i128) -> u128 {
         match self {

@@ -6,9 +6,9 @@ use super::super::super::test_support::{
 };
 use super::super::ResolvedScan;
 use super::*;
-use crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::pushdown::test_support::connection_storage;
+use crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 

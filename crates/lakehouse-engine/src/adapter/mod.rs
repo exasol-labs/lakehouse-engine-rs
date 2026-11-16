@@ -20,6 +20,7 @@ mod statement_state;
 mod table_filter;
 pub mod table_identity;
 pub mod tables;
+mod tuning;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::catalog_kind::CatalogKind;
@@ -28,9 +29,7 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::PermissionCheck;
-use crate::adapter::properties::{
-    Check, PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, VsProperties,
-};
+use crate::adapter::properties::{Check, PROP_CATALOG_CONNECTION, PROP_NAMESPACE, VsProperties};
 use crate::adapter::pushdown::{
     ConnectionStorage, PushdownContext, ScanCatalog, ScanUdfs, declare_columns, handle_pushdown,
 };
@@ -42,6 +41,7 @@ use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
     catalog_identifier_string, flatten_table_name, reject_name_collisions,
 };
+use crate::adapter::tuning::{Tuning, resolve_nr_of_cores};
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::StorageBackend;
 use crate::types::exasol_type::exasol_type_to_json;
@@ -57,21 +57,7 @@ use serde_json::{Value as Json, json};
 use std::num::NonZeroUsize;
 use vs_expression::ExasolVersion;
 
-const DEFAULT_PARALLELISM_FACTOR: usize = 1;
-/// DataFusion's default rows per RecordBatch.
-const DEFAULT_DF_BATCH_SIZE: usize = 8192;
-/// Fraction of the net per-instance RSS budget allocated to the DataFusion memory pool.
-const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
-/// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
-/// applying the pool fraction.
-const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
-const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
-/// The reads wait on the network, so the default does not follow the core count.
-const DEFAULT_METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const NOTE_CATALOG_PREFIX: &str = "CATALOG_PREFIX";
-/// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
-/// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
-const S3_CONNECTIONS_PER_THREAD: usize = 4;
 
 pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, UdfError> {
     let request: Json = serde_json::from_str(json_arg)
@@ -102,7 +88,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             let props = VsProperties::parse(&get_properties(request), Check::Lenient)?;
             // The user is mapped before the CONNECTION is read, so a refused user costs no request.
             let check = props.permission.check_for(|| ctx.current_user())?;
-            let tuning = resolve_tuning(&props.checked.tuning, resolve_nr_of_cores());
+            let tuning = Tuning::of(&props);
             let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request)?, || {
                 build_virtual_schema_state(
                     &*ctx,
@@ -240,7 +226,7 @@ fn handle_create_virtual_schema(
     };
     // The permission settings are validated only: listing runs as the CONNECTION's identity.
     let props = VsProperties::parse(&raw_props, Check::Strict)?;
-    let tuning = resolve_tuning(&props.checked.tuning, resolve_nr_of_cores());
+    let tuning = Tuning::of(&props);
     let rt = build_runtime()?;
     let config = resolve_connection_config(ctx, &props, tuning.metadata_read_concurrency, &rt)?;
 
@@ -265,7 +251,8 @@ fn handle_create_virtual_schema(
         ))
         .map_err(|e| redact_error(&config.storage, e))?;
 
-    let engine_timestamps = EngineTimestampSupport::from_database_version(&ctx.database_version());
+    let engine_timestamps =
+        EngineTimestampSupport::from(ExasolVersion::of(&ctx.database_version()));
 
     let tables_json = build_listing_virtual_tables(&configured_ns, &listing, engine_timestamps)
         .map_err(|e| redact_error(&config.storage, e))?;
@@ -517,20 +504,6 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
     read_identifier(request, involved_table_name)
 }
 
-/// The tuning a request derives from its properties and the adapter VM's core count.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Tuning {
-    pub(crate) parallelism_factor: usize,
-    pub(crate) df_target_partitions: usize,
-    pub(crate) df_threads_per_udf: usize,
-    pub(crate) df_batch_size: usize,
-    pub(crate) memory_pool_fraction: f64,
-    pub(crate) instance_overhead_mb: u64,
-    pub(crate) s3_max_connections: usize,
-    pub(crate) join_broadcast_max_bytes: u64,
-    pub(crate) metadata_read_concurrency: NonZeroUsize,
-}
-
 /// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
 fn build_adapter_notes(
     request: &Json,
@@ -544,67 +517,6 @@ fn build_adapter_notes(
     };
     insert_skipped_tables(&mut notes, skipped);
     Json::String(Json::Object(notes).to_string())
-}
-
-/// Applies each absent property's default and the AUTO/FIXED derivation. Absent FIXED counts take
-/// the AUTO values, and an absent `S3_MAX_CONNECTIONS` is `S3_CONNECTIONS_PER_THREAD` per thread.
-fn resolve_tuning(checked: &TuningProperties, nr_of_cores: u32) -> Tuning {
-    let df_threading_mode = checked.threading_mode.unwrap_or(ThreadingMode::Auto);
-    let (auto_partitions, auto_threads) = auto_df_threading(nr_of_cores);
-    let (df_target_partitions, df_threads_per_udf) = match df_threading_mode {
-        ThreadingMode::Fixed => (
-            checked
-                .df_target_partitions
-                .map_or(auto_partitions, |n| usize::from(n.get())),
-            checked
-                .df_threads_per_udf
-                .map_or(auto_threads, |n| usize::from(n.get())),
-        ),
-        ThreadingMode::Auto => (auto_partitions, auto_threads),
-    };
-    Tuning {
-        parallelism_factor: checked
-            .parallelism_factor
-            .map_or(DEFAULT_PARALLELISM_FACTOR, |n| usize::from(n.get())),
-        df_target_partitions,
-        df_threads_per_udf,
-        df_batch_size: checked
-            .df_batch_size
-            .map_or(DEFAULT_DF_BATCH_SIZE, |n| n.get() as usize),
-        memory_pool_fraction: checked
-            .memory_pool_fraction
-            .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION),
-        instance_overhead_mb: checked
-            .instance_overhead_mb
-            .map_or(DEFAULT_INSTANCE_OVERHEAD_MB, u64::from),
-        s3_max_connections: checked
-            .s3_max_connections
-            .map_or(df_threads_per_udf * S3_CONNECTIONS_PER_THREAD, |n| {
-                usize::from(n.get())
-            }),
-        join_broadcast_max_bytes: checked
-            .join_broadcast_max_bytes
-            .map_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES, |n| n.get()),
-        metadata_read_concurrency: checked
-            .metadata_read_concurrency
-            .map_or(DEFAULT_METADATA_READ_CONCURRENCY, NonZeroUsize::from),
-    }
-}
-
-/// Exasol runs one scalar scan VM per node, so that instance owns every core. Partitions
-/// beyond threads overlap object-store I/O with decoding.
-fn auto_df_threading(nr_of_cores: u32) -> (usize, usize) {
-    let threads = (nr_of_cores as usize).max(1);
-    (2 * threads, threads)
-}
-
-/// `available_parallelism()` honours the CPU quota of the adapter VM's container.
-fn resolve_nr_of_cores() -> u32 {
-    core_count_or_default(std::thread::available_parallelism())
-}
-
-fn core_count_or_default(detected: std::io::Result<NonZeroUsize>) -> u32 {
-    detected.map_or(1, |n| n.get() as u32)
 }
 
 /// `0` (stub or missing handshake) maps to `1`, the single-shard fallback.

@@ -684,19 +684,44 @@ impl<'a> ScanTranslator<'a> {
         .ok()
     }
 
-    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
-    /// raw tree, which Exasol applies itself.
-    pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
+    /// Where the request's WHERE applies, the scan or Exasol (`_decision/045`).
+    pub(super) fn split_where(self, filter: Option<&Json>) -> ScanWhere<'_> {
         let Some(raw) = filter else {
-            return (None, None);
+            return ScanWhere::Absent;
         };
         match render_scan_filter(
             &compare_binary_bytes(raw.clone(), self.columns),
             self.columns,
             self.version,
         ) {
-            Ok(sql) => (Some(sql), None),
-            Err(_) => (None, Some(raw)),
+            Ok(sql) => ScanWhere::Pushed(sql),
+            Err(_) => ScanWhere::Declined(raw),
+        }
+    }
+}
+
+/// A request's WHERE, as [`ScanTranslator::split_where`] places it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ScanWhere<'a> {
+    Absent,
+    /// The scan applies the rendered filter.
+    Pushed(String),
+    /// The raw tree, which Exasol applies itself.
+    Declined(&'a Json),
+}
+
+impl<'a> ScanWhere<'a> {
+    pub(super) fn pushed(&self) -> Option<String> {
+        match self {
+            Self::Pushed(sql) => Some(sql.clone()),
+            Self::Absent | Self::Declined(_) => None,
+        }
+    }
+
+    pub(super) fn declined(&self) -> Option<&'a Json> {
+        match self {
+            Self::Declined(raw) => Some(raw),
+            Self::Absent | Self::Pushed(_) => None,
         }
     }
 }

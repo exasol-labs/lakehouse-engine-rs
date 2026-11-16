@@ -11,7 +11,7 @@ mod scan_typing;
 pub mod timestamp;
 mod version;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-use datetime_format::{FormatTarget, fraction_digits, strftime_pattern};
+use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use json_value::{Fallback, JsonValueCall, Returning};
@@ -160,8 +160,8 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
 }
 
 /// Renders only a `literal_string` format the translation covers, and errs otherwise so the
-/// caller declines. `digits` are the fractional digits a `TO_TIMESTAMP` keeps, which the typed
-/// pass annotates and the format gives otherwise.
+/// caller declines. `digits` are the fractional digits a `TO_TIMESTAMP` keeps, which only the
+/// typed pass knows.
 fn render_to_datetime(
     target: FormatTarget,
     args: Option<&Vec<Json>>,
@@ -182,12 +182,11 @@ fn render_to_datetime(
             "function_scalar {node} without a format parses by the session's NLS settings"
         ))),
         [source, format] => {
-            let model = format
+            let pattern = format
                 .get("type")
                 .and_then(Json::as_str)
                 .filter(|kind| *kind == "literal_string")
-                .and_then(|_| format.get("value").and_then(Json::as_str));
-            let pattern = model
+                .and_then(|_| format.get("value").and_then(Json::as_str))
                 .and_then(|model| strftime_pattern(model, target))
                 .ok_or_else(|| {
                     UdfError::User(format!(
@@ -199,9 +198,9 @@ fn render_to_datetime(
             Ok(Some(match target {
                 FormatTarget::Date => format!("to_date(nullif({source}, ''), '{pattern}')"),
                 FormatTarget::Timestamp => {
-                    let digits = digits
-                        .or_else(|| model.and_then(fraction_digits))
-                        .unwrap_or(0);
+                    let digits = digits.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {node} carries no typed digits"))
+                    })?;
                     format!("{TO_TIMESTAMP_FN}(nullif({source}, ''), '{pattern}', {digits})")
                 }
             }))

@@ -26,10 +26,10 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let limit = extract_limit(pushdown_req);
     let has_order_by = order_by_present(pushdown_req);
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
-    let (filter, declined_filter) =
-        scan.split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
+    let scan_where = scan.split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
+    let filter = scan_where.pushed();
     assert!(
-        declined_filter.is_none(),
+        scan_where.declined().is_none(),
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 

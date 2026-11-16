@@ -25,8 +25,8 @@ pub use support::{
     build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    Emitted, RowProjection, extract_limit, involved_columns, order_by_present, project_columns,
-    projection_items, pushdown_response,
+    Emitted, RowProjection, ScanWhere, extract_limit, involved_columns, order_by_present,
+    project_columns, projection_items, pushdown_response,
 };
 use vs_expression::strip_table_alias;
 
@@ -167,7 +167,7 @@ pub(crate) async fn handle_pushdown(
     let projection = project_columns(&pushdown, scan, &emitted)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
-    let filters = scan.split_where(filter_json_raw);
+    let scan_where = scan.split_where(filter_json_raw);
     let scan_storage = context.scan_storage(&effective_storage)?;
 
     if files.is_empty() {
@@ -194,7 +194,7 @@ pub(crate) async fn handle_pushdown(
         projection,
         &emitted,
         scan,
-        filters,
+        scan_where,
         limit,
         has_order_by,
         &shards,
@@ -203,7 +203,7 @@ pub(crate) async fn handle_pushdown(
 }
 
 /// `emitted` is the single-table emission every row fan-out of the request draws its columns
-/// from. `filters` are exclusive, as [`ScanTranslator::split_where`] returns them.
+/// from.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
     request: &Json,
@@ -211,41 +211,31 @@ fn build_dispatch_sql(
     projection: RowProjection,
     emitted: &Emitted,
     scan: ScanTranslator<'_>,
-    filters: (Option<String>, Option<&Json>),
+    scan_where: ScanWhere<'_>,
     limit: Option<u64>,
     has_order_by: bool,
     shards: &Shards,
     base: CommonScanSpec,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
-    let (filter, declined_filter) = filters;
-    let version = scan.version();
-
-    // Ahead of shape routing so it applies before aggregating, grouping, and
-    // truncating (`_decision/045`).
-    if let Some(declined) = declined_filter {
-        return qualified_single_table_fallback_pushdown(
-            request,
-            pushdown,
-            &base,
-            (None, Some(declined)),
-            shards,
-            emitted,
-            version,
-        );
-    }
-
     let fallback = || {
         qualified_single_table_fallback_pushdown(
             request,
             pushdown,
             &base,
-            (filter.clone(), None),
+            &scan_where,
             shards,
             emitted,
-            version,
+            scan.version(),
         )
     };
+
+    // Ahead of shape routing so it applies before aggregating, grouping, and
+    // truncating (`_decision/045`).
+    if let ScanWhere::Declined(_) = scan_where {
+        return fallback();
+    }
+    let filter = scan_where.pushed();
 
     let (single_group_merge, mut projection) = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {

@@ -748,8 +748,11 @@ fn rewrite_scalar_function(
     if function.result == ResultRule::Unified {
         return unify_branches(node, out, "arguments", args, ty);
     }
+    // An unknown version proves no digits, so the format's own `FFn` gives them.
     if function.result == ResultRule::Timestamp
-        && let Some(digits) = ty.value_digits()
+        && let Some(digits) = ty
+            .value_digits()
+            .or_else(|| format_model(node).and_then(fraction_digits))
     {
         out[TIMESTAMP_DIGITS] = digits.into();
     }

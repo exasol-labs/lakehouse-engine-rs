@@ -15,6 +15,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use std::sync::Arc;
+use vs_expression::ExasolVersion;
 
 mod field_id_projection;
 pub(crate) use field_id_projection::{
@@ -225,7 +226,7 @@ pub async fn run_scan_one(
     ) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
-    let count_arithmetic = CountArithmetic::from_database_version(&ctx.database_version());
+    let count_arithmetic = CountArithmetic::from(ExasolVersion::of(&ctx.database_version()));
     let secrets = storage.all_secret_values();
     let redact = |e| emit::redact_scan_error(e, &secrets);
     let session_ctx =

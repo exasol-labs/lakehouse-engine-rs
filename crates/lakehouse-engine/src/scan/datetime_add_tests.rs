@@ -606,7 +606,7 @@ fn the_database_version_selects_the_count_arithmetic() {
     ];
     for (version, expected) in cases {
         assert_eq!(
-            CountArithmetic::from_database_version(version),
+            CountArithmetic::from(ExasolVersion::of(version)),
             expected,
             "version={version:?}"
         );
