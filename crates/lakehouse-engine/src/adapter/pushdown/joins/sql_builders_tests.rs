@@ -1,4 +1,5 @@
 use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
+use super::super::plan_broadcast_join;
 use super::super::planning::{
     JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
 };
@@ -2574,7 +2575,7 @@ fn join_block_names_the_dimension_legs_alias() {
         let [customer, orders] = customer_orders_sides(&request, customer_bytes, orders_bytes)
             .try_into()
             .expect("two sides");
-        let sides = select_broadcast_sides(customer, orders, u64::MAX);
+        let sides = select_broadcast_sides(customer, orders);
         let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "S", "D")
             .expect("selecting the wire storage must succeed")
             .expect("an unbounded join builds");
@@ -2600,12 +2601,11 @@ fn aggregating_broadcast_plan(
     orders_bytes: u64,
 ) -> Option<String> {
     let sides = customer_orders_sides(request, customer_bytes, orders_bytes);
-    let broadcast = select_broadcast_sides(sides[0].clone(), sides[1].clone(), u64::MAX);
-    build_broadcast_plan_sql(
+    plan_broadcast_join(
         &parsed_pushdown(request),
         &detected_join(request),
         &sides,
-        &broadcast,
+        u64::MAX,
         &two_scan_tuning(),
         "SCAN",
         "DISTRIBUTE",

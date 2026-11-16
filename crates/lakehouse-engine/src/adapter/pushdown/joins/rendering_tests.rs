@@ -1,12 +1,12 @@
 use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinLeaf, involved_table};
+use super::super::planning::involved_table;
 use super::super::sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
-    broadcast_projection, customer_orders_sides, detected_join, equi_condition, join_request,
-    legs_from_leaves, resolved_side, two_scan_tuning,
+    broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
+    equi_condition, join_request, legs_of, resolved_side, self_join_legs, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
@@ -14,38 +14,6 @@ use crate::adapter::pushdown::support::RowProjection;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::ExasolType;
-
-/// One unaliased leg per name, in FROM-tree order.
-fn legs_of(names: &[&str]) -> JoinLegs {
-    let leaves: Vec<JoinLeaf> = names
-        .iter()
-        .map(|name| JoinLeaf {
-            table_name: (*name).to_string(),
-            table_alias: None,
-            table_identifier: format!("lh.{}", name.to_lowercase()),
-        })
-        .collect();
-    legs_from_leaves(leaves)
-}
-
-fn customer_orders_legs() -> JoinLegs {
-    legs_of(&["CUSTOMER", "ORDERS"])
-}
-
-fn self_join_legs() -> JoinLegs {
-    legs_from_leaves(vec![
-        JoinLeaf {
-            table_name: "FACT_ORDERS".to_string(),
-            table_alias: Some("A".to_string()),
-            table_identifier: "lh.fact_orders".to_string(),
-        },
-        JoinLeaf {
-            table_name: "FACT_ORDERS".to_string(),
-            table_alias: Some("B".to_string()),
-            table_identifier: "lh.fact_orders".to_string(),
-        },
-    ])
-}
 
 #[test]
 fn join_condition_renders_via_translator() {
@@ -1101,123 +1069,4 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
-}
-
-#[test]
-fn broadcast_width_is_bounded_by_fixed_width_types_or_a_literal_condition() {
-    let customer = |name: &str| table_col("CUSTOMER", name);
-    let text = [("C_NAME", ExasolType::WIDEST_VARCHAR)];
-    let fixed = [
-        ("C_KEY", ExasolType::decimal(18, 0)),
-        ("C_SCORE", ExasolType::DoublePrecision),
-        ("C_SINCE", ExasolType::Date),
-        ("C_SEEN", ExasolType::BARE_TIMESTAMP),
-        ("C_ACTIVE", ExasolType::Boolean),
-    ];
-    let named = string_equal("CUSTOMER", "C_NAME", "ACME");
-    let order_date = compare(
-        "predicate_greater",
-        table_col("ORDERS", "O_ORDERDATE"),
-        date_lit("1995-01-01"),
-    );
-    let cases = [
-        ("fixed-width types", column_types(&fixed), None, true),
-        ("no column read", column_types(NO_COLUMNS), None, true),
-        ("unfiltered VARCHAR", column_types(&text), None, false),
-        (
-            "unfiltered CHAR",
-            column_types(&[("C_NAME", ExasolType::char(10))]),
-            None,
-            false,
-        ),
-        (
-            "an interval",
-            column_types(&[("C_TERM", ExasolType::IntervalYearToMonth { precision: 2 })]),
-            None,
-            false,
-        ),
-        (
-            "col = literal",
-            column_types(&text),
-            Some(named.clone()),
-            true,
-        ),
-        (
-            "literal = col",
-            column_types(&text),
-            Some(predicate_equal(str_lit("ACME"), customer("C_NAME"))),
-            true,
-        ),
-        (
-            "IN literals",
-            column_types(&text),
-            Some(in_list(
-                customer("C_NAME"),
-                [str_lit("ACME"), str_lit("GLOBEX")],
-            )),
-            true,
-        ),
-        (
-            "a literal conjunct beside another",
-            column_types(&text),
-            Some(and([order_date, named.clone()])),
-            true,
-        ),
-        (
-            "an OR of literals",
-            column_types(&text),
-            Some(or([named, string_equal("CUSTOMER", "C_NAME", "GLOBEX")])),
-            false,
-        ),
-        (
-            "an IN list holding a column",
-            column_types(&text),
-            Some(in_list(
-                customer("C_NAME"),
-                [str_lit("ACME"), customer("C_CITY")],
-            )),
-            false,
-        ),
-        (
-            "a column on both sides",
-            column_types(&text),
-            Some(predicate_equal(
-                customer("C_NAME"),
-                table_col("ORDERS", "O_COMMENT"),
-            )),
-            false,
-        ),
-        (
-            "a range",
-            column_types(&text),
-            Some(compare("predicate_less", customer("C_NAME"), str_lit("B"))),
-            false,
-        ),
-        (
-            "a literal on another column",
-            column_types(&text),
-            Some(string_equal("CUSTOMER", "C_CITY", "BERLIN")),
-            false,
-        ),
-    ];
-    let legs = customer_orders_legs();
-    for (case, read, filter, bounded) in cases {
-        assert_eq!(
-            broadcast_width_bounded(filter.as_ref(), &legs, 0, &read),
-            bounded,
-            "{case}"
-        );
-    }
-}
-
-#[test]
-fn a_literal_condition_bounds_only_its_own_self_join_leg() {
-    let read = column_types(&[("O_COMMENT", ExasolType::WIDEST_VARCHAR)]);
-    let filter = predicate_equal(
-        aliased_col("FACT_ORDERS", "A", "O_COMMENT"),
-        str_lit("rush"),
-    );
-    let legs = self_join_legs();
-    assert!(broadcast_width_bounded(Some(&filter), &legs, 0, &read));
-    assert!(!broadcast_width_bounded(Some(&filter), &legs, 1, &read));
 }

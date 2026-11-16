@@ -21,10 +21,10 @@ use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
-    LegColumns, broadcast_width_bounded, conjoin_filters, cross_leg_residual_filter,
-    fan_out_emission, leg_columns_named_in, leg_emission, leg_local_filter, named_emission,
-    projection_item_select_sql, referenced_clause_values, render_expression_qualified,
-    screen_leg_filter, select_item_type, with_placeholder, wrapper_clause_values,
+    LegColumns, conjoin_filters, cross_leg_residual_filter, fan_out_emission, leg_columns_named_in,
+    leg_emission, leg_local_filter, named_emission, projection_item_select_sql,
+    referenced_clause_values, render_expression_qualified, screen_leg_filter, select_item_type,
+    with_placeholder, wrapper_clause_values,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -635,26 +635,23 @@ pub(in super::super) fn build_broadcast_join_sql(
     )))
 }
 
-/// The broadcast plan of an eligible two-leg join. An aggregating request is aggregated, sorted,
-/// and limited only by an outer Exasol SELECT, never per shard. `None` falls through to the N-scan.
+/// The broadcast plan of a two-leg join. `aggregation_reads` is [`aggregation_reads`] of the
+/// request: an aggregating request is aggregated, sorted, and limited only by an outer Exasol
+/// SELECT, never per shard. `None` is a render decline and falls through to the N-scan.
+#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_broadcast_plan_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     broadcast: &JoinSides,
+    aggregation_reads: Option<Vec<Emitted>>,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
-    let aggregation_input = match aggregation_type(pushdown.json()) {
-        Some(_) => {
-            match aggregation_input_request(pushdown, join, sides, broadcast.dimension_leg)? {
-                Some(input) => Some(input),
-                None => return Ok(None),
-            }
-        }
-        None => None,
-    };
+    let aggregation_input = aggregation_reads
+        .map(|read| aggregation_input_request(pushdown, join, sides, read))
+        .transpose()?;
     let fan_out_request = aggregation_input
         .as_ref()
         .map_or(pushdown, |(request, _)| request);
@@ -674,25 +671,38 @@ pub(in super::super) fn build_broadcast_plan_sql(
     Ok(Some(format!("SELECT {select} FROM ({sql}){trailing}")))
 }
 
-/// The fan-out request of an aggregating broadcast beside the columns it emits per leg. `None`
-/// when a dimension column the aggregation reads is not [`broadcast_width_bounded`].
+/// Per leg, the columns the select list, `GROUP BY`, `HAVING`, and `ORDER BY` of an aggregating
+/// request read. `None` when the request does not aggregate.
+pub(in super::super) fn aggregation_reads(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+) -> Result<Option<Vec<Emitted>>, UdfError> {
+    if aggregation_type(pushdown.json()).is_none() {
+        return Ok(None);
+    }
+    let above: Vec<&Json> = wrapper_clause_values(pushdown.json()).collect();
+    named_emission(
+        pushdown.output(),
+        &above,
+        &join.legs(),
+        &scanned_legs(sides),
+    )
+    .map(Some)
+}
+
+/// The fan-out request of an aggregating broadcast beside the columns it emits per leg, from the
+/// columns the aggregation `read`s.
 fn aggregation_input_request(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    dimension_leg: usize,
-) -> Result<Option<(PushdownRequest, Vec<Emitted>)>, UdfError> {
+    read: Vec<Emitted>,
+) -> Result<(PushdownRequest, Vec<Emitted>), UdfError> {
     let pushdown_req = pushdown.json();
     let legs = join.legs();
-    let above: Vec<&Json> = wrapper_clause_values(pushdown_req).collect();
     let scanned = scanned_legs(sides);
-    let read = named_emission(pushdown.output(), &above, &legs, &scanned)?;
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    if !broadcast_width_bounded(filter, &legs, dimension_leg, read[dimension_leg].columns()) {
-        return Ok(None);
-    }
-    // After the width rule, which judges only what the aggregation reads. The scan reads a
-    // join key anyway, so one serves an aggregation that reads no column.
+    // The scan reads a join key anyway, so one serves an aggregation that reads no column.
     let keys = leg_columns_named_in(&join.conditions, &legs, 0, &sides[0].column_types);
     let read = with_placeholder(read, &scanned, &keys)?;
     let (select_list, select_types): (Vec<Json>, Vec<Json>) = join
@@ -717,7 +727,7 @@ fn aggregation_input_request(
     if let Some(filter) = pushdown_req.get("filter") {
         json["filter"] = filter.clone();
     }
-    Ok(Some((PushdownRequest::parse(json)?, read)))
+    Ok((PushdownRequest::parse(json)?, read))
 }
 
 fn join_group_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Option<String> {

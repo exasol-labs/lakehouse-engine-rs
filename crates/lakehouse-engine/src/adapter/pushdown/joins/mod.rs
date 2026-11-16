@@ -18,6 +18,7 @@ use super::support::{
 };
 
 mod attribution;
+mod broadcast_policy;
 mod planning;
 mod rendering;
 mod sql_builders;
@@ -36,11 +37,12 @@ pub(super) use sql_builders::{
     build_broadcast_join_sql, build_qualified_single_table_fallback_sql,
 };
 
+use broadcast_policy::{BroadcastFacts, n_scan_reason};
 pub(super) use planning::{JoinWindowPlan, involved_table};
 use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
 use rendering::{leg_local_filter, possible_side_column_names};
 pub(super) use sql_builders::{JoinScanRequestConfig, build_n_scan_join_sql};
-use sql_builders::{build_broadcast_plan_sql, qualified_emission};
+use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emission};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
 /// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
@@ -121,9 +123,8 @@ fn empty_join_sql(
 /// empty side short-circuits to the shape-correct empty result, since an inner join is then
 /// empty.
 ///
-/// Broadcast is an optimization inside this one path: taken only for an N = 2 equi-join
-/// whose smaller side fits `join_broadcast_max_bytes`, whose window the broadcast path can
-/// serve, and whose leg-qualified render succeeds. The legs may share column names or be one
+/// Broadcast is an optimization inside this one path, taken when [`plan_broadcast_join`] yields
+/// a plan. The legs may share column names or be one
 /// table joined to itself. Everything else takes the sole fallback,
 /// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
 /// A column that binds no single leg, or that its leg does not declare, fails the request
@@ -217,33 +218,16 @@ pub(super) async fn plan_join(
         connection: statement.connection(),
     };
 
-    // Exasol renders an aggregating request's window over the broadcast fan-out. Any other window
-    // the broadcast path cannot serve skips it before sizing, falling through to the N-scan.
-    let is_equi =
-        join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
-    if join.tables.len() == 2
-        && is_equi
-        && (aggregation_type(pushdown_req).is_some()
-            || !matches!(
-                classify_join_window(pushdown_req),
-                JoinWindowPlan::BroadcastUnservable
-            ))
-    {
-        let candidate =
-            select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
-        if candidate.broadcast_eligible
-            && let Some(sql) = build_broadcast_plan_sql(
-                pushdown,
-                join,
-                &sides,
-                &candidate,
-                &inputs,
-                &udf_name,
-                &distribute_udf_name,
-            )?
-        {
-            return Ok(pushdown_response(sql));
-        }
+    if let Some(sql) = plan_broadcast_join(
+        pushdown,
+        join,
+        &sides,
+        join_broadcast_max_bytes,
+        &inputs,
+        &udf_name,
+        &distribute_udf_name,
+    )? {
+        return Ok(pushdown_response(sql));
     }
 
     let sql = build_n_scan_join_sql(
@@ -256,6 +240,58 @@ pub(super) async fn plan_join(
         &distribute_udf_name,
     )?;
     Ok(pushdown_response(sql))
+}
+
+/// The broadcast plan of `join`, or `None` to keep the N-scan. Three things can say no, in this
+/// order: the shape (two legs, an equi-join, a window the path can serve), the policy
+/// ([`n_scan_reason`]), and a render decline of the builder.
+fn plan_broadcast_join(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    join_broadcast_max_bytes: u64,
+    inputs: &JoinScanRequestConfig<'_>,
+    udf_name: &str,
+    distribute_udf_name: &str,
+) -> Result<Option<String>, UdfError> {
+    let pushdown_req = pushdown.json();
+    let is_equi =
+        join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
+    // Exasol renders an aggregating request's window over the broadcast fan-out, so only a
+    // request that does not aggregate has a window the path may be unable to serve.
+    let window_servable = aggregation_type(pushdown_req).is_some()
+        || !matches!(
+            classify_join_window(pushdown_req),
+            JoinWindowPlan::BroadcastUnservable
+        );
+    if join.tables.len() != 2 || !is_equi || !window_servable {
+        return Ok(None);
+    }
+    let candidate = select_broadcast_sides(sides[0].clone(), sides[1].clone());
+    let reads = aggregation_reads(pushdown, join, sides)?;
+    let facts = BroadcastFacts {
+        dimension_bytes: candidate.dimension.total_bytes,
+        max_bytes: join_broadcast_max_bytes,
+        legs: &join.legs(),
+        dimension_leg: candidate.dimension_leg,
+        filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
+        aggregation_reads: reads
+            .as_ref()
+            .map(|read| read[candidate.dimension_leg].columns()),
+    };
+    if n_scan_reason(&facts).is_some() {
+        return Ok(None);
+    }
+    build_broadcast_plan_sql(
+        pushdown,
+        join,
+        sides,
+        &candidate,
+        reads,
+        inputs,
+        udf_name,
+        distribute_udf_name,
+    )
 }
 
 #[cfg(test)]

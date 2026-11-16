@@ -145,8 +145,8 @@ impl ResolvedJoinSide {
     }
 }
 
-/// Both sides stay fully resolved because the N-scan fallback scans both;
-/// `broadcast_eligible` only routes between the two builders and is never an error.
+/// Both sides stay fully resolved because the N-scan fallback scans both. The roles say nothing
+/// about whether the join is broadcast: `broadcast_policy` decides that.
 ///
 /// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
 /// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
@@ -158,7 +158,6 @@ pub(crate) struct JoinSides {
     pub fact: ResolvedJoinSide,
     /// Smaller side by bytes, the broadcast candidate.
     pub dimension: ResolvedJoinSide,
-    pub broadcast_eligible: bool,
     /// The dimension's leg in FROM-tree order, which names its relation alias.
     pub dimension_leg: usize,
 }
@@ -172,21 +171,15 @@ impl JoinSides {
 
 /// `a` is leg 0 and `b` leg 1. On an exact byte tie `a`, the first leg in FROM-tree order,
 /// becomes the dimension, so the choice of the sharded occurrence is deterministic.
-pub(super) fn select_broadcast_sides(
-    a: ResolvedJoinSide,
-    b: ResolvedJoinSide,
-    join_broadcast_max_bytes: u64,
-) -> JoinSides {
+pub(super) fn select_broadcast_sides(a: ResolvedJoinSide, b: ResolvedJoinSide) -> JoinSides {
     let (dimension, fact, dimension_leg) = if a.total_bytes <= b.total_bytes {
         (a, b, 0)
     } else {
         (b, a, 1)
     };
-    let broadcast_eligible = dimension.total_bytes <= join_broadcast_max_bytes;
     JoinSides {
         fact,
         dimension,
-        broadcast_eligible,
         dimension_leg,
     }
 }

@@ -78,7 +78,7 @@ impl LegColumns {
 }
 
 /// An OR is never split, so an OR spanning legs stays withheld from every leg.
-fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
+pub(super) fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
     if filter.get("type").and_then(|t| t.as_str()) == Some("predicate_and")
         && let Some(exprs) = filter.get("expressions").and_then(|e| e.as_array())
     {
@@ -224,70 +224,6 @@ pub(super) fn leg_columns_named_in<'a>(
         collect_leg_column_names(value, legs, leg, &mut names);
     }
     full_cols.narrowed(|column| names.contains(&column.name))
-}
-
-/// The fan-out repeats `read`, leg `leg`'s columns that the aggregation reads, once per joined
-/// row. Only a fixed-width type or a literal-bounding WHERE `filter` keeps such a column narrow.
-pub(super) fn broadcast_width_bounded(
-    filter: Option<&Json>,
-    legs: &JoinLegs,
-    leg: usize,
-    read: &ColumnTypes,
-) -> bool {
-    let bounded_text = literal_bounded_columns(filter, legs, leg);
-    read.iter().all(|(column, column_type)| {
-        matches!(
-            column_type.exa_type,
-            ExasolType::Boolean
-                | ExasolType::Decimal(_)
-                | ExasolType::DoublePrecision
-                | ExasolType::Date
-                | ExasolType::Timestamp { .. }
-        ) || (column_type.exa_type.is_character() && bounded_text.contains(&column.name))
-    })
-}
-
-/// Leg `leg`'s columns that a top-level WHERE conjunct `col = 'x'` or `col IN ('x', 'y')`
-/// limits to string literals.
-fn literal_bounded_columns(
-    filter: Option<&Json>,
-    legs: &JoinLegs,
-    leg: usize,
-) -> std::collections::HashSet<String> {
-    let is_literal =
-        |node: &Json| node.get("type").and_then(|t| t.as_str()) == Some("literal_string");
-    let leg_column = |node: &Json| {
-        ColumnNode::parse(node)
-            .filter(|column| legs.leg(*column) == leg)
-            .map(|column| column.ascii_upper_name())
-    };
-    let mut conjuncts = Vec::new();
-    if let Some(filter) = filter {
-        flatten_conjuncts(filter, &mut conjuncts);
-    }
-    conjuncts
-        .into_iter()
-        .filter_map(|conjunct| match conjunct.get("type")?.as_str()? {
-            "predicate_equal" => {
-                let (left, right) = (conjunct.get("left")?, conjunct.get("right")?);
-                if is_literal(right) {
-                    leg_column(left)
-                } else if is_literal(left) {
-                    leg_column(right)
-                } else {
-                    None
-                }
-            }
-            "predicate_in_constlist" => {
-                let values = conjunct.get("arguments")?.as_array()?;
-                if values.is_empty() || !values.iter().all(is_literal) {
-                    return None;
-                }
-                leg_column(conjunct.get("expression")?)
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// What the clauses `above` a fan-out make it emit per leg of `scanned`: every column for

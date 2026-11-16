@@ -539,7 +539,6 @@ pub(crate) fn broadcast_sides(
     joins::JoinSides {
         fact,
         dimension,
-        broadcast_eligible: true,
         dimension_leg,
     }
 }

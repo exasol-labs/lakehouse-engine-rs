@@ -287,6 +287,38 @@ pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     .legs()
 }
 
+/// One unaliased leg per name, in FROM-tree order.
+pub(super) fn legs_of(names: &[&str]) -> JoinLegs {
+    let leaves: Vec<JoinLeaf> = names
+        .iter()
+        .map(|name| JoinLeaf {
+            table_name: (*name).to_string(),
+            table_alias: None,
+            table_identifier: format!("lh.{}", name.to_lowercase()),
+        })
+        .collect();
+    legs_from_leaves(leaves)
+}
+
+pub(super) fn customer_orders_legs() -> JoinLegs {
+    legs_of(&["CUSTOMER", "ORDERS"])
+}
+
+pub(super) fn self_join_legs() -> JoinLegs {
+    legs_from_leaves(vec![
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("A".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("B".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+    ])
+}
+
 pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> ResolvedJoinSide {
     let lower = table_name.to_lowercase();
     ResolvedJoinSide::new(
