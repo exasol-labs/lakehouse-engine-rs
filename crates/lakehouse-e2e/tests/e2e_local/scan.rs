@@ -33,7 +33,7 @@ use crate::fixtures::{
     vs_lineitem_table,
 };
 
-/// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
+/// Its pushed `df_threads_per_udf` reads back the core count the adapter VM detected.
 const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
 fn vs_labels_table() -> String {

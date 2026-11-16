@@ -87,8 +87,6 @@ fn schema_count(conn: &mut ExaConn, vs: &str) -> i64 {
     ))
 }
 
-/// The scan spec a pushdown over `vs`'s seed table plans with: the tuning comes from the
-/// properties a pushdown reads, never from the adapterNotes.
 fn persisted_properties(conn: &mut ExaConn, vs: &str) -> BTreeMap<String, String> {
     let cols = conn.query_columns(&format!(
         "SELECT PROPERTY_NAME, PROPERTY_VALUE FROM SYS.EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES \
@@ -178,6 +176,7 @@ fn create_suggests_the_nearest_known_property_name() {
 /// Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 /// Scenario: An S3_MAX_CONNECTIONS value overrides the AUTO derivation
 /// Scenario: Pushdown resolves every tuning value from the properties
+/// Scenario: The memory budget controls reach the scan spec
 #[test]
 fn create_accepts_every_known_property_name() {
     const VS: &str = "PV_ALL_NAMES";
@@ -252,6 +251,7 @@ fn create_rejects_an_empty_table_pattern_entry() {
 /// Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
 /// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
 /// Scenario: Pushdown resolves every tuning value from the properties
+/// Scenario: The memory budget controls reach the scan spec
 #[test]
 fn create_without_tuning_properties_takes_the_defaults() {
     const VS: &str = "PV_DEFAULTS";

@@ -3343,6 +3343,11 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         PathCheck::Split,
     ),
     (
+        "SELECT COUNT(*) FROM {T} \
+         GROUP BY CASE WHEN ID > 6 THEN NULL WHEN ID > 2 THEN C_DATE ELSE C_TS END",
+        PathCheck::Split,
+    ),
+    (
         "SELECT COUNT(*) FROM {T} GROUP BY GREATEST(C_DATE, C_TS)",
         PathCheck::Split,
     ),
@@ -3581,8 +3586,8 @@ fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
     assert_pushed_into_scan(&mut conn, &sql, "%H:%M:%S%.f");
 }
 
-/// `TO_TIMESTAMP` inputs the scan once read differently: values outside 1677 to 2262, text that
-/// ends before its format, and fractions shorter or longer than `FFn`.
+/// `TO_TIMESTAMP` over values outside 1677 to 2262, text that ends before its format, and
+/// fractions shorter or longer than `FFn`.
 const TO_TIMESTAMP_CASES: &[&str] = &[
     "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '9999-12-31' WHEN 2 THEN '0001-01-01' \
      ELSE '1600-01-01' END, 'YYYY-MM-DD') FROM {T}",
@@ -3603,6 +3608,22 @@ const TO_TIMESTAMP_CASES: &[&str] = &[
      'YYYY-MM-DD') > TIMESTAMP '2262-04-12 00:00:00'",
 ];
 
+/// A second of 60, which Exasol rejects, and an `FFn` without its dot, which runs in Exasol.
+const TO_TIMESTAMP_EDGE_CASES: &[(&str, PathCheck<'static>, Expect)] = &[
+    (
+        "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31 10:11:60' \
+         ELSE '2024-01-31 10:11:12' END, 'YYYY-MM-DD HH24:MI:SS') FROM {T}",
+        PathCheck::Has(TO_TIMESTAMP_SCAN_FUNCTION),
+        Expect::Error,
+    ),
+    (
+        "SELECT ID, TO_TIMESTAMP(CASE ID WHEN 1 THEN '2024-01-31 10:11:12125' \
+         ELSE '2024-01-31 10:11:12' END, 'YYYY-MM-DD HH24:MI:SSFF6') FROM {T}",
+        PathCheck::Lacks(TO_TIMESTAMP_SCAN_FUNCTION),
+        Expect::Rows,
+    ),
+];
+
 /// Scenario: The scan reads a TO_TIMESTAMP string as Exasol does
 /// Scenario: A TIMESTAMP computes at the unit of the digits its values hold
 /// Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
@@ -3613,24 +3634,28 @@ fn e2e_to_timestamp_reads_text_as_native_does() {
     let typed = typed_table();
     create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
 
-    let failures: Vec<String> = TO_TIMESTAMP_CASES
+    let cases: Vec<(&str, PathCheck, Expect)> = TO_TIMESTAMP_CASES
         .iter()
-        .filter_map(|query| {
-            native_copy_mismatch(
-                &mut conn,
-                &typed,
-                NATIVE_COPY,
-                query,
+        .map(|query| {
+            (
+                *query,
                 PathCheck::Has(TO_TIMESTAMP_SCAN_FUNCTION),
                 Expect::Rows,
             )
+        })
+        .chain(TO_TIMESTAMP_EDGE_CASES.iter().copied())
+        .collect();
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(query, path, expect)| {
+            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, *expect)
         })
         .collect();
     assert!(
         failures.is_empty(),
         "{} of {} cases differ:\n{}",
         failures.len(),
-        TO_TIMESTAMP_CASES.len(),
+        cases.len(),
         failures.join("\n")
     );
 }
@@ -3656,6 +3681,17 @@ fn e2e_to_date_translated_format_fails_on_rejected_input() {
         ),
         &["event-01", "TO_TIMESTAMP"],
     );
+    for text in ["2024-01", "10000-01-01"] {
+        assert_query_fails(
+            &mut conn,
+            &format!(
+                "SELECT TO_TIMESTAMP(CASE ID WHEN 1 THEN '{text}' ELSE '2024-01-31' END, \
+                 'YYYY-MM-DD') FROM {}",
+                typed_table()
+            ),
+            &[text, "TO_TIMESTAMP"],
+        );
+    }
     assert_query_fails(
         &mut conn,
         &format!(

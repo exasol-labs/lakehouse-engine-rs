@@ -327,7 +327,6 @@ fn second_renders_the_fraction_of_its_argument_precision() {
     }
 }
 
-/// Scenario: SECOND over a DATE takes each version's type
 #[test]
 fn second_of_a_date_takes_each_versions_type() {
     let whole = r#"CAST(date_part('second', "D") AS DECIMAL(2,0))"#;
@@ -1132,7 +1131,6 @@ fn date_and_timestamp_types_follow_their_source() {
     }
 }
 
-/// Scenario: The typed pass derives each version's type for a version-dependent date form
 /// Scenario: An unknown Exasol version gives no form a version-dependent exact type
 #[test]
 fn version_dependent_forms_take_each_versions_type() {
@@ -1232,7 +1230,6 @@ fn version_dependent_forms_take_each_versions_type() {
     }
 }
 
-/// Scenario: The typed pass derives each version's type for a version-dependent date form
 #[test]
 fn exasol_8_brings_a_timestamp_after_a_date_to_the_date() {
     let expr = case_when([col("B")], [col("D"), col("TS3")]);

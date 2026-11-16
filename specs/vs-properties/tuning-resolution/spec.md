@@ -19,7 +19,6 @@ Every pushdown resolves the resource budgets from the virtual schema properties 
 * *GIVEN* an Exasol session that has installed the VS adapter script
 * *WHEN* Exasol sends a `pushdown` request
 * *THEN* the adapter SHALL read the per-node core count from `std::thread::available_parallelism()` on the executing node, WITHOUT opening any connect-back session and WITHOUT reading any VS or connection property
-* *AND* the adapter SHALL read that core count EXACTLY ONCE per request, at one call site, and pass the resolved value as a plain argument into the DataFusion-threading and connection-concurrency derivations
 * *AND* the adapter MUST NOT persist the resolved core count
 
 ### Scenario: Adapter uses a core count of 1 when available_parallelism() cannot report one

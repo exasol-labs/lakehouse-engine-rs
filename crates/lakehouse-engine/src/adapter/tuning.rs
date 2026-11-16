@@ -28,7 +28,6 @@ pub(crate) struct Tuning {
     pub(crate) instance_overhead_mb: u64,
     pub(crate) s3_max_connections: usize,
     pub(crate) join_broadcast_max_bytes: u64,
-    pub(crate) metadata_read_concurrency: NonZeroUsize,
 }
 
 impl Tuning {
@@ -77,11 +76,15 @@ impl Tuning {
             join_broadcast_max_bytes: checked
                 .join_broadcast_max_bytes
                 .map_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES, |n| n.get()),
-            metadata_read_concurrency: checked
-                .metadata_read_concurrency
-                .map_or(DEFAULT_METADATA_READ_CONCURRENCY, NonZeroUsize::from),
         }
     }
+}
+
+/// The bound on concurrent metadata reads, which needs no core count.
+pub(super) fn metadata_read_concurrency(checked: &TuningProperties) -> NonZeroUsize {
+    checked
+        .metadata_read_concurrency
+        .map_or(DEFAULT_METADATA_READ_CONCURRENCY, NonZeroUsize::from)
 }
 
 /// Exasol runs one scalar scan VM per node, so that instance owns every core. Partitions

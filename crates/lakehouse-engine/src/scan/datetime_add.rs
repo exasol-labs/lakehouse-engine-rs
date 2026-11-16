@@ -42,7 +42,7 @@ const DAY_AND_WEEK_COUNT_LIMIT: u32 = 999_999_999;
 /// Exasol 8 holds the milliseconds of an `ADD_HOURS` or `ADD_MINUTES` count in 18 digits.
 const EXASOL_8_MILLIS_LIMIT: u128 = 999_999_999_999_999_999;
 const NUMERIC_OUT_OF_RANGE: &str = "data exception - numeric value out of range";
-const DATETIME_OVERFLOW: &str = "data exception - datetime field overflow";
+pub(super) const DATETIME_OVERFLOW: &str = "data exception - datetime field overflow";
 const DATETIME_UNDERFLOW: &str = "data exception - datetime field underflow";
 
 /// The arithmetic an Exasol version adds an `ADD_HOURS` or `ADD_MINUTES` count in. A count

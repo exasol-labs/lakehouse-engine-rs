@@ -9,7 +9,7 @@ call itself.
 
 * **Supported formats.** A string-literal format built from `YYYY`, `MM`, and `DD` once each, in
   any letter case. For `TO_TIMESTAMP` only, it may also hold `HH24` and `MI`, then optionally
-  `SS`, then optionally one `FF3`, `FF6`, or `FF9` (`.FFn` joins as `%.f`, which reads one or more digits).
+  `SS`, then optionally one `.FF3`, `.FF6`, or `.FF9`, which joins as `%.f` and reads one or more digits.
   Separators are `-` `/` `.` `,` `;` `:` `_` and space.
 * **Everything else** runs in Exasol.
 
@@ -32,6 +32,7 @@ The inputs on which the scan and Exasol differ are documented in `docs/semantic-
 * *THEN* the scan SHALL return the value native Exasol returns for any date from 0001-01-01 to 9999-12-31, such as `9999-12-31` and `1600-01-01`
 * *AND* a string that ends after the date but before the format, such as `2024-01-31` or `2024-01-31 10` under `YYYY-MM-DD HH24:MI:SS`, SHALL read its missing time fields as 0, while a string that ends inside the date SHALL fail
 * *AND* a fraction under `FFn` SHALL read one or more digits and keep the first `n`, and on Exasol 8 the first 3
+* *AND* a second of 60 SHALL fail, as in Exasol
 * *AND* the scan SHALL compute the value in microseconds, and in nanoseconds only under `FF9` on Exasol 2025, where a value outside 1677-09-21 to 2262-04-11 fails (`docs/semantic-differences.md`)
 
 ### Scenario: A format the translation cannot express declines in the DataFusion dialect

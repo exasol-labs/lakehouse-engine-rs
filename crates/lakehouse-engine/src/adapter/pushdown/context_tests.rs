@@ -16,7 +16,6 @@ fn the_udfs_are_qualified_by_a_nonempty_schema() {
     }
 }
 
-/// Scenario: The parallelism factor drives work-unit sharding
 #[test]
 fn the_shard_count_is_the_parallelism_factor_times_the_node_count() {
     let files = |n: usize| (0..n).map(|i| FileEntry::new(format!("f{i}"), 1)).collect();
@@ -34,7 +33,6 @@ fn the_shard_count_is_the_parallelism_factor_times_the_node_count() {
     }
 }
 
-/// Scenario: The memory budget controls reach the scan spec
 #[test]
 fn the_common_spec_carries_the_resolved_tuning() {
     let mut context = test_context();

@@ -87,6 +87,8 @@ fn fails_where_exasol_fails() {
         ("event-01", "%Y-%m-%d", INVALID_VALUE),
         ("0000-01-01", "%Y-%m-%d", INVALID_DATE),
         ("10000-01-01", "%Y-%m-%d", INVALID_VALUE),
+        ("2024-01-31 10:11:60", SECONDS, INVALID_TIME),
+        ("2024-01-31 10:11:60.5", FRACTION, INVALID_TIME),
     ];
     for (text, pattern, class) in cases {
         let failure = parsed(text, pattern, 0).expect_err(text);

@@ -20,7 +20,6 @@ use futures::future::{self, BoxFuture};
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -48,7 +47,6 @@ pub(crate) fn test_context() -> PushdownContext<'static> {
             instance_overhead_mb: 0,
             s3_max_connections: 1,
             join_broadcast_max_bytes: 134_217_728,
-            metadata_read_concurrency: NonZeroUsize::MIN,
         },
         binary_as_string: false,
         version: ExasolVersion::Exasol2025,

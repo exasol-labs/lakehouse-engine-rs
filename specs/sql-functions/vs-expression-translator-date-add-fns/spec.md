@@ -13,7 +13,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * Exasol 8 and 2025 give a CASE, `GREATEST`, or `LEAST` over only dates a DATE, and one over a `TIMESTAMP(p)` and a `TIMESTAMP(q)` a `TIMESTAMP(max(p, q))`. Over a DATE and a TIMESTAMP, Exasol 2025 gives the TIMESTAMP's type and Exasol 8 the type of the first branch that is not NULL.
 * Exasol 2025 types `TO_TIMESTAMP` over text as `TIMESTAMP(9)`, over a DATE as `TIMESTAMP(0)`, and over a `TIMESTAMP(p)` as `TIMESTAMP(p)`. Exasol 8 has only `TIMESTAMP(3)`, so it types every TIMESTAMP result, a TIMESTAMP literal, and `ADD_HOURS` and `ADD_MINUTES` over a DATE as `TIMESTAMP(3)`, and cuts the digits beyond the millisecond.
 * The typed pass also tracks the fractional digits a TIMESTAMP's values hold, and the scan computes the value at the unit that holds them, so microseconds unless they exceed 6. A `TO_TIMESTAMP` holds the `n` of its format's `FFn`, or 0, at most its type's precision. A branch form holds the most digits among its branches, and every other form the digits of its argument.
-* Exasol 2026.1.1 types each of these forms as Exasol 2025.1.16 does. The pushdown reads the version from its UDF context: a major below 2025 is Exasol 8, any other numeric major is Exasol 2025.
+* The pushdown reads the version from its UDF context: a major below 2025 is Exasol 8, any other numeric major is Exasol 2025.
 
 ## Scenarios
 

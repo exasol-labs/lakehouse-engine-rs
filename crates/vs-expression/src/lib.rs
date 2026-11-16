@@ -11,7 +11,7 @@ mod scan_typing;
 pub mod timestamp;
 mod version;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-use datetime_format::{FormatTarget, strftime_pattern};
+use datetime_format::{FormatTarget, format_literal, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use json_value::{Fallback, JsonValueCall, Returning};
@@ -182,11 +182,7 @@ fn render_to_datetime(
             "function_scalar {node} without a format parses by the session's NLS settings"
         ))),
         [source, format] => {
-            let pattern = format
-                .get("type")
-                .and_then(Json::as_str)
-                .filter(|kind| *kind == "literal_string")
-                .and_then(|_| format.get("value").and_then(Json::as_str))
+            let pattern = format_literal(format)
                 .and_then(|model| strftime_pattern(model, target))
                 .ok_or_else(|| {
                     UdfError::User(format!(

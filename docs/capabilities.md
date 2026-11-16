@@ -94,13 +94,13 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 | JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
-`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or `TIMESTAMP` argument and a numeric count. Over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, the scan computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)). The argument can also be a `CASE`, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps, `NULLIF`, `DATE_TRUNC`, or `TO_DATE`. Any other argument form (`TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over a date and a timestamp, `TO_TIMESTAMP`, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
+`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan when the adapter knows the argument's `DATE` or `TIMESTAMP` type and the count is a number. Otherwise they run in Exasol SQL. A value with more than 6 fractional digits computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)).
 
 `DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
 
 A `CAST` to `INTERVAL`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE` runs in Exasol SQL. A cast that converts text by the session's NLS settings also does, see [Text and session settings](#text-and-session-settings).
 
-`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
+`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `.FF3`, `.FF6`, or `.FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
 
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
 

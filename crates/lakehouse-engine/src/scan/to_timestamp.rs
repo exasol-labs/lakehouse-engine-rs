@@ -2,7 +2,9 @@
 //! `to_timestamp` parses through nanoseconds, so it fails outside 1677 to 2262, and it fails on
 //! text that ends before its format, where Exasol reads the missing time fields as 0.
 
+use super::datetime_add::DATETIME_OVERFLOW;
 use super::raised_failure::RaisedFailure;
+use crate::types::mapping::arrow_time_unit;
 use arrow::array::{ArrayRef, AsArray, TimestampMicrosecondArray, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
@@ -18,12 +20,12 @@ use datafusion::logical_expr::{
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use vs_expression::TO_TIMESTAMP_FN;
+use vs_expression::timestamp::TimestampUnit;
 
-const MICROSECOND_DIGITS: u8 = 6;
-const NANOSECOND_DIGITS: u32 = 9;
+const NANOSECOND_DIGITS: u32 = TimestampUnit::Nanosecond.digits() as u32;
 const INVALID_VALUE: &str = "data exception - invalid value";
 const INVALID_DATE: &str = "data exception - invalid date value";
-const DATETIME_OVERFLOW: &str = "data exception - datetime field overflow";
+const INVALID_TIME: &str = "data exception - invalid time value";
 
 /// Exasol's `TO_TIMESTAMP` of `text` over `items`, the parsed strftime form of its format model,
 /// with the fraction cut to its first `digits` digits.
@@ -51,6 +53,12 @@ pub(crate) fn parse_timestamp(
     let value = parsed
         .to_naive_datetime_with_offset(0)
         .map_err(|e| invalid(&e))?;
+    // chrono reads `SS` = 60 as a leap second, which Exasol rejects.
+    if value.nanosecond() >= 1_000_000_000 {
+        return Err(format!(
+            "{INVALID_TIME}; TO_TIMESTAMP of '{text}' names second 60"
+        ));
+    }
     if !(1..=9999).contains(&value.year()) {
         return Err(format!(
             "{INVALID_DATE}; TO_TIMESTAMP of '{text}' lies outside 0001-01-01 to 9999-12-31"
@@ -63,13 +71,8 @@ pub(crate) fn parse_timestamp(
         .expect("a cut fraction stays a valid nanosecond"))
 }
 
-/// The unit that holds `digits` fractional digits. Microseconds span Exasol's whole range.
 fn unit_holding(digits: u8) -> TimeUnit {
-    if digits <= MICROSECOND_DIGITS {
-        TimeUnit::Microsecond
-    } else {
-        TimeUnit::Nanosecond
-    }
+    arrow_time_unit(TimestampUnit::holding(digits).max(TimestampUnit::Microsecond))
 }
 
 /// `value` as a count of `unit` from 1970-01-01.

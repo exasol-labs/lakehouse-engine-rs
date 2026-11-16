@@ -41,7 +41,7 @@ use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
     catalog_identifier_string, flatten_table_name, reject_name_collisions,
 };
-use crate::adapter::tuning::{Tuning, resolve_nr_of_cores};
+use crate::adapter::tuning::{Tuning, metadata_read_concurrency, resolve_nr_of_cores};
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::StorageBackend;
 use crate::types::exasol_type::exasol_type_to_json;
@@ -90,12 +90,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             let check = props.permission.check_for(|| ctx.current_user())?;
             let tuning = Tuning::of(&props);
             let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request)?, || {
-                build_virtual_schema_state(
-                    &*ctx,
-                    &props,
-                    stored_catalog_prefix(request),
-                    tuning.metadata_read_concurrency,
-                )
+                build_virtual_schema_state(&*ctx, &props, stored_catalog_prefix(request))
             })?;
             let udfs = ScanUdfs::in_schema(Some(&ctx.script_schema()));
             let cluster_nodes = cluster_nodes_from_context(ctx);
@@ -130,16 +125,14 @@ fn virtual_schema_name(request: &Json) -> Result<&str, UdfError> {
         .ok_or_else(|| UdfError::User("pushdown: the request names no virtual schema".to_string()))
 }
 
-/// The first pushdown of a statement on a virtual schema builds what its later pushdowns reuse.
 fn build_virtual_schema_state(
     ctx: &dyn UdfContext,
     props: &VsProperties,
     catalog_prefix: Option<String>,
-    metadata_read_concurrency: NonZeroUsize,
 ) -> Result<VirtualSchemaState, UdfError> {
     // Built before `resolve_connection_config`, which blocks on it to assume the role.
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, props, metadata_read_concurrency, &rt)?;
+    let config = resolve_connection_config(ctx, props, &rt)?;
     let catalog = StatementCatalog::open(config, props, catalog_prefix)?;
     Ok(VirtualSchemaState::new(rt, catalog))
 }
@@ -181,7 +174,6 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &VsProperties,
-    metadata_read_concurrency: NonZeroUsize,
     rt: &tokio::runtime::Runtime,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = props.catalog_kind;
@@ -210,7 +202,7 @@ fn resolve_connection_config(
         catalog_kind: kind,
         connection_name: connection_name.to_string(),
         sealed_storage_key: resolved.sealed_storage_key,
-        metadata_read_concurrency,
+        metadata_read_concurrency: metadata_read_concurrency(&props.checked.tuning),
     })
 }
 
@@ -226,9 +218,8 @@ fn handle_create_virtual_schema(
     };
     // The permission settings are validated only: listing runs as the CONNECTION's identity.
     let props = VsProperties::parse(&raw_props, Check::Strict)?;
-    let tuning = Tuning::of(&props);
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, &props, tuning.metadata_read_concurrency, &rt)?;
+    let config = resolve_connection_config(ctx, &props, &rt)?;
 
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {

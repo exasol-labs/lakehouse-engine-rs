@@ -6,7 +6,6 @@ use crate::adapter::pushdown::test_support::{
 use crate::adapter::pushdown::test_support::{
     named_table, with_delta_notes, with_iceberg_notes, with_identifier_notes,
 };
-use crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY;
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
@@ -873,7 +872,7 @@ fn resolve_config_over(
         .build()
         .expect("build the request runtime");
     let props = VsProperties::parse(props, Check::Lenient)?;
-    resolve_connection_config(&ctx, &props, DEFAULT_METADATA_READ_CONCURRENCY, &rt)
+    resolve_connection_config(&ctx, &props, &rt)
 }
 
 #[test]

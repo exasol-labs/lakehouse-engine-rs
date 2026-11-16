@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::datetime_format::fraction_digits;
+use crate::datetime_format::{format_literal, fraction_digits};
 use crate::exasol_type::{
     Decimal, ExasolType, MAX_DECIMAL_PRECISION, MAX_FRACTIONAL_DIGITS, exasol_type_from_json,
     exasol_type_to_json,
@@ -617,12 +617,9 @@ fn node_type(node: &Json, children: &ChildTypes, version: ExasolVersion) -> Infe
         "function_scalar_json_value" => json_value_type(node),
         _ if is_cast(node) => cast_target(node).map_or(Inferred::Unknown, Inferred::Exact),
         "function_scalar" => {
-            let name = upper_name(node);
-            let ty = typed_function(&name).result_type(children.of("arguments"), version);
-            match format_model(node)
-                .filter(|_| name == "TO_TIMESTAMP")
-                .and_then(fraction_digits)
-            {
+            let function = typed_function(&upper_name(node));
+            let ty = function.result_type(children.of("arguments"), version);
+            match format_digits(node, function) {
                 Some(digits) => ty.holding(digits),
                 None => ty,
             }
@@ -632,12 +629,12 @@ fn node_type(node: &Json, children: &ChildTypes, version: ExasolVersion) -> Infe
     }
 }
 
-/// The format model of a `TO_DATE` or `TO_TIMESTAMP` call, when it is a string literal.
-fn format_model(node: &Json) -> Option<&str> {
-    let format = node.get("arguments")?.get(1)?;
-    (kind(format) == "literal_string")
-        .then(|| format.get("value")?.as_str())
-        .flatten()
+/// The `n` of a `TO_TIMESTAMP` format's `FFn`, or 0, when the format is a literal it translates.
+fn format_digits(node: &Json, function: ScalarFunction) -> Option<u8> {
+    if function.result != ResultRule::Timestamp {
+        return None;
+    }
+    format_literal(node.get("arguments")?.get(1)?).and_then(fraction_digits)
 }
 
 /// Declines what the scan cannot compute as Exasol does, and rewrites `out` for DataFusion.
@@ -750,9 +747,7 @@ fn rewrite_scalar_function(
     }
     // An unknown version proves no digits, so the format's own `FFn` gives them.
     if function.result == ResultRule::Timestamp
-        && let Some(digits) = ty
-            .value_digits()
-            .or_else(|| format_model(node).and_then(fraction_digits))
+        && let Some(digits) = ty.value_digits().or_else(|| format_digits(node, function))
     {
         out[TIMESTAMP_DIGITS] = digits.into();
     }

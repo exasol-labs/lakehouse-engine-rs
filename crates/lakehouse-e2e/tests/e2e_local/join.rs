@@ -424,6 +424,7 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
 
 /// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 /// Scenario: A join outside the broadcast contract is declined safely
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();

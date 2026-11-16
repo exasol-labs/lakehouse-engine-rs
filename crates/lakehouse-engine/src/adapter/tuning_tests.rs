@@ -15,7 +15,6 @@ fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> Tuning {
     Tuning::resolve(&checked(props), nr_of_cores)
 }
 
-/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn the_parallelism_factor_comes_from_the_property() {
     let tuning = resolved_tuning(serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" }), 1);
