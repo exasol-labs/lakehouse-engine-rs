@@ -149,7 +149,7 @@ An aggregate argument can be a column or a scalar expression. Examples are `SUM(
 two-column binary arithmetic expression such as `SUM(price * discount)`. Statistical aggregates take
 the partial path only for a bare-column argument.
 
-A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or a type Exasol 8 and 2025 give alike, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A computed group key that is not selected, such as `GROUP BY qty * 2`, needs a CAST, while `GROUP BY COALESCE(d, DATE '2000-01-01')` splits.
+A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or a type Exasol 8 and 2025 give alike, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A computed group key that is not selected, such as `GROUP BY qty * 2`, needs a CAST, while `GROUP BY COALESCE(d, DATE '2000-01-01')` and `GROUP BY qty > 5` split.
 
 Each aggregate emits partial values instead of a final value:
 

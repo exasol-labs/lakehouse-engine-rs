@@ -20,7 +20,7 @@ use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
     seconds_type,
 };
-pub use scan_typing::{ColumnTypeLookup, infer_type};
+pub use scan_typing::{ColumnTypeLookup, exact_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
@@ -1234,12 +1234,9 @@ pub fn render_expression_exasol(expr: &Json) -> String {
 
 const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
-/// [`render_expression_exasol`] for an output select item, with its exact [`infer_type`].
+/// [`render_expression_exasol`] for an output select item, with its [`exact_type`].
 pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
-    SqlFragment::new(
-        render_expression_exasol(expr),
-        infer_type(expr, columns).exact(),
-    )
+    SqlFragment::new(render_expression_exasol(expr), exact_type(expr, columns))
 }
 
 #[cfg(test)]

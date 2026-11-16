@@ -956,9 +956,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
         "MIN must qualify its argument to the owning side: {sql}"
     );
     assert!(
-        sql.starts_with(
-            r#"SELECT CAST(COUNT(*) AS DECIMAL(18,0)), MIN("LHS_T1"."O_ORDERDATE") FROM"#
-        ),
+        sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_T1"."O_ORDERDATE") FROM"#),
         "the outer SELECT must be exactly the two aggregate columns: {sql}"
     );
     assert!(
@@ -1696,7 +1694,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -2645,7 +2643,7 @@ fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
         let sql = aggregating_broadcast_sql(&request);
 
         assert!(
-            sql.starts_with("SELECT CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN("),
+            sql.starts_with("SELECT COUNT(*) FROM (SELECT SCAN("),
             "{sql}"
         );
         assert!(sql.ends_with(") GROUP BY ()"), "{sql}");

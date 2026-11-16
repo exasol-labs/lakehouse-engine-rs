@@ -7,9 +7,10 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use crate::exasol_type::{
-    Decimal, ExasolType, MAX_FRACTIONAL_DIGITS, exasol_type_from_json, exasol_type_to_json,
+    Decimal, ExasolType, MAX_DECIMAL_PRECISION, MAX_FRACTIONAL_DIGITS, exasol_type_from_json,
+    exasol_type_to_json,
 };
-use crate::json_value::JsonValueCall;
+use crate::json_value::{JsonValueCall, returning_type};
 use crate::scalar_functions::{
     DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
@@ -22,7 +23,7 @@ pub trait ColumnTypeLookup {
 
 /// What the typed pass knows of a node's Exasol type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Inferred {
+pub(crate) enum Inferred {
     /// The type Exasol gives the node. Each rule that derives one is checked against a live
     /// Exasol.
     Exact(ExasolType),
@@ -34,7 +35,7 @@ pub enum Inferred {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Partial {
+pub(crate) enum Partial {
     /// CHAR or VARCHAR.
     Text,
     /// DECIMAL(p,0).
@@ -49,7 +50,7 @@ const BOOLEAN: Inferred = Inferred::Exact(ExasolType::Boolean);
 const DATE: Inferred = Inferred::Exact(ExasolType::Date);
 
 impl Inferred {
-    pub fn exact(self) -> Option<ExasolType> {
+    pub(crate) fn exact(self) -> Option<ExasolType> {
         match self {
             Self::Exact(ty) => Some(ty),
             _ => None,
@@ -374,9 +375,14 @@ fn cast_from_text(source: &Json, ty: Inferred, target: ExasolType) -> Result<(),
     Ok(())
 }
 
+/// The type Exasol gives `node`, where the typed pass proves it. `None` leaves the type to Exasol.
+pub fn exact_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
+    infer_type(node, columns).exact()
+}
+
 /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent
 /// it, because the scan's rewrites keep Exasol's semantics.
-pub fn infer_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Inferred {
+pub(crate) fn infer_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Inferred {
     if let Some(ty) = leaf_type(node, columns) {
         return ty;
     }
@@ -732,13 +738,25 @@ fn is_numeric_aggregate(name: &str) -> bool {
     )
 }
 
+/// Exasol's result type of an aggregate, each rule checked live (#476).
 fn aggregate_type(name: &str, args: &[Inferred]) -> Inferred {
     match name {
-        "COUNT" => Inferred::Partial(Partial::Integer),
+        "COUNT" => Inferred::Exact(ExasolType::decimal(18, 0)),
         "MIN" | "MAX" => args.first().copied().unwrap_or(Inferred::Unknown),
-        "SUM" if args.iter().all(|ty| ty.is_integer()) => Inferred::Partial(Partial::Integer),
+        "SUM" => match args {
+            [Inferred::Exact(ExasolType::Decimal(d))] => Inferred::Exact(ExasolType::decimal(
+                (d.precision() + 11).min(MAX_DECIMAL_PRECISION),
+                d.scale(),
+            )),
+            [Inferred::Exact(ExasolType::DoublePrecision)] => {
+                Inferred::Exact(ExasolType::DoublePrecision)
+            }
+            _ if args.iter().all(|ty| ty.is_integer()) => Inferred::Partial(Partial::Integer),
+            _ if args.iter().all(|ty| ty.is_numeric()) => Inferred::Partial(Partial::Number),
+            _ => Inferred::Unknown,
+        },
         _ if is_numeric_aggregate(name) && args.iter().all(|ty| ty.is_numeric()) => {
-            Inferred::Partial(Partial::Number)
+            Inferred::Exact(ExasolType::DoublePrecision)
         }
         _ => Inferred::Unknown,
     }
@@ -753,11 +771,9 @@ fn check_aggregate(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {
     }
 }
 
-/// The type the RETURNING clause states.
+/// The type the RETURNING clause states, or Exasol's default without one.
 fn json_value_type(node: &Json) -> Inferred {
-    node.get("returningDataType")
-        .and_then(|ty| exasol_type_from_json(ty).ok())
-        .map_or(Inferred::Partial(Partial::Text), Inferred::Exact)
+    returning_type(node).map_or(Inferred::Unknown, Inferred::Exact)
 }
 
 fn check_json_value(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {

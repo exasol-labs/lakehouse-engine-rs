@@ -97,7 +97,16 @@ pub fn detect_group_by_aggregates(
     // Any group-key render failure collapses the whole result.
     let mut key_fragments = Vec::with_capacity(group_by.len());
     for node in group_by {
-        key_fragments.push(scan.expression(node)?);
+        let mut key = scan.expression(node)?;
+        // A constant key is staged as text whatever type the literal has (#550).
+        if node
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(is_literal_selectlist_item)
+        {
+            key.ty = Some(CONSTANT_KEY_EMIT_TYPE);
+        }
+        key_fragments.push(key);
     }
     let group_keys: Vec<String> = key_fragments.iter().map(|key| key.sql.clone()).collect();
 
@@ -172,25 +181,7 @@ fn group_key_exasol_types(
     group_keys: &[SqlFragment],
     select_items: &[GroupedSelectItem],
 ) -> Option<Vec<ExasolType>> {
-    let group_by = pushdown.json().get("groupBy").and_then(|v| v.as_array());
-    let is_constant = |slot: usize| {
-        group_by
-            .and_then(|keys| keys.get(slot))
-            .and_then(|node| node.get("type"))
-            .and_then(|t| t.as_str())
-            .is_some_and(is_literal_selectlist_item)
-    };
-    let mut types: Vec<Option<ExasolType>> = group_keys
-        .iter()
-        .enumerate()
-        .map(|(slot, key)| {
-            if is_constant(slot) {
-                Some(CONSTANT_KEY_EMIT_TYPE)
-            } else {
-                key.ty
-            }
-        })
-        .collect();
+    let mut types: Vec<Option<ExasolType>> = group_keys.iter().map(|key| key.ty).collect();
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,

@@ -3309,6 +3309,23 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT SUM(ID) FROM {T} GROUP BY GREATEST(ID, C_QTY) ORDER BY 1",
         PathCheck::Split,
     ),
+    // A predicate is BOOLEAN and a DOUBLE literal is DOUBLE.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY C_QTY > 5",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY ID BETWEEN 2 AND 4 OR C_BOOL",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY COALESCE(C_DOUBLE, 2.5E0)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT MAX(COALESCE(C_DOUBLE, 2.5E0)) + 1 FROM {T}",
+        PathCheck::Split,
+    ),
     (
         "SELECT YEAR(MAX(CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END)) FROM {T}",
         PathCheck::Wrapper,

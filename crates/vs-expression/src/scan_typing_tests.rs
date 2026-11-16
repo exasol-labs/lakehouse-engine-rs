@@ -1104,9 +1104,9 @@ fn branches_of_integers_and_other_types_unify_as_exasol_does() {
             Inferred::Partial(Partial::Number),
         ),
         (
-            "CASE over an integer and a COUNT",
+            "CASE over DECIMAL(9,0) and a COUNT, which is DECIMAL(18,0)",
             case_when([col("B")], [col("I"), count_star()]),
-            Inferred::Partial(Partial::Integer),
+            integer(18),
         ),
         (
             "CASE over two texts",
