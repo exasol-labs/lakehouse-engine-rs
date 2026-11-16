@@ -10,13 +10,9 @@
 use crate::adapter::catalog_kind::CatalogKind;
 #[cfg(test)]
 use crate::adapter::connection::ConnectionCreds;
-use crate::adapter::get_properties;
 use crate::adapter::permission::PermissionCheck;
-use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::statement_state::StatementCatalog;
-use crate::scan::spec::{
-    CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
-};
+use crate::scan::spec::{CatalogProps, CommonScanSpec, ScanSpec};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -29,17 +25,19 @@ pub use support::{
     build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, Emitted, RowProjection, SCAN_UDF_NAME, extract_limit,
-    involved_columns, order_by_present, project_columns, projection_items, pushdown_response,
-    scan_storage_for,
+    Emitted, RowProjection, extract_limit, involved_columns, order_by_present, project_columns,
+    projection_items, pushdown_response,
 };
 use vs_expression::strip_table_alias;
+
+mod context;
+pub(crate) use context::PushdownContext;
+pub use context::{ScanUdfs, Shards};
 
 mod empty_result;
 use empty_result::empty_result_sql;
 
 mod shard_paths;
-use shard_paths::relativize_shards_to_root;
 
 mod format;
 pub(crate) use format::declare_columns;
@@ -82,13 +80,17 @@ pub(crate) use joins::{
 };
 use joins::{
     EmptyRelation, ensure_columns_declared, plan_join, qualified_single_table_fallback_pushdown,
-    qualify_udf, single_table_emission,
+    single_table_emission,
 };
 
 #[cfg(test)]
-use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
+use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, LogicalField, StorageBackend};
+#[cfg(test)]
+use support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, scan_storage_for};
 #[cfg(test)]
 use test_support::scan_filter_sql;
+#[cfg(test)]
+use vs_expression::ExasolVersion;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
@@ -98,24 +100,12 @@ pub(crate) mod test_support;
 #[path = "dispatch_golden_tests.rs"]
 mod dispatch_golden;
 
-/// `join_broadcast_max_bytes`: a two-table inner equi-join broadcasts its smaller
-/// side when that side's manifest byte size is at or below this threshold.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_pushdown(
     request: &Json,
     statement: &StatementCatalog,
     permission: &PermissionCheck,
     catalog: &CatalogProps,
-    scan_schema: Option<&str>,
-    cluster_nodes: usize,
-    parallelism_factor: usize,
-    df_target_partitions: usize,
-    df_batch_size: usize,
-    df_threads_per_udf: usize,
-    memory_pool_fraction: f64,
-    instance_overhead_mb: u64,
-    s3_max_connections: usize,
-    join_broadcast_max_bytes: u64,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown = PushdownRequest::parse(
         request
@@ -124,32 +114,12 @@ pub(crate) async fn handle_pushdown(
             .unwrap_or(Json::Null),
     )?;
 
-    let props = get_properties(request);
-
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.
     match detect_join(request, pushdown.json())? {
         JoinShape::NotAJoin => {}
         JoinShape::Join(join) => {
-            return plan_join(
-                request,
-                &pushdown,
-                &join,
-                statement,
-                permission,
-                &props,
-                scan_schema,
-                cluster_nodes,
-                parallelism_factor,
-                df_target_partitions,
-                df_batch_size,
-                df_threads_per_udf,
-                memory_pool_fraction,
-                instance_overhead_mb,
-                s3_max_connections,
-                join_broadcast_max_bytes,
-            )
-            .await;
+            return plan_join(request, &pushdown, &join, statement, permission, context).await;
         }
     }
 
@@ -168,9 +138,13 @@ pub(crate) async fn handle_pushdown(
     // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
     let has_order_by = order_by_present(pushdown_req);
 
-    let resolver =
-        TableScanResolver::for_request(statement, permission, &[catalog.table.as_str()], &props)
-            .await?;
+    let resolver = TableScanResolver::for_request(
+        statement,
+        permission,
+        &[catalog.table.as_str()],
+        context.binary_as_string,
+    )
+    .await?;
     let (
         ResolvedScan {
             files,
@@ -185,7 +159,7 @@ pub(crate) async fn handle_pushdown(
     ) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
-    let scan = ScanTranslator::over(&col_types, &[pushdown_req])?;
+    let scan = ScanTranslator::over(&col_types, context.version, &[pushdown_req])?;
     // Before the zero-files early return: a refused column must error, never yield an empty
     // result.
     ensure_no_refused_column_referenced(request, pushdown.output(), &refused_columns)?;
@@ -193,16 +167,8 @@ pub(crate) async fn handle_pushdown(
     let projection = project_columns(&pushdown, scan, &emitted)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
-    let binary_as_string = resolve_binary_as_string(&props);
-    let (filter, declined_filter) = scan.split_where(filter_json_raw);
-    let conn = statement.connection();
-    let scan_storage = scan_storage_for(
-        &conn.creds,
-        &conn.connection_name,
-        conn.allow_http,
-        &effective_storage,
-        conn.sealed_storage_key.as_ref(),
-    )?;
+    let filters = scan.split_where(filter_json_raw);
+    let scan_storage = context.scan_storage(&effective_storage)?;
 
     if files.is_empty() {
         return empty_result_sql(
@@ -214,44 +180,30 @@ pub(crate) async fn handle_pushdown(
         );
     }
 
-    let g = shard_count(cluster_nodes, parallelism_factor, files.len());
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let shards = relativize_shards_to_root(shards, &table_root);
-
-    // Schema-qualified: the pushdown query runs outside the adapter script's schema.
-    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
-
+    let shards = context.shards(files, &table_root);
+    let base = context.common_spec(
+        table_root,
+        logical_schema,
+        name_mapping,
+        partition_columns,
+        scan_storage,
+    );
     build_dispatch_sql(
         request,
         &pushdown,
         projection,
         &emitted,
         scan,
-        filter,
-        declined_filter,
+        filters,
         limit,
         has_order_by,
         &shards,
-        table_root,
-        logical_schema,
-        name_mapping,
-        partition_columns,
-        &scan_storage,
-        &udf_name,
-        &distribute_udf_name,
-        df_target_partitions,
-        df_batch_size,
-        df_threads_per_udf,
-        memory_pool_fraction,
-        instance_overhead_mb,
-        s3_max_connections,
-        binary_as_string,
+        base,
     )
 }
 
 /// `emitted` is the single-table emission every row fan-out of the request draws its columns
-/// from. `filter` and `declined_filter` are never both `Some`.
+/// from. `filters` are exclusive, as [`ScanTranslator::split_where`] returns them.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
     request: &Json,
@@ -259,49 +211,15 @@ fn build_dispatch_sql(
     projection: RowProjection,
     emitted: &Emitted,
     scan: ScanTranslator<'_>,
-    filter: Option<String>,
-    declined_filter: Option<&Json>,
+    filters: (Option<String>, Option<&Json>),
     limit: Option<u64>,
     has_order_by: bool,
-    shards: &[Vec<FileEntry>],
-    table_root: String,
-    logical_schema: Vec<LogicalField>,
-    name_mapping: Vec<NameMappingEntry>,
-    partition_columns: Vec<String>,
-    scan_storage: &ScanStorage,
-    udf_name: &str,
-    distribute_udf_name: &str,
-    df_target_partitions: usize,
-    df_batch_size: usize,
-    df_threads_per_udf: usize,
-    memory_pool_fraction: f64,
-    instance_overhead_mb: u64,
-    s3_max_connections: usize,
-    binary_as_string: bool,
+    shards: &Shards,
+    base: CommonScanSpec,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
-    let base = CommonScanSpec {
-        table_root: table_root.clone(),
-        projection: Vec::new(),
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        logical_schema: logical_schema.clone(),
-        name_mapping: name_mapping.clone(),
-        join: None,
-        partition_columns,
-        storage: scan_storage.clone(),
-        df_target_partitions,
-        df_batch_size,
-        df_threads_per_udf,
-        memory_pool_fraction,
-        instance_overhead_mb,
-        s3_max_connections,
-        binary_as_string,
-    };
+    let (filter, declined_filter) = filters;
+    let version = scan.version();
 
     // Ahead of shape routing so it applies before aggregating, grouping, and
     // truncating (`_decision/045`).
@@ -310,12 +228,10 @@ fn build_dispatch_sql(
             request,
             pushdown,
             &base,
-            None,
+            (None, Some(declined)),
             shards,
             emitted,
-            udf_name,
-            distribute_udf_name,
-            Some(declined),
+            version,
         );
     }
 
@@ -324,12 +240,10 @@ fn build_dispatch_sql(
             request,
             pushdown,
             &base,
-            filter.clone(),
+            (filter.clone(), None),
             shards,
             emitted,
-            udf_name,
-            distribute_udf_name,
-            None,
+            version,
         )
     };
 
@@ -371,8 +285,6 @@ fn build_dispatch_sql(
                 grouped_limit,
                 support::extract_offset(pushdown_req),
                 scan,
-                udf_name,
-                distribute_udf_name,
                 having.as_deref(),
                 grouped_order_by.as_deref(),
             );
@@ -413,13 +325,7 @@ fn build_dispatch_sql(
                     files: vec![],
                 };
                 let sql = support::build_count_distinct_scan_sql(
-                    &base_spec,
-                    shards,
-                    &items,
-                    emitted,
-                    limit,
-                    udf_name,
-                    distribute_udf_name,
+                    &base_spec, shards, &items, emitted, limit,
                 )?;
                 return Ok(pushdown_response(sql));
             }
@@ -463,7 +369,7 @@ fn build_dispatch_sql(
         detect_topn(
             pushdown_req,
             &projection_items(&projection),
-            &logical_schema,
+            &base.logical_schema,
         )
     } else {
         None
@@ -522,8 +428,6 @@ fn build_dispatch_sql(
         &projection,
         effective_limit,
         merge_inputs.as_ref(),
-        udf_name,
-        distribute_udf_name,
     );
 
     // Exasol does not re-apply a delegated sort/limit, so wrap the unbounded fan-out

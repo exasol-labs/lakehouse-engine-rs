@@ -495,6 +495,10 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
              MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {orders}"
         ),
         format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE \
+             ELSE TIMESTAMP '1960-01-01 10:00:00.123456' END) FROM {orders}"
+        ),
+        format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
              '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_CUSTKEY HAVING COUNT(*) > 1 \
              ORDER BY COUNT(*) DESC, c.C_CUSTKEY LIMIT 2"

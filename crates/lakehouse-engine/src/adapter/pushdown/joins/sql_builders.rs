@@ -1,19 +1,19 @@
-use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
-    StorageBackend, relation_alias, render_ordered,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, SortKey,
+    relation_alias, render_ordered,
 };
 use crate::types::exasol_type::exasol_type_to_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment};
+use vs_expression::{ColumnNode, ExasolVersion, SqlFragment};
 
+use super::super::context::{PushdownContext, Shards};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     AggregationType, ColumnTypes, Emitted, OutputContract, ProjectedColumn, PushdownRequest,
     RowProjection, ScanTranslator, aggregation_type, build_scan_driving_sql, extract_limit,
     extract_offset, output_select_list, project_columns, projection_items, pushdown_response,
-    quote_ident, render_limit_offset, scan_storage_for, shard_count,
+    quote_ident, render_limit_offset,
 };
 use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
 use super::attribution::JoinLegs;
@@ -56,9 +56,10 @@ pub(crate) fn render_broadcast_join(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
+    version: ExasolVersion,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let emitted = broadcast_emission(pushdown, join, sides)?;
-    render_broadcast_join_emitting(pushdown, join, sides, &emitted)
+    render_broadcast_join_emitting(pushdown, join, sides, &emitted, version)
 }
 
 /// [`render_broadcast_join`] of a fan-out that emits `emitted` per leg.
@@ -67,6 +68,7 @@ fn render_broadcast_join_emitting(
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     emitted: &[Emitted],
+    version: ExasolVersion,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let legs = join.legs();
     let condition_tree = legs.qualify(&join.conditions[0]);
@@ -82,6 +84,7 @@ fn render_broadcast_join_emitting(
         .filter_map(|clause| qualified.json().get(clause));
     let scan = ScanTranslator::over(
         &col_types,
+        version,
         &std::iter::once(&condition_tree)
             .chain(rendered_clauses)
             .collect::<Vec<_>>(),
@@ -228,14 +231,8 @@ fn n_full_row_items(
 }
 
 /// Takes the whole side so files and table root cannot be mismatched.
-fn shard_side(side: &ResolvedJoinSide, inputs: &JoinScanRequestConfig<'_>) -> Vec<Vec<FileEntry>> {
-    let g = shard_count(
-        inputs.cluster_nodes,
-        inputs.parallelism_factor,
-        side.files.len(),
-    );
-    let shards = crate::adapter::sharding::partition_files_by_bytes(side.files.clone(), g);
-    relativize_shards_to_root(shards, &side.table_root)
+fn shard_side(side: &ResolvedJoinSide, context: &PushdownContext<'_>) -> Shards {
+    context.shards(side.files.clone(), &side.table_root)
 }
 
 fn join_render_decline(clause: &str) -> UdfError {
@@ -251,6 +248,7 @@ fn n_scan_join_select_items(
     legs: &JoinLegs,
     emitted: &[Emitted],
     naming: LegColumns,
+    version: ExasolVersion,
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     let list = match pushdown.output() {
         OutputContract::WholeRow => {
@@ -267,7 +265,7 @@ fn n_scan_join_select_items(
     let fragments = list.iter().map(|item| {
         SqlFragment::new(
             naming.render(item, legs),
-            select_item_type(item, legs, &cols_per_leg),
+            select_item_type(item, legs, &cols_per_leg, version),
         )
     });
     let items = output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
@@ -291,9 +289,10 @@ fn outer_wrapper_clauses(
     legs: &JoinLegs,
     emitted: &[Emitted],
     naming: LegColumns,
+    version: ExasolVersion,
 ) -> Result<OuterWrapperClauses, UdfError> {
     let pushdown_req = pushdown.json();
-    let select_items = n_scan_join_select_items(pushdown, legs, emitted, naming)?;
+    let select_items = n_scan_join_select_items(pushdown, legs, emitted, naming, version)?;
     if select_items.is_empty() {
         return Err(UdfError::User(
             "internal adapter error: the pushdown wrapper selects no column".into(),
@@ -371,7 +370,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     emitted: &[Emitted],
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
     let cols_per_side: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
 
@@ -389,18 +388,19 @@ pub(in super::super) fn build_n_scan_join_sql(
     let mut fan_outs = Vec::with_capacity(sides.len());
     let mut declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
-        let (side_filter, side_declined) =
-            match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
-                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i])?,
-                None => (None, None),
-            };
+        let (side_filter, side_declined) = match where_filter
+            .and_then(|f| leg_local_filter(f, &legs, i))
+        {
+            Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i], context.version)?,
+            None => (None, None),
+        };
         // Disjoint by attribution, so no conjunct is double-applied.
         declined = conjoin_filters(declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(
             side,
             &emitted[i],
             side_filter,
-            inputs,
+            context,
         )?);
     }
 
@@ -411,8 +411,13 @@ pub(in super::super) fn build_n_scan_join_sql(
     );
     let filter = residual.map(|tree| render_expression_qualified(&tree, &legs));
 
-    let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown, &legs, emitted, LegColumns::Relations)?;
+    let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
+        pushdown,
+        &legs,
+        emitted,
+        LegColumns::Relations,
+        context.version,
+    )?;
 
     let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
@@ -422,21 +427,6 @@ pub(in super::super) fn build_n_scan_join_sql(
     }
     sql.push_str(&trailing);
     Ok(sql)
-}
-
-pub(in super::super) struct JoinScanRequestConfig<'a> {
-    pub(in super::super) cluster_nodes: usize,
-    pub(in super::super) parallelism_factor: usize,
-    pub(in super::super) df_target_partitions: usize,
-    pub(in super::super) df_batch_size: usize,
-    pub(in super::super) df_threads_per_udf: usize,
-    pub(in super::super) memory_pool_fraction: f64,
-    pub(in super::super) instance_overhead_mb: u64,
-    pub(in super::super) s3_max_connections: usize,
-    pub(in super::super) binary_as_string: bool,
-    pub(in super::super) connection: &'a ResolvedConnectionConfig,
-    pub(in super::super) udf_name: &'a str,
-    pub(in super::super) distribute_udf_name: &'a str,
 }
 
 fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<FileEntry> {
@@ -451,49 +441,23 @@ fn join_fan_out_scan_spec(
     primary: &ResolvedJoinSide,
     filter: Option<String>,
     join: Option<JoinSpec>,
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<ScanSpec, UdfError> {
-    let storage = scan_storage_for_side(&primary.effective_storage, inputs)?;
+    let common = context.common_spec(
+        primary.table_root.clone(),
+        primary.logical_schema.clone(),
+        primary.name_mapping.clone(),
+        primary.partition_columns.clone(),
+        context.scan_storage(&primary.effective_storage)?,
+    );
     Ok(ScanSpec {
         common: CommonScanSpec {
-            table_root: primary.table_root.clone(),
-            // The fan-out builder writes the projection beside its `EMITS`.
-            projection: Vec::new(),
             filter,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            logical_schema: primary.logical_schema.clone(),
-            name_mapping: primary.name_mapping.clone(),
             join,
-            partition_columns: primary.partition_columns.clone(),
-            storage,
-            df_target_partitions: inputs.df_target_partitions,
-            df_batch_size: inputs.df_batch_size,
-            df_threads_per_udf: inputs.df_threads_per_udf,
-            memory_pool_fraction: inputs.memory_pool_fraction,
-            instance_overhead_mb: inputs.instance_overhead_mb,
-            s3_max_connections: inputs.s3_max_connections,
-            binary_as_string: inputs.binary_as_string,
+            ..common
         },
         files: vec![],
     })
-}
-
-fn scan_storage_for_side(
-    effective: &StorageBackend,
-    inputs: &JoinScanRequestConfig<'_>,
-) -> Result<ScanStorage, UdfError> {
-    let conn = inputs.connection;
-    scan_storage_for(
-        &conn.creds,
-        &conn.connection_name,
-        conn.allow_http,
-        effective,
-        conn.sealed_storage_key.as_ref(),
-    )
 }
 
 /// `filter` is the leg filter [`screen_leg_filter`] rendered.
@@ -501,20 +465,18 @@ pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
     columns: &Emitted,
     filter: Option<String>,
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
     let projection = columns.projection();
 
-    let shards = shard_side(side, inputs);
-    let spec = join_fan_out_scan_spec(side, filter, None, inputs)?;
+    let shards = shard_side(side, context);
+    let spec = join_fan_out_scan_spec(side, filter, None, context)?;
     Ok(build_scan_driving_sql(
         &spec,
         &shards,
         &projection,
         None,
         None,
-        inputs.udf_name,
-        inputs.distribute_udf_name,
     ))
 }
 
@@ -593,7 +555,7 @@ fn place_broadcast_window(
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<Option<String>, UdfError> {
     let Some(placement) = place_broadcast_window(rendered.window.clone(), &rendered.projection)
     else {
@@ -603,7 +565,7 @@ pub(in super::super) fn build_broadcast_join_sql(
     let fact = &sides.fact;
     let dimension = &sides.dimension;
 
-    let shards = shard_side(fact, inputs);
+    let shards = shard_side(fact, context);
 
     let join = JoinSpec {
         table_root: dimension.table_root.clone(),
@@ -617,10 +579,10 @@ pub(in super::super) fn build_broadcast_join_sql(
         post_join_limit: placement.shard_cap,
         post_join_order_by: placement.shard_order_by,
         partition_columns: dimension.partition_columns.clone(),
-        storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
+        storage: context.scan_storage(&dimension.effective_storage)?,
     };
 
-    let spec = join_fan_out_scan_spec(fact, rendered.filter.clone(), Some(join), inputs)?;
+    let spec = join_fan_out_scan_spec(fact, rendered.filter.clone(), Some(join), context)?;
 
     let fan_out = build_scan_driving_sql(
         &spec,
@@ -628,8 +590,6 @@ pub(in super::super) fn build_broadcast_join_sql(
         &rendered.projection,
         placement.merge_cap,
         None,
-        inputs.udf_name,
-        inputs.distribute_udf_name,
     );
 
     let Some((keys, limit, offset)) = placement.wrapper else {
@@ -654,26 +614,34 @@ pub(in super::super) fn build_broadcast_plan_sql(
     sides: &[ResolvedJoinSide],
     broadcast: &JoinSides,
     aggregation_reads: Option<Vec<Emitted>>,
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<Option<String>, UdfError> {
+    let version = context.version;
     let aggregation_input = aggregation_reads
         .map(|read| aggregation_input_request(pushdown, join, sides, read))
         .transpose()?;
     let rendered = match &aggregation_input {
-        Some((request, emitted)) => render_broadcast_join_emitting(request, join, sides, emitted)?,
-        None => render_broadcast_join(pushdown, join, sides)?,
+        Some((request, emitted)) => {
+            render_broadcast_join_emitting(request, join, sides, emitted, version)?
+        }
+        None => render_broadcast_join(pushdown, join, sides, version)?,
     };
     let Some(rendered) = rendered else {
         return Ok(None);
     };
-    let Some(sql) = build_broadcast_join_sql(broadcast, &rendered, inputs)? else {
+    let Some(sql) = build_broadcast_join_sql(broadcast, &rendered, context)? else {
         return Ok(None);
     };
     let Some((_, emitted)) = aggregation_input else {
         return Ok(Some(sql));
     };
-    let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown, &join.legs(), &emitted, LegColumns::FanOutOutput)?;
+    let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
+        pushdown,
+        &join.legs(),
+        &emitted,
+        LegColumns::FanOutOutput,
+        version,
+    )?;
     Ok(Some(format!("SELECT {select} FROM ({sql}){trailing}")))
 }
 
@@ -774,16 +742,14 @@ fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Op
 
 /// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out, which emits
 /// `emitted`. `declined_filter` is the wrapper's WHERE, so `fan_out.filter` must then be `None`.
-#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown: &PushdownRequest,
     fan_out: CommonScanSpec,
     emitted: &Emitted,
-    shards: &[Vec<E>],
-    udf_name: &str,
-    distribute_udf_name: &str,
+    shards: &Shards<E>,
     declined_filter: Option<&Json>,
+    version: ExasolVersion,
 ) -> Result<String, UdfError> {
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
@@ -793,6 +759,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         &legs,
         std::slice::from_ref(emitted),
         LegColumns::Relations,
+        version,
     )?;
 
     let fan_out = build_scan_driving_sql(
@@ -804,8 +771,6 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         &emitted.projection(),
         None,
         None,
-        udf_name,
-        distribute_udf_name,
     );
 
     let where_clause = declined_filter.map(|tree| render_expression_qualified(tree, &legs));
@@ -821,20 +786,17 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     Ok(sql)
 }
 
-/// `filter` must be `None` when `declined_filter` is set. The emission is decided by the request's
-/// clauses, not the decline, so a declined filter over a real select list keeps the narrowing
-/// (#160), which matters here since the fan-out ships every row.
-#[allow(clippy::too_many_arguments)]
+/// `(filter, declined_filter)` are exclusive, as [`ScanTranslator::split_where`] returns them. The
+/// emission is decided by the request's clauses, not the decline, so a declined filter over a real
+/// select list keeps the narrowing (#160), which matters here since the fan-out ships every row.
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
     request: &Json,
     pushdown: &PushdownRequest,
     base: &CommonScanSpec,
-    filter: Option<String>,
-    shards: &[Vec<FileEntry>],
+    (filter, declined_filter): (Option<String>, Option<&Json>),
+    shards: &Shards,
     emitted: &Emitted,
-    udf_name: &str,
-    distribute_udf_name: &str,
-    declined_filter: Option<&Json>,
+    version: ExasolVersion,
 ) -> Result<Json, UdfError> {
     let fan_out = CommonScanSpec {
         filter,
@@ -851,9 +813,8 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
         fan_out,
         emitted,
         shards,
-        udf_name,
-        distribute_udf_name,
         declined_filter,
+        version,
     )?;
     Ok(pushdown_response(sql))
 }
@@ -883,9 +844,15 @@ impl EmptyRelation {
     pub(in super::super) fn pushdown(
         &self,
         pushdown: &PushdownRequest,
+        version: ExasolVersion,
     ) -> Result<String, UdfError> {
-        let OuterWrapperClauses { select, trailing } =
-            outer_wrapper_clauses(pushdown, &self.legs, &self.emitted, LegColumns::Relations)?;
+        let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
+            pushdown,
+            &self.legs,
+            &self.emitted,
+            LegColumns::Relations,
+            version,
+        )?;
         let from = self
             .emitted
             .iter()

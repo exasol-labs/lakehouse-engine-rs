@@ -9,6 +9,7 @@ mod json_value;
 mod scalar_functions;
 mod scan_typing;
 pub mod timestamp;
+mod version;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
@@ -22,6 +23,7 @@ use scan_typing::{
 };
 pub use scan_typing::{ColumnTypeLookup, exact_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
+pub use version::ExasolVersion;
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -1176,8 +1178,9 @@ fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String 
 pub fn render_scan_expression(
     expr: &Json,
     columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
 ) -> Result<SqlFragment, UdfError> {
-    let (typed, inferred) = scan_typing::type_scan_tree(expr, columns)?;
+    let (typed, inferred) = scan_typing::type_scan_tree(expr, columns, version)?;
     let ty = inferred.exact().map(|ty| {
         if ty.is_character() {
             ExasolType::WIDEST_VARCHAR
@@ -1193,9 +1196,10 @@ pub fn render_scan_expression(
 pub fn render_scan_filter(
     filter_expr: &Json,
     columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
 ) -> Result<String, UdfError> {
     Ok(null_keeps_no_row(
-        render_scan_expression(filter_expr, columns)?.sql,
+        render_scan_expression(filter_expr, columns, version)?.sql,
     ))
 }
 
@@ -1235,8 +1239,15 @@ pub fn render_expression_exasol(expr: &Json) -> String {
 const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
 /// [`render_expression_exasol`] for an output select item, with its [`exact_type`].
-pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
-    SqlFragment::new(render_expression_exasol(expr), exact_type(expr, columns))
+pub fn render_exasol_fragment(
+    expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
+) -> SqlFragment {
+    SqlFragment::new(
+        render_expression_exasol(expr),
+        exact_type(expr, columns, version),
+    )
 }
 
 #[cfg(test)]

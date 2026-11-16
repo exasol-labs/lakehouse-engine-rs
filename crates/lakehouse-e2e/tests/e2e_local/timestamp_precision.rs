@@ -469,7 +469,7 @@ fn native_copy_mismatches(conn: &mut ExaConn, table: &str, cases: &[NativeCase])
 
 /// Scenario: SECOND and EXTRACT(SECOND) return native results through the virtual schema
 /// Scenario: An unprojected SECOND group key takes the type of its argument's precision
-/// Scenario: SECOND over a DATE computes 0 without a stated type
+/// Scenario: SECOND over a DATE takes each version's type
 /// Scenario: SECOND over any other argument, or EXTRACT(SECOND) over a DATE, runs in Exasol
 #[test]
 fn second_and_extract_second_match_a_native_copy() {
@@ -482,7 +482,12 @@ fn second_and_extract_second_match_a_native_copy() {
     } else {
         microsecond.clone()
     };
-    let whole_second = scan_date_part("second");
+    // Exasol 8 types SECOND of a DATE as a TIMESTAMP(3)'s seconds, so the scan reads its microseconds.
+    let second_of_date = if engine_honors_declared_precision(&mut conn) {
+        scan_date_part("second")
+    } else {
+        microsecond.clone()
+    };
 
     let mut cases: Vec<NativeCase> = Vec::new();
     for (column, marker, filter, grouped) in [
@@ -540,7 +545,7 @@ fn second_and_extract_second_match_a_native_copy() {
         ),
         (
             "SELECT ID, SECOND(CAST(TS AS DATE)) FROM {T} ORDER BY ID".to_string(),
-            PathCheck::Has(&whole_second),
+            PathCheck::Has(&second_of_date),
             Expect::Rows,
         ),
         (

@@ -1,6 +1,6 @@
 # Feature: Create Virtual Schema
 
-An Exasol user registers every Iceberg table in a configured namespace as a virtual table, resolved through an Iceberg REST catalog over S3-compatible storage, including AWS Glue with SigV4-signed requests. Each table's columns appear in Exasol with mapped SQL types, the response's schema-level `adapterNotes` records the resource budgets, and each virtual table's own `adapterNotes` records its catalog identifier for later pushdowns.
+An Exasol user registers every Iceberg table in a configured namespace as a virtual table, resolved through an Iceberg REST catalog over S3-compatible storage, including AWS Glue with SigV4-signed requests. Each table's columns appear in Exasol with mapped SQL types, and each virtual table's own `adapterNotes` records its catalog identifier for later pushdowns.
 
 ## Background
 

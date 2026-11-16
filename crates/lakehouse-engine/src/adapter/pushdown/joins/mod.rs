@@ -1,20 +1,20 @@
 use crate::adapter::permission::PermissionCheck;
-use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::statement_state::StatementCatalog;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
+use vs_expression::ExasolVersion;
 
+use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, Emitted, InvolvedColumns, OutputContract,
-    PushdownRequest, SCAN_UDF_NAME, aggregation_type, project_columns, pushdown_response,
-    quote_ident,
+    ColumnTypes, Emitted, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
+    project_columns, pushdown_response,
 };
 
 mod attribution;
@@ -41,7 +41,7 @@ use broadcast_policy::{BroadcastFacts, n_scan_reason};
 pub(super) use planning::{JoinWindowPlan, involved_table};
 use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
 use rendering::{leg_local_filter, possible_side_column_names};
-pub(super) use sql_builders::{JoinScanRequestConfig, build_n_scan_join_sql};
+pub(super) use sql_builders::build_n_scan_join_sql;
 use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emission};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
@@ -59,15 +59,6 @@ pub(crate) fn ensure_columns_declared(
         None => attribution::JoinLegs::for_single_scan(request),
     };
     legs.ensure_columns_declared(pushdown, declared)
-}
-
-/// The generated SQL runs outside the adapter script's schema, so an unqualified name would
-/// not resolve.
-pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
-    match scan_schema {
-        Some(schema) if !schema.is_empty() => format!("{}.{}", quote_ident(schema), udf),
-        _ => udf.to_string(),
-    }
 }
 
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
@@ -99,6 +90,7 @@ fn empty_join_sql(
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     emitted: Vec<Emitted>,
+    version: ExasolVersion,
 ) -> Result<Json, UdfError> {
     let legs = join.legs();
     let col_types = ColumnTypes::per_relation(
@@ -108,7 +100,7 @@ fn empty_join_sql(
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
     let bound = pushdown.with_json(legs.qualify(pushdown.json()));
-    let scan = ScanTranslator::over(&col_types, &[bound.json()])?;
+    let scan = ScanTranslator::over(&col_types, version, &[bound.json()])?;
     let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
     empty_result_sql(
         pushdown,
@@ -133,24 +125,13 @@ fn empty_join_sql(
 /// No plan-time check compares the sides' storage backends: each side reads through its own
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
 /// different stores) is owned by the scan's `validate_sides_share_one_store`.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     statement: &StatementCatalog,
     permission: &PermissionCheck,
-    props: &Json,
-    scan_schema: Option<&str>,
-    cluster_nodes: usize,
-    parallelism_factor: usize,
-    df_target_partitions: usize,
-    df_batch_size: usize,
-    df_threads_per_udf: usize,
-    memory_pool_fraction: f64,
-    instance_overhead_mb: u64,
-    s3_max_connections: usize,
-    join_broadcast_max_bytes: u64,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
@@ -174,8 +155,13 @@ pub(super) async fn plan_join(
         Some(join),
         &involved.iter().collect::<Vec<_>>(),
     )?;
-    let resolver =
-        TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
+    let resolver = TableScanResolver::for_request(
+        statement,
+        permission,
+        &identifiers,
+        context.binary_as_string,
+    )
+    .await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
@@ -200,33 +186,14 @@ pub(super) async fn plan_join(
     let emitted = n_scan_emission(pushdown, join, &sides)?;
 
     if sides.iter().any(|s| s.files.is_empty()) {
-        return empty_join_sql(pushdown, join, &sides, emitted);
+        return empty_join_sql(pushdown, join, &sides, emitted, context.version);
     }
 
-    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
-    let inputs = JoinScanRequestConfig {
-        cluster_nodes,
-        parallelism_factor,
-        df_target_partitions,
-        df_batch_size,
-        df_threads_per_udf,
-        memory_pool_fraction,
-        instance_overhead_mb,
-        s3_max_connections,
-        binary_as_string: resolve_binary_as_string(props),
-        connection: statement.connection(),
-        udf_name: &udf_name,
-        distribute_udf_name: &distribute_udf_name,
-    };
-
-    if let Some(sql) =
-        plan_broadcast_join(pushdown, join, &sides, join_broadcast_max_bytes, &inputs)?
-    {
+    if let Some(sql) = plan_broadcast_join(pushdown, join, &sides, context)? {
         return Ok(pushdown_response(sql));
     }
 
-    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, &inputs)?;
+    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, context)?;
     Ok(pushdown_response(sql))
 }
 
@@ -237,8 +204,7 @@ fn plan_broadcast_join(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    join_broadcast_max_bytes: u64,
-    inputs: &JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<Option<String>, UdfError> {
     let pushdown_req = pushdown.json();
     let is_equi =
@@ -257,7 +223,7 @@ fn plan_broadcast_join(
     let reads = aggregation_reads(pushdown, join, sides)?;
     let facts = BroadcastFacts {
         dimension_bytes: candidate.dimension.total_bytes,
-        max_bytes: join_broadcast_max_bytes,
+        max_bytes: context.tuning.join_broadcast_max_bytes,
         legs: &join.legs(),
         dimension_leg: candidate.dimension_leg,
         filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
@@ -268,7 +234,7 @@ fn plan_broadcast_join(
     if n_scan_reason(&facts).is_some() {
         return Ok(None);
     }
-    build_broadcast_plan_sql(pushdown, join, sides, &candidate, reads, inputs)
+    build_broadcast_plan_sql(pushdown, join, sides, &candidate, reads, context)
 }
 
 #[cfg(test)]

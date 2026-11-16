@@ -24,7 +24,7 @@ pub(super) fn empty_result_sql(
             empty_select_list_typed_sql(pushdown.select_types())
         }
         RequestShape::SingleGroupAgg { .. } | RequestShape::SingleGroupWrapper => {
-            relation.pushdown(pushdown)?
+            relation.pushdown(pushdown, scan.version())?
         }
         RequestShape::RowScan => match projection {
             RowProjection::Wrapped => empty_select_list_typed_sql(pushdown.select_types()),

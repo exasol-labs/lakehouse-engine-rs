@@ -4,9 +4,10 @@
 
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, float_div, full_row_n_scan_sql, parsed_pushdown, pd, projected_columns,
-    pushdown_request, request_sides, request_typed, round_of, sample_scan_storage, sample_storage,
-    scan_for, with_identifier_notes,
+    count_star, dispatch_context, float_div, full_row_n_scan_sql, parsed_pushdown, pd,
+    projected_columns, pushdown_request, request_sides, request_typed, round_of,
+    sample_scan_storage, sample_storage, scan_for, test_context, unqualified_shards,
+    with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -229,25 +230,17 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         projection,
         &emitted,
         scan_for(&columns, pushdown.json()),
-        None,
-        None,
+        (None, None),
         None,
         false,
-        &fixed_shards(),
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(fixed_shards()),
+        dispatch_context().common_spec(
+            "s3://warehouse/db/events".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sample_scan_storage(),
+        ),
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -276,25 +269,17 @@ fn dispatch_sql_with_pushdown_req(
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
         &golden_emission(request, &pushdown, &columns),
         scan_for(&columns, pushdown_req),
-        filter,
-        None,
+        (filter, None),
         limit,
         false,
-        &fixed_shards(),
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(fixed_shards()),
+        dispatch_context().common_spec(
+            "s3://warehouse/db/events".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sample_scan_storage(),
+        ),
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -693,7 +678,7 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql};
+use super::joins::build_broadcast_join_sql;
 
 fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
     let mut request = pushdown_request(
@@ -783,23 +768,6 @@ fn resolved_orders_side() -> ResolvedJoinSide {
     }
 }
 
-fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
-    JoinScanRequestConfig {
-        cluster_nodes: 1,
-        parallelism_factor: 1,
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 0,
-        s3_max_connections: 1,
-        binary_as_string: false,
-        connection: &super::test_support::TEST_CONNECTION,
-        udf_name: SCAN_UDF_NAME,
-        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
-    }
-}
-
 #[test]
 fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -815,11 +783,12 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         &parsed_pushdown(&request),
         &join,
         &request_sides(&request, &join),
+        ExasolVersion::Exasol2025,
     )
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
     assert_eq!(
@@ -832,7 +801,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
-        &join_scan_tuning(),
+        &test_context(),
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(
@@ -863,11 +832,12 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         &parsed_pushdown(&request),
         &join,
         &request_sides(&request, &join),
+        ExasolVersion::Exasol2025,
     )
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
     assert_eq!(
@@ -880,7 +850,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
-        &join_scan_tuning(),
+        &test_context(),
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(

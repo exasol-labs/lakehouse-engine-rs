@@ -1,13 +1,17 @@
 //! Adapter pushdown fixtures: request JSON and column-type builders, Iceberg, Delta, and Glue
 //! catalog and AdapterNotes fixtures, fake catalog and object-store endpoints, test CONNECTIONs.
 
+use super::shard_paths::relativize_shards_to_root;
 use super::*;
-use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::column_notes::TableNotes;
+use crate::adapter::properties::{Check, VsProperties};
 use crate::adapter::table_identity::encode_identifier_note;
+use crate::adapter::{ResolvedConnectionConfig, Tuning, get_properties};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
-use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
+use crate::scan::spec::{
+    DeleteMechanism, FileEntry, LogicalField, ScanStorage, StorageBackend, StorageProps,
+};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 use futures::FutureExt;
@@ -15,9 +19,11 @@ use futures::future::{self, BoxFuture};
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use vs_expression::ExasolVersion;
 // Named, not globbed: a local helper of the same name would silently shadow a glob import.
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
@@ -25,6 +31,62 @@ pub(crate) use vs_expression::test_support::{
     is_null, like, like_escape, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
     scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
+
+/// The context the unit tests plan with: one node and one thread, unqualified UDFs, Exasol 2025.
+pub(crate) fn test_context() -> PushdownContext<'static> {
+    PushdownContext {
+        connection: &TEST_CONNECTION,
+        udfs: ScanUdfs::in_schema(None),
+        cluster_nodes: 1,
+        tuning: Tuning {
+            parallelism_factor: 1,
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
+            df_batch_size: 8192,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 0,
+            s3_max_connections: 1,
+            join_broadcast_max_bytes: 134_217_728,
+            metadata_read_concurrency: NonZeroUsize::MIN,
+        },
+        binary_as_string: false,
+        version: ExasolVersion::Exasol2025,
+    }
+}
+
+/// [`test_context`] with the dispatch fixtures' tuning.
+pub(crate) fn dispatch_context() -> PushdownContext<'static> {
+    let base = test_context();
+    PushdownContext {
+        tuning: Tuning {
+            df_target_partitions: 4,
+            df_threads_per_udf: 2,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+            ..base.tuning
+        },
+        ..base
+    }
+}
+
+/// `files` as one fan-out's shards over the unqualified UDFs.
+pub(crate) fn unqualified_shards<E>(files: Vec<Vec<E>>) -> Shards<E> {
+    Shards {
+        files,
+        udfs: ScanUdfs::in_schema(None),
+    }
+}
+
+/// `files` as one fan-out's shards over UDFs named `SCAN` and `DISTRIBUTE`.
+pub(crate) fn scan_distribute_shards<E>(files: Vec<Vec<E>>) -> Shards<E> {
+    Shards {
+        files,
+        udfs: ScanUdfs {
+            scan: "SCAN".into(),
+            distribute: "DISTRIBUTE".into(),
+        },
+    }
+}
 
 /// The scan's typed filter SQL, `None` when it declines.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
@@ -96,13 +158,13 @@ pub(crate) fn scan_of(request: &Json) -> ScanTranslator<'static> {
 /// A translator over `columns` for a unit that takes nodes, never a request, so no request tree
 /// is checked against them.
 pub(crate) fn scan_over(columns: &ColumnTypes) -> ScanTranslator<'_> {
-    ScanTranslator::over(columns, &[]).expect("no tree to check")
+    ScanTranslator::over(columns, ExasolVersion::Exasol2025, &[]).expect("no tree to check")
 }
 
 /// The translator production builds over `columns` for `pushdown_req`, through the same check.
 /// Panics on a column of the request that `columns` does not bind.
 pub(crate) fn scan_for<'c>(columns: &'c ColumnTypes, pushdown_req: &Json) -> ScanTranslator<'c> {
-    ScanTranslator::over(columns, &[pushdown_req])
+    ScanTranslator::over(columns, ExasolVersion::Exasol2025, &[pushdown_req])
         .unwrap_or_else(|error| panic!("{}", user_message(error)))
 }
 
@@ -586,7 +648,7 @@ pub(super) fn project_row(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<RowProjection, UdfError> {
-    let scan = ScanTranslator::over(all_cols, &[pushdown.json()])?;
+    let scan = ScanTranslator::over(all_cols, ExasolVersion::Exasol2025, &[pushdown.json()])?;
     support::project_columns(pushdown, scan, &emitting(all_cols))
 }
 
@@ -617,13 +679,13 @@ pub(super) fn full_row_n_scan_sql(
     pushdown: &PushdownRequest,
     join: &joins::DetectedJoin,
     sides: &[joins::ResolvedJoinSide],
-    inputs: &joins::JoinScanRequestConfig<'_>,
+    context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
     let emitted: Vec<Emitted> = sides
         .iter()
         .map(|side| emitting(&side.column_types))
         .collect();
-    joins::build_n_scan_join_sql(pushdown, join, sides, &emitted, inputs)
+    joins::build_n_scan_join_sql(pushdown, join, sides, &emitted, context)
 }
 
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
@@ -652,10 +714,9 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
             ..Default::default()
         },
         &emitting(&first_table_column_types(request)),
-        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         Some(declined),
+        ExasolVersion::Exasol2025,
     )
     .expect("the wrapper must render the declined predicate")
 }
@@ -1315,26 +1376,31 @@ pub(crate) async fn pushdown_over(
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
     let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    let statement = StatementCatalog::open(connection, &get_properties(request), None)?;
+    let props = VsProperties::parse(&get_properties(request), Check::Lenient)?;
+    let statement = StatementCatalog::open(connection, &props, None)?;
     let catalog = CatalogProps {
         warehouse: "wh".into(),
         table: table.into(),
+    };
+    let base = test_context();
+    let context = PushdownContext {
+        connection: statement.connection(),
+        tuning: Tuning {
+            df_batch_size: 1024,
+            instance_overhead_mb: 200,
+            s3_max_connections: 4,
+            join_broadcast_max_bytes,
+            ..base.tuning
+        },
+        binary_as_string: props.checked.binary_as_string,
+        ..base
     };
     handle_pushdown(
         request,
         &statement,
         &PermissionCheck::Off,
         &catalog,
-        None,
-        1,
-        1,
-        1,
-        1024,
-        1,
-        0.6,
-        200,
-        4,
-        join_broadcast_max_bytes,
+        &context,
     )
     .await
 }
@@ -1347,8 +1413,8 @@ pub(crate) fn statement_over(
     storage: StorageBackend,
 ) -> StatementCatalog {
     let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    StatementCatalog::open(connection, &Json::Null, None)
-        .expect("the catalog client issues no request")
+    let props = VsProperties::parse(&Json::Null, Check::Lenient).expect("no property to parse");
+    StatementCatalog::open(connection, &props, None).expect("the catalog client issues no request")
 }
 
 /// A CONNECTION's storage view that allows HTTP.
@@ -1479,16 +1545,16 @@ pub(crate) fn build_sql_for_fixture_n(
     .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
-    let shards =
-        crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
+    let shards = unqualified_shards(crate::adapter::sharding::partition_files_by_bytes(
+        files_with_sizes,
+        cluster_nodes,
+    ));
     build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&proj_items, &proj_types),
         limit,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
 }
 
@@ -1881,15 +1947,13 @@ pub(crate) fn build_row_sql_with_root(
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let shards = relativize_shards_to_root(shards, table_root);
+    let shards = unqualified_shards(relativize_shards_to_root(shards, table_root));
     build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&proj_items, &proj_types),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
 }
 

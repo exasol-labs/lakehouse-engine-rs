@@ -5,7 +5,9 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
-use crate::fixtures::{STUB_ADAPTER_SCHEMA, lakehouse_vs, persist_properties, vs_table};
+use crate::fixtures::{
+    STUB_ADAPTER_SCHEMA, lakehouse_vs, persist_properties, pushed_scan_spec, spec_u64, vs_table,
+};
 
 use std::collections::BTreeMap;
 
@@ -85,21 +87,8 @@ fn schema_count(conn: &mut ExaConn, vs: &str) -> i64 {
     ))
 }
 
-fn notes(conn: &mut ExaConn, vs: &str) -> BTreeMap<String, String> {
-    schema_notes(conn, vs)
-        .into_iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-        .collect()
-}
-
-fn note_usize(notes: &BTreeMap<String, String>, key: &str) -> usize {
-    notes
-        .get(key)
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must hold {key}: {notes:?}"))
-        .parse()
-        .unwrap_or_else(|e| panic!("{key} must be a whole number ({e}): {notes:?}"))
-}
-
+/// The scan spec a pushdown over `vs`'s seed table plans with: the tuning comes from the
+/// properties a pushdown reads, never from the adapterNotes.
 fn persisted_properties(conn: &mut ExaConn, vs: &str) -> BTreeMap<String, String> {
     let cols = conn.query_columns(&format!(
         "SELECT PROPERTY_NAME, PROPERTY_VALUE FROM SYS.EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES \
@@ -186,15 +175,9 @@ fn create_suggests_the_nearest_known_property_name() {
 }
 
 /// Scenario: Every property the adapter reads is known under every catalog kind
-/// Scenario: Adapter records the parallelism factor in the virtual-schema adapterNotes
-/// Scenario: Adapter records the DataFusion threading mode in the virtual-schema adapterNotes
-/// Scenario: Adapter records the DataFusion target partition count in the virtual-schema adapterNotes
-/// Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
-/// Scenario: Adapter records the memory-pool fraction in the virtual-schema adapterNotes
-/// Scenario: Adapter records the instance-overhead megabytes in the virtual-schema adapterNotes
 /// Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
-/// Scenario: FIXED value overrides the AUTO derivation at createVirtualSchema
-/// Scenario: Adapter records the metadata read concurrency in the virtual-schema adapterNotes
+/// Scenario: An S3_MAX_CONNECTIONS value overrides the AUTO derivation
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn create_accepts_every_known_property_name() {
     const VS: &str = "PV_ALL_NAMES";
@@ -224,25 +207,17 @@ fn create_accepts_every_known_property_name() {
         ],
     );
 
-    let notes = notes(&mut conn, VS);
+    let spec = pushed_scan_spec(&mut conn, VS);
     for (key, expected) in [
-        ("PARALLELISM_FACTOR", "3"),
-        ("DF_THREADING_MODE", "FIXED"),
-        ("DF_TARGET_PARTITIONS", "6"),
-        ("DF_THREADS_PER_UDF", "3"),
-        ("DF_BATCH_SIZE", "4096"),
-        ("MEMORY_POOL_FRACTION", "0.5"),
-        ("INSTANCE_OVERHEAD_MB", "100"),
-        ("JOIN_BROADCAST_MAX_BYTES", "1048576"),
-        ("S3_MAX_CONNECTIONS", "7"),
-        ("METADATA_READ_CONCURRENCY", "4"),
+        ("df_target_partitions", 6),
+        ("df_threads_per_udf", 3),
+        ("df_batch_size", 4096),
+        ("instance_overhead_mb", 100),
+        ("s3_max_connections", 7),
     ] {
-        assert_eq!(
-            notes.get(key).map(String::as_str),
-            Some(expected),
-            "{key} must record the supplied value: {notes:?}"
-        );
+        assert_eq!(spec_u64(&spec, key), expected, "{key}: {spec}");
     }
+    assert_eq!(spec["memory_pool_fraction"], 0.5, "{spec}");
     drop_vs(&mut conn, VS);
 }
 
@@ -276,45 +251,27 @@ fn create_rejects_an_empty_table_pattern_entry() {
 /// Scenario: AUTO mode gives the node's single scan instance every core
 /// Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
 /// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
-fn create_without_tuning_properties_records_the_defaults() {
+fn create_without_tuning_properties_takes_the_defaults() {
     const VS: &str = "PV_DEFAULTS";
     lakehouse_vs();
     let mut conn = exa_conn();
 
     create_ok(&mut conn, VS, &[]);
 
-    let notes = notes(&mut conn, VS);
-    let threads = note_usize(&notes, "DF_THREADS_PER_UDF");
-    assert!(
-        threads >= 1,
-        "threads derive from the node's cores: {notes:?}"
-    );
+    let spec = pushed_scan_spec(&mut conn, VS);
+    let threads = spec_u64(&spec, "df_threads_per_udf");
+    assert!(threads >= 1, "threads derive from the node's cores: {spec}");
     assert_eq!(
-        note_usize(&notes, "DF_TARGET_PARTITIONS"),
+        spec_u64(&spec, "df_target_partitions"),
         2 * threads,
-        "{notes:?}"
+        "{spec}"
     );
-    assert_eq!(
-        note_usize(&notes, "S3_MAX_CONNECTIONS"),
-        4 * threads,
-        "{notes:?}"
-    );
-    for (key, expected) in [
-        ("PARALLELISM_FACTOR", "1"),
-        ("DF_THREADING_MODE", "AUTO"),
-        ("DF_BATCH_SIZE", "8192"),
-        ("MEMORY_POOL_FRACTION", "0.6"),
-        ("INSTANCE_OVERHEAD_MB", "200"),
-        ("JOIN_BROADCAST_MAX_BYTES", "134217728"),
-        ("METADATA_READ_CONCURRENCY", "16"),
-    ] {
-        assert_eq!(
-            notes.get(key).map(String::as_str),
-            Some(expected),
-            "{key} must hold its default: {notes:?}"
-        );
-    }
+    assert_eq!(spec_u64(&spec, "s3_max_connections"), 4 * threads, "{spec}");
+    assert_eq!(spec_u64(&spec, "df_batch_size"), 8192, "{spec}");
+    assert_eq!(spec_u64(&spec, "instance_overhead_mb"), 200, "{spec}");
+    assert_eq!(spec["memory_pool_fraction"], 0.6, "{spec}");
     drop_vs(&mut conn, VS);
 }
 
@@ -496,6 +453,7 @@ fn misspelled_required_property_reports_the_misspelling() {
 }
 
 /// Scenario: An empty or null property value counts as absent
+/// Scenario: A SET of a tuning property applies from the next query
 #[test]
 fn empty_and_null_property_values_count_as_absent() {
     const VS: &str = "PV_EMPTY_NULL";
@@ -525,16 +483,16 @@ fn empty_and_null_property_values_count_as_absent() {
     create_ok(&mut conn, VS, &[("MEMORY_POOL_FRACTION", "0.5")]);
     for literal in ["''", "null"] {
         conn.execute(&format!(
-            "ALTER VIRTUAL SCHEMA {VS} SET MEMORY_POOL_FRACTION = '0.5'"
+            "ALTER VIRTUAL SCHEMA {VS} SET MEMORY_POOL_FRACTION = '0.4'"
         ));
-        assert_eq!(notes(&mut conn, VS)["MEMORY_POOL_FRACTION"], "0.5");
+        assert_eq!(pushed_scan_spec(&mut conn, VS)["memory_pool_fraction"], 0.4);
 
         conn.execute(&format!(
             "ALTER VIRTUAL SCHEMA {VS} SET MEMORY_POOL_FRACTION = {literal}"
         ));
         assert_eq!(
-            notes(&mut conn, VS)["MEMORY_POOL_FRACTION"],
-            "0.6",
+            pushed_scan_spec(&mut conn, VS)["memory_pool_fraction"],
+            0.6,
             "SET MEMORY_POOL_FRACTION = {literal} must fall back to the default"
         );
         assert!(
@@ -543,7 +501,7 @@ fn empty_and_null_property_values_count_as_absent() {
         );
 
         conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS} REFRESH"));
-        assert_eq!(notes(&mut conn, VS)["MEMORY_POOL_FRACTION"], "0.6");
+        assert_eq!(pushed_scan_spec(&mut conn, VS)["memory_pool_fraction"], 0.6);
     }
 
     // A required property that is unset reports the missing property, not an invalid value.
@@ -569,7 +527,7 @@ fn set_properties_rejects_problems_and_keeps_the_schema() {
 
     create_ok(&mut conn, VS, &[("MEMORY_POOL_FRACTION", "0.5")]);
     let properties = persisted_properties(&mut conn, VS);
-    let notes_before = notes(&mut conn, VS);
+    let spec_before = pushed_scan_spec(&mut conn, VS);
     let tables = table_count(&mut conn, VS);
     assert!(tables > 0, "{VS} must hold the namespace's tables");
 
@@ -594,7 +552,7 @@ fn set_properties_rejects_problems_and_keeps_the_schema() {
             "{sql}: {msg}"
         );
         assert_eq!(persisted_properties(&mut conn, VS), properties, "{sql}");
-        assert_eq!(notes(&mut conn, VS), notes_before, "{sql}");
+        assert_eq!(pushed_scan_spec(&mut conn, VS), spec_before, "{sql}");
         assert_eq!(table_count(&mut conn, VS), tables, "{sql}");
     }
     drop_vs(&mut conn, VS);
@@ -681,7 +639,12 @@ fn stray_persisted_properties_block_refresh_but_not_queries() {
     assert_eq!(
         conn.query_scalar_i64(&count),
         SEED_TOTAL_ROWS as i64,
-        "a pushdown must plan from the adapterNotes and ignore the stray properties"
+        "a pushdown must ignore the stray properties"
+    );
+    let spec = pushed_scan_spec(&mut conn, STRAY_VS);
+    assert_eq!(
+        spec["memory_pool_fraction"], 0.6,
+        "a pushdown reads an invalid value as absent: {spec}"
     );
 
     let refresh = format!("ALTER VIRTUAL SCHEMA {STRAY_VS} REFRESH");

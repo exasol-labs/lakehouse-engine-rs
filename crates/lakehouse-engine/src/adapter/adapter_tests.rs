@@ -70,13 +70,13 @@ fn schema_request(request_type: &str, properties: serde_json::Value) -> Json {
 }
 
 fn checked(props: serde_json::Value) -> TuningProperties {
-    check_properties(&props)
+    properties::checked_values(&props, Check::Strict)
         .unwrap_or_else(|e| panic!("{props} must pass the check: {e}"))
         .tuning
 }
 
-fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
-    resolve_tuning_notes(&checked(props), nr_of_cores)
+fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> Tuning {
+    resolve_tuning(&checked(props), nr_of_cores)
 }
 
 #[track_caller]
@@ -250,12 +250,12 @@ fn merge_set_properties_new_wins_and_null_unsets() {
     });
     let merged = merge_set_properties(&req);
 
-    assert_eq!(nonempty_str(&merged, "NAMESPACE"), Some("new_ns"));
+    assert_eq!(merged["NAMESPACE"], "new_ns");
     assert!(
         merged.get("ALLOW_HTTP").is_none(),
         "a null request value must unset the property"
     );
-    assert_eq!(nonempty_str(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
+    assert_eq!(merged["CATALOG_CONNECTION"], "keep_me");
 }
 
 fn password_connection(
@@ -423,44 +423,8 @@ fn cluster_nodes_from_context_passes_through_reported_node_count() {
     );
 }
 
-#[test]
-fn adapter_note_absent_or_unparseable_yields_none() {
-    let bare = serde_json::json!({"type": "pushdown"});
-    assert!(adapter_note(&bare, NOTE_PARALLELISM_FACTOR).is_none());
-
-    let garbage = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "not json" },
-    });
-    assert!(adapter_note(&garbage, NOTE_PARALLELISM_FACTOR).is_none());
-
-    let empty = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "" },
-    });
-    assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
-}
-
-impl Default for super::TuningNotes {
-    fn default() -> Self {
-        let (df_target_partitions, df_threads_per_udf) = auto_df_threading(1);
-        Self {
-            parallelism_factor: DEFAULT_PARALLELISM_FACTOR,
-            df_threading_mode: ThreadingMode::Auto,
-            df_target_partitions,
-            df_threads_per_udf,
-            df_batch_size: DEFAULT_DF_BATCH_SIZE,
-            memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
-            instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
-            s3_max_connections: DEFAULT_S3_MAX_CONNECTIONS,
-            join_broadcast_max_bytes: DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
-        }
-    }
-}
-
-fn parsed_notes(request: &Json, tuning: &TuningNotes, skipped: &[SkippedTable]) -> Json {
-    let notes = build_adapter_notes(request, tuning, &SkippedTables::listed(skipped), None);
+fn parsed_notes(request: &Json, skipped: &[SkippedTable]) -> Json {
+    let notes = build_adapter_notes(request, &SkippedTables::listed(skipped), None);
     serde_json::from_str(notes.as_str().expect("adapterNotes is a JSON string"))
         .expect("adapterNotes is valid JSON")
 }
@@ -478,7 +442,6 @@ fn build_adapter_notes_writes_or_removes_the_catalog_prefix() {
     ] {
         let notes = build_adapter_notes(
             &refresh,
-            &TuningNotes::default(),
             &SkippedTables::default(),
             prefix.map(str::to_string),
         );
@@ -511,7 +474,7 @@ fn build_adapter_notes_merges_existing() {
             "adapterNotes": "{\"OTHER_KEY\":\"keep-me\"}"
         },
     });
-    let parsed = parsed_notes(&req, &TuningNotes::default(), &[]);
+    let parsed = parsed_notes(&req, &[]);
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
@@ -548,7 +511,6 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
             "tables": tables,
             "adapterNotes": build_adapter_notes(
                 &request,
-                &TuningNotes::default(),
                 &SkippedTables::listed(&listing.skipped),
                 None,
             ),
@@ -580,51 +542,19 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
     assert_eq!(schema_notes["OTHER_KEY"], "keep-me");
 }
 
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
-fn create_vs_records_parallelism_factor() {
+fn the_parallelism_factor_comes_from_the_property() {
     let tuning = resolved_tuning(serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" }), 1);
     assert_eq!(
         tuning.parallelism_factor, 4,
         "factor must be read from the property"
     );
 
-    let request = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&request, &tuning, &[]);
-    assert_eq!(
-        parsed[NOTE_PARALLELISM_FACTOR].as_str(),
-        Some("4"),
-        "PARALLELISM_FACTOR must be recorded in adapterNotes"
-    );
-
     let default_factor = resolved_tuning(serde_json::json!({}), 1).parallelism_factor;
     assert_eq!(
         default_factor, DEFAULT_PARALLELISM_FACTOR,
         "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent"
-    );
-}
-
-#[test]
-fn adapter_notes_carry_parallelism_factor() {
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        &TuningNotes {
-            parallelism_factor: 12,
-            ..TuningNotes::default()
-        },
-        &SkippedTables::default(),
-        None,
-    );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
-    assert_eq!(
-        adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
-        Some("12"),
-        "PARALLELISM_FACTOR must round-trip through adapterNotes"
     );
 }
 
@@ -637,6 +567,7 @@ fn core_count_comes_from_available_parallelism() {
     );
 }
 
+/// Scenario: Adapter uses a core count of 1 when available_parallelism() cannot report one
 #[test]
 fn core_count_defaults_to_one_when_detection_fails() {
     let detection_failed = Err(std::io::Error::other("platform reports no core count"));
@@ -677,14 +608,6 @@ fn df_target_partitions_uses_supplied_value() {
         tuning.df_target_partitions, 4,
         "explicit value must be returned"
     );
-
-    let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&req, &tuning, &[]);
-    assert_eq!(
-        parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
-        Some("4"),
-        "DF_TARGET_PARTITIONS must round-trip through adapterNotes"
-    );
 }
 
 #[test]
@@ -700,20 +623,6 @@ fn df_batch_size_uses_supplied_value() {
         DEFAULT_DF_BATCH_SIZE,
         "absent property must return DEFAULT_DF_BATCH_SIZE (8192)"
     );
-
-    let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default(), None);
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
-    assert_eq!(
-        adapter_note(&pushdown_req, NOTE_DF_BATCH_SIZE).as_deref(),
-        Some("4096"),
-        "DF_BATCH_SIZE must round-trip through adapterNotes"
-    );
 }
 
 #[test]
@@ -725,14 +634,6 @@ fn df_threads_per_udf_uses_supplied_value() {
     assert_eq!(
         tuning.df_threads_per_udf, 2,
         "explicit value must be returned"
-    );
-
-    let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&req, &tuning, &[]);
-    assert_eq!(
-        parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
-        Some("2"),
-        "DF_THREADS_PER_UDF must round-trip through adapterNotes"
     );
 }
 
@@ -786,62 +687,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_reads_the_supplied_value() {
 }
 
 #[test]
-fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        &TuningNotes {
-            join_broadcast_max_bytes: 67_108_864,
-            ..TuningNotes::default()
-        },
-        &SkippedTables::default(),
-        None,
-    );
-
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes.as_str().unwrap() },
-    });
-
-    assert_eq!(
-        adapter_note(&pushdown_req, NOTE_JOIN_BROADCAST_MAX_BYTES).as_deref(),
-        Some("67108864"),
-        "JOIN_BROADCAST_MAX_BYTES must round-trip through adapterNotes"
-    );
-}
-
-#[test]
-fn memory_budget_params_round_trip_through_adapter_notes() {
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        &TuningNotes {
-            memory_pool_fraction: 0.5,
-            instance_overhead_mb: 256,
-            ..TuningNotes::default()
-        },
-        &SkippedTables::default(),
-        None,
-    );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
-    assert_eq!(
-        adapter_note(&pushdown_req, NOTE_MEMORY_POOL_FRACTION).as_deref(),
-        Some("0.5"),
-        "MEMORY_POOL_FRACTION must round-trip through adapterNotes"
-    );
-    assert_eq!(
-        adapter_note(&pushdown_req, NOTE_INSTANCE_OVERHEAD_MB).as_deref(),
-        Some("256"),
-        "INSTANCE_OVERHEAD_MB must round-trip through adapterNotes"
-    );
-}
-
-#[test]
 fn threading_mode_parses_case_insensitively() {
     for (value, expected) in [
         ("fixed", ThreadingMode::Fixed),
@@ -849,9 +694,8 @@ fn threading_mode_parses_case_insensitively() {
         ("AUTO", ThreadingMode::Auto),
     ] {
         assert_eq!(
-            resolved_tuning(serde_json::json!({ PROP_DF_THREADING_MODE: value }), 1)
-                .df_threading_mode,
-            expected,
+            checked(serde_json::json!({ PROP_DF_THREADING_MODE: value })).threading_mode,
+            Some(expected),
             "'{value}' must parse to {expected:?}"
         );
     }
@@ -859,19 +703,10 @@ fn threading_mode_parses_case_insensitively() {
 
 #[test]
 fn threading_mode_defaults_to_auto() {
-    let tuning = resolved_tuning(serde_json::json!({}), 1);
     assert_eq!(
-        tuning.df_threading_mode,
-        ThreadingMode::Auto,
+        resolved_tuning(serde_json::json!({}), 8),
+        resolved_tuning(serde_json::json!({ PROP_DF_THREADING_MODE: "AUTO" }), 8),
         "absent property → Auto"
-    );
-
-    let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&req, &tuning, &[]);
-    assert_eq!(
-        parsed[NOTE_DF_THREADING_MODE].as_str(),
-        Some("AUTO"),
-        "DF_THREADING_MODE: AUTO must be recorded in adapterNotes"
     );
 }
 
@@ -1179,11 +1014,7 @@ fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
         ),
     ];
 
-    let parsed = parsed_notes(
-        &json!({"type": "createVirtualSchema"}),
-        &TuningNotes::default(),
-        &skipped,
-    );
+    let parsed = parsed_notes(&json!({"type": "createVirtualSchema"}), &skipped);
 
     let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
     let expected = [
@@ -1230,7 +1061,7 @@ fn a_listing_without_skips_records_an_empty_list_replacing_the_previous() {
         },
     });
 
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &[]);
+    let parsed = parsed_notes(&request, &[]);
 
     assert_eq!(parsed["SKIPPED_TABLES"], json!([]));
 }
@@ -1252,11 +1083,7 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
         EngineTimestampSupport::MillisecondOnly,
     )
     .expect("an all-skipped namespace must not fail the listing");
-    let parsed = parsed_notes(
-        &json!({"type": "createVirtualSchema"}),
-        &TuningNotes::default(),
-        &listing.skipped,
-    );
+    let parsed = parsed_notes(&json!({"type": "createVirtualSchema"}), &listing.skipped);
 
     assert!(tables_json.is_empty());
     assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 2);
@@ -1312,13 +1139,8 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(
-        &ctx,
-        props,
-        &PermissionSettings::Off,
-        DEFAULT_METADATA_READ_CONCURRENCY,
-        &rt,
-    )
+    let props = VsProperties::parse(props, Check::Lenient)?;
+    resolve_connection_config(&ctx, &props, DEFAULT_METADATA_READ_CONCURRENCY, &rt)
 }
 
 #[test]

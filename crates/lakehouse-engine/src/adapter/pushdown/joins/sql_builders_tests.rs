@@ -1,4 +1,3 @@
-use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
 use super::super::plan_broadcast_join;
 use super::super::planning::{
     JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
@@ -10,8 +9,9 @@ use super::super::tests::{
     self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
+use crate::adapter::Tuning;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
+use crate::scan::spec::{ColumnRef, ScanStorage, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
@@ -108,7 +108,8 @@ fn broadcast_join_declines_wrapped_projection() {
         render_broadcast_join(
             &parsed_pushdown(&ok_req),
             &detected,
-            &request_sides(&ok_req, &detected)
+            &request_sides(&ok_req, &detected),
+            ExasolVersion::Exasol2025
         )
         .expect("the control must not error")
         .is_some(),
@@ -129,7 +130,8 @@ fn broadcast_join_declines_wrapped_projection() {
         render_broadcast_join(
             &parsed_pushdown(&request),
             &detected,
-            &request_sides(&request, &detected)
+            &request_sides(&request, &detected),
+            ExasolVersion::Exasol2025
         )
         .expect("a wrapped projection is a clean decline, NOT an error")
         .is_none(),
@@ -149,7 +151,8 @@ fn broadcast_declines_on_a_declined_filter() {
         render_broadcast_join(
             &parsed_pushdown(&request),
             &detected,
-            &request_sides(&request, &detected)
+            &request_sides(&request, &detected),
+            ExasolVersion::Exasol2025
         )
         .expect("a declined filter is a clean decline, not an error")
         .is_none(),
@@ -175,6 +178,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        ExasolVersion::Exasol2025,
     )
     .expect("a type-declined filter is a clean decline, not an error");
     assert!(
@@ -193,6 +197,7 @@ fn broadcast_absent_filter_stays_eligible() {
         &parsed_pushdown(&absent_request),
         &absent_detected,
         &request_sides(&absent_request, &absent_detected),
+        ExasolVersion::Exasol2025,
     )
     .expect("an absent filter must not error")
     .expect("an absent filter must keep the broadcast plan");
@@ -880,6 +885,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        ExasolVersion::Exasol2025,
     )
     .expect("a VARCHAR LIKE subject must not error")
     .expect("a VARCHAR LIKE subject must keep the broadcast plan");
@@ -1278,7 +1284,7 @@ fn broadcast_carries_each_sides_own_storage() {
     let sql = build_broadcast_join_sql(
         &sides,
         &rendered,
-        &JoinScanRequestConfig {
+        &PushdownContext {
             connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
             ..two_scan_tuning()
         },
@@ -1530,6 +1536,7 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
             &parsed_pushdown(request),
             &detected_join(request),
             &request_sides(request, &detected_join(request)),
+            ExasolVersion::Exasol2025,
         )
         .expect("renders")
         .expect("an ordered equi-join renders");
@@ -1686,10 +1693,9 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         &pushdown_req,
         fan_out_spec,
         &emitting(&first_table_column_types(&request)),
-        &[vec![("s3://w/c-0.parquet".to_string(), 10u64)]],
-        "SCAN",
-        "DISTRIBUTE",
+        &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
         None,
+        ExasolVersion::Exasol2025,
     )
     .expect("the grouped qualified fallback must build");
     assert_eq!(
@@ -1807,10 +1813,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &grouped_req,
         fan_out_base(),
         &emitting_named(&column_types(&grouped_all), &["GK", "REGION"]),
-        &shards,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        &unqualified_shards(shards.to_vec()),
         None,
+        ExasolVersion::Exasol2025,
     )
     .expect("grouped decline wrapper must build");
     assert!(
@@ -1853,10 +1858,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &sg_req,
         fan_out_base(),
         &emitting_named(&column_types(&sg_all), &["A", "B"]),
-        &shards,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        &unqualified_shards(shards.to_vec()),
         None,
+        ExasolVersion::Exasol2025,
     )
     .expect("single-group Case 2/3 wrapper must build");
     assert!(
@@ -1969,12 +1973,10 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &request,
         &pushdown,
         &base,
-        None,
-        &[vec![FileEntry::new("s3://w/f-0.parquet", 10)]],
+        (None, None),
+        &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
         &emitting(&first_table_column_types(&request)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
+        ExasolVersion::Exasol2025,
     )
 }
 
@@ -2102,8 +2104,14 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     let (pushdown_req, legs) = planned(&request);
     let leg = emitting(&first_table_column_types(&request));
 
-    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[leg], LegColumns::Relations)
-        .expect("a renderable expression sort key must render, not decline");
+    let clauses = outer_wrapper_clauses(
+        &pushdown_req,
+        &legs,
+        &[leg],
+        LegColumns::Relations,
+        ExasolVersion::Exasol2025,
+    )
+    .expect("a renderable expression sort key must render, not decline");
 
     assert!(
         clauses
@@ -2141,6 +2149,7 @@ fn seam_trailing(request: &Json) -> Result<String, UdfError> {
         &legs,
         &vec![events; leg_count],
         LegColumns::Relations,
+        ExasolVersion::Exasol2025,
     )
     .map(|clauses| clauses.trailing)
 }
@@ -2359,9 +2368,13 @@ fn shared_names_broadcast_sql_over(
     labels: ResolvedJoinSide,
 ) -> Option<String> {
     let typed = request_typed(request, &[events, labels]);
-    let rendered =
-        render_broadcast_join(&parsed_pushdown(request), &detected_join(request), &typed)
-            .expect("a well-formed request renders without error")?;
+    let rendered = render_broadcast_join(
+        &parsed_pushdown(request),
+        &detected_join(request),
+        &typed,
+        ExasolVersion::Exasol2025,
+    )
+    .expect("a well-formed request renders without error")?;
     let sides = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
     build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
@@ -2486,6 +2499,7 @@ fn output_name_over_identifier_limit_declines_broadcast() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            ExasolVersion::Exasol2025,
         )
         .expect("an identifier-limit decline is not an error")
     };
@@ -2515,6 +2529,7 @@ fn self_join_renders_each_occurrence_as_its_own_relation() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            ExasolVersion::Exasol2025,
         )
         .expect("renders")
         .expect("a self-join is no reason to decline");
@@ -2539,6 +2554,7 @@ fn join_block_names_the_dimension_legs_alias() {
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_sides(&request, &detected_join(&request)),
+        ExasolVersion::Exasol2025,
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -2576,8 +2592,13 @@ fn aggregating_broadcast_plan(
         &parsed_pushdown(request),
         &detected_join(request),
         &sides,
-        u64::MAX,
-        &two_scan_tuning(),
+        &PushdownContext {
+            tuning: Tuning {
+                join_broadcast_max_bytes: u64::MAX,
+                ..two_scan_tuning().tuning
+            },
+            ..two_scan_tuning()
+        },
     )
     .expect("a declined broadcast is not an error")
 }

@@ -29,7 +29,8 @@ use crate::common::timestamp_precision::{
 };
 use crate::fixtures::{
     LAKEHOUSE_VS, TYPED_COLUMNS, emits_clause, events_table, explain_virtual_pushdown_sql,
-    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
+    lakehouse_vs, pushed_scan_spec, spec_u64, typed_table, vs_dim_table, vs_fact_table,
+    vs_lineitem_table,
 };
 
 /// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
@@ -1120,27 +1121,13 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// Scenario: createVirtualSchema adapterNotes omit the cluster node count
-/// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: Schema-level adapterNotes hold only the skipped tables and the catalog prefix
 /// Scenario: The Iceberg REST catalog prefix is recorded at schema level
 #[test]
-fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
+fn schema_notes_hold_the_skipped_tables_and_the_catalog_prefix() {
     const NOTES_VS: &str = "LHVS_NOTE_KEYS";
     const NOTES_DIRECT_CONN: &str = "LHVS_NOTE_KEYS_DIRECT";
-    const EXPECTED_KEYS: [&str; 12] = [
-        "CATALOG_PREFIX",
-        "DF_BATCH_SIZE",
-        "DF_TARGET_PARTITIONS",
-        "DF_THREADING_MODE",
-        "DF_THREADS_PER_UDF",
-        "INSTANCE_OVERHEAD_MB",
-        "JOIN_BROADCAST_MAX_BYTES",
-        "MEMORY_POOL_FRACTION",
-        "METADATA_READ_CONCURRENCY",
-        "PARALLELISM_FACTOR",
-        "S3_MAX_CONNECTIONS",
-        "SKIPPED_TABLES",
-    ];
+    const EXPECTED_KEYS: [&str; 2] = ["CATALOG_PREFIX", "SKIPPED_TABLES"];
 
     lakehouse_vs();
     let mut conn = exa_conn();
@@ -1152,8 +1139,8 @@ fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
         keys.sort_unstable();
         assert_eq!(
             keys, EXPECTED_KEYS,
-            "ADAPTER_NOTES after {after} must hold exactly the tuning keys, SKIPPED_TABLES, \
-             and CATALOG_PREFIX, with no node count or core count: {notes:?}"
+            "ADAPTER_NOTES after {after} must hold exactly SKIPPED_TABLES and CATALOG_PREFIX: \
+             {notes:?}"
         );
         assert_eq!(
             notes["CATALOG_PREFIX"], "",
@@ -1225,17 +1212,12 @@ fn adapter_detects_container_cpuset() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE));
 
-    let notes = schema_notes(&mut conn, CPU_PROBE_VS_NAME);
-    let detected: usize = notes
-        .get("DF_THREADS_PER_UDF")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry DF_THREADS_PER_UDF: {notes:?}"))
-        .parse()
-        .unwrap_or_else(|e| panic!("DF_THREADS_PER_UDF must be an integer ({e}): {notes:?}"));
+    let spec = pushed_scan_spec(&mut conn, CPU_PROBE_VS_NAME);
+    let detected = spec_u64(&spec, "df_threads_per_udf") as usize;
 
     assert_eq!(
         detected, cpuset_cores,
-        "the recorded DF_THREADS_PER_UDF is the core count the adapter VM \
+        "the pushed df_threads_per_udf is the core count the adapter VM \
          detected; it must equal the number of CPUs in the \
          container's CPU set ({cpuset_cores}), and so be neither the \
          undetectable-platform fallback of 1 nor the host's {host_cores} cores"

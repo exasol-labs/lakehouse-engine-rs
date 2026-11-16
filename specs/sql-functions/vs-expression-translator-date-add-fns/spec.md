@@ -10,8 +10,9 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * The scan holds a `TIMESTAMP(7)` to `TIMESTAMP(9)` value as an Arrow nanosecond timestamp, whose range spans 1677-09-21 00:12:43.145224192 to 2262-04-11 23:47:16.854775807. A microsecond timestamp drops its digits below a microsecond, and spans Exasol's whole range.
 * A declined expression takes its path's fallback (`pushdown-types/pushdown-planning-scan-text-conversion`), so Exasol computes it.
 * Exasol sends `COALESCE` and `NULLIF` as CASE expressions.
-* Exasol 8 and 2025 give a CASE, `GREATEST`, or `LEAST` over only dates a DATE, and one over a `TIMESTAMP(p)` and a `TIMESTAMP(q)` a `TIMESTAMP(max(p, q))`. Over a DATE and a TIMESTAMP, Exasol 2025 gives the TIMESTAMP's type and Exasol 8 the first branch's type.
-* Exasol 2025 types `TO_TIMESTAMP` as `TIMESTAMP(9)`, and Exasol 8 as `TIMESTAMP(3)`.
+* Exasol 8 and 2025 give a CASE, `GREATEST`, or `LEAST` over only dates a DATE, and one over a `TIMESTAMP(p)` and a `TIMESTAMP(q)` a `TIMESTAMP(max(p, q))`. Over a DATE and a TIMESTAMP, Exasol 2025 gives the TIMESTAMP's type and Exasol 8 the type of the first branch that is not NULL.
+* Exasol 2025 types `TO_TIMESTAMP` over text as `TIMESTAMP(9)`, over a DATE as `TIMESTAMP(0)`, and over a `TIMESTAMP(p)` as `TIMESTAMP(p)`. Exasol 8 has only `TIMESTAMP(3)`, so it types every TIMESTAMP result, a TIMESTAMP literal, and `ADD_HOURS` and `ADD_MINUTES` over a DATE as `TIMESTAMP(3)`, and cuts the digits beyond the millisecond.
+* Exasol 2026.1.1 types each of these forms as Exasol 2025.1.16 does. The pushdown reads the version from its UDF context: a major below 2025 is Exasol 8, any other numeric major is Exasol 2025.
 
 ## Scenarios
 
@@ -20,11 +21,26 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 * *GIVEN* a scan expression that contains a DATE or `TIMESTAMP(p)` column, a DATE or TIMESTAMP literal, a CAST to DATE or `TIMESTAMP(p)`, an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` call, a `DATE_TRUNC`, `TO_DATE`, or `TO_TIMESTAMP` call, or a `MIN`, `MAX`, CASE, `COALESCE`, `GREATEST`, `LEAST`, or `NULLIF` over one of them
 * *WHEN* `render_scan_expression` types the expression
 * *THEN* the typed pass SHALL derive DATE for a DATE column, a DATE literal, a CAST to DATE, `TO_DATE`, and `ADD_DAYS` or `ADD_WEEKS` over a DATE
-* *AND* it SHALL derive `TIMESTAMP(p)` for a `TIMESTAMP(p)` column, a TIMESTAMP literal that spells `p` fractional-second digits, trailing zeros included, a CAST to `TIMESTAMP(p)`, and any of the four functions over a `TIMESTAMP(p)`, and `TIMESTAMP(0)` for `ADD_HOURS` or `ADD_MINUTES` over a DATE
+* *AND* it SHALL derive `TIMESTAMP(p)` for a `TIMESTAMP(p)` column, a CAST to `TIMESTAMP(p)`, and any of the four functions over a `TIMESTAMP(p)`
 * *AND* `MIN`, `MAX`, and `DATE_TRUNC` SHALL keep the type of their DATE or TIMESTAMP argument, and `NULLIF` the type of its first argument
 * *AND* a CASE, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps SHALL take the type both Exasol versions give it, NULL branches aside, and the scan SHALL compute its value at that type's precision
-* *AND* one over a DATE and a TIMESTAMP, `TO_TIMESTAMP`, and a `TIMESTAMP WITH LOCAL TIME ZONE` value SHALL get no DATE or TIMESTAMP type, because Exasol types the first two differently by version
+* *AND* a `TIMESTAMP WITH LOCAL TIME ZONE` value SHALL get no DATE or TIMESTAMP type
 * *AND* a DATE or TIMESTAMP value converted to text SHALL still decline, because Exasol formats both by session settings (`pushdown-types/pushdown-planning-scan-text-conversion`)
+
+### Scenario: The typed pass derives each version's type for a version-dependent date form
+
+* *GIVEN* a scan expression that is a TIMESTAMP literal, `TO_TIMESTAMP`, `ADD_HOURS` or `ADD_MINUTES` over a DATE, or a CASE, `COALESCE`, `GREATEST`, or `LEAST` over a DATE and a TIMESTAMP
+* *WHEN* `render_scan_expression` types it on Exasol 8 or Exasol 2025
+* *THEN* on Exasol 2025 the typed pass SHALL derive `TIMESTAMP(p)` for a literal that spells `p` fractional-second digits, trailing zeros included, `TIMESTAMP(0)` for `ADD_HOURS` or `ADD_MINUTES` over a DATE, the `TO_TIMESTAMP` type of the Background, and the TIMESTAMP's type for a branch form
+* *AND* on Exasol 8 it SHALL derive `TIMESTAMP(3)` for each of them except a branch form, which takes the type of its first branch that is not NULL
+* *AND* the scan SHALL cast each other branch of a branch form to the derived type
+
+### Scenario: An unknown Exasol version gives no form a version-dependent exact type
+
+* *GIVEN* a pushdown whose UDF context reports a database version with no numeric major
+* *WHEN* `render_scan_expression` types a form whose type differs between Exasol 8 and 2025 (Background)
+* *THEN* the typed pass SHALL derive an exact type only where both versions agree, such as `TIMESTAMP(3)` for a literal with 3 fractional digits
+* *AND* a CASE over a DATE and a TIMESTAMP SHALL get no type, and `TO_TIMESTAMP`, a literal with other than 3 fractional digits, and `ADD_HOURS` or `ADD_MINUTES` over a DATE SHALL get no precision
 
 ### Scenario: ADD_DAYS and ADD_WEEKS over a DATE return a DATE from the scan
 
@@ -94,7 +110,7 @@ The scan computes Exasol's `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTE
 
 ### Scenario: A form the scan cannot match runs in Exasol
 
-* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a derived DATE or TIMESTAMP type, such as `TO_TIMESTAMP` or a CASE over a DATE and a TIMESTAMP, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
+* *GIVEN* an `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` node whose first argument is a `TIMESTAMP WITH LOCAL TIME ZONE` value, text, a NULL literal, or an expression without a derived DATE or TIMESTAMP type, such as `TO_TIMESTAMP` on an unknown Exasol version, or whose count is text, a DATE, or a TIMESTAMP, or whose count is a numeric literal with a magnitude above 1e10
 * *WHEN* `render_scan_expression` processes the node
 * *THEN* `render_scan_expression` SHALL return `Err`, and the expression SHALL take its path's fallback, so Exasol computes the function
 * *AND* the query SHALL return the rows native Exasol returns

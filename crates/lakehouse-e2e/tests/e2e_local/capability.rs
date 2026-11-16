@@ -3327,18 +3327,56 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT MAX(COALESCE(C_DOUBLE, 1E300)) + 1 FROM {T}",
         PathCheck::Wrapper,
     ),
+    // Each form below takes the type of the Exasol version it runs on.
     (
         "SELECT YEAR(MAX(CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END)) FROM {T}",
-        PathCheck::Wrapper,
+        PathCheck::Split,
     ),
     (
         "SELECT COUNT(*) FROM {T} GROUP BY CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END",
-        PathCheck::Wrapper,
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY CASE WHEN ID > 6 THEN C_TS ELSE C_DATE END",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY GREATEST(C_DATE, C_TS)",
+        PathCheck::Split,
     ),
     (
         "SELECT COUNT(*) FROM {T} GROUP BY TO_TIMESTAMP(CASE WHEN ID > 2 \
          THEN '2024-01-01 10:00:00' ELSE '1960-01-01 00:00:00' END, 'YYYY-MM-DD HH24:MI:SS')",
-        PathCheck::Wrapper,
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY TO_TIMESTAMP(CASE WHEN ID > 2 \
+         THEN '2024-01-01 10:00:00.123456' ELSE '1960-01-01 00:00:00.999999' END, \
+         'YYYY-MM-DD HH24:MI:SS.FF6')",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT C_BOOL, YEAR(MAX(ADD_HOURS(C_DATE, 1))) FROM {T} GROUP BY C_BOOL",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY ADD_MINUTES(C_DATE, ID)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY CASE WHEN ID > 2 THEN C_TS \
+         ELSE TIMESTAMP '1960-01-01 00:00:00.123456' END",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT MAX(CASE WHEN ID > 2 THEN C_DATE \
+         ELSE TIMESTAMP '1960-01-01 10:00:00.123456' END) FROM {T}",
+        PathCheck::Split,
+    ),
+    ("SELECT SUM(SECOND(C_DATE)) + 1 FROM {T}", PathCheck::Split),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY SECOND(C_DATE)",
+        PathCheck::Split,
     ),
 ];
 
@@ -3394,6 +3432,7 @@ fn char_cast_cases() -> Vec<(String, Expect)> {
 /// Scenario: An unprojected bare-column group key takes its column type
 /// Scenario: An unprojected group key with a derived exact type keeps the split
 /// Scenario: An unprojected group key without an exact type declines the split
+/// Scenario: A form whose type differs by Exasol version takes the type of the version it runs on
 /// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]
 fn e2e_split_aggregate_columns_match_native_oracle() {

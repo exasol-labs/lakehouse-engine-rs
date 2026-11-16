@@ -1,4 +1,5 @@
 use super::*;
+use crate::ExasolVersion;
 use crate::test_support::*;
 use crate::{exact_type, render_expression_exasol, render_scan_expression};
 
@@ -98,7 +99,12 @@ fn session_free_calls_render_to_the_scan_functions() {
         ),
     ];
     for (call, sql) in cases {
-        assert_eq!(render_scan_expression(&call, &columns()).unwrap().sql, sql);
+        assert_eq!(
+            render_scan_expression(&call, &columns(), ExasolVersion::Exasol2025)
+                .unwrap()
+                .sql,
+            sql
+        );
     }
 }
 
@@ -154,7 +160,7 @@ fn calls_the_scan_cannot_compute_decline() {
     ];
     for (case, call) in cases {
         assert!(
-            render_scan_expression(&call, &columns()).is_err(),
+            render_scan_expression(&call, &columns(), ExasolVersion::Exasol2025).is_err(),
             "{case} must decline"
         );
     }
@@ -185,7 +191,7 @@ fn the_returning_type_is_the_exact_type() {
         null(),
     );
     assert_eq!(
-        exact_type(&call, &columns()),
+        exact_type(&call, &columns(), ExasolVersion::Exasol2025),
         Some(ExasolType::decimal(18, 0))
     );
 }

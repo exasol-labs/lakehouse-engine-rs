@@ -1,5 +1,6 @@
 use super::test_support::*;
 use super::*;
+use crate::adapter::Tuning;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
@@ -659,25 +660,17 @@ fn dispatch_with(
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
         &single_table_emission(request, &pushdown, col_types)?,
         scan_for(col_types, &pushdown_req),
-        filter,
-        declined_filter,
+        (filter, declined_filter),
         limit,
         order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        logical_schema,
-        Vec::new(),
-        Vec::new(),
-        scan_storage,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
+        dispatch_context().common_spec(
+            "s3://warehouse/db/events".to_string(),
+            logical_schema,
+            Vec::new(),
+            Vec::new(),
+            scan_storage.clone(),
+        ),
     )
 }
 
@@ -1669,25 +1662,17 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection,
         &emitting(&columns),
         scan_for(&columns, &pushdown_req),
-        None,
-        None,
+        (None, None),
         None,
         false,
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        vec!["LETTER".to_string()],
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
+        dispatch_context().common_spec(
+            "s3://warehouse/db/events".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec!["LETTER".to_string()],
+            sample_scan_storage(),
+        ),
     )
     .expect("build_dispatch_sql must succeed for the EVENTS fixture");
     let sql = result["sql"]
@@ -1733,19 +1718,14 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
             exa_type: ExasolType::decimal(20, 0),
         }],
     );
-    let tuning = super::joins::JoinScanRequestConfig {
-        cluster_nodes: 1,
-        parallelism_factor: 1,
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
-        binary_as_string: false,
-        connection: &super::test_support::TEST_CONNECTION,
-        udf_name: SCAN_UDF_NAME,
-        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
+    let base = test_context();
+    let tuning = PushdownContext {
+        tuning: Tuning {
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+            ..base.tuning
+        },
+        ..base
     };
     let join_sql = super::joins::build_broadcast_join_sql(&sides, &rendered, &tuning)
         .expect("selecting the wire storage must succeed")

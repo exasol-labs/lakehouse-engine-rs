@@ -15,6 +15,7 @@ use crate::scalar_functions::{
     DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
 use crate::timestamp::{TimestampLiteral, TimestampUnit};
+use crate::version::ExasolVersion;
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
@@ -42,7 +43,7 @@ pub(crate) enum Partial {
     Integer,
     /// DOUBLE or DECIMAL(p,s): a number not proven to be an integer.
     Number,
-    /// TIMESTAMP of a precision that differs by Exasol version.
+    /// TIMESTAMP of a precision the pass does not prove.
     Timestamp,
 }
 
@@ -97,10 +98,17 @@ impl Inferred {
         }
     }
 
-    /// The type of a CASE, `GREATEST`, or `LEAST` over these branches.
-    fn union(self, other: Self) -> Self {
+    /// The type of a CASE, `GREATEST`, or `LEAST` over these branches, `self` first.
+    fn union(self, other: Self, version: ExasolVersion) -> Self {
         let exact = match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => return ty,
+            (DATE, timestamp) | (timestamp, DATE) if timestamp.is_timestamp() => {
+                return match version {
+                    ExasolVersion::Exasol8 => self,
+                    ExasolVersion::Exasol2025 => timestamp,
+                    ExasolVersion::Unknown => Self::Unknown,
+                };
+            }
             (Self::Exact(a), Self::Exact(b)) => unified_type(a, b),
             _ => None,
         };
@@ -117,8 +125,8 @@ impl Inferred {
     }
 }
 
-/// Exasol's type for two branches brought to one type, where a live check proved it. A DATE with
-/// a TIMESTAMP has none: Exasol 2025 gives the TIMESTAMP's type, Exasol 8 the first branch's.
+/// Exasol's type for two branches brought to one type, where a live check proved it on every
+/// version. [`Inferred::union`] types a DATE with a TIMESTAMP per version.
 fn unified_type(a: ExasolType, b: ExasolType) -> Option<ExasolType> {
     match (a, b) {
         (ExasolType::Boolean, ExasolType::Boolean) | (ExasolType::Date, ExasolType::Date) => {
@@ -156,28 +164,53 @@ pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
     ExasolType::decimal(2 + fraction, fraction)
 }
 
+/// A TIMESTAMP that Exasol 2025 types with `precision` digits. Exasol 8 types every TIMESTAMP with
+/// 3, so an unknown version proves only that one.
+fn derived_timestamp(precision: u8, version: ExasolVersion) -> Inferred {
+    let exasol_2025 = ExasolType::timestamp(precision);
+    match version {
+        ExasolVersion::Exasol8 => Inferred::Exact(ExasolType::BARE_TIMESTAMP),
+        ExasolVersion::Exasol2025 => Inferred::Exact(exasol_2025),
+        ExasolVersion::Unknown if exasol_2025 == ExasolType::BARE_TIMESTAMP => {
+            Inferred::Exact(exasol_2025)
+        }
+        ExasolVersion::Unknown => Inferred::Partial(Partial::Timestamp),
+    }
+}
+
 /// What the scan computes for a one-argument `SECOND(x)` or an `EXTRACT(SECOND FROM x)`.
 #[derive(Clone, Copy)]
 enum Seconds {
     /// The seconds of a `TIMESTAMP(p)` with its first p fractional digits.
     OfTimestamp { fraction: u8 },
-    /// 0, which Exasol types `DECIMAL(2,0)` on 2025.1 and `DECIMAL(5,3)` on 8.29.
-    OfDate,
+    /// 0, which Exasol 8 types as a bare TIMESTAMP's seconds and Exasol 2025 as `DECIMAL(2,0)`.
+    OfDate(ExasolVersion),
 }
 
 impl Seconds {
-    /// A DATE's seconds are no integer for the text rule: their text form differs by version.
-    fn inferred(self) -> Inferred {
+    /// `None` for a DATE on an unknown version.
+    fn fraction(self) -> Option<u8> {
         match self {
-            Self::OfTimestamp { fraction } => Inferred::Exact(seconds_type(fraction)),
-            Self::OfDate => Inferred::Partial(Partial::Number),
+            Self::OfTimestamp { fraction } => Some(fraction),
+            Self::OfDate(ExasolVersion::Exasol8) => Some(TimestampUnit::Millisecond.digits()),
+            Self::OfDate(ExasolVersion::Exasol2025) => Some(0),
+            Self::OfDate(ExasolVersion::Unknown) => None,
         }
     }
 
+    /// Without a fraction they are no integer for the text rule: their text differs by version.
+    fn inferred(self) -> Inferred {
+        self.fraction()
+            .map_or(Inferred::Partial(Partial::Number), |fraction| {
+                Inferred::Exact(seconds_type(fraction))
+            })
+    }
+
     fn node(self, argument: Json) -> Json {
-        let fraction = match self {
-            Self::OfTimestamp { fraction } => fraction,
-            Self::OfDate => 0,
+        let fraction = self.fraction().unwrap_or(0);
+        let argument = match self {
+            Self::OfDate(_) if fraction > 0 => cast_node(ExasolType::timestamp(fraction), argument),
+            _ => argument,
         };
         serde_json::json!({"type": SECOND_NODE, SECOND_FRACTION: fraction, "arguments": [argument]})
     }
@@ -200,7 +233,7 @@ enum SecondCall {
     Of(Seconds),
 }
 
-fn second_call(node: &Json, children: &ChildTypes) -> SecondCall {
+fn second_call(node: &Json, children: &ChildTypes, version: ExasolVersion) -> SecondCall {
     let (name, extract) = match kind(node) {
         "function_scalar_extract" => (
             node.get("toExtract")
@@ -222,7 +255,7 @@ fn second_call(node: &Json, children: &ChildTypes) -> SecondCall {
                 fraction: *precision,
             })
         }
-        [Inferred::Exact(ExasolType::Date)] if !extract => SecondCall::Of(Seconds::OfDate),
+        [Inferred::Exact(ExasolType::Date)] if !extract => SecondCall::Of(Seconds::OfDate(version)),
         [_] => SecondCall::Unsupported,
         _ => SecondCall::NotSecond,
     }
@@ -285,7 +318,7 @@ impl ScalarFunction {
         positions.into_iter().filter(|i| *i < arg_count).collect()
     }
 
-    fn result_type(self, args: &[Inferred]) -> Inferred {
+    fn result_type(self, args: &[Inferred], version: ExasolVersion) -> Inferred {
         let partial = Inferred::Partial;
         match self.result {
             ResultRule::Text => partial(Partial::Text),
@@ -300,11 +333,11 @@ impl ScalarFunction {
                 partial(Partial::Number)
             }
             ResultRule::FirstArgument => args.first().copied().unwrap_or(Inferred::Unknown),
-            ResultRule::Unified => union_of(args),
+            ResultRule::Unified => union_of(args, version),
             ResultRule::DateAddition(date_result) => match args.first() {
                 Some(&DATE) => match date_result {
                     DateResult::Date => DATE,
-                    DateResult::Timestamp => Inferred::Exact(ExasolType::timestamp(0)),
+                    DateResult::Timestamp => derived_timestamp(0, version),
                 },
                 Some(&first) if first.timestamp_precision().is_some() => first,
                 _ => Inferred::Unknown,
@@ -314,7 +347,17 @@ impl ScalarFunction {
                 _ => Inferred::Unknown,
             },
             ResultRule::Date => DATE,
-            ResultRule::Timestamp => partial(Partial::Timestamp),
+            ResultRule::Timestamp => match args.first().copied() {
+                Some(DATE) => derived_timestamp(0, version),
+                Some(source) => match source.timestamp_precision() {
+                    Some(precision) => derived_timestamp(precision, version),
+                    None if source.is_text() => {
+                        derived_timestamp(TimestampUnit::Nanosecond.digits(), version)
+                    }
+                    None => partial(Partial::Timestamp),
+                },
+                None => partial(Partial::Timestamp),
+            },
             ResultRule::Arithmetic | ResultRule::NumberOverNumbers | ResultRule::Other => {
                 Inferred::Unknown
             }
@@ -387,20 +430,28 @@ fn cast_from_text(source: &Json, ty: Inferred, target: ExasolType) -> Result<(),
 }
 
 /// The type Exasol gives `node`, where the typed pass proves it. `None` leaves the type to Exasol.
-pub fn exact_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
-    infer_type(node, columns).exact()
+pub fn exact_type(
+    node: &Json,
+    columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
+) -> Option<ExasolType> {
+    infer_type(node, columns, version).exact()
 }
 
 /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent
 /// it, because the scan's rewrites keep Exasol's semantics.
-pub(crate) fn infer_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Inferred {
+pub(crate) fn infer_type(
+    node: &Json,
+    columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
+) -> Inferred {
     if let Some(ty) = leaf_type(node, columns) {
         return ty;
     }
     let Ok(children) = ChildTypes::collect(node, |_, _, child| {
-        Ok::<_, Infallible>(infer_type(child, columns))
+        Ok::<_, Infallible>(infer_type(child, columns, version))
     });
-    node_type(node, &children)
+    node_type(node, &children, version)
 }
 
 /// Rewrites `node` for the DataFusion dialect and derives its type, post-order. Text passes only
@@ -408,21 +459,22 @@ pub(crate) fn infer_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Inferre
 pub(crate) fn type_scan_tree(
     node: &Json,
     columns: &dyn ColumnTypeLookup,
+    version: ExasolVersion,
 ) -> Result<(Json, Inferred), UdfError> {
     if let Some(ty) = leaf_type(node, columns) {
         return Ok((node.clone(), ty));
     }
     let mut out = node.clone();
     let children = ChildTypes::collect(node, |field, index, child| {
-        let (rewritten, ty) = type_scan_tree(child, columns)?;
+        let (rewritten, ty) = type_scan_tree(child, columns, version)?;
         match index {
             Some(i) => out[field][i] = rewritten,
             None => out[field] = rewritten,
         }
         Ok(ty)
     })?;
-    let ty = node_type(node, &children);
-    rewrite_for_scan(node, &mut out, &children, ty)?;
+    let ty = node_type(node, &children, version);
+    rewrite_for_scan(node, &mut out, &children, ty, version)?;
     Ok((out, ty))
 }
 
@@ -500,8 +552,8 @@ impl ChildTypes {
 }
 
 /// Exasol's type of a non-column `node` whose children are typed.
-fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
-    match second_call(node, children) {
+fn node_type(node: &Json, children: &ChildTypes, version: ExasolVersion) -> Inferred {
+    match second_call(node, children, version) {
         SecondCall::Of(seconds) => return seconds.inferred(),
         SecondCall::Unsupported => return Inferred::Unknown,
         SecondCall::NotSecond => {}
@@ -513,19 +565,19 @@ fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
         "literal_double" => Inferred::Exact(ExasolType::DoublePrecision),
         "literal_exactnumeric" => exact_numeric_type(node),
         "literal_date" => DATE,
-        "literal_timestamp" => timestamp_literal_type(node),
+        "literal_timestamp" => timestamp_literal_type(node, version),
         k if k.starts_with("predicate_") => BOOLEAN,
         "function_scalar_extract" => node
             .get("toExtract")
             .and_then(Json::as_str)
             .map_or(Inferred::Unknown, |field| {
-                typed_function(field).result_type(&[])
+                typed_function(field).result_type(&[], version)
             }),
-        "function_scalar_case" => union_of(children.of("results")),
+        "function_scalar_case" => union_of(children.of("results"), version),
         "function_scalar_json_value" => json_value_type(node),
         _ if is_cast(node) => cast_target(node).map_or(Inferred::Unknown, Inferred::Exact),
         "function_scalar" => {
-            typed_function(&upper_name(node)).result_type(children.of("arguments"))
+            typed_function(&upper_name(node)).result_type(children.of("arguments"), version)
         }
         "function_aggregate" => aggregate_type(&upper_name(node), children.of("arguments")),
         _ => Inferred::Unknown,
@@ -539,8 +591,9 @@ fn rewrite_for_scan(
     out: &mut Json,
     children: &ChildTypes,
     ty: Inferred,
+    version: ExasolVersion,
 ) -> Result<(), UdfError> {
-    match second_call(node, children) {
+    match second_call(node, children, version) {
         SecondCall::Of(seconds) => {
             *out = seconds.node(out["arguments"][0].take());
             return Ok(());
@@ -614,15 +667,13 @@ fn exact_numeric_type(node: &Json) -> Inferred {
         })
 }
 
-fn timestamp_literal_type(node: &Json) -> Inferred {
+fn timestamp_literal_type(node: &Json, version: ExasolVersion) -> Inferred {
     let precision = node
         .get("value")
         .and_then(Json::as_str)
         .and_then(|value| u8::try_from(TimestampLiteral(value).type_precision()).ok());
     match precision {
-        Some(p) if p <= TimestampUnit::Nanosecond.digits() => {
-            Inferred::Exact(ExasolType::timestamp(p))
-        }
+        Some(p) if p <= TimestampUnit::Nanosecond.digits() => derived_timestamp(p, version),
         _ => Inferred::Partial(Partial::Timestamp),
     }
 }
@@ -1074,22 +1125,26 @@ fn unify_branches(
     unified: Inferred,
 ) -> Result<(), UdfError> {
     refuse_text_among_others(node, branches)?;
-    if let Some(precision) = unified.timestamp_precision() {
-        let target = ExasolType::timestamp(TimestampUnit::holding(precision).digits());
-        for (i, branch) in branches.iter().enumerate() {
-            if *branch != Inferred::Null {
-                out[field][i] = cast_node(target, out[field][i].take());
-            }
+    let target = |branch: Inferred| match unified.exact() {
+        Some(ExasolType::Timestamp { precision }) => (branch != Inferred::Null)
+            .then(|| ExasolType::timestamp(TimestampUnit::holding(precision).digits())),
+        // Exasol 8 brings a TIMESTAMP after a DATE to the DATE.
+        Some(ExasolType::Date) => branch.is_timestamp().then_some(ExasolType::Date),
+        _ => None,
+    };
+    for (i, branch) in branches.iter().enumerate() {
+        if let Some(target) = target(*branch) {
+            out[field][i] = cast_node(target, out[field][i].take());
         }
     }
     Ok(())
 }
 
-fn union_of(branches: &[Inferred]) -> Inferred {
+fn union_of(branches: &[Inferred], version: ExasolVersion) -> Inferred {
     branches
         .iter()
         .copied()
-        .reduce(Inferred::union)
+        .reduce(|first, other| first.union(other, version))
         .unwrap_or(Inferred::Unknown)
 }
 

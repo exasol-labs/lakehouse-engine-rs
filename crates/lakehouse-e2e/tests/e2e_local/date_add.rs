@@ -162,19 +162,11 @@ fn derived_argument_cases() -> Vec<DateAddCase> {
         "SELECT ID FROM {T} WHERE ADD_DAYS(CASE WHEN ID > 2 THEN ADD_HOURS(C_DATE, 1) ELSE ADD_MINUTES(C_DATE, 1) END, 1) >= TIMESTAMP '2024-01-04 01:00:00.5'",
         "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) < TIMESTAMP '2024-01-04 00:00:00.5'",
         "SELECT ID FROM {T} WHERE ADD_DAYS(C_DATE, 1) = TIMESTAMP '2024-01-04 00:00:00.5'",
-    ]
-    .map(|query| DateAddCase::new(query, Has(SCAN_FUNCTION)))
-    .into()
-}
-
-fn declined_cases() -> Vec<DateAddCase> {
-    [
-        // Exasol 2025 brings a DATE and a TIMESTAMP to the TIMESTAMP, Exasol 8 to the first branch.
         "SELECT ID, ADD_DAYS(CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END, 1) FROM {T}",
         "SELECT ID, ADD_HOURS(LEAST(C_DATE, C_TS), 1) FROM {T}",
         "SELECT ID, ADD_HOURS(TO_TIMESTAMP(CASE WHEN ID > 2 THEN '2024-01-01 10:00:00' ELSE '1960-01-01 00:00:00' END, 'YYYY-MM-DD HH24:MI:SS'), 1) FROM {T}",
     ]
-    .map(|query| DateAddCase::new(query, Lacks(SCAN_FUNCTION)))
+    .map(|query| DateAddCase::new(query, Has(SCAN_FUNCTION)))
     .into()
 }
 
@@ -215,6 +207,7 @@ fn mismatch(conn: &mut ExaConn, table: &str, case: &DateAddCase, expect: Expect)
 }
 
 /// Scenario: The typed pass tells a DATE from a TIMESTAMP
+/// Scenario: The typed pass derives each version's type for a version-dependent date form
 /// Scenario: ADD_DAYS and ADD_WEEKS over a DATE return a DATE from the scan
 /// Scenario: ADD_HOURS and ADD_MINUTES over a DATE return a timestamp from the scan
 /// Scenario: The four functions over a TIMESTAMP keep its fractional seconds in the scan
@@ -234,7 +227,6 @@ fn date_add_functions_match_native() {
         .into_iter()
         .chain(finer_literal_cases())
         .chain(derived_argument_cases())
-        .chain(declined_cases())
         .map(|case| (case, Expect::Rows));
     let errors = error_cases().into_iter().map(|case| (case, Expect::Error));
     let cases: Vec<_> = rows.chain(errors).collect();

@@ -38,6 +38,10 @@ const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 8] = [
     ("JOIN_BROADCAST_MAX_BYTES", "1", "18446744073709551615"),
 ];
 
+fn strict(props: &Json) -> Result<CheckedProperties, UdfError> {
+    checked_values(props, Check::Strict)
+}
+
 fn props(pairs: &[(&str, &str)]) -> Json {
     Json::Object(
         pairs
@@ -48,7 +52,7 @@ fn props(pairs: &[(&str, &str)]) -> Json {
 }
 
 fn message(pairs: &[(&str, &str)]) -> String {
-    match check_properties(&props(pairs)) {
+    match strict(&props(pairs)) {
         Err(UdfError::User(message)) => message,
         other => panic!("{pairs:?} must fail with a user error, got {other:?}"),
     }
@@ -96,7 +100,7 @@ fn every_known_name_passes() {
         "the adapter must accept exactly the 22 names of vs-properties/property-name-validation"
     );
 
-    check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
+    strict(&props(&valid_values)).expect("every known name with a valid value passes");
 }
 
 #[test]
@@ -157,7 +161,7 @@ fn the_suggestion_compares_without_regard_to_case() {
 fn whole_number_tuning_values_accept_the_minimum_and_the_maximum() {
     for (name, min, max) in WHOLE_NUMBER_RANGES {
         for value in [min, max] {
-            check_properties(&props(&[(name, value)]))
+            strict(&props(&[(name, value)]))
                 .unwrap_or_else(|e| panic!("{name} = {value} must pass: {e:?}"));
         }
     }
@@ -165,7 +169,7 @@ fn whole_number_tuning_values_accept_the_minimum_and_the_maximum() {
 
 #[test]
 fn whole_number_tuning_values_return_their_typed_value() {
-    let tuning = check_properties(&props(&[
+    let tuning = strict(&props(&[
         ("PARALLELISM_FACTOR", "255"),
         ("DATAFUSION_THREADS_PER_UDF", "65535"),
         ("DATAFUSION_TARGET_PARTITIONS", "12"),
@@ -197,7 +201,7 @@ fn whole_number_tuning_values_return_their_typed_value() {
 
 #[test]
 fn absent_tuning_properties_return_none() {
-    let checked = check_properties(&props(&[("NAMESPACE", "sales")])).expect("passes");
+    let checked = strict(&props(&[("NAMESPACE", "sales")])).expect("passes");
 
     assert_eq!(checked, CheckedProperties::default());
 }
@@ -211,7 +215,7 @@ fn an_empty_or_null_value_counts_as_absent() {
         "DATAFUSION_BATCH_SIZE": null,
     });
 
-    let checked = check_properties(&props).expect("an empty or null value is never checked");
+    let checked = strict(&props).expect("an empty or null value is never checked");
 
     assert_eq!(checked, CheckedProperties::default());
 }
@@ -249,7 +253,7 @@ fn whole_number_tuning_values_outside_the_range_name_the_range() {
 fn memory_pool_fraction_accepts_only_a_number_above_zero_and_at_most_one() {
     let expected = "a number greater than 0 and at most 1";
     for value in ["0.0001", "0.6", "1", "1.0"] {
-        check_properties(&props(&[("MEMORY_POOL_FRACTION", value)]))
+        strict(&props(&[("MEMORY_POOL_FRACTION", value)]))
             .unwrap_or_else(|e| panic!("{value} must pass: {e:?}"));
     }
     for value in ["0", "1.5", "60", "-0.5", "NaN", "inf", "abc"] {
@@ -265,7 +269,7 @@ fn memory_pool_fraction_accepts_only_a_number_above_zero_and_at_most_one() {
 #[test]
 fn threading_mode_accepts_auto_or_fixed_in_any_case() {
     for value in ["AUTO", "FIXED", "auto", "fixed", "Fixed"] {
-        check_properties(&props(&[("DATAFUSION_THREADING_MODE", value)]))
+        strict(&props(&[("DATAFUSION_THREADING_MODE", value)]))
             .unwrap_or_else(|e| panic!("{value} must pass: {e:?}"));
     }
     for value in ["garbage", "FIXED ", "1"] {
@@ -286,7 +290,7 @@ fn threading_mode_accepts_auto_or_fixed_in_any_case() {
 fn boolean_properties_accept_true_or_false_in_any_case() {
     for name in ["ALLOW_HTTP", "BINARY_AS_STRING"] {
         for value in ["true", "FALSE", "True", "false"] {
-            check_properties(&props(&[(name, value)]))
+            strict(&props(&[(name, value)]))
                 .unwrap_or_else(|e| panic!("{name}={value} must pass: {e:?}"));
         }
         for value in ["yes", "1", "t"] {
@@ -300,27 +304,27 @@ fn boolean_properties_accept_true_or_false_in_any_case() {
     }
 }
 
+/// A pushdown reads a rejected boolean as `false`, so a schema persisted before the check plans.
 #[test]
-fn binary_as_string_resolves_true_only_for_a_true_value() {
-    assert!(resolve_binary_as_string(&props(&[(
-        "BINARY_AS_STRING",
-        "True"
-    )])));
-    for value in ["false", "", "yes"] {
-        assert!(
-            !resolve_binary_as_string(&props(&[("BINARY_AS_STRING", value)])),
-            "{value}"
-        );
+fn a_lenient_read_takes_true_only_for_a_true_value() {
+    let lenient = |name: &str, value: &str| {
+        checked_values(&props(&[(name, value)]), Check::Lenient)
+            .expect("a lenient read never fails")
+    };
+    for name in ["ALLOW_HTTP", "BINARY_AS_STRING"] {
+        let read = |value| {
+            let checked = lenient(name, value);
+            if name == "ALLOW_HTTP" {
+                checked.allow_http
+            } else {
+                checked.binary_as_string
+            }
+        };
+        assert!(read("True"), "{name}");
+        for value in ["false", "", "yes"] {
+            assert!(!read(value), "{name}={value}");
+        }
     }
-    assert!(!resolve_binary_as_string(&props(&[])));
-}
-
-#[test]
-fn resolve_allow_http_accepts_true_or_false_and_treats_a_rejected_value_as_false() {
-    assert!(resolve_allow_http(&props(&[("ALLOW_HTTP", "True")])));
-    assert!(!resolve_allow_http(&props(&[("ALLOW_HTTP", "false")])));
-    assert!(!resolve_allow_http(&props(&[("ALLOW_HTTP", "yes")])));
-    assert!(!resolve_allow_http(&props(&[])));
 }
 
 #[test]
@@ -456,7 +460,7 @@ fn s3_max_connections_auto_and_zero_are_rejected() {
 
 #[test]
 fn values_the_owning_modules_check_are_not_checked_here() {
-    check_properties(&props(&[
+    strict(&props(&[
         ("CATALOG_KIND", "NOPE"),
         ("PERMISSION_CHECK", "NOPE"),
         ("USER_MAPPING", "{{"),
@@ -486,18 +490,18 @@ fn unadvertised_capability_entries_are_reported_once_each_with_a_suggestion() {
 #[test]
 fn every_advertised_capability_is_accepted_alone_and_all_together() {
     for capability in CAPABILITIES {
-        check_properties(&props(&[(EXCLUDED_CAPABILITIES, capability)]))
+        strict(&props(&[(EXCLUDED_CAPABILITIES, capability)]))
             .unwrap_or_else(|e| panic!("{capability} must pass: {e:?}"));
     }
 
-    check_properties(&props(&[(EXCLUDED_CAPABILITIES, &CAPABILITIES.join(","))]))
+    strict(&props(&[(EXCLUDED_CAPABILITIES, &CAPABILITIES.join(","))]))
         .expect("every advertised name together must pass");
 }
 
 #[test]
 fn excluded_capability_entries_accept_whitespace_and_empty_entries() {
     for value in [" FN_PRED_LIKE ,, LIMIT,", " , ", ",", " \t FN_PRED_LIKE\n"] {
-        check_properties(&props(&[(EXCLUDED_CAPABILITIES, value)]))
+        strict(&props(&[(EXCLUDED_CAPABILITIES, value)]))
             .unwrap_or_else(|e| panic!("{value:?} must pass: {e:?}"));
     }
 }

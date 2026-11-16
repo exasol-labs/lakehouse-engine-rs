@@ -44,8 +44,8 @@
 
 ### Scenario: Pushdown and drop never validate properties
 
-* *GIVEN* a virtual schema whose persisted properties hold an unknown name or an invalid tuning value, and whose `adapterNotes` hold valid tuning entries
+* *GIVEN* a virtual schema whose persisted properties hold an unknown name or an invalid tuning value
 * *WHEN* a user queries one of its virtual tables, or drops it
-* *THEN* the `pushdown` request SHALL plan from the `adapterNotes` as before and the query SHALL return the table's rows
+* *THEN* the `pushdown` request SHALL ignore the unknown name, plan with the default of the invalid tuning value, and the query SHALL return the table's rows
 * *AND* `DROP VIRTUAL SCHEMA ... CASCADE` SHALL succeed
 * *AND* the adapter MUST NOT run this feature's name check or tuning-value check on a `pushdown`, `getCapabilities`, or `dropVirtualSchema` request, and the value checks that `vs-adapter/catalog-kind-selection`, `vs-adapter/lakekeeper-permission-check`, and `direct-storage/direct-storage-properties` run on pushdown stay unchanged

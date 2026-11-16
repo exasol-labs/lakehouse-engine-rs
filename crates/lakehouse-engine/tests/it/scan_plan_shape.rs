@@ -11,7 +11,9 @@ use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::adapter::pushdown::{ProjectedColumn, build_scan_driving_sql};
+use lakehouse_engine::adapter::pushdown::{
+    ProjectedColumn, ScanUdfs, Shards, build_scan_driving_sql,
+};
 use lakehouse_engine::scan::spec::{
     ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem, ScanSpec,
     ScanStorage, SortKey, StorageBackend, StorageProps,
@@ -330,19 +332,14 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     }];
     let spec = row_scan_spec();
 
-    let shards = vec![
-        vec![("data/part-0.parquet".to_string(), 1000u64)],
-        vec![("data/part-1.parquet".to_string(), 1000u64)],
-    ];
-    let sql = build_scan_driving_sql(
-        &spec,
-        &shards,
-        &projection,
-        None,
-        None,
-        "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_DISTRIBUTE_FILES",
-    );
+    let shards = Shards {
+        files: vec![
+            vec![("data/part-0.parquet".to_string(), 1000u64)],
+            vec![("data/part-1.parquet".to_string(), 1000u64)],
+        ],
+        udfs: ScanUdfs::in_schema(None),
+    };
+    let sql = build_scan_driving_sql(&spec, &shards, &projection, None, None);
 
     assert!(
         sql.starts_with("SELECT LAKEHOUSE_SCAN("),
@@ -380,19 +377,14 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     }];
     spec.common.limit = Some(20);
 
-    let shards = vec![
-        vec![("data/part-0.parquet".to_string(), 1000u64)],
-        vec![("data/part-1.parquet".to_string(), 1000u64)],
-    ];
-    let sql = build_scan_driving_sql(
-        &spec,
-        &shards,
-        &projection,
-        Some(20),
-        None,
-        "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_DISTRIBUTE_FILES",
-    );
+    let shards = Shards {
+        files: vec![
+            vec![("data/part-0.parquet".to_string(), 1000u64)],
+            vec![("data/part-1.parquet".to_string(), 1000u64)],
+        ],
+        udfs: ScanUdfs::in_schema(None),
+    };
+    let sql = build_scan_driving_sql(&spec, &shards, &projection, Some(20), None);
 
     let fan_out_close = sql
         .find("GROUP BY shard_key)")
@@ -451,10 +443,13 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     }
     .with_files(vec![]);
 
-    let shards = vec![
-        vec![("data/ord-0.parquet".to_string(), 8192u64)],
-        vec![("data/ord-1.parquet".to_string(), 8192u64)],
-    ];
+    let shards = Shards {
+        files: vec![
+            vec![("data/ord-0.parquet".to_string(), 8192u64)],
+            vec![("data/ord-1.parquet".to_string(), 8192u64)],
+        ],
+        udfs: ScanUdfs::in_schema(None),
+    };
     let types = [ExasolType::varchar(100), ExasolType::Date];
     let projection: Vec<ProjectedColumn> = spec
         .common
@@ -464,15 +459,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         .zip(types)
         .map(|(item, exa_type)| ProjectedColumn { item, exa_type })
         .collect();
-    let sql = build_scan_driving_sql(
-        &spec,
-        &shards,
-        &projection,
-        None,
-        None,
-        "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_DISTRIBUTE_FILES",
-    );
+    let sql = build_scan_driving_sql(&spec, &shards, &projection, None, None);
 
     assert!(
         sql.starts_with("SELECT LAKEHOUSE_SCAN("),

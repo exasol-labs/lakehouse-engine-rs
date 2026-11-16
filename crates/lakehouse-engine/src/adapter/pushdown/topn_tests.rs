@@ -1,8 +1,8 @@
 use super::super::single_group_agg::single_group_merge_select;
 use super::super::support::projection_items;
 use super::super::support::{
-    AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, RowProjection, SCAN_UDF_NAME,
-    build_scan_driving_sql, order_by_present, project_columns, shard_count,
+    AggregateMergeInputs, RowProjection, build_scan_driving_sql, order_by_present, project_columns,
+    shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, single_group_plans};
@@ -95,15 +95,13 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+    let shards = unqualified_shards(crate::adapter::sharding::partition_files_by_bytes(files, g));
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projection,
         effective_limit,
         merge_inputs.as_ref(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     if declined_order_by {
         wrap_declined_order_by(

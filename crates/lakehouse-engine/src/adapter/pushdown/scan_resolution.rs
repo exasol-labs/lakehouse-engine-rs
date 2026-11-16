@@ -5,7 +5,6 @@ use super::ResolvedScan;
 use super::binary_filter::with_binary_literals;
 use super::support::{ColumnTypes, InvolvedColumns};
 use crate::adapter::permission::PermissionCheck;
-use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::statement_state::StatementCatalog;
 
 #[cfg(test)]
@@ -33,7 +32,7 @@ impl<'a> TableScanResolver<'a> {
         statement: &'a StatementCatalog,
         permission: &'a PermissionCheck,
         table_identifiers: &[&str],
-        props: &Json,
+        binary_as_string: bool,
     ) -> Result<Self, UdfError> {
         let client = statement.client();
         for identifier in table_identifiers {
@@ -49,7 +48,7 @@ impl<'a> TableScanResolver<'a> {
         Ok(Self {
             statement,
             permission,
-            binary_as_string: resolve_binary_as_string(props),
+            binary_as_string,
         })
     }
 
