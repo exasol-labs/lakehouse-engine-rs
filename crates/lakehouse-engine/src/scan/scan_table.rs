@@ -130,6 +130,7 @@ impl ParquetScanTable {
         &self,
         state: &dyn Session,
         files: &[PartitionedFile],
+        projection: Option<&Vec<usize>>,
     ) -> Result<ScanFiles, UdfError> {
         let runtime = state.runtime_env();
         let store = runtime.object_store(&self.object_store_url).map_err(|e| {
@@ -159,9 +160,14 @@ impl ParquetScanTable {
                 delete_key,
             )
         });
+        // Below half of the columns, a whole-file fetch moves more unread bytes than the
+        // requests it saves are worth.
+        let columns = self.schema.declared_schema().fields().len();
+        let whole_small_files = projection.is_none_or(|p| p.len() * 2 >= columns);
         Ok(ScanFiles::new(
             store,
             metadata_size_hint,
+            whole_small_files,
             &runtime.memory_pool,
             Arc::clone(&self.limits.read_budget),
             shared,
@@ -190,7 +196,10 @@ impl TableProvider for ParquetScanTable {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let external = |e: UdfError| DataFusionError::External(Box::new(e));
         let files = self.partitioned_files().map_err(external)?;
-        let scan_files = Arc::new(self.scan_files(state, &files).map_err(external)?);
+        let scan_files = Arc::new(
+            self.scan_files(state, &files, projection)
+                .map_err(external)?,
+        );
 
         let mut files_by_group = vec![Vec::new(); self.schema.groups().len()];
         for (index, file) in files.into_iter().enumerate() {

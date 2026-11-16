@@ -8,7 +8,7 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 * An entry that contains a `://` scheme is absolute and passes through unchanged. A relative entry is joined onto the common spec's table root, normalizing the trailing `/`. Delete-file paths follow the same rule.
 * An empty table root is unreachable from the current adapter. The rule stays defined for it (every entry is absolute) so path resolution is a total function over the wire format.
 * One shared reader per scan table reads its data files. A file's footer, the bytes fetched with it, and its page index each load once, however many byte ranges read the file. The first range that needs a load starts it, and the others wait for it.
-* The footer read is one GET of the file's last `metadata_size_hint` bytes (`datafusion.execution.parquet.metadata_size_hint`, default 512 KiB, on the `ParquetFormat` the provider owns). A file of at most 8 MiB is fetched whole in that GET.
+* The footer read is one GET of the file's last `metadata_size_hint` bytes (`datafusion.execution.parquet.metadata_size_hint`, default 512 KiB, on the `ParquetFormat` the provider owns). A file of at most 8 MiB is fetched whole in that GET when the scan projects at least half of the table's columns.
 * The fetched bytes stay in memory while the file is read and serve every read that falls inside them. `scan-runtime/scan-execution-memory-and-credentials` owns their reservation.
 * With an empty `logical_schema`, registration runs `ParquetFormat::infer_schema`, which reads the first file's footer on its own. A request count is therefore only meaningful with a non-empty `logical_schema`, as the adapter supplies in production.
 
@@ -70,10 +70,17 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 ### Scenario: A small data file is read in one request
 
 * *GIVEN* a data file of at most 8 MiB, with or without row-position deletes
-* *WHEN* the scan reads it
+* *WHEN* a scan that projects at least half of the table's columns reads it
 * *THEN* the UDF SHALL issue exactly one GET against the file, for the whole file, and serve the footer, the page index, and every column read from those bytes
 * *AND* a positional-delete file within the metadata size hint SHALL also cost one GET
 * *AND* when the file's bytes do not fit the memory pool, the UDF SHALL read the file as it reads a larger one
+
+### Scenario: A small data file read for few columns is read by ranges
+
+* *GIVEN* a data file of at most 8 MiB that is larger than the metadata size hint
+* *WHEN* a scan that projects less than half of the table's columns reads it
+* *THEN* the UDF SHALL fetch the file's last `metadata_size_hint` bytes and then only the column bytes it reads
+* *AND* the UDF MUST NOT fetch the whole file
 
 ### Scenario: Delete-file relative and absolute paths resolve like data-file paths
 

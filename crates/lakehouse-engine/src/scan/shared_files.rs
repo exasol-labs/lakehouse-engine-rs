@@ -24,7 +24,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
-/// A file up to this size is fetched whole with its footer and is never cut into byte ranges.
+/// A file up to this size is never cut into byte ranges, and is fetched whole with its footer
+/// when the scan projects enough of its columns.
 pub(super) const SMALL_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A contiguous part of a file held in memory.
@@ -209,6 +210,8 @@ impl SharedFile {
 pub(super) struct ScanFiles {
     store: Arc<dyn ObjectStore>,
     metadata_size_hint: u64,
+    /// False when the scan reads too few columns for a whole-file fetch to pay off.
+    whole_small_files: bool,
     held_bytes: Arc<MemoryReservation>,
     read_budget: Arc<ReadBudget>,
     files: HashMap<Path, SharedFile>,
@@ -228,6 +231,7 @@ impl ScanFiles {
     pub(super) fn new(
         store: Arc<dyn ObjectStore>,
         metadata_size_hint: Option<usize>,
+        whole_small_files: bool,
         pool: &Arc<dyn MemoryPool>,
         read_budget: Arc<ReadBudget>,
         files: impl IntoIterator<Item = (Path, u64, Option<String>)>,
@@ -236,6 +240,7 @@ impl ScanFiles {
         Self {
             store,
             metadata_size_hint: metadata_size_hint.unwrap_or(0) as u64,
+            whole_small_files,
             held_bytes: Arc::new(MemoryConsumer::new("scan file bytes").register(pool)),
             read_budget,
             files: files
@@ -270,13 +275,13 @@ impl ScanFiles {
         })
     }
 
-    /// A small file is fetched whole when its bytes fit the pool, any other file by its last
-    /// `metadata_size_hint` bytes. Bytes that do not fit the pool are parsed and dropped.
+    /// A small file is fetched whole when the scan wants whole files and its bytes fit the pool,
+    /// any other file by its last `metadata_size_hint` bytes. Bytes that do not fit the pool are parsed and dropped.
     async fn footer<'a>(&self, file: &SharedFile, loads: &'a FileLoads) -> Result<&'a Footer> {
         loads
             .footer
             .get_or_try_init(|| async {
-                let whole = (file.size <= SMALL_FILE_BYTES)
+                let whole = (self.whole_small_files && file.size <= SMALL_FILE_BYTES)
                     .then(|| Reserved::try_new(&self.held_bytes, file.size as usize).ok())
                     .flatten();
                 let want = if whole.is_some() {

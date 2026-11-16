@@ -42,7 +42,7 @@ DataFusion cut one file group into `target_partitions` byte ranges after `scan()
 
 ### Decision
 
-The scan table builds its own file groups and turns DataFusion's file-scan repartitioning off. A file of at most 8 MiB stays whole and is fetched in one GET. A larger file is cut into byte ranges whose readers share one footer load, the bytes fetched with it, and one page-index load. Held bytes are reserved in the memory pool, and bytes that do not fit are not held.
+The scan table builds its own file groups and turns DataFusion's file-scan repartitioning off. A file of at most 8 MiB stays whole, and is fetched in one GET when the scan projects at least half of the table's columns. A larger file is cut into byte ranges whose readers share one footer load, the bytes fetched with it, and one page-index load. Held bytes are reserved in the memory pool, and bytes that do not fit are not held.
 
 ### Options Considered
 
@@ -54,7 +54,7 @@ The scan table builds its own file groups and turns DataFusion's file-scan repar
 ### Consequences
 
 - Storage requests no longer grow with `DATAFUSION_TARGET_PARTITIONS`.
-- A small file read for a few columns moves its unprojected columns too, in exchange for one request.
+- Below half of the columns a small file is read by ranges, because a whole-file fetch was twice as slow on 8 MiB files of 40 columns read for two. At or above half it moves its unprojected columns too, in exchange for one request.
 - Shared state is released once a file's finished ranges cover it. A file reopened after that is fetched again, which changes no row.
 
 ## ADR: Row-group reads wait on a byte budget

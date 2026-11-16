@@ -839,7 +839,8 @@ fn scan_reads_a_small_delete_carrying_file_in_one_get() {
 fn scan_reads_each_small_file_once_at_shard_scale() {
     use std::collections::HashSet;
 
-    const COLUMNS: usize = 64;
+    // Two of four columns are projected, enough for a whole-file fetch.
+    const COLUMNS: usize = 4;
     const ROW_GROUPS: usize = 64;
     const ROWS_PER_ROW_GROUP: usize = 4;
     const SHARD_FILE_COUNT: usize = 22;
@@ -943,5 +944,43 @@ fn scan_reads_each_small_file_once_at_shard_scale() {
         data_file_gets(&delta_log),
         SHARD_FILE_COUNT,
         "a delete-carrying shard must read each small data file with one request"
+    );
+}
+
+/// Scenario: A small data file read for few columns is read by ranges
+#[test]
+fn scan_reads_a_small_file_by_ranges_when_it_projects_few_columns() {
+    const COLUMNS: usize = 64;
+    // Enough rows to make the file larger than the footer read.
+    const ROWS: usize = 4_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let url = write_wide_local_parquet(tmp.path(), "data/f.parquet", COLUMNS, 1, ROWS);
+    let size = std::fs::metadata(url.strip_prefix("file://").unwrap())
+        .unwrap()
+        .len();
+    let mut spec = raw_spec_with_wide_logical_schema(vec![], String::new(), COLUMNS);
+    spec.files = vec![FileEntry::new(url.clone(), size)];
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(RequestLoggingStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        sizes: HashMap::from([(head_key(&url), size)]),
+        log: Arc::clone(&log),
+    });
+
+    let rows = block_on(run_scan_with_store(&spec, &url, store));
+
+    assert_eq!(rows_of(&rows).len(), ROWS);
+    let requests = log.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the footer, then the two projected columns: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, range)| *range != Some(GetRange::Bounded(0..size))),
+        "no request fetches the whole file: {requests:?}"
     );
 }

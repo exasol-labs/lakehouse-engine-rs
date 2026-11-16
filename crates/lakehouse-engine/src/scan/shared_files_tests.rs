@@ -30,7 +30,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pool: Arc<dyn MemoryPool>, metadata_size_hint: usize) -> Self {
-        Self::with(pool, metadata_size_hint, None, usize::MAX).await
+        Self::with(pool, metadata_size_hint, None, usize::MAX, true).await
     }
 
     async fn with(
@@ -38,6 +38,7 @@ impl Fixture {
         metadata_size_hint: usize,
         delete_key: Option<String>,
         read_budget: usize,
+        whole_small_files: bool,
     ) -> Self {
         let bytes = data_file();
         let store = Arc::new(CountingObjectStore::new(Arc::new(InMemory::new())));
@@ -48,6 +49,7 @@ impl Fixture {
         let files = Arc::new(ScanFiles::new(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             Some(metadata_size_hint),
+            whole_small_files,
             &pool,
             Arc::new(ReadBudget::with_capacity(&pool, read_budget)),
             [(Path::from(NAME), bytes.len() as u64, delete_key)],
@@ -309,6 +311,7 @@ async fn a_delete_carrying_file_without_its_access_plan_is_refused() {
         0,
         Some("memory:///data/a.parquet".into()),
         usize::MAX,
+        true,
     )
     .await;
     let factory = SharedReaderFactory(Arc::clone(&fixture.files));
@@ -352,7 +355,7 @@ async fn a_reader_holds_the_bytes_of_its_row_group_until_it_fetches_the_next() {
 /// Scenario: Row-group reads wait on the read budget
 #[tokio::test]
 async fn a_reader_waits_for_the_row_group_another_reader_holds() {
-    let fixture = Fixture::with(pool_holding_no_file_bytes(), 0, None, 1).await;
+    let fixture = Fixture::with(pool_holding_no_file_bytes(), 0, None, 1, true).await;
     let (mut first, mut second) = (fixture.reader(None), fixture.reader(None));
     let chunks = column_chunks(&first.get_metadata(None).await.unwrap());
     second.get_metadata(None).await.unwrap();
@@ -375,4 +378,21 @@ async fn bytes_served_from_held_file_bytes_take_no_read_budget() {
 
     reader.get_bytes(chunks[0].clone()).await.unwrap();
     assert_eq!(fixture.pool.reserved() as u64, fixture.size());
+}
+
+/// Scenario: A small data file read for few columns is read by ranges
+#[tokio::test]
+async fn a_small_file_read_for_few_columns_fetches_its_footer_and_the_columns_it_reads() {
+    let fixture = Fixture::with(unbounded(), 16 * 1024, None, usize::MAX, false).await;
+    let mut reader = fixture.reader(None);
+    let chunks = column_chunks(&reader.get_metadata(None).await.unwrap());
+
+    reader.get_bytes(chunks[0].clone()).await.unwrap();
+    assert_eq!(
+        fixture.requests(),
+        [
+            fixture.size() - 16 * 1024..fixture.size(),
+            chunks[0].clone()
+        ]
+    );
 }
