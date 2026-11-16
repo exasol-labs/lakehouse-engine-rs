@@ -334,11 +334,44 @@ fn second_of_a_date_is_zero_without_an_exact_type() {
     );
 }
 
+/// Scenario: SECOND keeps the fraction of its argument's declared precision
+#[test]
+fn second_takes_a_computed_arguments_type_from_the_typed_pass() {
+    let coalesce = case_when([is_not_null(col("TS"))], [col("TS"), col("TS9")]);
+    let cases = [
+        (
+            scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")]),
+            "microsecond",
+            Some(ExasolType::decimal(8, 6)),
+        ),
+        (
+            scalar_fn("ADD_MINUTES", [col("TS3"), num_lit(30)]),
+            "microsecond",
+            Some(ExasolType::decimal(5, 3)),
+        ),
+        (coalesce, "nanosecond", Some(ExasolType::decimal(11, 9))),
+        (
+            scalar_fn("DATE_TRUNC", [str_lit("month"), col("D")]),
+            "second",
+            None,
+        ),
+    ];
+    for (argument, unit, ty) in cases {
+        let fragment = render_scan_expression(&second(argument), &columns()).unwrap();
+        assert!(
+            fragment.sql.contains(&format!("date_part('{unit}'")),
+            "{fragment:?}"
+        );
+        assert_eq!(fragment.ty, ty, "{fragment:?}");
+    }
+}
+
 #[test]
 fn second_over_any_other_argument_declines() {
     let local_time_zone = ExasolType::TimestampWithLocalTimeZone { precision: 6 };
     for expr in [
-        second(scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")])),
+        second(scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")])),
+        second(case_when([is_not_null(col("TS"))], [col("TS"), col("D")])),
         second(col("S")),
         second(col("UNKNOWN")),
         second(cast_to(local_time_zone, col("TS"))),

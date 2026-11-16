@@ -19,7 +19,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: SECOND keeps the fraction of its argument's declared precision
 
-* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` is a column with the declared type `TIMESTAMP(p)`, or a `CAST` to `TIMESTAMP(p)` with p of 0, 3, 6, or 9, the only CAST precisions the DataFusion dialect renders
+* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has the exact type `TIMESTAMP(p)` in the typed scan pass: a column, a `CAST` to `TIMESTAMP(p)` with p of 0, 3, 6, or 9 (the only CAST precisions the DataFusion dialect renders), `DATE_TRUNC`, `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over a TIMESTAMP, a timestamp literal, or a `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, or `LEAST` over only timestamps
 * *WHEN* `render_scan_expression` renders it
 * *THEN* the fragment SHALL compute the seconds of `x` with their first p fractional digits, and SHALL carry the type `DECIMAL(2+p, p)`
 * *AND* it SHALL read `date_part('second', …)` when p is 0, `date_part('microsecond', …)` when p is 1 to 6, and `date_part('nanosecond', …)` when p is 7 to 9
@@ -27,7 +27,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: SECOND over a DATE computes 0 without a stated type
 
-* *GIVEN* `SECOND(x)` whose argument `x` is a column or a `CAST` with the declared type `DATE`
+* *GIVEN* `SECOND(x)` whose argument `x` has the exact type `DATE` in the typed scan pass, such as a DATE column, a `CAST` to `DATE`, `DATE_TRUNC` over a DATE, or `TO_DATE`
 * *WHEN* `render_scan_expression` renders it
 * *THEN* the fragment SHALL compute 0 for a non-NULL `x` and NULL for a NULL `x`
 * *AND* the fragment SHALL carry no exact type, because the type Exasol gives it differs by version (Background)
@@ -35,7 +35,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: SECOND over any other argument, or EXTRACT(SECOND) over a DATE, runs in Exasol
 
-* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has neither the declared type `TIMESTAMP(p)` nor `DATE`, such as `SECOND(DATE_TRUNC('minute', ts))`, `SECOND` of a `VARCHAR` column, `SECOND(CAST(ts AS TIMESTAMP(7)))` (a CAST precision the DataFusion dialect cannot render), or `SECOND(CAST(ts AS TIMESTAMP(6) WITH LOCAL TIME ZONE))`, or `EXTRACT(SECOND FROM x)` over a DATE `x`
+* *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has neither the exact type `TIMESTAMP(p)` nor `DATE`, such as `SECOND(TO_TIMESTAMP(s))` (whose precision differs between Exasol 8 and 2025), a `CASE` over a DATE and a TIMESTAMP, `SECOND` of a `VARCHAR` column, `SECOND(CAST(ts AS TIMESTAMP(7)))` (a CAST precision the DataFusion dialect cannot render), or `SECOND(CAST(ts AS TIMESTAMP(6) WITH LOCAL TIME ZONE))`, or `EXTRACT(SECOND FROM x)` over a DATE `x`
 * *WHEN* `render_scan_expression` renders it
 * *THEN* the DataFusion dialect SHALL decline the node, so Exasol computes the function in the wrapper
 * *AND* `EXTRACT(SECOND FROM <date>)` SHALL therefore fail with Exasol's own `Feature not supported` error, as it does over a native table
@@ -43,7 +43,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ### Scenario: SECOND and EXTRACT(SECOND) return native results through the virtual schema
 
 * *GIVEN* a virtual table whose `TIMESTAMP(6)` and `TIMESTAMP(9)` columns hold values with fractional seconds
-* *WHEN* a query applies `SECOND(ts)` or `EXTRACT(SECOND FROM ts)` in the select list, a WHERE filter, a projected or unprojected GROUP BY key, or an aggregate argument
+* *WHEN* a query applies `SECOND(x)` or `EXTRACT(SECOND FROM x)`, where `x` is a column, `DATE_TRUNC`, `ADD_MINUTES`, or `COALESCE` over those columns, in the select list, a WHERE filter, a projected or unprojected GROUP BY key, or an aggregate argument
 * *THEN* the query SHALL return the values, rows, and column types the same query returns over a native copy of the table
 * *AND* the pushdown SQL SHALL show that the scan computes the function
 * *AND* `SECOND(ts, n)` SHALL keep returning native results, computed by Exasol

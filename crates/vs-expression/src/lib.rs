@@ -1177,8 +1177,13 @@ pub fn render_scan_expression(
     expr: &Json,
     columns: &dyn ColumnTypeLookup,
 ) -> Result<SqlFragment, UdfError> {
-    let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
-    let ty = exact_expression_type(expr, columns).map(|ty| {
+    let (typed, inferred) = scan_typing::type_scan_tree(expr, columns)?;
+    let stated = if scan_typing::kind(&typed) == SECOND_NODE {
+        inferred.exact()
+    } else {
+        exact_expression_type(expr, columns)
+    };
+    let ty = stated.map(|ty| {
         if ty.is_character() {
             ExasolType::WIDEST_VARCHAR
         } else {

@@ -553,6 +553,21 @@ fn second_and_extract_second_match_a_native_copy() {
             PathCheck::Lacks("date_part("),
             Expect::Rows,
         ),
+        (
+            "SELECT ID, SECOND(DATE_TRUNC('second', TS)) FROM {T} ORDER BY ID".to_string(),
+            PathCheck::Has(&microsecond),
+            Expect::Rows,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE SECOND(ADD_MINUTES(TS, 30)) > 0.1 ORDER BY ID".to_string(),
+            PathCheck::Has(&microsecond),
+            Expect::Rows,
+        ),
+        (
+            "SELECT COUNT(*) FROM {T} GROUP BY SECOND(COALESCE(TS_NS, TS))".to_string(),
+            PathCheck::Split,
+            Expect::Rows,
+        ),
     ]);
     if engine_honors_declared_precision(&mut conn) {
         // DataFusion parses only TIMESTAMP(0|3|6|9), so a CAST to any other precision runs in Exasol.
