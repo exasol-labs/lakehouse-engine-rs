@@ -1,14 +1,5 @@
 use super::*;
 
-fn props(pairs: &[(&str, &str)]) -> Json {
-    Json::Object(
-        pairs
-            .iter()
-            .map(|(key, value)| (key.to_string(), Json::from(*value)))
-            .collect(),
-    )
-}
-
 fn user_error<T>(result: Result<T, UdfError>) -> String {
     match result {
         Err(UdfError::User(message)) => message,
@@ -22,11 +13,7 @@ fn principal(template: &str, user: &str) -> Result<String, UdfError> {
 }
 
 fn checked(mapping: &str) -> PermissionSettings {
-    PermissionSettings::parse(&props(&[
-        (PERMISSION_CHECK, "LAKEKEEPER"),
-        (USER_MAPPING, mapping),
-    ]))
-    .expect("valid properties")
+    PermissionSettings::parse(Some("LAKEKEEPER"), Some(mapping)).expect("valid properties")
 }
 
 #[test]
@@ -69,7 +56,7 @@ fn a_template_that_does_not_compile_is_rejected() {
 
 #[test]
 fn an_absent_permission_check_is_off_and_needs_no_user() {
-    let settings = PermissionSettings::parse(&props(&[])).unwrap();
+    let settings = PermissionSettings::parse(None, None).unwrap();
 
     let check = settings.check_for(|| panic!("an off check never reads the user"));
 
@@ -78,12 +65,12 @@ fn an_absent_permission_check_is_off_and_needs_no_user() {
 
 #[test]
 fn invalid_permission_properties_are_rejected() {
-    for properties in [
-        props(&[(PERMISSION_CHECK, "OPA")]),
-        props(&[(PERMISSION_CHECK, "LAKEKEEPER")]),
-        props(&[(PERMISSION_CHECK, "LAKEKEEPER"), (USER_MAPPING, "{{ user ")]),
+    for (permission_check, user_mapping) in [
+        ("OPA", None),
+        ("LAKEKEEPER", None),
+        ("LAKEKEEPER", Some("{{ user ")),
     ] {
-        assert!(PermissionSettings::parse(&properties).is_err());
+        assert!(PermissionSettings::parse(Some(permission_check), user_mapping).is_err());
     }
 }
 

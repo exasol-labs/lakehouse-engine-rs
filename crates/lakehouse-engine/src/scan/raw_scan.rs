@@ -92,7 +92,7 @@ impl ScanLimits {
     /// At least one delete-read permit, because zero would deadlock every read.
     pub(super) fn new(ctx: &SessionContext, spec: &ScanSpec) -> Self {
         Self {
-            delete_reads: Arc::new(Semaphore::new(spec.common.s3_max_connections.max(1))),
+            delete_reads: Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1))),
             read_budget: Arc::new(ReadBudget::new(&ctx.runtime_env().memory_pool)),
         }
     }

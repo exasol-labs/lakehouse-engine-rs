@@ -12,7 +12,10 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{JOIN_ORACLE, copy_join_tables_natively, events, stack, vs_table};
+use crate::fixtures::{
+    JOIN_ORACLE, assert_two_scan_join_wrapper, copy_join_tables_natively, events,
+    events_labels_join, stack, vs_table,
+};
 
 use parquet::file::statistics::Statistics;
 
@@ -424,6 +427,7 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
 
 /// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 /// Scenario: A join outside the broadcast contract is declined safely
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -461,6 +465,27 @@ fn e2e_above_threshold_result_matches_broadcast() {
     );
 }
 
+/// Scenario: A constant sort key does not become a select-list position
+#[test]
+fn e2e_join_fallback_constant_sort_key_returns_the_native_order() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for constant in [1, 5] {
+        let query = events_labels_join(
+            VS_NAME_LOW,
+            &format!("e.ID, {constant}"),
+            "ORDER BY 2 DESC, 1 LIMIT 3",
+        );
+        assert_two_scan_join_wrapper(&mut conn, &query);
+        assert_eq!(
+            int_column(&conn.query_columns(&query)[0]),
+            [1, 2, 3],
+            "{query}"
+        );
+    }
+}
+
 fn aggregate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM {} o \
@@ -493,6 +518,10 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
         format!(
             "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
              MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {orders}"
+        ),
+        format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE \
+             ELSE TIMESTAMP '1960-01-01 10:00:00.123456' END) FROM {orders}"
         ),
         format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \

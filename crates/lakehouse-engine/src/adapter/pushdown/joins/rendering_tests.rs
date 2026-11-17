@@ -2,16 +2,16 @@ use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
 use super::super::planning::involved_table;
 use super::super::sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_side_fan_out_sql, render_broadcast_join,
+    build_broadcast_join_sql, build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
     broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
     equi_condition, join_request, legs_of, resolved_side, self_join_legs, two_scan_tuning,
 };
 use super::*;
-use crate::adapter::pushdown::ProjectedColumn;
 use crate::adapter::pushdown::support::RowProjection;
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::pushdown::{ProjectedColumn, PushdownContext};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::ExasolType;
 
@@ -35,9 +35,14 @@ fn join_condition_renders_via_translator() {
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
 
-    let rendered = render_broadcast_join(&parsed_pushdown(&request), &detected, &sides)
-        .expect("renderable join")
-        .expect("an equi-join must render, not decline");
+    let rendered = render_broadcast_join(
+        &parsed_pushdown(&request),
+        &detected,
+        &sides,
+        &test_context(),
+    )
+    .expect("renderable join")
+    .expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
         "each operand is qualified by its own leg's alias"
@@ -61,6 +66,7 @@ fn join_where_filter_spanning_both_sides_renders() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("renderable join")
     .expect("must render");
@@ -439,8 +445,9 @@ fn screen_leg_filter_renders_the_accepted_set_bare() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
-        .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -462,8 +469,9 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
-        .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -485,8 +493,12 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
 
     let pruning = leg_local_filter(&filter, &customer_orders_legs(), 1)
         .expect("both conjuncts are ORDERS-leg-local");
-    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()))
-        .expect("every column of the leg filter binds the leg");
+    let (_, declined) = screen_leg_filter(
+        &pruning,
+        &column_types(&orders_col_types()),
+        &test_context(),
+    )
+    .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, Some(date_like.clone()));
     assert_eq!(
@@ -503,8 +515,9 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()))
-        .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     assert_eq!(leg, None);
     assert_eq!(declined, Some(filter));
@@ -515,8 +528,12 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let dated_filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
     let numbered_filter = like(table_col("NUMBERED", "SHARED_KEY"), "1995%");
     let screen = |filter: &Json, exa_type: ExasolType| {
-        screen_leg_filter(filter, &column_types(&[("SHARED_KEY", exa_type)]))
-            .expect("every column of the leg filter binds the leg")
+        screen_leg_filter(
+            filter,
+            &column_types(&[("SHARED_KEY", exa_type)]),
+            &test_context(),
+        )
+        .expect("every column of the leg filter binds the leg")
     };
 
     assert_eq!(
@@ -828,9 +845,8 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
         vec![("s3://w/o-0.parquet", 100), ("s3://w/o-1.parquet", 100)],
     );
     let cols = vec![("O_CUSTKEY".to_string(), ExasolType::decimal(20, 0))];
-    let tuning = JoinScanRequestConfig {
+    let tuning = PushdownContext {
         cluster_nodes: 2,
-        parallelism_factor: 1,
         ..two_scan_tuning()
     };
     let sql = build_side_fan_out_sql(&side, &emitting(&column_types(&cols)), None, &tuning)
@@ -866,9 +882,8 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
             exa_type: ExasolType::decimal(20, 0),
         }],
     );
-    let tuning = JoinScanRequestConfig {
+    let tuning = PushdownContext {
         cluster_nodes: 2,
-        parallelism_factor: 1,
         ..two_scan_tuning()
     };
     let sql = build_broadcast_join_sql(&sides, &rendered, &tuning)
@@ -902,6 +917,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -928,6 +944,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("renderable join")
     .expect("an equi-join must render, not decline");
@@ -955,6 +972,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -1046,15 +1064,20 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &c_name,
     );
 
-    let rendered = render_broadcast_join(&parsed_pushdown(&request), &detected, &sides)
-        .expect("renderable join")
-        .expect("must render");
+    let rendered = render_broadcast_join(
+        &parsed_pushdown(&request),
+        &detected,
+        &sides,
+        &test_context(),
+    )
+    .expect("renderable join")
+    .expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types)
+    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types, &test_context())
         .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));

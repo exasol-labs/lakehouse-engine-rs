@@ -1,11 +1,11 @@
 # Feature: DataFusion Scan Execution, Object-Store Connection Concurrency
 
-Each scan UDF instance holds a bounded number of connections open to the S3-compatible object store. An `S3_MAX_CONNECTIONS` property pins the budget. When the property is absent, the adapter derives the budget from the resolved thread count. Either way the adapter passes it to the UDF through `adapterNotes` and the common spec.
+Each scan UDF instance holds a bounded number of connections open to the S3-compatible object store. An `S3_MAX_CONNECTIONS` property pins the budget. When the property is absent, the adapter derives the budget from the resolved thread count. Either way the adapter passes it to the UDF through the common spec.
 
 ## Background
 
 * The budget is a different axis from the CPU thread and partition budget of `scan-runtime/scan-execution-threading`. It sets how many HTTP connections to the object store the instance keeps warm.
-* The adapter resolves the budget at `createVirtualSchema` time from the `S3_MAX_CONNECTIONS` property, whose value `vs-properties/property-value-validation` checks first. The adapter records the result in `adapterNotes`, and only the integer reaches the UDF, in the shard-invariant common spec (`parallelism/work-unit-sharding`).
+* The adapter resolves the budget at each pushdown from the `S3_MAX_CONNECTIONS` property (`vs-properties/tuning-resolution`). Only the integer reaches the UDF, in the shard-invariant common spec (`parallelism/work-unit-sharding`).
 * The budget maps to the `object_store` option `pool_max_idle_per_host`, which bounds warm idle connections. `object_store` exposes no hard in-flight ceiling, so the bound is on sockets and file descriptors, not request rate.
 * The row-position delete pipeline (`scan-read-path/scan-execution-row-position-deletes`) reads the delete payloads a data file needs when the file is opened: the footer and then each surviving row group of a positional-delete file, a Delta deletion-vector sidecar, and a merged byte-range request over a Puffin file. Data-file reads, footers included, go through the object store alone.
 
@@ -28,29 +28,27 @@ Each scan UDF instance holds a bounded number of connections open to the S3-comp
 * *THEN* the UDF SHALL use a conservative built-in default connection-concurrency budget, clamped to at least 1
 * *AND* the scan SHALL otherwise execute identically to the explicit-value path
 
-### Scenario: FIXED value overrides the AUTO derivation at createVirtualSchema
+### Scenario: An S3_MAX_CONNECTIONS value overrides the AUTO derivation
 
-* *GIVEN* a `createVirtualSchema` request whose `S3_MAX_CONNECTIONS` property is a whole number M that `vs-properties/property-value-validation` accepts
-* *WHEN* the adapter resolves the connection-concurrency budget
-* *THEN* the adapter SHALL record M as the connection-concurrency budget, without applying the AUTO derivation
-* *AND* the adapter SHALL record the resolved value in the `createVirtualSchema` `adapterNotes` so the per-shard scan spec carries an integer field the scan UDF consumes unchanged
+* *GIVEN* a virtual schema whose `S3_MAX_CONNECTIONS` property is a whole number M that `vs-properties/property-value-validation` accepts
+* *WHEN* the adapter resolves the connection-concurrency budget at pushdown
+* *THEN* the per-shard scan spec SHALL carry M as the connection-concurrency budget, without the AUTO derivation
 
 ### Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
 
-* *GIVEN* a `createVirtualSchema` request whose `S3_MAX_CONNECTIONS` property is absent or empty
+* *GIVEN* a virtual schema whose `S3_MAX_CONNECTIONS` property is absent or empty
 * *AND* a resolved `df_threads_per_udf` of T, in either threading mode
-* *WHEN* the adapter resolves the connection-concurrency budget
+* *WHEN* the adapter resolves the connection-concurrency budget at pushdown
 * *THEN* the adapter SHALL derive a budget of `T × 4`
-* *AND* the adapter SHALL record the derived value in `adapterNotes`
-* *AND* a value that `vs-properties/property-value-validation` rejects, including `AUTO` and `0`, SHALL fail the request, and the adapter MUST NOT apply the AUTO derivation for it
+* *AND* a value that `vs-properties/property-value-validation` rejects, including `AUTO` and `0`, SHALL fail the `CREATE`, `REFRESH`, or `SET` that supplies it
 
 ### Scenario: AUTO derivation yields the single-core budget when the core count cannot be detected
 
-* *GIVEN* a `createVirtualSchema` request whose `S3_MAX_CONNECTIONS` property is absent or empty
+* *GIVEN* a virtual schema whose `S3_MAX_CONNECTIONS` property is absent or empty
 * *AND* an executing node whose operating system cannot report a core count, so the adapter resolves a core count of `1`
 * *WHEN* the adapter resolves the connection-concurrency budget
 * *THEN* the adapter SHALL apply the ordinary AUTO formula to the single thread that core count yields, a budget of 4
-* *AND* the scan-side built-in default budget SHALL serve as the default for a scan-spec JSON payload that omits `s3_max_connections`, and as the pushdown-side fallback when the `S3_MAX_CONNECTIONS` adapterNote is absent or not a positive integer
+* *AND* the scan-side built-in default budget SHALL serve as the default for a scan-spec JSON payload that omits `s3_max_connections`
 
 ### Scenario: Connection budget travels once in the shard-invariant common spec
 

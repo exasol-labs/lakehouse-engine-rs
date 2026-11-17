@@ -66,8 +66,14 @@ pub const DEFAULT_CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
 /// Replaces any existing `RUST=` entry; this Exasol is dedicated to lakehouse-engine.
 pub fn install_slc() {
+    // Docker runs the host's native image, so the Exasol container shares this process's arch.
+    let arch_suffix = if cfg!(target_arch = "aarch64") {
+        "-aarch64"
+    } else {
+        ""
+    };
     let slc_url = format!(
-        "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
+        "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}{arch_suffix}.tar.gz"
     );
     let tarball_bytes = reqwest::blocking::get(&slc_url)
         .unwrap_or_else(|e| panic!("download SLC {SLC_VERSION} from {slc_url}: {e}"))

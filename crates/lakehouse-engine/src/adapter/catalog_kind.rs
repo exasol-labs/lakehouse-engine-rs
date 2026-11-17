@@ -1,6 +1,6 @@
-use super::properties::PROP_CATALOG_KIND;
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
+
+use super::properties::PROP_CATALOG_KIND;
 
 const CATALOG_KIND_UNITY_CATALOG: &str = "UNITY_CATALOG";
 
@@ -16,20 +16,22 @@ pub enum CatalogKind {
     Glue,
 }
 
-/// Absent means Iceberg REST; an unrecognized value is an error, never defaulted.
-pub fn resolve_catalog_kind(props: &Json) -> Result<CatalogKind, UdfError> {
-    match super::nonempty_str(props, PROP_CATALOG_KIND) {
-        None => Ok(CatalogKind::IcebergRest),
-        Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_UNITY_CATALOG) => {
-            Ok(CatalogKind::UnityCatalogNative)
+impl CatalogKind {
+    /// Absent means Iceberg REST; an unrecognized value is an error, never defaulted.
+    pub(super) fn parse(value: Option<&str>) -> Result<Self, UdfError> {
+        match value {
+            None => Ok(Self::IcebergRest),
+            Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_UNITY_CATALOG) => {
+                Ok(Self::UnityCatalogNative)
+            }
+            Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_DIRECT_STORAGE) => {
+                Ok(Self::DirectStorage)
+            }
+            Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_GLUE) => Ok(Self::Glue),
+            Some(value) => Err(UdfError::User(format!(
+                "unrecognized '{PROP_CATALOG_KIND}' value '{value}'; leave it absent for Iceberg REST (the default), or set it to '{CATALOG_KIND_UNITY_CATALOG}', '{CATALOG_KIND_DIRECT_STORAGE}', or '{CATALOG_KIND_GLUE}'"
+            ))),
         }
-        Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_DIRECT_STORAGE) => {
-            Ok(CatalogKind::DirectStorage)
-        }
-        Some(value) if value.eq_ignore_ascii_case(CATALOG_KIND_GLUE) => Ok(CatalogKind::Glue),
-        Some(value) => Err(UdfError::User(format!(
-            "unrecognized '{PROP_CATALOG_KIND}' value '{value}'; leave it absent for Iceberg REST (the default), or set it to '{CATALOG_KIND_UNITY_CATALOG}', '{CATALOG_KIND_DIRECT_STORAGE}', or '{CATALOG_KIND_GLUE}'"
-        ))),
     }
 }
 

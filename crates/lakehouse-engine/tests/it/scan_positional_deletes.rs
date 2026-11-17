@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, LogicalField, ProjectionItem,
-    ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    ScanSpec, ScanStorage, ScanTuning, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_join_scan_with_session,
@@ -135,7 +135,10 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)
@@ -170,7 +173,10 @@ fn scan_spec_with_logical_schema(
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
         ..Default::default()
     }
@@ -298,8 +304,8 @@ fn scan_applies_deletes_to_a_data_file_cut_into_byte_ranges() {
         vec![delete_ref(&delete_url)],
     );
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.common.df_target_partitions = 4;
-    spec.common.df_batch_size = 8192;
+    spec.common.tuning.df_target_partitions = 4;
+    spec.common.tuning.df_batch_size = 8192;
 
     let gets = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store = Arc::new(TrackingStore {
@@ -349,7 +355,7 @@ fn scan_stopped_by_a_limit_reads_no_delete_file_of_an_unopened_data_file() {
         ),
     ];
     let mut spec = scan_spec(entries, None, Some(1));
-    spec.common.df_target_partitions = 1;
+    spec.common.tuning.df_target_partitions = 1;
 
     let gets = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store = Arc::new(TrackingStore {
@@ -881,7 +887,7 @@ fn scan_delete_reads_bounded_by_connection_budget() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);
     let rows = block_on(async {
@@ -924,7 +930,7 @@ fn scan_delete_reads_serial_when_budget_is_one() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.common.s3_max_connections = 1;
+    spec.common.tuning.s3_max_connections = 1;
 
     let (store, peak) = tracking_store_with_probe(needles, 1);
     let rows = block_on(async {
@@ -1040,7 +1046,7 @@ fn scan_delete_reads_of_a_join_stay_within_the_connection_budget() {
         ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
         ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
     ];
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
         files: vec![dim_entry],
         condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),

@@ -27,7 +27,7 @@ fn build_fact_side(spec: &ScanSpec) -> Result<Arc<dyn ObjectStore>, UdfError> {
     let sides = present_sides(spec, &resolved);
     build_side_store(
         &sides[0],
-        spec.common.s3_max_connections,
+        spec.common.tuning.s3_max_connections,
         &resolved.all_secret_values(),
     )
 }
@@ -115,9 +115,9 @@ impl RecordingEndpoint {
 fn session_context_sizes_pool_from_ctx_limit() {
     let limit: u64 = 2 * 1024 * 1024 * 1024;
     let spec = minimal_spec();
-    let overhead_bytes = spec.common.instance_overhead_mb * 1024 * 1024;
+    let overhead_bytes = spec.common.tuning.instance_overhead_mb * 1024 * 1024;
     let net = limit - overhead_bytes;
-    let expected_budget = (net as f64 * spec.common.memory_pool_fraction) as usize;
+    let expected_budget = (net as f64 * spec.common.tuning.memory_pool_fraction) as usize;
     let ctx = build_session_context(
         &spec,
         &inline_resolved(&spec),
@@ -156,8 +156,8 @@ fn session_context_uses_default_budget_on_zero_limit() {
 #[test]
 fn memory_budget_round_trips_into_scan_spec() {
     let mut spec = minimal_spec();
-    spec.common.memory_pool_fraction = 0.5;
-    spec.common.instance_overhead_mb = 256;
+    spec.common.tuning.memory_pool_fraction = 0.5;
+    spec.common.tuning.instance_overhead_mb = 256;
     let limit: u64 = 4 * 1024 * 1024 * 1024;
     let overhead_bytes = 256_u64 * 1024 * 1024;
     let net = limit - overhead_bytes;
@@ -242,7 +242,7 @@ fn each_side_store_gets_the_full_connection_budget() {
         "s3://test-bucket/db/dim",
         vec![FileEntry::new("data/dim-0.parquet", 64)],
     );
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
 
     let resolved = inline_resolved(&spec);
     let sides = present_sides(&spec, &resolved);
@@ -250,7 +250,7 @@ fn each_side_store_gets_the_full_connection_budget() {
     let all_secrets = resolved.all_secret_values();
 
     for side in &sides {
-        let budget = spec.common.s3_max_connections;
+        let budget = spec.common.tuning.s3_max_connections;
         let described = build_side_store(side, budget, &all_secrets)
             .unwrap_or_else(|e| {
                 panic!(
@@ -280,7 +280,7 @@ fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
     let resolved = inline_resolved(&spec);
     let sides = present_sides(&spec, &resolved);
     let all_secrets = resolved.all_secret_values();
-    let budget = spec.common.s3_max_connections;
+    let budget = spec.common.tuning.s3_max_connections;
     let table_root = "s3://test-bucket/data";
 
     let raw = build_table_root_store(sides[0].backend, table_root, budget, &all_secrets)

@@ -2,7 +2,7 @@ use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, ScanTuning, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::exasol_type_to_json;
 
@@ -88,11 +88,11 @@ fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
 #[test]
 fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
     let spec_template = delete_spec_template();
-    let shards = vec![vec![FileEntry::with_deletes(
+    let shards = unqualified_shards(vec![vec![FileEntry::with_deletes(
         "data/part-0.parquet",
         1000,
         vec![pos_delete("data/deletes/del-0.parquet", 50)],
-    )]];
+    )]]);
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
@@ -102,8 +102,6 @@ fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
         ),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         sql.contains("del-0.parquet"),
@@ -129,7 +127,7 @@ fn fan_out_primitive_wraps_distributor_in_ungrouped_scalar_scan() {
     ];
     let emits = r#""ID" DECIMAL(20,0)"#;
     let fan_out = FanOut::aggregate(spec.common.clone(), &[emits.to_string()]);
-    let sql = build_fan_out_inner(&fan_out, &shards, "SCAN", "DISTRIBUTE");
+    let sql = build_fan_out_inner(&fan_out, &scan_distribute_shards(shards.clone()));
 
     assert!(
         sql.contains("DISTRIBUTE(files) FROM (VALUES"),
@@ -167,7 +165,7 @@ fn single_shard_short_circuits_distributor_fromless() {
     let shards = vec![vec![FileEntry::new("data/part-0.parquet", 1000)]];
     let emits = r#""ID" DECIMAL(20,0)"#;
     let fan_out = FanOut::aggregate(spec.common.clone(), &[emits.to_string()]);
-    let sql = build_fan_out_inner(&fan_out, &shards, "SCAN", "DISTRIBUTE");
+    let sql = build_fan_out_inner(&fan_out, &scan_distribute_shards(shards.clone()));
 
     assert!(
         sql.starts_with("SELECT SCAN("),
@@ -518,15 +516,13 @@ fn aggregate_query_builds_partial_agg_spec() {
     }
     .with_files(vec![]);
 
-    let shards = vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]]);
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&["AMOUNT".into()], &[ExasolType::DoublePrecision]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
 
     let spec_json = {
@@ -635,14 +631,17 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
         storage: ScanStorage::Inline(sample_storage()),
-        s3_max_connections: distinctive_s3_max_connections,
+        tuning: ScanTuning {
+            s3_max_connections: distinctive_s3_max_connections,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![]);
 
     let common = spec_template.to_common();
     assert_eq!(
-        common.s3_max_connections, distinctive_s3_max_connections,
+        common.tuning.s3_max_connections, distinctive_s3_max_connections,
         "s3_max_connections must carry from ScanSpec into CommonScanSpec"
     );
 
@@ -650,15 +649,16 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
         .into_iter()
         .map(|p: String| FileEntry::new(p, 1))
         .collect();
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, 3);
+    let shards = unqualified_shards(crate::adapter::sharding::partition_files_by_bytes(
+        files_with_sizes,
+        3,
+    ));
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
 
     let needle = format!("\"s3_max_connections\":{distinctive_s3_max_connections}");
@@ -695,12 +695,10 @@ fn build_agg_sql(
         .expect("a bare-aggregate merge SELECT is never empty");
     build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards),
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
 }
 
@@ -718,7 +716,7 @@ fn aggregate_merge_renders_having_then_request_limit() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]);
     let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, Some(0))
         .expect("a bare-aggregate merge SELECT is never empty")
         .with_having(Some("(1 > 0)".to_string()));
@@ -728,8 +726,6 @@ fn aggregate_merge_renders_having_then_request_limit() {
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(sql.ends_with(") HAVING (1 > 0) LIMIT 0"), "{sql}");
 }
@@ -858,7 +854,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]);
     let merge_select = vec![r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4))"#.to_string()];
     let merge_inputs = AggregateMergeInputs::new(
         vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()],
@@ -872,8 +868,6 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4)) FROM ("#),
@@ -974,14 +968,16 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
         vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
         vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
     ];
+    let shards = Shards {
+        files: shards,
+        udfs: super::super::ScanUdfs::in_schema(Some("VS_SCHEMA")),
+    };
     let sql = build_count_distinct_scan_sql(
         &base_spec,
         &shards,
         &items,
         &emitting(&column_types(&col_types)),
         None,
-        r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
-        r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
     )
     .expect("the distinct column is readable");
 
@@ -1001,8 +997,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
     assert!(
         sql.contains(r#""VS_SCHEMA".LAKEHOUSE_SCAN"#)
             && sql.contains(r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#),
-        "both the scan and distributor UDFs must be schema-qualified from the \
-         names passed in: {sql}"
+        "both the scan and distributor UDFs must be schema-qualified: {sql}"
     );
     assert!(
         !sql.to_uppercase().contains("LISTAGG") && !sql.contains("DISTINCT_MERGE"),
@@ -1046,10 +1041,9 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         &pushdown,
         count_distinct_base_spec().common,
         &emitting(&column_types(&all_cols)),
-        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         None,
+        &test_context(),
     )
     .expect("Case 2/3 qualified wrapper must build");
 
@@ -1098,10 +1092,10 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         ("A".to_string(), ExasolType::decimal(20, 0)),
         ("B".to_string(), ExasolType::decimal(20, 0)),
     ];
-    let shards = vec![
+    let shards = unqualified_shards(vec![
         vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
         vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
-    ];
+    ]);
 
     let assert_only_outer_limit_no_order_by = |sql: &str, case: &str| {
         assert!(
@@ -1136,8 +1130,6 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         &case1_items,
         &emitting(&column_types(&col_types)),
         Some(1),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
     .expect("the distinct column is readable");
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
@@ -1334,12 +1326,10 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards.to_vec()),
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         !sql.contains("IPROC()"),
@@ -1368,12 +1358,10 @@ fn single_shard_collapses_to_single_invocation() {
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards.to_vec()),
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         !sql.contains("IPROC()"),
@@ -2582,8 +2570,95 @@ fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
     let wrong_relation = alias_col("LHS_T2", "X");
 
     for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
-        let error = ScanTranslator::over(&universe, &[&tree])
+        let error = ScanTranslator::over(&universe, ExasolVersion::Exasol2025, &[&tree])
             .expect_err("a column no entry binds is an adapter bug, never a decline");
         assert_mentions(&user_message(error), &[column]);
     }
+}
+
+fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Option<Vec<Json>> {
+    let mut request = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .order_by(Json::Array(keys.to_vec()));
+    if let Some(offset) = offset {
+        request = request.limit_with_offset(3, offset);
+    }
+    request
+        .build_pushdown()
+        .json()
+        .get("orderBy")
+        .map(|keys| keys.as_array().expect("orderBy is an array").clone())
+}
+
+/// Sort keys, the request's offset, and the `orderBy` that remains.
+type SortKeyCase = (Vec<Json>, Option<u64>, Option<Vec<Json>>);
+
+#[test]
+fn parse_drops_constant_sort_keys() {
+    let id_key = order_by_element(table_col("EVENTS", "ID"), true, true);
+    // A literal type Exasol sends, plus `literal_interval`, which the select-list literal list omits.
+    let constants = [
+        num_lit(2),
+        lit("literal_double", 1.5),
+        str_lit("a"),
+        null_lit(),
+        bool_lit(true),
+        date_lit("2024-01-01"),
+        timestamp_lit("2024-01-01 00:00:00"),
+        lit("literal_interval", "1"),
+    ];
+    let mut cases: Vec<SortKeyCase> = constants
+        .iter()
+        .map(|constant| {
+            (
+                vec![
+                    order_by_element(constant.clone(), false, false),
+                    id_key.clone(),
+                ],
+                None,
+                Some(vec![id_key.clone()]),
+            )
+        })
+        .collect();
+    let random = order_by_element(scalar_fn("RAND", Vec::<Json>::new()), true, true);
+    cases.extend([
+        (
+            vec![random.clone(), id_key.clone()],
+            None,
+            Some(vec![random, id_key.clone()]),
+        ),
+        (Vec::new(), Some(2), Some(Vec::new())),
+        (vec![order_by_element(num_lit(2), true, true)], None, None),
+        (
+            vec![order_by_element(num_lit(2), true, true)],
+            Some(0),
+            None,
+        ),
+        (
+            vec![
+                order_by_element(num_lit(2), false, false),
+                order_by_element(str_lit("a"), true, true),
+            ],
+            Some(2),
+            Some(vec![order_by_element(bool_lit(false), false, false)]),
+        ),
+        (
+            vec![order_by_element(num_lit(2), true, true), id_key.clone()],
+            Some(2),
+            Some(vec![id_key.clone()]),
+        ),
+    ]);
+
+    for (keys, offset, expected) in cases {
+        assert_eq!(
+            parsed_order_by(&keys, offset),
+            expected,
+            "keys {keys:?}, offset {offset:?}"
+        );
+    }
+
+    let no_order_by = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .build_pushdown();
+    assert!(no_order_by.json().get("orderBy").is_none());
 }

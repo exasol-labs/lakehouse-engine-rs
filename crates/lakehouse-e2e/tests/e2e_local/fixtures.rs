@@ -2,7 +2,8 @@ use crate::common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts,
     create_schema_and_scripts, create_schema_and_scripts_in, create_virtual_schema,
     create_virtual_schema_with_password, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, runtime, upload_so,
+    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, isolated_pushdown_statement, runtime,
+    upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
@@ -94,17 +95,20 @@ pub fn lakehouse_vs() {
 /// The adapter schema of a virtual schema whose properties [`persist_properties`] sets.
 pub const STUB_ADAPTER_SCHEMA: &str = "PV_STUB_ADAPTER";
 
-/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did.
-const PERSISTING_ADAPTER_BODY: &str = r#"import json
+/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did. Lua,
+/// because it is built into every Exasol image, while Nano ships no Python container.
+const PERSISTING_ADAPTER_BODY: &str = r#"local cjson = require("cjson")
 
-
-def adapter_call(request_json):
-    kind = json.loads(request_json)["type"]
-    if kind == "getCapabilities":
-        return json.dumps({"type": kind, "capabilities": []})
-    if kind == "setProperties":
-        return json.dumps({"type": kind})
-    raise Exception("the stub adapter answers only setProperties, got " + kind)
+function adapter_call(request_json)
+    local kind = cjson.decode(request_json)["type"]
+    if kind == "getCapabilities" then
+        return '{"type": "getCapabilities", "capabilities": []}'
+    end
+    if kind == "setProperties" then
+        return '{"type": "setProperties"}'
+    end
+    error("the stub adapter answers only setProperties, got " .. kind)
+end
 "#;
 
 /// Swaps the stub in, runs `ALTER VIRTUAL SCHEMA <vs> SET <set_clause>`, and puts the engine
@@ -112,7 +116,7 @@ def adapter_call(request_json):
 /// created `USING` [`STUB_ADAPTER_SCHEMA`], whose scripts must already exist.
 pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
     conn.execute(&format!(
-        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT \
+        "CREATE OR REPLACE LUA ADAPTER SCRIPT \
          {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
     ));
     conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} SET {set_clause}"));
@@ -121,6 +125,15 @@ pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
 
 pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
+}
+
+/// `SELECT <select> FROM <events> e JOIN <labels> l ON e.ID = l.ID <tail>` over one virtual schema.
+pub fn events_labels_join(vs_name: &str, select: &str, tail: &str) -> String {
+    format!(
+        "SELECT {select} FROM {} e JOIN {} l ON e.ID = l.ID {tail}",
+        vs_table(vs_name, E2E_TABLE),
+        vs_table(vs_name, E2E_TABLE_2)
+    )
 }
 
 pub fn events_table() -> String {
@@ -436,4 +449,26 @@ pub async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, b
     crate::common::seed::write_one_file_append(catalog, &loaded, table, [batch])
         .await
         .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
+}
+
+/// The common scan spec a `SELECT *` over `vs`.`E2E_TABLE` pushes into `LAKEHOUSE_SCAN`.
+pub fn pushed_scan_spec(conn: &mut ExaConn, vs: &str) -> serde_json::Value {
+    let statement =
+        isolated_pushdown_statement(conn, &format!("SELECT * FROM {}", vs_table(vs, E2E_TABLE)));
+    let (_, rest) = statement
+        .split_once("LAKEHOUSE_SCAN('")
+        .unwrap_or_else(|| panic!("the pushdown calls the scan: {statement}"));
+    let literal = rest
+        .split("', ")
+        .next()
+        .expect("the common spec is the scan's first argument")
+        .replace("''", "'");
+    serde_json::from_str(&literal)
+        .unwrap_or_else(|e| panic!("the common spec is JSON ({e}): {literal}"))
+}
+
+pub fn spec_u64(spec: &serde_json::Value, key: &str) -> u64 {
+    spec[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the scan spec must hold {key}: {spec}"))
 }

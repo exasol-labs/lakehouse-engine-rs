@@ -1,7 +1,9 @@
 use crate::scan::spec::{AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered};
 use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment};
+use vs_expression::{ColumnNode, SqlFragment};
+
+use super::context::Shards;
 
 use super::scalar_over_agg::{
     TypedPlans, classify_scalar_over_aggregate, fold_aggregate_plan, fold_nested_plans,
@@ -130,7 +132,7 @@ pub fn detect_group_by_aggregates(
             }
             // Exasol dialect: the constant is projected by the Exasol-parsed merge (#550).
             t if is_literal_selectlist_item(t) => {
-                let projection = render_exasol_fragment(item, scan.columns());
+                let projection = scan.exasol_fragment(item);
                 select_items.push(GroupedSelectItem::Constant {
                     select_index,
                     projection,
@@ -256,7 +258,7 @@ pub(super) enum GroupedOrderBy {
 #[allow(clippy::too_many_arguments)]
 pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     group_key_types: &[ExasolType],
     aggregates: &TypedPlans,
     select_items: &[GroupedSelectItem],
@@ -264,8 +266,6 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     offset: u64,
     scan: ScanTranslator<'_>,
-    udf_name: &str,
-    distribute_udf_name: &str,
     having: Option<&str>,
     order_by: Option<&str>,
 ) -> Option<String> {
@@ -308,7 +308,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     let mut common_template = spec_template.clone();
     common_template.common.limit = None;
     let fan_out = FanOut::aggregate(common_template.common, &all_emits);
-    let fan_out = build_fan_out_inner(&fan_out, shards, udf_name, distribute_udf_name);
+    let fan_out = build_fan_out_inner(&fan_out, shards);
 
     let from = with_stat_grand_means(&fan_out, &aggregates.plans, &outer_group_by);
 

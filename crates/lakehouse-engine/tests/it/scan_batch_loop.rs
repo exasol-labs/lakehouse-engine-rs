@@ -19,8 +19,8 @@ use exasol_udf_sdk::test_support::{NextPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, StorageBackend,
-    StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, ScanTuning,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     CountArithmetic, ResolvedScanStorage, build_scan_runtime, read_scan_spec,
@@ -79,7 +79,10 @@ fn spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -161,7 +164,10 @@ fn nested_spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -181,7 +187,10 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -273,7 +282,7 @@ fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<R
         emits,
     );
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
-    let rt = counting_build_runtime(reconstituted.common.df_threads_per_udf, built);
+    let rt = counting_build_runtime(reconstituted.common.tuning.df_threads_per_udf, built);
     let storage = scan_fixture::resolved_storage(&reconstituted);
     let result = rt.block_on(run_scan_one(
         &mut ctx,

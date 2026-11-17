@@ -8,7 +8,7 @@ This page lists every property and shows how to see what a scan does. Set these 
 
 ## Parameters
 
-`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... SET`, and `ALTER VIRTUAL SCHEMA ... REFRESH` fail on an unknown property name or an invalid value. One error names each problem and suggests the nearest known name for a close misspelling, for example `unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)`. Names are case-sensitive. `CREATE VIRTUAL SCHEMA` rejects an empty or `null` value. `ALTER VIRTUAL SCHEMA ... SET <name> = ''` or `SET <name> = null` removes the property, which then takes its default. To change a value, run `ALTER VIRTUAL SCHEMA ... SET`. A `REFRESH` re-reads the properties too.
+`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... SET`, and `ALTER VIRTUAL SCHEMA ... REFRESH` fail on an unknown property name or an invalid value. One error names each problem and suggests the nearest known name for a close misspelling, for example `unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)`. Names are case-sensitive. `CREATE VIRTUAL SCHEMA` rejects an empty or `null` value. `ALTER VIRTUAL SCHEMA ... SET <name> = ''` or `SET <name> = null` removes the property, which then takes its default. To change a value, run `ALTER VIRTUAL SCHEMA ... SET`. The new value applies from the next query, with no `REFRESH`.
 
 | Property | Required | Default | Accepted values | Effect |
 |---|---|---|---|---|

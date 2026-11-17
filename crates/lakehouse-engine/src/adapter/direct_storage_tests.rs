@@ -24,7 +24,7 @@ fn test_client(
         store,
         base_path,
         options,
-        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .expect("the fixture base path is a valid storage URI")
 }
@@ -284,7 +284,7 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         &(Arc::clone(&inner) as Arc<dyn ObjectStore>),
         &StorePath::from("lake/events"),
         FOLD_NO_HIVE,
-        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .await
     .expect("the fixture directory folds");

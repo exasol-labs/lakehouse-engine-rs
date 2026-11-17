@@ -326,12 +326,13 @@ fn a_role_create_assumes_the_role_once() {
 fn a_role_session_serves_every_pushdown_of_a_statement() {
     proxy_virtual_schemas();
     let events = events_of(PROXY_ROLE_VS);
-    let sql =
-        format!("SELECT COUNT(*) FROM (SELECT ID FROM {events} UNION ALL SELECT ID FROM {events})");
+    let sql = format!("SELECT ID FROM {events} UNION ALL SELECT ID FROM {events}");
     let mut rows = 0;
 
     let pushdowns = pushdown_statements(&mut exa_conn(), &sql).len();
-    let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || rows = count(&sql));
+    let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || {
+        rows = exa_conn().query_row_count(&sql)
+    });
 
     assert_eq!(pushdowns, 2, "each branch is a pushdown of its own");
     assert_eq!(rows, 2 * SEED_TOTAL_ROWS as i64);

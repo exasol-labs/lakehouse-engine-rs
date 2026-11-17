@@ -29,4 +29,4 @@ A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal fi
 * *AND* a value lies inside 0001-01-01 to 9999-12-31 but outside 1677-09-21 to 2262-04-11
 * *WHEN* the scan computes the expression in a filter, the select list, or a broadcast join condition
 * *THEN* the query SHALL return the rows native Exasol returns
-* *AND* the typed pass SHALL cast each DATE to the TIMESTAMP at the unit holding the finest `p` among the operands
+* *AND* the typed pass SHALL cast each DATE to the TIMESTAMP at the unit holding the most fractional digits the operands hold, except in a branch form that Exasol 8 brings to a DATE, where it casts each TIMESTAMP to DATE (`sql-functions/vs-expression-translator-date-add-fns`)
