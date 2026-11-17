@@ -417,55 +417,109 @@ fn iceberg_declaration_omits_default_for_no_default_field() {
     );
 }
 
-/// Scenario: A decimal initial-default outside Exasol's DECIMAL domain is not encoded as a numeric default
+/// Scenario: The VS encodes each field's Iceberg initial-default once per query into the scan spec
 #[test]
-fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
-    use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+fn declaration_encodes_every_primitive_initial_default() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
     use std::sync::Arc;
 
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![
-            Arc::new(
-                NestedField::optional(
-                    1,
-                    "scale_over_precision",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 5,
-                        scale: 10,
-                    }),
-                )
-                .with_initial_default(Literal::decimal(1234)),
-            ),
-            Arc::new(
-                NestedField::optional(
-                    2,
-                    "zero_precision",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 0,
-                        scale: 0,
-                    }),
-                )
-                .with_initial_default(Literal::decimal(0)),
-            ),
-        ])
-        .build()
-        .unwrap();
+    // Each type reads as the text or hex a stored value of the column renders as.
+    let cases: Vec<(PrimitiveType, Literal, &str, &str)> = vec![
+        (
+            PrimitiveType::Time,
+            Literal::time((22 * 3600 + 31 * 60 + 8) * 1_000_000 + 123_456),
+            "utf8",
+            "22:31:08.123456",
+        ),
+        (
+            PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+            Literal::decimal(12_345),
+            "utf8",
+            "123.45",
+        ),
+        (
+            PrimitiveType::Binary,
+            Literal::binary([0xde, 0xad, 0xbe, 0xef]),
+            "binary",
+            "deadbeef",
+        ),
+        (
+            PrimitiveType::Fixed(4),
+            Literal::fixed([1, 2, 3, 4]),
+            "fixed_size_binary(4)",
+            "01020304",
+        ),
+        (
+            PrimitiveType::Uuid,
+            Literal::uuid_from_str("01234567-89ab-cdef-0123-456789abcdef").unwrap(),
+            "fixed_size_binary(16)",
+            "0123456789abcdef0123456789abcdef",
+        ),
+    ];
 
-    let logical = declared_logical_schema(&schema);
-
-    assert_eq!(logical.len(), 2);
-    for field in &logical {
+    for (primitive, default, tag, encoded) in cases {
+        let field = NestedField::required(1, "c", Type::Primitive(primitive.clone()))
+            .with_initial_default(default);
+        let declaration = decoded_notes(&iceberg_notes(&[Arc::new(field)])).remove(0);
+        assert_eq!(declaration.refused, None, "{primitive} must not be refused");
+        assert_eq!(declaration.source_type.arrow_type, tag, "{primitive} tag");
         assert_eq!(
-            field.arrow_type, "utf8",
-            "field {} must fall back to the utf8 tag",
-            field.name
+            declaration.source_type.initial_default.as_deref(),
+            Some(encoded),
+            "{primitive} default must read as a stored value renders"
         );
+    }
+}
+
+/// Scenario: A primitive initial-default that cannot be read at its column's declared type refuses the column
+#[test]
+fn declaration_refuses_a_column_whose_initial_default_cannot_be_rendered() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+    use std::sync::Arc;
+
+    let cases: Vec<(&str, PrimitiveType, Literal)> = vec![
+        (
+            "scale_over_precision",
+            PrimitiveType::Decimal {
+                precision: 5,
+                scale: 10,
+            },
+            Literal::decimal(1234),
+        ),
+        (
+            "zero_precision",
+            PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            },
+            Literal::decimal(0),
+        ),
+        (
+            "fixed_wrong_length",
+            PrimitiveType::Fixed(4),
+            Literal::fixed([1, 2, 3]),
+        ),
+        // Unreachable from catalog JSON, which iceberg-rust parses against the field's type.
+        ("mismatched_literal", PrimitiveType::Int, Literal::long(7)),
+    ];
+
+    for (name, primitive, default) in cases {
+        let field = NestedField::optional(1, name, Type::Primitive(primitive))
+            .with_initial_default(default);
+        let declaration = decoded_notes(&iceberg_notes(&[Arc::new(field)])).remove(0);
+        let reason = declaration
+            .refused
+            .unwrap_or_else(|| panic!("column '{name}' must be refused"));
         assert!(
-            field.initial_default.is_none(),
-            "field {} must encode no default under the utf8 tag",
-            field.name
+            reason.contains(&format!("'{name}'"))
+                && reason.contains("initial-default")
+                && !reason.contains("partition"),
+            "the reason must name the column and its initial-default, not a partition: {reason}"
         );
+        assert_eq!(declaration.source_type.initial_default, None);
     }
 }
 

@@ -23,27 +23,3 @@ The adapter appends the sort expression's base columns as hidden scan columns. T
 ### Consequences
 
 - One renderer serves every Exasol-evaluated `ORDER BY` clause.
-
-## ADR: A grouped ORDER BY over an aggregate absent from the select list routes to the qualified single-table wrapper
-
-**ID:** unresolvable-grouped-order-by-routes-to-qualified-wrapper
-**Plan:** fix-198-orderby-expr-hidden-col
-**Status:** Accepted
-
-### Context
-
-A grouped `ORDER BY` can sort on an aggregate outside the select list. The merge wrapper has only group-key and partial columns, and Exasol declares no type for that aggregate.
-
-### Decision
-
-The adapter matches the aggregate sort key against the select-list plans. A match keeps the partial/merge path, and no match routes to the qualified single-table wrapper, not to an error.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Append the aggregate as an extra partial plan | Rejected: needs a fabricated Exasol type and risks SUM overflow and misordering |
-
-### Consequences
-
-- Such requests return a correct answer but lose partial/merge decomposition.

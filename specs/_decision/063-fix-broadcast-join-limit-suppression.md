@@ -8,7 +8,7 @@
 
 ### Context
 
-A bare `LIMIT` over a broadcast-eligible inner join needs a per-shard cap applied after the join. Applied to the pre-join fact scan, it returns wrong rows without error. The fallback leg has no join and must never carry the cap.
+A bare `LIMIT` over a broadcast-eligible inner join needs a per-shard cap applied after the join, because a cap on the pre-join fact scan returns wrong rows without error. The fallback leg has no join and must never carry the cap.
 
 ### Decision
 

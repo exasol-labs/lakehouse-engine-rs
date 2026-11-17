@@ -9,7 +9,7 @@
 
 ### Context
 
-Pushdown loads tables through a second per-kind session stack beside the catalog clients. The earlier reason for avoiding the catalog client, that an abstract client hides the concrete session a load needs, no longer holds, because each client can run its load on its own concrete session.
+A second per-kind session stack for pushdown table loads beside the catalog clients duplicates the catalog-kind match. Each catalog client can run a load on its own concrete session.
 
 ### Decision
 
