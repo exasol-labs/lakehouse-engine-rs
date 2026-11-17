@@ -93,7 +93,7 @@ A bounded queue between the DataFusion stream and the emit calls could overlap o
 
 ### Decision
 
-The engine builds no overlap buffer. It becomes a requirement only if phase telemetry shows that emit and object-storage import are both material and serialized. On the far-VPC workload emit took about 2 ms against about 650 ms for import, so the gate failed.
+The engine builds no overlap buffer. It becomes a requirement only if phase telemetry shows that emit and object-storage import are both material and serialized.
 
 ### Options Considered
 
@@ -131,33 +131,6 @@ The auth fields live on the planning-layer connection credentials and are inject
 ### Consequences
 
 - A unit test guards that no auth field name or value appears in a serialized scan spec.
-
----
-
-## ADR: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
-
-**ID:** constant-projection-over-group-by-placeholder-drives-the-existing-grouped-scan-instead-of-the-row-scan-path
-**Plan:** `fix-nested-aggregate-pushdown`
-**Status:** Accepted
-
-### Context
-
-For `SELECT COUNT(*) FROM (SELECT id, COUNT(*) FROM t GROUP BY id)`, Exasol sends one flat `group_by` pushdown whose select list is a single `NULL` literal, a "count the groups" rewrite. A row-scan fallback returns one row per source row, not per group, which is wrong for duplicate group-key values.
-
-### Decision
-
-The adapter treats a pure-literal select-list item as a constant "count the groups" projection and drives the existing grouped scan with no aggregates. This returns one row per distinct group for any key cardinality. A rendered literal is never pushed as a column name.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Tighten the guard so the row-scan fallback engages | Rejected: returns the raw row count, not the group count, for duplicate keys |
-| Return an error to force native retry | Rejected: a virtual schema has no native data path, so the query fails |
-
-### Consequences
-
-- The regression test uses a duplicate-key group column, because unique-key data cannot tell the grouped scan from the row-scan fallback.
 
 ---
 
@@ -218,35 +191,6 @@ The adapter declines the whole top-N shape and falls back to the raw scan when a
 
 ---
 
-## ADR: Drop `tpchgen-arrow`; build arrow-58 batches from `tpchgen` core directly
-
-**ID:** drop-tpchgen-arrow-build-arrow-58-batches-from-tpchgen-core-directly
-**Plan:** `change-iceberg-rust-0-10-bump`
-**Status:** Accepted
-
-### Context
-
-`tpchgen-arrow` has releases for arrow 57 and 59 but none for arrow 58, which the Iceberg writer expects. Keeping it leaves a second arrow tree in the dev and e2e graph and needs an Arrow IPC bridge. `tpchgen` core has no arrow dependency.
-
-### Decision
-
-The seed and TPC-H loader code builds arrow-58 record batches from `tpchgen` core with the workspace arrow builders, and drops `tpchgen-arrow`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep `tpchgen-arrow` for arrow 57 with an IPC bridge | Rejected: leaves arrow 57 in the dev lock and adds an IPC round-trip |
-| Use `tpchgen-arrow` for arrow 59 with an IPC bridge | Rejected: adds an arrow tree newer than the workspace's, and the same bridge |
-| Drop the TPC-H loader | Rejected: it backs the live smoke test |
-
-### Consequences
-
-- The dev and e2e graph has one arrow tree, and a future arrow bump needs no `tpchgen-arrow` release.
-- The loader carries about 100 to 200 lines of test-only column builders.
-
----
-
 ## ADR: Per-Side Predicate Pushdown for Joins by `tableName` Conjunct Attribution
 
 **ID:** per-side-predicate-pushdown-for-joins-by-tablename-conjunct-attribution
@@ -255,11 +199,11 @@ The seed and TPC-H loader code builds arrow-58 record batches from `tpchgen` cor
 
 ### Context
 
-Both join routes resolved file lists with no filter, and the two-scan fallback shipped every row of each side to Exasol. Passing the whole WHERE to each side is unsound: Iceberg predicate translation resolves columns by name only, so on a shared column name it applies the other side's conjunct and wrongly prunes files.
+Filtering each join side before it reaches Exasol needs the WHERE split by side. Passing the whole WHERE to each side is unsound: Iceberg predicate translation resolves columns by name only, so on a shared column name it applies the other side's conjunct and wrongly prunes files.
 
 ### Decision
 
-For an inner equi-join, the adapter attributes each WHERE conjunct to a side by its columns' `tableName`. Only conjuncts whose columns all belong to one table are pushed to that side, for manifest pruning and as the fallback leg's filter. Cross-table conjuncts, the join condition, and any OR spanning both tables stay in the outer WHERE, which remains the correctness backstop. Each fallback leg projects only the columns the outer wrapper references for that side.
+For an inner equi-join, the adapter attributes each WHERE conjunct to a side by its columns' `tableName` and pushes it to that side only when all its columns belong to that table, for manifest pruning and as the fallback leg's filter. Cross-table conjuncts, the join condition, and any OR spanning both tables stay in the outer WHERE, which remains the correctness backstop. Each fallback leg projects only the columns the outer wrapper references for that side.
 
 ### Options Considered
 
@@ -272,32 +216,6 @@ For an inner equi-join, the adapter attributes each WHERE conjunct to a side by 
 - Both routes get manifest pruning per side, and fallback legs filter before emitting.
 - Pruned byte totals make side selection and the broadcast threshold more accurate.
 - Tests cover shared column names, and the leg filter renders bare column names while the broadcast path keeps the native alias.
-
----
-
-## ADR: Reuse the Iceberg Crate's NameMapping Deserializer
-
-**ID:** reuse-the-iceberg-crate-s-namemapping-deserializer
-**Plan:** `change-name-mapping-fallback`
-**Status:** Accepted
-
-### Context
-
-The `schema.name-mapping.default` table property is JSON with kebab-case keys, an optional `field-id`, and nested `fields`. The `iceberg` crate already exports types for exactly this shape.
-
-### Decision
-
-The engine parses the property with the `iceberg` crate's `NameMapping` type.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Hand-rolled serde struct | Rejected: reinvents a deserializer the dependency provides |
-
-### Consequences
-
-- Parsing correctness tracks the `iceberg` crate's spec fidelity.
 
 ---
 
@@ -363,7 +281,7 @@ The adapter folds the item's inner aggregates into the existing partial aggregat
 
 ### Context
 
-Exasol materializes the `GROUP BY shard_key` raw-row emit fan-out into temp-DB RAM, so memory grows with scanned data volume. A nested distributor script driving an outer ungrouped scalar scan keeps memory constant, at about 2.5 GB against 22 GB or more. The materialization affects every wrapper that drove the old SET scan.
+Exasol materializes a `GROUP BY shard_key` raw-row SET-scan emit into temp-DB RAM, so memory grows with scanned data volume for every wrapper that drives it. A nested distributor script driving an outer ungrouped scalar scan keeps that memory constant.
 
 ### Decision
 
@@ -379,32 +297,7 @@ The distributor plus scalar scan is the only scan path, with no flag, property, 
 ### Consequences
 
 - Every scan-driving wrapper shares one fan-out shape, and scan-output memory stays constant.
-
----
-
-## ADR: `LAKEHOUSE_SCAN` Itself Becomes SCALAR: One Scan Entry Point, Not Two
-
-**ID:** lakehouse-scan-itself-becomes-scalar-one-scan-entry-point-not-two
-**Plan:** `change-scan-fanout-to-scalar-emit`
-**Status:** Accepted
-
-### Context
-
-Streaming-only scan output requires the scan UDF to run as a SCALAR EMIT script, not a SET script. The scan logic is identical for both, and only the script type and run loop differ.
-
-### Decision
-
-The existing `LAKEHOUSE_SCAN` script changes from SET to SCALAR in place.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Add a separate scalar scan entry point | Rejected: doubles packaging and fingerprint surface for identical logic, and the two would drift |
-
-### Consequences
-
-- The SET script type is retired from the scan path, and the script name is unchanged.
+- `LAKEHOUSE_SCAN` itself is the SCALAR script, so there is one scan entry point and no separate SET variant.
 
 ---
 
@@ -443,11 +336,11 @@ Fan-out needs a `GROUP BY shard_key` relation so Exasol distributes shard groups
 
 ### Context
 
-The unaccelerated join fallback rendered its FROM as a comma cross join with one flat WHERE. That shape leaves side-local filters unpushed and is less favorable to Exasol's optimizer.
+The unaccelerated join fallback needs a FROM shape. A comma cross join with one flat WHERE leaves side-local filters unpushed and is less favorable to Exasol's optimizer.
 
 ### Decision
 
-The fallback FROM is a left-to-right `INNER JOIN ... ON` chain. Each join condition attaches at the earliest join point where every table it references is in scope, decided by the `tableName`s it touches and never by column name, so shared column names stay qualified. A join point with no resolvable condition renders `ON 1=1`. Each side's side-local WHERE conjuncts go into that side's leg as a DataFusion filter, and only residual conjuncts stay in the outer WHERE.
+The fallback FROM is a left-to-right `INNER JOIN ... ON` chain. Each join condition attaches at the earliest join point where every table it references is in scope, decided by the `tableName`s it touches and never by column name, so shared column names stay qualified. A join point with no resolvable condition renders `ON 1=1`.
 
 ### Options Considered
 

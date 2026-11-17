@@ -8,7 +8,7 @@
 
 ### Context
 
-Exasol `GREATEST` and `LEAST` return NULL if any argument is NULL. DataFusion's functions of the same name return NULL only if all arguments are NULL. Exasol never re-checks a delegated capability, so a mapping by name alone returns wrong rows over nullable arguments.
+Exasol `GREATEST` and `LEAST` return NULL if any argument is NULL, while DataFusion's functions of the same name return NULL only if all arguments are NULL. Exasol never re-checks a delegated capability, so a mapping by name alone returns wrong rows over nullable arguments.
 
 ### Decision
 

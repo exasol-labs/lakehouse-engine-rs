@@ -8,7 +8,7 @@
 
 ### Context
 
-A broadcast join must read each table with that table's own storage credential. DataFusion keys its object-store registry on `scheme://host[:port]`, so one bucket has one registered store. Two tables of one Databricks catalog normally share a bucket.
+A broadcast join must read each table with that table's own storage credential, and two tables of one Databricks catalog normally share a bucket. DataFusion keys its object-store registry on `scheme://host[:port]`, so one bucket has one registered store.
 
 ### Decision
 
@@ -26,30 +26,7 @@ The adapter registers one routing store per bucket, holding one inner store per 
 
 - One code path serves every join with no credential comparison.
 - Two credentials live behind one registered store.
-
-## ADR: `validate_sides_share_one_store` stays; prefix routing does not subsume it
-
-**ID:** join-keep-validate-sides-share-one-store-guard
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
-
-### Context
-
-DataFusion's registry key drops URL userinfo, which on `abfss://` is the container. Azure paths are container-relative, so two containers of one storage account can produce identical paths that path-based routing cannot distinguish.
-
-### Decision
-
-A scan-time guard stays. It refuses a scan whose sides share one registry key but need different stores.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Delete it as subsumed by the router | Rejected: the router cannot separate two containers with identical relative paths |
-
-### Consequences
-
-- This is the only guard over the different-container case.
+- Path routing does not replace the scan-time container/store collision guard, because two containers of one storage account can produce identical container-relative paths.
 
 ## ADR: Delete the plan-time backend guard; the store-URL collision is the only rule, and the scan owns it
 
@@ -59,7 +36,7 @@ A scan-time guard stays. It refuses a scan whose sides share one registry key bu
 
 ### Context
 
-The scan builds each side's store from that side's own backend and registers one store per derived store URL. Different backend types or different ADLS accounts give different registry keys, so the scan serves them. Two containers of one account collide. A plan-time backend guard compared only the account name, so it rejected configurations the scan serves and admitted the one it cannot.
+The scan registers one store per derived store URL, so different backend types or ADLS accounts get different registry keys and only two containers of one account collide. A plan-time guard that compares backends or account names rejects configurations the scan serves and admits the one it cannot.
 
 ### Decision
 
@@ -76,5 +53,4 @@ The adapter has no plan-time backend guard. The scan-time guard owns the one rea
 ### Consequences
 
 - Cross-backend joins and two-account ADLS joins plan and run normally.
-- Two containers of one storage account fail at scan time, with a message naming both store URLs. Whether it errors depends on the chosen plan, since the N-scan fallback serves that shape.
-- Acceptance no longer follows the configuration alone, because refusing at plan time would reject a query the fallback reads correctly.
+- Two containers of one storage account fail at scan time with a message naming both store URLs, unless the plan uses the N-scan fallback, which serves that shape.
