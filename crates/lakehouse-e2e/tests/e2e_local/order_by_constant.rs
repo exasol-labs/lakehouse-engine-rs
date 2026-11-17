@@ -1,4 +1,4 @@
-//! Constant `ORDER BY` keys through Exasol (#620): a constant sort key never reaches the pushed
+//! Constant `ORDER BY` keys through Exasol: a constant sort key never reaches the pushed
 //! SQL as a bare number that Exasol reads as a select-list position. Fail, never skip, without
 //! the stack.
 
