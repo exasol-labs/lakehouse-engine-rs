@@ -2,6 +2,10 @@ name: E2E setup
 description: >
   Common preparation shared by the e2e, e2e-lakekeeper, e2e-unity, e2e-azure and e2e-glue jobs.
   Callers must run `actions/checkout` themselves before this action.
+inputs:
+  arch:
+    description: The runner's architecture, `x86_64` or `aarch64`; selects the `.so` artifact and the build cache.
+    default: x86_64
 runs:
   using: composite
   steps:
@@ -22,15 +26,16 @@ runs:
     # download must stay after this step.
     - name: Restore cargo & build artifacts
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The arm64 unit-test job writes the aarch64 tree; rust-cache adds the platform to the key.
       with:
-        shared-key: workspace-rlib
+        shared-key: ${{ inputs.arch == 'aarch64' && 'workspace-arm64' || 'workspace-rlib' }}
         save-if: "false"
 
     # The download's mtime is newer than the sources, so make treats the .so as current.
     - name: Download liblakehouse_engine.so
       uses: actions/download-artifact@v8
       with:
-        name: lakehouse-engine-so-x86_64
+        name: lakehouse-engine-so-${{ inputs.arch }}
         path: target/release/
 
     - name: Forbid make from rebuilding the .so
