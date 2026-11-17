@@ -1,9 +1,7 @@
 use super::super::detect_aggregates;
 use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::merge_select_items;
-use super::super::support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, involved_columns, shard_count,
-};
+use super::super::support::{SCAN_UDF_NAME, involved_columns, shard_count};
 use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, CommonScanSpec, ScanStorage};
@@ -355,7 +353,7 @@ impl GroupedSql {
     fn build(&self) -> String {
         build_grouped_aggregate_scan_sql(
             &self.spec,
-            &self.shards,
+            &unqualified_shards(self.shards.to_vec()),
             &self.group_key_types,
             &self.aggregates,
             &self.select_items,
@@ -363,8 +361,6 @@ impl GroupedSql {
             self.limit,
             self.offset,
             scan_over(&self.columns),
-            SCAN_UDF_NAME,
-            DISTRIBUTE_FILES_UDF_NAME,
             self.having.as_deref(),
             self.order_by.as_deref(),
         )
@@ -1530,10 +1526,9 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         &pushdown,
         fan_out_spec,
         &emitting(&column_types(&all_cols)),
-        &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
         None,
+        &test_context(),
     )
     .expect("qualified fallback must build");
 

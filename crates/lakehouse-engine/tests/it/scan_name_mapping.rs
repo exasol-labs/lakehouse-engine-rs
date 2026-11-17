@@ -13,7 +13,7 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage, ScanTuning,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
@@ -77,7 +77,10 @@ fn name_mapping_spec(
         logical_schema,
         name_mapping,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, file_size)])

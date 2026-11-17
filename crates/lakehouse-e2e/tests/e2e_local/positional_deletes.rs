@@ -273,6 +273,8 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     );
 }
 
+/// Scenario: The parallelism factor drives work-unit sharding
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();

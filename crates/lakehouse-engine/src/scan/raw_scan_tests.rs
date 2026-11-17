@@ -120,7 +120,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
 #[test]
 fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     let mut spec = minimal_spec();
-    spec.common.s3_max_connections = 0;
+    spec.common.tuning.s3_max_connections = 0;
     assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
 }
 

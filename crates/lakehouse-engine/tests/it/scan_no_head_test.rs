@@ -18,7 +18,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage, ScanTuning,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -177,7 +177,10 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
         table_root,
         projection: vec!["ID".into(), "NAME".into()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files.into_iter().map(FileEntry::from).collect())
@@ -191,7 +194,10 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
         table_root,
         projection: vec!["ID".into(), "NAME".into()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         logical_schema: vec![
             LogicalField {
                 field_id: Some(1),
@@ -246,7 +252,10 @@ fn raw_spec_with_wide_logical_schema(
         table_root,
         projection: vec!["ID".into(), "NAME".into()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         logical_schema: wide_logical_fields(columns),
         ..Default::default()
     }

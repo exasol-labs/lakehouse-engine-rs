@@ -489,7 +489,7 @@ async fn plan_file_tasks(
     manifest_concurrency: NonZeroUsize,
     secrets: &[&str],
 ) -> Result<Vec<iceberg::scan::FileScanTask>, UdfError> {
-    let cores = crate::adapter::resolve_nr_of_cores() as usize;
+    let cores = crate::adapter::tuning::resolve_nr_of_cores() as usize;
     // iceberg-rust sets the manifest-file limit only together with the CPU-bound entry limit.
     let mut scan_builder = table
         .scan()

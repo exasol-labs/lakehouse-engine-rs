@@ -1,9 +1,8 @@
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
 use crate::adapter::properties::{
-    PROP_HIVE_PARTITIONING, PROP_MERGE_SCHEMA, PROP_NAMESPACE, parse_boolean,
+    PROP_HIVE_PARTITIONING, PROP_MERGE_SCHEMA, PROP_NAMESPACE, VsProperties, parse_boolean,
 };
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageProperties {
@@ -32,14 +31,15 @@ impl DirectStorageProperties {
 
 /// An unparseable `MERGE_SCHEMA`/`HIVE_PARTITIONING` value is rejected rather than defaulted, and
 /// a `NAMESPACE` with a URI scheme or leading `/` is rejected rather than repaired.
-pub fn resolve_direct_storage_properties(
-    props: &Json,
+pub(super) fn resolve_direct_storage_properties(
+    props: &VsProperties,
     connection_address: &str,
 ) -> Result<DirectStorageProperties, UdfError> {
-    let namespace = parse_namespace(props)?;
-    let base_path = join_storage_path(connection_address, namespace.as_deref());
-    let merge_schema = parse_bool_property(props, PROP_MERGE_SCHEMA, true)?;
-    let hive_partitioning = parse_bool_property(props, PROP_HIVE_PARTITIONING, true)?;
+    let namespace = parse_namespace(props.namespace.as_deref())?;
+    let base_path = join_storage_path(connection_address, namespace);
+    let merge_schema = parse_bool_property(props.merge_schema.as_deref(), PROP_MERGE_SCHEMA)?;
+    let hive_partitioning =
+        parse_bool_property(props.hive_partitioning.as_deref(), PROP_HIVE_PARTITIONING)?;
     Ok(DirectStorageProperties {
         base_path,
         merge_schema,
@@ -56,8 +56,8 @@ pub fn join_storage_path(base: &str, segment: Option<&str>) -> String {
     }
 }
 
-fn parse_namespace(props: &Json) -> Result<Option<String>, UdfError> {
-    let Some(value) = super::nonempty_str(props, PROP_NAMESPACE) else {
+fn parse_namespace(value: Option<&str>) -> Result<Option<&str>, UdfError> {
+    let Some(value) = value else {
         return Ok(None);
     };
     if value.contains("://") {
@@ -74,12 +74,13 @@ fn parse_namespace(props: &Json) -> Result<Option<String>, UdfError> {
             PROP_NAMESPACE
         )));
     }
-    Ok(Some(value.to_string()))
+    Ok(Some(value))
 }
 
-fn parse_bool_property(props: &Json, key: &str, default: bool) -> Result<bool, UdfError> {
-    let Some(value) = super::nonempty_str(props, key) else {
-        return Ok(default);
+/// An absent value is `TRUE`.
+fn parse_bool_property(value: Option<&str>, key: &str) -> Result<bool, UdfError> {
+    let Some(value) = value else {
+        return Ok(true);
     };
     parse_boolean(value).ok_or_else(|| {
         UdfError::User(format!(

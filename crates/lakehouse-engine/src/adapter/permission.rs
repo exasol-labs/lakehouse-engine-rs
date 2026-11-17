@@ -9,7 +9,6 @@ use lakehouse_catalog::{
     lakekeeper_management_url,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, context};
-use serde_json::Value as Json;
 
 const LAKEKEEPER: &str = "LAKEKEEPER";
 /// The largest planned template renders in 19 units, a 5,000-entry lookup table in 8.
@@ -28,8 +27,11 @@ pub(crate) enum PermissionSettings {
 impl PermissionSettings {
     /// Compiles `USER_MAPPING` without rendering it, so createVirtualSchema, refresh, and
     /// setProperties reject a template syntax error without knowing any user.
-    pub(crate) fn parse(props: &Json) -> Result<Self, UdfError> {
-        let Some(value) = super::nonempty_str(props, PERMISSION_CHECK) else {
+    pub(crate) fn parse(
+        permission_check: Option<&str>,
+        user_mapping: Option<&str>,
+    ) -> Result<Self, UdfError> {
+        let Some(value) = permission_check else {
             return Ok(Self::Off);
         };
         if !value.eq_ignore_ascii_case(LAKEKEEPER) {
@@ -38,7 +40,7 @@ impl PermissionSettings {
                  or leave it absent to turn the permission check off"
             )));
         }
-        let template = super::nonempty_str(props, USER_MAPPING).ok_or_else(|| {
+        let template = user_mapping.ok_or_else(|| {
             UdfError::User(format!(
                 "{PERMISSION_CHECK} = '{LAKEKEEPER}' requires a '{USER_MAPPING}' template that \
                  maps the querying Exasol user to a Lakekeeper principal"

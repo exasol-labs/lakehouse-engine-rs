@@ -2309,6 +2309,12 @@ fn placeholder_dates_meet_timestamps_like_native() {
 
     let in_scan = PathCheck::Has("AS TIMESTAMP(");
     let broadcast = PathCheck::Has(BROADCAST_JOIN);
+    // Exasol 8 brings a CASE whose first branch is a DATE to the DATE.
+    let date_first_case = if engine_honors_declared_precision(&mut conn) {
+        in_scan
+    } else {
+        PathCheck::Has("AS DATE)")
+    };
     let cases = [
         (
             "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_DATE < TIMESTAMP '2020-01-01 00:00:00'",
@@ -2328,7 +2334,7 @@ fn placeholder_dates_meet_timestamps_like_native() {
         ),
         (
             "SELECT ID, CASE WHEN ID > 2 THEN STORED_DATE ELSE STORED_TS END FROM {T} WHERE ID <= 3",
-            in_scan,
+            date_first_case,
         ),
         (
             "SELECT ID, COALESCE(STORED_DATE, STORED_TS), GREATEST(STORED_DATE, STORED_TS), \

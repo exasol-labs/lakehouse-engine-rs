@@ -5,7 +5,7 @@ const TIMESTAMP_ONLY: [FormatTarget; 1] = [FormatTarget::Timestamp];
 
 #[test]
 fn translates_supported_formats() {
-    let cases: [(&str, &str, &[FormatTarget]); 17] = [
+    let cases: [(&str, &str, &[FormatTarget]); 16] = [
         ("YYYY-MM-DD", "%Y-%m-%d", &BOTH),
         ("yyyy-mm-dd", "%Y-%m-%d", &BOTH),
         ("Yyyy-Mm-Dd", "%Y-%m-%d", &BOTH),
@@ -24,17 +24,12 @@ fn translates_supported_formats() {
         ("YYYY-MM-DD HH24:MI", "%Y-%m-%d %H:%M", &TIMESTAMP_ONLY),
         (
             "YYYY-MM-DD HH24:MI:SS.FF3",
-            "%Y-%m-%d %H:%M:%S%.3f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
         (
             "YYYY-MM-DD HH24:MI:ss.ff9",
-            "%Y-%m-%d %H:%M:%S%.9f",
-            &TIMESTAMP_ONLY,
-        ),
-        (
-            "YYYY-MM-DD HH24:MI:SSFF6",
-            "%Y-%m-%d %H:%M:%S%6f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
         (
@@ -44,7 +39,7 @@ fn translates_supported_formats() {
         ),
         (
             "YYYY-MM-DD HH24:MI:SS.FF6",
-            "%Y-%m-%d %H:%M:%S%.6f",
+            "%Y-%m-%d %H:%M:%S%.f",
             &TIMESTAMP_ONLY,
         ),
     ];
@@ -61,7 +56,7 @@ fn translates_supported_formats() {
 
 #[test]
 fn declines_unsupported_formats() {
-    let cases: [(&str, FormatTarget); 19] = [
+    let cases: [(&str, FormatTarget); 20] = [
         ("DD-MON-YYYY", FormatTarget::Date),
         ("YYYY-MM-DD HH24:MI", FormatTarget::Date),
         ("YYYY-MM-DD HH24:MI:SS", FormatTarget::Date),
@@ -78,6 +73,7 @@ fn declines_unsupported_formats() {
         ("YYYY-MM-DD%", FormatTarget::Date),
         ("YYYY-MM-DD HH24:MI:SS.FF", FormatTarget::Timestamp),
         ("YYYY-MM-DD HH24:MI:SSFF", FormatTarget::Timestamp),
+        ("YYYY-MM-DD HH24:MI:SSFF6", FormatTarget::Timestamp),
         ("YYYY年MM月DD日", FormatTarget::Date),
         ("YYYY-MM-DDX", FormatTarget::Date),
         ("YYYY-MM-DD HH24:MI:ſſ", FormatTarget::Timestamp),
@@ -88,5 +84,22 @@ fn declines_unsupported_formats() {
             None,
             "{format} for {target:?}"
         );
+    }
+}
+
+#[test]
+fn fraction_digits_follow_the_ff_part_of_a_translated_format() {
+    let cases = [
+        ("YYYY-MM-DD", Some(0)),
+        ("YYYY-MM-DD HH24:MI:SS", Some(0)),
+        ("YYYY-MM-DD HH24:MI:SS.FF3", Some(3)),
+        ("YYYY-MM-DD HH24:MI:ss.ff6", Some(6)),
+        ("YYYY-MM-DD HH24:MI:SS.FF9", Some(9)),
+        ("YYYY-MM-DD HH24:MI:SSFF9", None),
+        ("YYYY-MM-DD HH24:MI:SS.FF", None),
+        ("YYYY-MM-DD HH24:MI:SS.FF2", None),
+    ];
+    for (format, expected) in cases {
+        assert_eq!(fraction_digits(format), expected, "{format}");
     }
 }

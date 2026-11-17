@@ -1,24 +1,23 @@
 # Feature: Create Virtual Schema, AdapterNotes
 
-The `createVirtualSchema` response's schema-level `adapterNotes` records the resource budgets, the skipped-table list, and the Iceberg REST catalog prefix. Later pushdowns read the budgets to bound each scan UDF instance, and the prefix to skip the catalog's `/v1/config` lookup. Each virtual table's catalog identifier lives in that table's own identifier note (`vs-adapter/create-virtual-schema`), not here. The notes exclude the cluster node count and the per-node core count.
+The `createVirtualSchema` response's schema-level `adapterNotes` records the skipped-table list and the Iceberg REST catalog prefix. Later pushdowns read the prefix to skip the catalog's `/v1/config` lookup. Each virtual table's catalog identifier lives in that table's own identifier note (`vs-adapter/create-virtual-schema`), not here.
 
 ## Background
 
-* The schema-level `adapterNotes` holds only values a pushdown cannot recompute without a catalog request, plus `SKIPPED_TABLES`. Every pushdown reads the cluster node count from `UdfContext::node_count()` in its own UDF handshake (`pushdown/pushdown-planning`), so the notes carry no node count.
+* The schema-level `adapterNotes` holds only values a pushdown cannot recompute without a catalog request, plus `SKIPPED_TABLES`. Every pushdown resolves its tuning values from the virtual schema properties (`vs-properties/tuning-resolution`) and reads the cluster node count from its UDF handshake (`pushdown/pushdown-planning`).
 * `SKIPPED_TABLES` is a diagnostic entry that no pushdown reads. It records the tables the listing skipped, so a user reads each skip reason from `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`. Only a partial refresh reads it back, to merge it (`vs-adapter/refresh-and-set-properties`).
-* Exasol rejects an `adapterNotes` value longer than 2,000,000 characters with sqlCode `04000` on CREATE and REFRESH, and keeps the previous value. The tuning entries have a fixed size.
-* No virtual schema property sets the core count, and `vs-properties/property-name-validation` rejects a property name the adapter does not read. An operator who needs a smaller core count constrains the node's CPU affinity, which `available_parallelism()` honours.
-* The adapter holds no state between requests. It returns the resolved tuning values of `vs-properties/create-virtual-schema-adapter-notes-resources` in `adapterNotes` (stringified JSON), which Exasol persists and returns at pushdown time. `schemaMetadata.properties` is not used, because Exasol 2025.2.1 silently drops adapter-returned properties.
+* Exasol rejects an `adapterNotes` value longer than 2,000,000 characters with sqlCode `04000` on CREATE and REFRESH, and keeps the previous value.
+* `adapterNotes` is stringified JSON, which Exasol persists and returns at pushdown time. `schemaMetadata.properties` is not used, because Exasol 2025.2.1 silently drops adapter-returned properties.
 
 ## Scenarios
 
-### Scenario: createVirtualSchema adapterNotes omit the cluster node count
+### Scenario: Schema-level adapterNotes hold only the skipped tables and the catalog prefix
 
 * *GIVEN* an Exasol session that has installed the VS adapter script, with the catalog and storage connection properties supplied
 * *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL write exactly these schema-level entries into the returned `adapterNotes`: `PARALLELISM_FACTOR`, `DF_THREADING_MODE`, `DF_TARGET_PARTITIONS`, `DF_THREADS_PER_UDF`, `DF_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `S3_MAX_CONNECTIONS`, `JOIN_BROADCAST_MAX_BYTES`, `METADATA_READ_CONCURRENCY`, and `SKIPPED_TABLES`, plus `SKIPPED_TABLES_OMITTED` when it caps the skip list and `CATALOG_PREFIX` under the Iceberg REST catalog kind
-* *AND* a `refresh` or `setProperties` response SHALL carry the same entries and keep every other entry of the persisted `adapterNotes`, per `vs-adapter/refresh-and-set-properties`, so an inherited node-count entry stays unread
-* *AND* the adapter MUST NOT write an entry for the cluster node count or the per-node core count, because every pushdown reads the node count from its own UDF handshake and derives the core count itself
+* *THEN* the adapter SHALL write exactly `SKIPPED_TABLES` into the returned schema-level `adapterNotes`, plus `SKIPPED_TABLES_OMITTED` when it caps the skip list and `CATALOG_PREFIX` under the Iceberg REST catalog kind
+* *AND* a `refresh` or `setProperties` response SHALL carry the same entries and keep every other entry of the persisted `adapterNotes`, per `vs-adapter/refresh-and-set-properties`
+* *AND* the adapter MUST NOT write a tuning value, the cluster node count, or the per-node core count, because every pushdown derives them itself
 
 ### Scenario: The Iceberg REST catalog prefix is recorded at schema level
 
@@ -26,29 +25,6 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 * *WHEN* createVirtualSchema, refresh, or setProperties completes
 * *THEN* adapterNotes SHALL carry `CATALOG_PREFIX`, the REST path prefix the listing's catalog session used: the catalog's `/v1/config` prefix, an empty string when the catalog serves none, and `catalogs/{warehouse}` under `use_sigv4`
 * *AND* a response under any other catalog kind SHALL carry no `CATALOG_PREFIX`, so a `SET CATALOG_KIND` away from Iceberg REST removes a recorded one
-
-### Scenario: Adapter derives the per-node core count from available_parallelism() on every request
-
-* *GIVEN* an Exasol session that has installed the VS adapter script and supplies the catalog and storage connection properties
-* *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL read the per-node core count from `std::thread::available_parallelism()` on the executing node, WITHOUT opening any connect-back session and WITHOUT reading any VS or connection property
-* *AND* the adapter SHALL read that core count EXACTLY ONCE per request, at one call site, and pass the resolved value as a plain argument into the parallelism-factor, DataFusion-threading, and connection-concurrency derivations
-* *AND* the adapter MUST NOT write the resolved core count into the response `adapterNotes`, and MUST NOT persist it anywhere else
-
-### Scenario: Adapter uses a core count of 1 when available_parallelism() cannot report one
-
-* *GIVEN* an executing node whose platform cannot report a core count, so `std::thread::available_parallelism()` returns an error
-* *WHEN* the adapter resolves the per-node core count for a `createVirtualSchema` request
-* *THEN* the adapter SHALL use a core count of `1`, and MUST NOT use a distinct unknown sentinel value such as `0`
-* *AND* the adapter SHALL return a successful `createVirtualSchema` response
-* *AND* every budget derived from that core count SHALL equal the budget a genuine single-core node produces
-
-### Scenario: The adapter detects the node's CPU affinity set
-
-* *GIVEN* an Exasol node whose CPU affinity set holds `k` CPUs, with `2 ≤ k <` the host's core count
-* *AND* a virtual schema created with no `DATAFUSION_THREADING_MODE` property
-* *WHEN* the adapter records `DF_THREADS_PER_UDF` in the schema's adapterNotes
-* *THEN* the recorded value SHALL equal `k`, not the fallback of `1` or the host's core count
 
 ### Scenario: Every skipped table is recorded with its reason under every catalog kind
 

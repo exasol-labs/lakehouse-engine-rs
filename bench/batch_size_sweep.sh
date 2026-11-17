@@ -32,8 +32,8 @@ USING ${SCHEMA}.${ADAPTER} WITH
   NAMESPACE             = '${NS}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${bs}'" | exapump sql -d "$DSN" >/dev/null 2>&1
-  qout "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME='${VS}'" \
-    | tr ',' '\n' | grep -i 'DF_BATCH_SIZE' | grep -oE '[0-9]+' | tail -1
+  qout "EXPLAIN VIRTUAL SELECT * FROM ${VS}.LINEITEM WHERE L_ORDERKEY < ${KEY}" \
+    | grep -oE 'df_batch_size[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1
 }
 
 timed_ctas() {  # label  select_expr
@@ -57,8 +57,8 @@ echo | tee -a "$REPORT"
 
 for bs in $SIZES; do
   resolved="$(recreate_vs "$bs")"
-  echo "--- batch_size=${bs} (adapterNotes DF_BATCH_SIZE=${resolved:-?}) ---" | tee -a "$REPORT"
-  if [ "$resolved" != "$bs" ]; then echo "  WARN: resolved DF_BATCH_SIZE '${resolved}' != requested '${bs}'" | tee -a "$REPORT"; fi
+  echo "--- batch_size=${bs} (scan spec df_batch_size=${resolved:-?}) ---" | tee -a "$REPORT"
+  if [ "$resolved" != "$bs" ]; then echo "  WARN: scan spec df_batch_size '${resolved}' != requested '${bs}'" | tee -a "$REPORT"; fi
   best=0
   for pass in 1 2; do
     rps="$(timed_ctas "emit_bs${bs}_p${pass}" "SELECT * FROM ${VS}.LINEITEM WHERE L_ORDERKEY < ${KEY}" | tail -1)"

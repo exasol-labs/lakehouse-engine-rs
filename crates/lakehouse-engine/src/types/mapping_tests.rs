@@ -1058,7 +1058,7 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
         ("7.1.20", MillisecondOnly, "TIMESTAMP"),
     ];
     for (version, expected, expected_declaration) in cases {
-        let resolved = EngineTimestampSupport::from_database_version(version);
+        let resolved = EngineTimestampSupport::from(ExasolVersion::of(version));
         assert_eq!(resolved, expected, "version={version}");
         assert_eq!(
             resolved.declaration(TimestampUnit::Microsecond).to_string(),
@@ -1071,7 +1071,7 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
 #[test]
 fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
-        let resolved = EngineTimestampSupport::from_database_version(version);
+        let resolved = EngineTimestampSupport::from(ExasolVersion::of(version));
         assert_eq!(
             resolved,
             EngineTimestampSupport::DeclaredPrecision,

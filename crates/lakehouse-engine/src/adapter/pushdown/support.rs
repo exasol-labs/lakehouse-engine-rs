@@ -13,12 +13,12 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, SqlFragment, render_scan_expression, render_scan_filter,
-    walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, SqlFragment, walk_column_nodes,
 };
 
 use super::RefusedColumn;
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
+use super::context::Shards;
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
@@ -71,15 +71,12 @@ impl AggregateMergeInputs {
 
 /// No materialization wrapper (decision [5]). The spec's `aggregates` and `merge_inputs` are
 /// present or absent together, and a row scan emits `projection`, which replaces the spec's own.
-#[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     projection: &[ProjectedColumn],
     limit: Option<u64>,
     merge_inputs: Option<&AggregateMergeInputs>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> String {
     debug_assert_eq!(
         spec_template.common.aggregates.is_some(),
@@ -89,23 +86,9 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     if let (Some(aggregates), Some(inputs)) =
         (spec_template.common.aggregates.as_deref(), merge_inputs)
     {
-        build_aggregate_scan_sql(
-            spec_template,
-            shards,
-            aggregates,
-            inputs,
-            udf_name,
-            distribute_udf_name,
-        )
+        build_aggregate_scan_sql(spec_template, shards, aggregates, inputs)
     } else {
-        build_row_scan_sql(
-            spec_template,
-            shards,
-            projection,
-            limit,
-            udf_name,
-            distribute_udf_name,
-        )
+        build_row_scan_sql(spec_template, shards, projection, limit)
     }
 }
 
@@ -139,14 +122,12 @@ pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
 /// agree on direction and NULL placement.
 fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     projection: &[ProjectedColumn],
     limit: Option<u64>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> String {
     let fan_out = FanOut::rows(spec_template.common.clone(), projection);
-    let mut sql = build_fan_out_inner(&fan_out, shards, udf_name, distribute_udf_name);
+    let mut sql = build_fan_out_inner(&fan_out, shards);
 
     // SQL requires ORDER BY before LIMIT.
     if !spec_template.common.order_by.is_empty() {
@@ -165,16 +146,14 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
 /// return zero rows (#198).
 fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     aggregates: &[AggregatePlan],
     inputs: &AggregateMergeInputs,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> String {
     let merge_select = inputs.merge_select.join(", ");
 
     let fan_out = FanOut::aggregate(spec_template.common.clone(), &inputs.partial_emits);
-    let fan_out = build_fan_out_inner(&fan_out, shards, udf_name, distribute_udf_name);
+    let fan_out = build_fan_out_inner(&fan_out, shards);
     let from = with_stat_grand_means(&fan_out, aggregates, &[]);
 
     let mut sql = format!("SELECT {merge_select} FROM ({from})");
@@ -189,29 +168,19 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 
 /// `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`. LIMIT goes only on the outer
 /// wrapper: inside the fan-out it would truncate a shard's distinct set.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     items: &[SingleGroupItem],
     emitted: &Emitted,
     limit: Option<u64>,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let [SingleGroupItem::Distinct(dc)] = items else {
         unreachable!(
             "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
         )
     };
-    let fan_out = build_distinct_fan_out(
-        base_spec,
-        shards,
-        dc,
-        emitted,
-        udf_name,
-        distribute_udf_name,
-    )?;
+    let fan_out = build_distinct_fan_out(base_spec, shards, dc, emitted)?;
     let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
@@ -223,11 +192,9 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
 /// the outer `COUNT(DISTINCT "V")` dedups across shards with no cast.
 fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
-    shards: &[Vec<E>],
+    shards: &Shards<E>,
     dc: &DistinctCount,
     emitted: &Emitted,
-    udf_name: &str,
-    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let Some(col) = dc.column.as_deref() else {
         unreachable!(
@@ -252,12 +219,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         ..base_spec.common.clone()
     };
     let fan_out = FanOut::distinct_values(common, value);
-    Ok(build_fan_out_inner(
-        &fan_out,
-        shards,
-        udf_name,
-        distribute_udf_name,
-    ))
+    Ok(build_fan_out_inner(&fan_out, shards))
 }
 
 /// One scan fan-out: the scan spec and its `EMITS` clause. Each constructor derives both from one
@@ -316,19 +278,21 @@ impl FanOut {
 /// serialized once; only per-shard file lists flow through the distributor.
 pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     fan_out: &FanOut,
-    shards: &[Vec<E>],
-    udf_name: &str,
-    distribute_udf_name: &str,
+    shards: &Shards<E>,
 ) -> String {
     let common_literal = sql_string_literal(&fan_out.spec.to_common_json());
     let emits = fan_out.emits.as_str();
+    let Shards {
+        files: shards,
+        udfs,
+    } = shards;
 
     // A scalar EMIT UDF over constant literals fires exactly once.
     if shards.len() == 1 {
         let files_literal = sql_string_literal(&shard_files_json(&shards[0]));
         return format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
-            udf = udf_name,
+            udf = udfs.scan,
             common = common_literal,
             files = files_literal,
             emits = emits,
@@ -347,10 +311,10 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     // The distributor has a static `EMITS`, so Exasol rejects a query-side `EMITS` on it.
     format!(
         "SELECT {udf}({common}, files) EMITS ({emits}) FROM (SELECT {distribute}(files) FROM (VALUES {values}) AS shards(shard_key, files) GROUP BY shard_key)",
-        udf = udf_name,
+        udf = udfs.scan,
         common = common_literal,
         emits = emits,
-        distribute = distribute_udf_name,
+        distribute = udfs.distribute,
         values = values_list,
     )
 }
@@ -659,6 +623,7 @@ impl ColumnTypeLookup for ColumnTypes {
 #[derive(Debug, Clone, Copy)]
 pub struct ScanTranslator<'a> {
     columns: &'a ColumnTypes,
+    version: ExasolVersion,
 }
 
 impl<'a> ScanTranslator<'a> {
@@ -666,7 +631,11 @@ impl<'a> ScanTranslator<'a> {
     /// once each column of `trees` binds an entry, the typed pass declines only by a type rule.
     /// The request check already failed every undeclared column, so a column that binds none is
     /// an adapter bug, such as a wrong leg qualification, and fails the request loudly (#615).
-    pub(super) fn over(columns: &'a ColumnTypes, trees: &[&Json]) -> Result<Self, UdfError> {
+    pub(super) fn over(
+        columns: &'a ColumnTypes,
+        version: ExasolVersion,
+        trees: &[&Json],
+    ) -> Result<Self, UdfError> {
         for tree in trees {
             let mut unbound = None;
             walk_column_nodes(tree, &mut |column| {
@@ -684,34 +653,70 @@ impl<'a> ScanTranslator<'a> {
                 )));
             }
         }
-        Ok(Self { columns })
+        Ok(Self { columns, version })
     }
 
     pub(super) fn columns(self) -> &'a ColumnTypes {
         self.columns
     }
 
-    /// `None` declines: the caller applies the expression in Exasol or declines the shape.
-    pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
-        render_scan_expression(
-            &compare_binary_bytes(expr.clone(), self.columns),
-            self.columns,
-        )
-        .ok()
+    fn typing(self) -> ScanTyping<'a> {
+        ScanTyping::new(self.columns, self.version)
     }
 
-    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
-    /// raw tree, which Exasol applies itself.
-    pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
+    pub(super) fn exact_type(self, node: &Json) -> Option<ExasolType> {
+        self.typing().exact_type(node)
+    }
+
+    /// The Exasol-dialect `expr` with its exact type, for an item Exasol computes.
+    pub(super) fn exasol_fragment(self, expr: &Json) -> SqlFragment {
+        self.typing().exasol_fragment(expr)
+    }
+
+    /// `None` declines: the caller applies the expression in Exasol or declines the shape.
+    pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
+        self.typing()
+            .render_expression(&compare_binary_bytes(expr.clone(), self.columns))
+            .ok()
+    }
+
+    /// Where the request's WHERE applies, the scan or Exasol (`_decision/045`).
+    pub(super) fn split_where(self, filter: Option<&Json>) -> ScanWhere<'_> {
         let Some(raw) = filter else {
-            return (None, None);
+            return ScanWhere::Absent;
         };
-        match render_scan_filter(
-            &compare_binary_bytes(raw.clone(), self.columns),
-            self.columns,
-        ) {
-            Ok(sql) => (Some(sql), None),
-            Err(_) => (None, Some(raw)),
+        match self
+            .typing()
+            .render_filter(&compare_binary_bytes(raw.clone(), self.columns))
+        {
+            Ok(sql) => ScanWhere::Pushed(sql),
+            Err(_) => ScanWhere::Declined(raw),
+        }
+    }
+}
+
+/// A request's WHERE, as [`ScanTranslator::split_where`] places it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ScanWhere<'a> {
+    Absent,
+    /// The scan applies the rendered filter.
+    Pushed(String),
+    /// The raw tree, which Exasol applies itself.
+    Declined(&'a Json),
+}
+
+impl<'a> ScanWhere<'a> {
+    pub(super) fn pushed(&self) -> Option<String> {
+        match self {
+            Self::Pushed(sql) => Some(sql.clone()),
+            Self::Absent | Self::Declined(_) => None,
+        }
+    }
+
+    pub(super) fn declined(&self) -> Option<&'a Json> {
+        match self {
+            Self::Declined(raw) => Some(raw),
+            Self::Absent | Self::Pushed(_) => None,
         }
     }
 }

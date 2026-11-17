@@ -427,6 +427,7 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
 
 /// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 /// Scenario: A join outside the broadcast contract is declined safely
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -517,6 +518,10 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
         format!(
             "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
              MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {orders}"
+        ),
+        format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE \
+             ELSE TIMESTAMP '1960-01-01 10:00:00.123456' END) FROM {orders}"
         ),
         format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \

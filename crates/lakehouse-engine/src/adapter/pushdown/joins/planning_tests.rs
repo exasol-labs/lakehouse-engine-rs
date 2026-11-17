@@ -237,10 +237,16 @@ fn dimension_is_left_when_left_side_is_smaller() {
     assert_eq!(sides.fact.total_bytes, 100_000);
     assert_eq!(sides.dimension.table_identifier, "lh.customer");
     assert_eq!(sides.fact.table_identifier, "lh.orders");
-    assert_eq!(sides.dimension.files, vec![FileEntry::new("c1", 1_000)]);
-    assert_eq!(sides.dimension.table_root, "s3://warehouse/lh/customer");
-    assert_eq!(sides.dimension.logical_schema.len(), 1);
-    assert_eq!(sides.dimension.effective_storage, sample_storage());
+    assert_eq!(
+        sides.dimension.scan.files,
+        vec![crate::scan::spec::FileEntry::new("c1", 1_000)]
+    );
+    assert_eq!(
+        sides.dimension.scan.table_root,
+        "s3://warehouse/lh/customer"
+    );
+    assert_eq!(sides.dimension.scan.logical_schema.len(), 1);
+    assert_eq!(sides.dimension.scan.effective_storage, sample_storage());
 }
 
 #[test]
@@ -267,7 +273,7 @@ fn empty_side_is_the_dimension() {
 
     assert_eq!(sides.dimension.table_name, "EMPTYDIM");
     assert_eq!(sides.dimension.total_bytes, 0);
-    assert!(sides.dimension.files.is_empty());
+    assert!(sides.dimension.scan.files.is_empty());
 }
 
 #[test]

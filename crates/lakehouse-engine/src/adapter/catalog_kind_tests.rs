@@ -6,7 +6,8 @@ use serde_json::json;
 fn absent_catalog_kind_resolves_iceberg_rest() {
     let props = json!({});
 
-    let kind = resolve_catalog_kind(&props).expect("absent CATALOG_KIND must resolve, not error");
+    let kind = CatalogKind::parse(props["CATALOG_KIND"].as_str())
+        .expect("absent CATALOG_KIND must resolve, not error");
 
     assert_eq!(kind, CatalogKind::IcebergRest);
 }
@@ -16,7 +17,7 @@ fn unity_catalog_value_resolves_native_kind() {
     for value in ["UNITY_CATALOG", "unity_catalog", "Unity_Catalog"] {
         let props = json!({ "CATALOG_KIND": value });
 
-        let kind = resolve_catalog_kind(&props)
+        let kind = CatalogKind::parse(props["CATALOG_KIND"].as_str())
             .unwrap_or_else(|err| panic!("'{value}' must resolve, got error: {err}"));
 
         assert_eq!(
@@ -32,7 +33,7 @@ fn direct_storage_value_resolves_direct_storage_kind() {
     for value in ["DIRECT_STORAGE", "direct_storage", "Direct_Storage"] {
         let props = json!({ "CATALOG_KIND": value });
 
-        let kind = resolve_catalog_kind(&props)
+        let kind = CatalogKind::parse(props["CATALOG_KIND"].as_str())
             .unwrap_or_else(|err| panic!("'{value}' must resolve, got error: {err}"));
 
         assert_eq!(
@@ -49,7 +50,7 @@ fn glue_catalog_kind_resolves_case_insensitively() {
     for value in ["GLUE", "glue", "Glue"] {
         let props = json!({ "CATALOG_KIND": value });
 
-        let kind = resolve_catalog_kind(&props)
+        let kind = CatalogKind::parse(props["CATALOG_KIND"].as_str())
             .unwrap_or_else(|err| panic!("'{value}' must resolve, got error: {err}"));
 
         assert_eq!(kind, CatalogKind::Glue, "'{value}' must resolve to Glue");
@@ -60,7 +61,7 @@ fn glue_catalog_kind_resolves_case_insensitively() {
 fn unrecognized_catalog_kind_is_rejected() {
     let props = json!({ "CATALOG_KIND": "SNOWFLAKE" });
 
-    let err = resolve_catalog_kind(&props)
+    let err = CatalogKind::parse(props["CATALOG_KIND"].as_str())
         .expect_err("an unrecognized CATALOG_KIND value must be rejected, not defaulted");
 
     let message = err.to_string();
