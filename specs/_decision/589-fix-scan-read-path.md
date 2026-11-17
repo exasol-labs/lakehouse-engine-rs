@@ -69,7 +69,7 @@ DataFusion's Parquet reader holds the fetched bytes of each stream's current row
 
 ### Decision
 
-The shared reader admits the first fetch of a row group against one byte budget per invocation, a quarter of the memory pool. The bytes stay reserved in the pool until the reader fetches its next row group or drops. A fetch that does not fit waits in arrival order. A fetch is admitted when nothing else is held, and a later fetch of an admitted row group never waits.
+The shared reader admits every fetch of a row group against one byte budget per invocation, a quarter of the memory pool. The bytes stay reserved in the pool until the reader fetches its next row group or drops. A fetch that does not fit waits in arrival order. A first fetch is admitted when nothing else is held. A later fetch of the same row group keeps its bytes while it waits and goes before any first fetch. When every reader that holds bytes waits, the first of them goes beyond the budget.
 
 ### Options Considered
 
@@ -77,6 +77,8 @@ The shared reader admits the first fetch of a row group against one byte budget 
 |--------|---------|
 | Cap the stream count | Rejected: it bounds memory for one row-group size only, and it lowers small-file concurrency |
 | Fail a read that does not fit | Rejected: a query that ran before would fail, where waiting only slows it |
+| Let a later fetch of an admitted row group skip the budget | Rejected: a filter fetches its columns first, so every stream was admitted for a small fetch and then held a whole row group. 16 streams reserved 95 MB against a 16 MB budget, and the next operator's reservation failed |
+| Admit the whole row group at its first fetch | Rejected: the reader does not know the scan's Parquet columns, so it would count unread columns and stall wide tables |
 | Count held file bytes against the same budget | Rejected: a file's footer bytes stay held until all its ranges finish, so they could block the reads that release them |
 
 ### Consequences
@@ -84,4 +86,6 @@ The shared reader admits the first fetch of a row group against one byte budget 
 - Scan read memory follows the budget, not the stream count: 263 MB from 32 to 192 streams with a 1 GiB pool, at the same run time.
 - Row-group bytes now count in the pool, so operators get that much less of it. The reservation never fails, so a row group larger than the free pool can make an operator's reservation fail.
 - The budget counts fetched bytes. Decoded batches are bounded per stream by the batch size.
-- A waiting reader holds no row-group bytes. This is deadlock-free only while no plan makes one scan stream wait for another, which a host test checks for every pushed plan shape.
+- Held bytes exceed the budget by at most one row group.
+- A reader that waits for a first fetch holds no row-group bytes, and a reader that waits for a later fetch is passed when no other reader runs. This is deadlock-free only while no plan makes one scan stream wait for another, which a host test checks for every pushed plan shape.
+- Streams that hold filter columns while they wait take budget from the streams that decode. With a small pool and many streams, few row groups decode at once.

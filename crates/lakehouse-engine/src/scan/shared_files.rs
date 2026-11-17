@@ -435,8 +435,8 @@ impl SharedFileReader {
         &self.files.files[&self.location]
     }
 
-    /// Holds `fetched` against the read budget until this reader fetches another row group or
-    /// drops. The parquet decoder keeps a row group's bytes for exactly that long.
+    /// Waits for the read budget and holds `fetched` against it until this reader fetches
+    /// another row group or drops. The parquet decoder keeps a row group's bytes that long.
     async fn admit(&mut self, fetched: &[Range<u64>]) {
         let footer = self.loads.footer.get();
         let Some(row_group) = fetched
@@ -447,7 +447,7 @@ impl SharedFileReader {
         };
         let bytes = fetched.iter().map(|r| (r.end - r.start) as usize).sum();
         match &mut self.lease {
-            Some((held, lease)) if *held == row_group => lease.extend(bytes),
+            Some((held, lease)) if *held == row_group => lease.extend(bytes).await,
             lease => {
                 *lease = None;
                 *lease = Some((row_group, self.files.read_budget.admit(bytes).await));

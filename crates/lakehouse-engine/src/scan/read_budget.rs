@@ -10,13 +10,27 @@ use tokio::sync::Notify;
 /// The budget is the memory pool divided by this.
 const POOL_SHARE: usize = 4;
 
+#[derive(Debug, Default)]
+struct Held {
+    bytes: usize,
+    /// Leases whose reader is not waiting to fetch more.
+    running: usize,
+}
+
+/// Waiters pass one at a time in arrival order, so a large read is not starved.
+#[derive(Debug, Default)]
+struct Queue {
+    turn: tokio::sync::Mutex<()>,
+    freed: Notify,
+}
+
 #[derive(Debug)]
 pub(crate) struct ReadBudget {
     capacity: usize,
-    held: Mutex<usize>,
-    /// Admits waiters one at a time in arrival order, so a large read is not starved.
-    turn: tokio::sync::Mutex<()>,
-    freed: Notify,
+    held: Mutex<Held>,
+    admits: Queue,
+    /// Apart from `admits`, so a lease finishes its row group before a new one is admitted.
+    extends: Queue,
     reservation: MemoryReservation,
 }
 
@@ -33,34 +47,46 @@ impl ReadBudget {
         Self {
             capacity,
             held: Mutex::default(),
-            turn: tokio::sync::Mutex::default(),
-            freed: Notify::new(),
+            admits: Queue::default(),
+            extends: Queue::default(),
             reservation: MemoryConsumer::new("scan row-group reads").register(pool),
         }
     }
 
-    fn held(&self) -> MutexGuard<'_, usize> {
+    fn held(&self) -> MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Waits until `bytes` fit. A read is admitted when nothing else is held, whatever its size,
-    /// so a row group larger than the budget still reads.
-    pub(super) async fn admit(self: &Arc<Self>, bytes: usize) -> ReadLease {
-        let _turn = self.turn.lock().await;
+    fn wake(&self) {
+        self.admits.freed.notify_one();
+        self.extends.freed.notify_one();
+    }
+
+    /// Waits until `bytes` fit, or until `unblocked` says that waiting longer frees nothing.
+    async fn take(&self, bytes: usize, queue: &Queue, unblocked: fn(&Held) -> bool) {
+        let _turn = queue.turn.lock().await;
         loop {
             {
                 let mut held = self.held();
-                if *held == 0 || held.saturating_add(bytes) <= self.capacity {
-                    *held += bytes;
+                if unblocked(&held) || held.bytes.saturating_add(bytes) <= self.capacity {
+                    held.bytes += bytes;
+                    held.running += 1;
                     break;
                 }
             }
-            self.freed.notified().await;
+            queue.freed.notified().await;
         }
         self.reservation.grow(bytes);
+    }
+
+    /// A read is admitted when nothing is held, whatever its size, so a row group larger than
+    /// the budget still reads.
+    pub(super) async fn admit(self: &Arc<Self>, bytes: usize) -> ReadLease {
+        self.take(bytes, &self.admits, |held| held.bytes == 0).await;
         ReadLease {
             budget: Arc::clone(self),
             bytes,
+            waiting: false,
         }
     }
 }
@@ -70,22 +96,37 @@ impl ReadBudget {
 pub(super) struct ReadLease {
     budget: Arc<ReadBudget>,
     bytes: usize,
+    /// Set while `extend` waits, and left set when that wait is cancelled.
+    waiting: bool,
 }
 
 impl ReadLease {
-    /// Never waits: a reader that waited while it holds bytes could deadlock the budget.
-    pub(super) fn extend(&mut self, bytes: usize) {
-        *self.budget.held() += bytes;
-        self.budget.reservation.grow(bytes);
+    /// Keeps the held bytes while it waits. When every lease waits here, none frees bytes, so
+    /// the first one goes beyond the budget.
+    pub(super) async fn extend(&mut self, bytes: usize) {
+        let budget = &self.budget;
+        if !self.waiting {
+            self.waiting = true;
+            budget.held().running -= 1;
+            budget.wake();
+        }
+        budget
+            .take(bytes, &budget.extends, |held| held.running == 0)
+            .await;
+        self.waiting = false;
         self.bytes += bytes;
     }
 }
 
 impl Drop for ReadLease {
     fn drop(&mut self) {
-        *self.budget.held() -= self.bytes;
+        {
+            let mut held = self.budget.held();
+            held.bytes -= self.bytes;
+            held.running -= usize::from(!self.waiting);
+        }
         self.budget.reservation.shrink(self.bytes);
-        self.budget.freed.notify_one();
+        self.budget.wake();
     }
 }
 

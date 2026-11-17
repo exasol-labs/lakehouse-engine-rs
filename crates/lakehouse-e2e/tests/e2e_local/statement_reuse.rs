@@ -541,52 +541,6 @@ fn storage_requests_do_not_grow_with_the_stream_count() {
     );
 }
 
-/// Scenario: Row-group reads wait on the read budget
-#[test]
-fn a_scan_fetching_more_than_the_read_budget_at_once_returns_every_row() {
-    const ROWS: usize = 1_600_000;
-    const STREAMS: usize = 16;
-
-    proxy_virtual_schemas();
-    put_fixture_object(
-        &format!("{READS_BASE}budget/f.parquet"),
-        encode_parquet_with(
-            &reads_batch(ROWS),
-            WriterProperties::builder()
-                .set_max_row_group_row_count(Some(ROWS / STREAMS))
-                .build(),
-        ),
-    );
-
-    let vs = "PROXY_READS_BUDGET_VS";
-    let mut conn = exa_conn();
-    // The smallest pool is 256 MiB, so the budget is 64 MiB. The filter makes every stream fetch
-    // the 5.6 MB of seven columns of its row group, 90 MB at once.
-    create_virtual_schema_with_password(
-        &mut conn,
-        &VsProps::new(vs, "")
-            .proxied("PROXY_READS_BUDGET_CREDS")
-            .with_catalog_kind("DIRECT_STORAGE")
-            .with_parallelism_factor(1)
-            .with_property("DATAFUSION_THREADING_MODE", "FIXED")
-            .with_property("DATAFUSION_TARGET_PARTITIONS", &STREAMS.to_string())
-            .with_property("MEMORY_POOL_FRACTION", "0.01"),
-        READS_BASE,
-        &CatalogConnectionPassword {
-            warehouse: String::new(),
-            ..local_stack_connection_password().via_proxy()
-        },
-    );
-
-    let filter: Vec<String> = (1..8).map(|column| format!("c{column} >= 0")).collect();
-    let rows = count(&format!(
-        "SELECT COUNT(*) FROM {} WHERE {}",
-        vs_table(vs, "budget"),
-        filter.join(" AND ")
-    ));
-    assert_eq!(rows, ROWS as i64);
-}
-
 /// Scenario: A small data file is read in one request
 /// Scenario: A delete payload is read once for the data files that share it
 #[test]

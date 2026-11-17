@@ -2,6 +2,7 @@ use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -9,7 +10,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -30,10 +33,15 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
-    write_local_parquet_rows(dir, 100, 100)
+    write_local_parquet_rows(dir, 100, 100, 0)
 }
 
-fn write_local_parquet_rows(dir: &std::path::Path, rows: i64, row_group_rows: usize) -> String {
+fn write_local_parquet_rows(
+    dir: &std::path::Path,
+    rows: i64,
+    row_group_rows: usize,
+    name_padding: usize,
+) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
@@ -42,10 +50,14 @@ fn write_local_parquet_rows(dir: &std::path::Path, rows: i64, row_group_rows: us
     let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group_rows))
+        // Padded names are stored plain, so the `name` chunk is as large as its values.
+        .set_dictionary_enabled(name_padding == 0)
         .build();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
-    let names: Vec<String> = (0..rows).map(|i| format!("row-{}", i % 100)).collect();
+    let names: Vec<String> = (0..rows)
+        .map(|i| format!("row-{:0>name_padding$}", i % 100))
+        .collect();
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -450,19 +462,70 @@ async fn every_plan_shape_keeps_the_file_groups_the_scan_built() {
     }
 }
 
-/// Scenario: No pushed plan shape waits forever on the read budget
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_plan_shape_completes_when_the_read_budget_admits_one_row_group_at_a_time() {
-    // The budget is a quarter of the pool, below the 2.4 MB `id` chunk of one row group.
-    const POOL_BYTES: usize = 8 * 1024 * 1024;
+/// A bounded pool that records its largest reservation. Infallible reservations can exceed
+/// the bound, which fails whichever operator asks the pool next.
+#[derive(Debug)]
+struct PeakPool {
+    pool: GreedyMemoryPool,
+    peak: AtomicUsize,
+}
 
+impl PeakPool {
+    fn record(&self) {
+        self.peak.fetch_max(self.pool.reserved(), Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Display for PeakPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pool.fmt(f)
+    }
+}
+
+impl MemoryPool for PeakPool {
+    fn name(&self) -> &str {
+        self.pool.name()
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.pool.grow(reservation, additional);
+        self.record();
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.pool.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.pool.try_grow(reservation, additional)?;
+        self.record();
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.pool.memory_limit()
+    }
+}
+
+/// Every pushed plan shape returns the same row count under a `pool_bytes` pool as unbounded,
+/// and never reserves more than the pool.
+async fn assert_plan_shapes_complete(files: &[FileEntry], target: usize, pool_bytes: usize) {
     let tmp = tempfile::tempdir().unwrap();
-    let files = local_files(&tmp.path().join("fact"), 2, |dir| {
-        write_local_parquet_rows(dir, 1_200_000, 300_000)
+    let dimension = local_files(tmp.path(), 1, write_local_parquet);
+    let pool = Arc::new(PeakPool {
+        pool: GreedyMemoryPool::new(pool_bytes),
+        peak: AtomicUsize::new(0),
     });
-    let dimension = local_files(&tmp.path().join("dimension"), 1, write_local_parquet);
     let tight = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
         .build_arc()
         .unwrap();
     let unbounded = Arc::new(RuntimeEnv::default());
@@ -477,13 +540,38 @@ async fn every_plan_shape_completes_when_the_read_budget_admits_one_row_group_at
         .unwrap_or_else(|e| panic!("the {shape} plan fails: {e}"));
         batches.iter().map(RecordBatch::num_rows).sum::<usize>()
     };
-    let budgeted = pushed_plan_shapes(&files, &dimension, 4, &tight).await;
-    let free = pushed_plan_shapes(&files, &dimension, 4, &unbounded).await;
+    let budgeted = pushed_plan_shapes(files, &dimension, target, &tight).await;
+    let free = pushed_plan_shapes(files, &dimension, target, &unbounded).await;
     for ((shape, plan, ctx), (_, free_plan, free_ctx)) in budgeted.into_iter().zip(free) {
         let expected = rows(free_plan, free_ctx, shape).await;
         assert!(expected > 0, "{shape}");
         assert_eq!(rows(plan, ctx, shape).await, expected, "{shape}");
+        let peak = pool.peak.load(Ordering::Relaxed);
+        assert!(peak <= pool_bytes, "{shape}: {peak} bytes reserved");
     }
+}
+
+/// Scenario: No pushed plan shape waits forever on the read budget
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_plan_shape_completes_when_the_read_budget_admits_one_row_group_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files = local_files(tmp.path(), 2, |dir| {
+        write_local_parquet_rows(dir, 1_200_000, 300_000, 0)
+    });
+    // The budget is a quarter of the pool, below the 2.4 MB `id` chunk of one row group.
+    assert_plan_shapes_complete(&files, 4, 8 * 1024 * 1024).await;
+}
+
+/// Scenario: Every fetch of a row group waits on the read budget
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_plan_shape_completes_when_the_streams_row_groups_exceed_the_pool() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 16 row groups of 6.6 MB. The filter reads the 0.4 MB `id` chunk first, so 16 streams
+    // are all admitted and then fetch 100 MB of `name` chunks between them.
+    let files = local_files(tmp.path(), 1, |dir| {
+        write_local_parquet_rows(dir, 800_000, 50_000, 120)
+    });
+    assert_plan_shapes_complete(&files, 16, 64 * 1024 * 1024).await;
 }
 
 fn row_scan_spec() -> ScanSpec {
