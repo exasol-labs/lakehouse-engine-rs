@@ -209,12 +209,15 @@ async fn answer_ok(mut stream: TcpStream) {
     let _ = stream.write_all(answer.as_bytes()).await;
 }
 
-/// Answers whatever arrives, a TLS ClientHello included, in plain HTTP.
+/// Answers whatever arrives, a TLS ClientHello included, in plain HTTP. It drains until the client
+/// closes, because a close with unread bytes is a reset, which the client retries as transient.
 async fn answer_in_plain_http(mut stream: TcpStream) {
     let mut hello = [0u8; 1024];
     let _ = stream.read(&mut hello).await;
     let answer = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     let _ = stream.write_all(answer.as_bytes()).await;
+    let _ = stream.shutdown().await;
+    let _ = stream.read_to_end(&mut Vec::new()).await;
 }
 
 /// Reads the first bytes of the TLS handshake, then resets the connection.

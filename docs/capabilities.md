@@ -17,7 +17,7 @@ The scan reads only the projected columns. The scan also evaluates select-list e
 
 ## Filtering
 
-Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
+Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. A condition DataFusion cannot render runs in Exasol SQL on its own, and the scan still filters on the other conditions of the `AND`. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -85,7 +85,7 @@ full scan.
 
 ## Scalar functions
 
-The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
+The scan computes these functions when DataFusion can render the filter condition or the whole select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
 
 | Family | Capabilities | Example |
 |---|---|---|
@@ -126,7 +126,7 @@ Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and re
 
 Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A BOOLEAN cast to DECIMAL or compared with a number runs in the scan as 1 or 0, except an `IN` list of numbers over a BOOLEAN, which runs in Exasol SQL. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
-Such a condition runs in Exasol SQL. On a single table it takes the whole WHERE with it, so the scan filters no rows, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
+Such a condition runs in Exasol SQL on its own. On a single table the scan still filters on the other conditions of the `AND`, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
 
 | Runs in Exasol SQL | Runs in the scan |
 |---|---|
@@ -152,7 +152,7 @@ An aggregate argument can be a column or a scalar expression. Examples are `SUM(
 two-column binary arithmetic expression such as `SUM(price * discount)`. Statistical aggregates take
 the partial path only for a bare-column argument.
 
-A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or the type the running Exasol version gives an expression, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A computed group key that is not selected, such as `GROUP BY qty * 2`, needs a CAST, while `GROUP BY COALESCE(d, DATE '2000-01-01')` and `GROUP BY qty > 5` split.
+A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or the type the running Exasol version gives an expression, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A date-part key that is not selected, such as `GROUP BY YEAR(d)`, splits, and another computed key, such as `GROUP BY qty * 2`, still needs a CAST. `GROUP BY COALESCE(d, DATE '2000-01-01')` and `GROUP BY qty > 5` split too.
 
 Each aggregate emits partial values instead of a final value:
 

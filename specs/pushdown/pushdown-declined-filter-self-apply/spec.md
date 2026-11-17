@@ -5,22 +5,17 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 ## Background
 
 * Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
-* Three sites render the DataFusion-bound WHERE filter: the single-table path (`handle_pushdown`) and the broadcast-join path (`render_broadcast_join`) through `ScanTranslator::split_where`, and the N-scan legs one conjunct at a time through `screen_leg_filter`. A missing scan filter covers two outcomes: no filter and a declined filter. Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter. Only the declined filter must not be omitted, so each site returns it beside the scan filter.
-* A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
-* Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
-* The adapter self-applies a declined predicate through the Exasol-dialect render. That render renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so every declined predicate is applied.
-* `handle_pushdown` computes the decline classification once per path and passes it down.
-* The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
-* On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row. An empty select list narrows to the columns the declined filter names.
-* Iceberg file pruning keeps every conjunct, renderable or not, at both pruning inputs: the single-table scan-resolution tree and each join side's side-local predicate. Pruning only removes files that cannot match.
-* The N-scan partition screens per side and per conjunct after attribution, because it needs the owning side's column metadata. `pushdown-joins/pushdown-planning-join-fallback` owns the leg-eligibility rule.
+* A conjunct declines when the scan cannot compute it (`pushdown-types/pushdown-planning-scan-text-conversion`). Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter.
+* The adapter self-applies a declined conjunct by rendering its original request tree in the Exasol dialect, which renders every predicate Exasol sends (`sql-comprehension/vs-expression-translator`), so Exasol applies its own conversions with the session's settings.
+* File pruning reads the original request filter at the single-table scan and at each join side, so it keeps every conjunct, renderable or not, and removes only files that cannot match.
+* `pushdown-joins/pushdown-planning-join-fallback` owns the N-scan leg-eligibility rule.
 
 ## Scenarios
 
 ### Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
 
 * *GIVEN* a single-table `pushdown` request carrying a non-null `filter` whose capability the adapter advertises, for example `WHERE SECOND(c_ts, 3) > 1`, delegated because `FN_SECOND` is advertised
-* *AND* the DataFusion-bound render of that filter declines
+* *AND* the DataFusion-bound render declines every top-level conjunct of that filter
 * *WHEN* the adapter builds the pushdown SQL
 * *THEN* the adapter SHALL route the request to the qualified single-table wrapper and render the ORIGINAL request filter tree as that wrapper's own `WHERE`, table-qualified against the wrapper's single subquery alias
 * *AND* the per-shard scan spec SHALL carry NO `filter`, so the predicate is applied exactly once
@@ -46,12 +41,11 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 
 ### Scenario: A declined filter does not widen the wrapper's projection
 
-* *GIVEN* a single-table `pushdown` request whose filter declines
-* *WHEN* the adapter derives the wrapper's inner-scan projection
-* *THEN* the projection SHALL be decided by the request's `selectList` alone, never by the fact that a filter declined
-* *AND* a request carrying a non-empty `selectList` SHALL keep the referenced-column narrowing, projecting only the columns the wrapper's rendered clauses name, its select list's and the self-applied predicate's
-* *AND* a request carrying NO select list, a `SELECT *`, which Exasol sends as an omitted `selectList` key, SHALL project the FULL base row in table-column order at BOTH the inner scan and the wrapper's outer select list, because Exasol validates the pushdown result positionally against the whole row
-* *AND* the "no select list" test SHALL treat an absent key, JSON null, an empty array, and a non-array value alike, so a later change in Exasol's wire form cannot reintroduce a positional mismatch
+* *GIVEN* a single-table `pushdown` request whose filter holds a declined conjunct
+* *WHEN* the adapter builds the qualified single-table wrapper
+* *THEN* the wrapper's fan-out SHALL emit only the columns that the request's select list, the wrapper's other clauses, and the declined conjuncts name, and no column because a conjunct declined
+* *AND* the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares: the full base row in table-column order for an absent or JSON-null `selectList`, and one column for an empty one, so the route never trips Exasol's positional `04000` validation
+* *AND* for an absent or JSON-null `selectList`, the fan-out SHALL emit the full base row, because Exasol validates the result positionally against the whole row
 
 ### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 
@@ -83,3 +77,13 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *THEN* every site SHALL treat the filter as ABSENT: no scan-spec filter, no outer `WHERE`, no wrapper route, and no broadcast decline
 * *AND* no site SHALL infer "absent" from a `None` render result alone, because a present-but-declined filter produces the same `None` and requires the opposite handling
 * *AND* the emitted SQL for a filterless request SHALL be byte-identical to its pre-change output at all three sites
+
+### Scenario: A single-table WHERE filter splits at AND between the scan and the wrapper
+
+* *GIVEN* a single-table `pushdown` request whose `filter` is an `AND` of conjuncts, at least one of which the DataFusion-bound render declines and at least one of which it renders, such as `WHERE c_decimal LIKE '1%' AND id > 1` over a `DECIMAL(9,2)` column
+* *WHEN* the adapter builds the pushdown SQL
+* *THEN* the adapter SHALL split the filter into its top-level conjuncts, flattening nested `AND` nodes and keeping each `OR` or `NOT` node whole, and apply each conjunct exactly once, in the scan or in the wrapper's `WHERE`
+* *AND* the per-shard scan spec of the qualified single-table wrapper's fan-out SHALL carry the conjunction of the rendered conjuncts as its `filter`, and the wrapper's `WHERE` SHALL carry the conjunction of the declined conjuncts, each rendered from its original request tree in the Exasol dialect
+* *AND* the fan-out's columns SHALL follow "A declined filter does not widen the wrapper's projection", so a column that only a rendered conjunct names is not emitted
+* *AND* the result SHALL equal native Exasol evaluation of the same query, for a row scan, an aggregate, a `GROUP BY`, a `COUNT(DISTINCT)`, and an `ORDER BY` with `LIMIT`
+* *AND* a broadcast-eligible join whose filter holds a declined conjunct SHALL still take the N-scan fallback, as "A broadcast-eligible join whose filter declines takes the N-scan fallback" states

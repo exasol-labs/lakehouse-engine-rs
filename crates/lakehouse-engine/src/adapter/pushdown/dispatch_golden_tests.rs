@@ -61,6 +61,10 @@ fn unmergeable_having_request() -> (Json, Vec<ExasolType>) {
 
 /// Non-numeric SUM target: declines grouped decomposition to the qualified wrapper.
 fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
+    group_by_fallback_builder().build()
+}
+
+fn group_by_fallback_builder() -> PushdownRequestBuilder {
     events_request()
         .group_by(vec![col("REGION")])
         .column(col("REGION"))
@@ -68,6 +72,12 @@ fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
             agg_item("SUM", Some("NAME"), false),
             ExasolType::decimal(30, 4),
         )
+}
+
+/// The filter names a column no other clause names, so the wrapper's fan-out emits it.
+fn group_by_fallback_rendering_filter_request() -> (Json, Vec<ExasolType>) {
+    group_by_fallback_builder()
+        .filter(compare("predicate_greater", col("AMOUNT"), num_lit(100)))
         .build()
 }
 
@@ -223,7 +233,7 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         RowProjection::Wrapped,
         "this fixture must exercise the wrapping guard, not a per-item projection"
     );
-    let result = build_dispatch_sql(
+    golden_dispatch(
         request,
         &pushdown,
         projection,
@@ -231,20 +241,7 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         scan_for(&columns, pushdown.json()),
         ScanWhere::Absent,
         None,
-        false,
-        &unqualified_shards(fixed_shards()),
-        dispatch_base(ResolvedScan {
-            logical_schema: Vec::new(),
-            partition_columns: Vec::new(),
-            ..resolved_table("s3://warehouse/db/events")
-        }),
-        &dispatch_context(),
     )
-    .expect("build_dispatch_sql must succeed for this fixture");
-    result["sql"]
-        .as_str()
-        .expect("pushdown response must carry a sql field")
-        .to_string()
 }
 
 /// Takes `pushdown_req` explicitly so callers can pass a stripped or alias-carrying
@@ -261,13 +258,50 @@ fn dispatch_sql_with_pushdown_req(
     let pushdown = PushdownRequest::parse(pushdown_req.clone())
         .expect("the fixture declares a valid selectListDataTypes");
     let columns = column_types(&col_types);
-    let result = build_dispatch_sql(
+    golden_dispatch(
         request,
         &pushdown,
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
         &golden_emission(request, &pushdown, &columns),
         scan_for(&columns, pushdown_req),
         filter.map_or(ScanWhere::Absent, ScanWhere::Pushed),
+        limit,
+    )
+}
+
+/// Places the request's own filter through `split_where`, as `handle_pushdown` does.
+fn dispatch_sql_placing_filter(request: &Json) -> String {
+    let pushdown = parsed_pushdown(request);
+    let columns = column_types(&base_col_types());
+    let scan = scan_for(&columns, pushdown.json());
+    golden_dispatch(
+        request,
+        &pushdown,
+        RowProjection::Direct(Vec::new()),
+        &golden_emission(request, &pushdown, &columns),
+        scan,
+        scan.split_where(pushdown.json().get("filter")),
+        None,
+    )
+}
+
+/// The dispatch SQL over [`fixed_shards`] of the `events` table.
+fn golden_dispatch(
+    request: &Json,
+    pushdown: &PushdownRequest,
+    projection: RowProjection,
+    emitted: &Emitted,
+    scan: ScanTranslator<'_>,
+    scan_where: ScanWhere<'_>,
+    limit: Option<u64>,
+) -> String {
+    let result = build_dispatch_sql(
+        request,
+        pushdown,
+        projection,
+        emitted,
+        scan,
+        scan_where,
         limit,
         false,
         &unqualified_shards(fixed_shards()),
@@ -326,6 +360,13 @@ fn group_by_fallback_matches_golden() {
         None,
     );
     let expected = include_str!("testdata/dispatch_golden/group_by_fallback.sql");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn group_by_fallback_with_rendering_filter_matches_golden() {
+    let actual = dispatch_sql_placing_filter(&group_by_fallback_rendering_filter_request().0);
+    let expected = include_str!("testdata/dispatch_golden/group_by_fallback_rendering_filter.sql");
     assert_eq!(actual, expected);
 }
 

@@ -2660,6 +2660,7 @@ fn e2e_now_family_matches_native_oracle() {
 // Declined-filter self-apply (#279): a WHERE predicate the adapter cannot push into the
 // scan must be applied in its own Exasol-dialect SQL, since Exasol never re-applies it.
 
+/// Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     lakehouse_vs();
@@ -2762,6 +2763,7 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
+/// Scenario: A declined filter does not widen the wrapper's projection
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     lakehouse_vs();
@@ -2786,6 +2788,192 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     assert_eq!(
         num_rows, 0,
         "SELECT * WHERE SECOND(c_ts, 3) > 1 must return 0 rows: {resp}"
+    );
+}
+
+/// How a case's result is compared with the native copy's.
+#[derive(Clone, Copy, Debug)]
+enum Oracle {
+    Rows,
+    /// For a select list whose values differ on every run.
+    RowCount,
+    /// Native Exasol rejects the query, and the virtual table must raise the same error class.
+    Error,
+}
+
+/// A query over `{T}` whose WHERE holds a `LIKE` over a DECIMAL column, which the scan declines,
+/// beside the conjunct `ID > 1`, which it renders.
+struct DeclinedConjunctCase {
+    query: &'static str,
+    oracle: Oracle,
+    /// Whether a clause other than the rendered conjunct names `ID`, so the fan-out emits it.
+    emits_id: bool,
+}
+
+const DECLINED_CONJUNCT_CASES: [DeclinedConjunctCase; 9] = [
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 ORDER BY ID",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT C_VARCHAR FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT COUNT(*) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT C_BOOL, COUNT(*) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 \
+                GROUP BY C_BOOL",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT COUNT(DISTINCT ID) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 ORDER BY ID LIMIT 1",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT RANDOM() FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::RowCount,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE (C_DECIMAL_A LIKE '1%' OR ID = 2) AND ID > 1 ORDER BY ID",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_VARCHAR AND C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Error,
+        emits_id: true,
+    },
+];
+
+/// The scan spec's filter SQL in `plan`, `None` when the scan applies no WHERE conjunct.
+fn scan_spec_filter(plan: &str) -> Option<&str> {
+    let (_, rest) = plan.split_once(SCAN_FILTER)?;
+    rest.split_once(r#"",""#).map(|(filter, _)| filter)
+}
+
+/// The column list of the fan-out's `EMITS` clause in `plan`, `None` when the plan has none.
+fn fan_out_emits(plan: &str) -> Option<&str> {
+    plan.split_once("EMITS (")
+        .and_then(|(_, rest)| rest.split_once(") FROM"))
+        .map(|(emits, _)| emits)
+}
+
+/// What differs from a WHERE split between the `LHS_T0` wrapper and the scan, for `case`.
+fn where_split_mismatch(case: &DeclinedConjunctCase, plan: &str) -> Option<String> {
+    let wrapper_where = plan
+        .split_once(r#"AS "LHS_T0" WHERE "#)
+        .map(|(_, clause)| clause);
+    if !wrapper_where.is_some_and(|clause| clause.contains("LIKE")) {
+        return Some(format!(
+            "`{}`: the LHS_T0 wrapper's WHERE must apply the LIKE: {plan}",
+            case.query
+        ));
+    }
+    if !scan_spec_filter(plan)
+        .is_some_and(|filter| filter.contains("ID") && !filter.contains("LIKE"))
+    {
+        return Some(format!(
+            "`{}`: the scan filter must name ID and hold no LIKE: {plan}",
+            case.query
+        ));
+    }
+    let Some(emits) = fan_out_emits(plan) else {
+        return Some(format!(
+            "`{}`: the plan has no fan-out EMITS clause: {plan}",
+            case.query
+        ));
+    };
+    let emits_id = emits.contains(r#""ID""#);
+    (emits_id != case.emits_id).then(|| {
+        format!(
+            "`{}`: the fan-out must emit ID only when a clause beside the rendered conjunct \
+             names it ({}): {plan}",
+            case.query, case.emits_id
+        )
+    })
+}
+
+/// What differs for `case` over the virtual `table` from the native copy, or from the split.
+fn declined_conjunct_mismatch(
+    conn: &mut ExaConn,
+    table: &str,
+    case: &DeclinedConjunctCase,
+) -> Option<String> {
+    let vs_query = case.query.replace("{T}", table);
+    let outcome = match case.oracle {
+        Oracle::Rows => native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            case.query,
+            PathCheck::Wrapper,
+            Expect::Rows,
+        ),
+        Oracle::RowCount => {
+            let actual = conn.query_row_count(&vs_query);
+            let expected = conn.query_row_count(&case.query.replace("{T}", NATIVE_COPY));
+            (actual != expected)
+                .then(|| format!("`{}`: got {actual} rows, native {expected}", case.query))
+        }
+        Oracle::Error => native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            case.query,
+            PathCheck::Wrapper,
+            Expect::Error,
+        ),
+    };
+    outcome.or_else(|| where_split_mismatch(case, &isolated_pushdown_statement(conn, &vs_query)))
+}
+
+/// Scenario: A single-table WHERE filter splits at AND between the scan and the wrapper
+/// Scenario: Filter predicate is pushed into the scan spec
+/// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
+/// Scenario: A declined WHERE filter under an aggregate request is applied ahead of the aggregate
+/// Scenario: A declined filter does not widen the wrapper's projection
+#[test]
+fn e2e_declined_conjunct_keeps_the_other_conjuncts_in_the_scan() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+    assert_eq!(
+        int_column(
+            &conn.query_columns(&format!(
+                "SELECT ID FROM {NATIVE_COPY} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID"
+            ))[0]
+        ),
+        vec![1, 5, 7],
+        "fixture precondition: ID 1 must match the LIKE, so a scan that drops `ID > 1` returns \
+         a row the native copy does not"
+    );
+    let failures: Vec<String> = DECLINED_CONJUNCT_CASES
+        .iter()
+        .filter_map(|case| declined_conjunct_mismatch(&mut conn, &typed, case))
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} declined-conjunct cases failed:\n{}",
+        failures.len(),
+        DECLINED_CONJUNCT_CASES.len(),
+        failures.join("\n")
     );
 }
 
@@ -3396,6 +3584,28 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT COUNT(*) FROM {T} GROUP BY SECOND(C_DATE)",
         PathCheck::Split,
     ),
+    // A date part takes DECIMAL(4,0) for YEAR and DECIMAL(2,0) for the rest on every version.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY YEAR(C_DATE)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY MONTH(C_TS)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY WEEK(C_DATE)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY HOUR(C_TS)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY EXTRACT(MINUTE FROM C_TS)",
+        PathCheck::Split,
+    ),
+    ("SELECT MAX(DAY(C_DATE)) + 1 FROM {T}", PathCheck::Split),
 ];
 
 /// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR, and
@@ -3449,6 +3659,7 @@ fn char_cast_cases() -> Vec<(String, Expect)> {
 /// Scenario: A group key travels with its exact type
 /// Scenario: An unprojected bare-column group key takes its column type
 /// Scenario: An unprojected group key with a derived exact type keeps the split
+/// Scenario: A date-part function takes its fixed native type
 /// Scenario: An unprojected group key without an exact type declines the split
 /// Scenario: A form whose type differs by Exasol version takes the type of the version it runs on
 /// Scenario: A CAST to CHAR returns Exasol's padded value

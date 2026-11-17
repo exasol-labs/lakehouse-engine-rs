@@ -30,6 +30,8 @@ pub(crate) enum TextArgs {
 pub(crate) enum ResultRule {
     Text,
     Integer,
+    /// `DECIMAL(precision,0)`, the type Exasol 8 and 2025 give a date part.
+    FixedInteger(u8),
     /// A number of unproven scale.
     Number,
     /// An integer over integers, a number over numbers.
@@ -236,13 +238,13 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("NULLIFZERO").typed(T::Never, R::FirstArgument),
         F::verbatim("ZEROIFNULL").typed(T::Never, R::FirstArgument),
         // DataFusion renders these as `date_part`, which Exasol lacks.
-        F::verbatim("YEAR").typed(T::Never, R::Integer),
-        F::verbatim("MONTH").typed(T::Never, R::Integer),
-        F::verbatim("DAY").typed(T::Never, R::Integer),
-        F::verbatim("HOUR").typed(T::Never, R::Integer),
-        F::verbatim("MINUTE").typed(T::Never, R::Integer),
+        F::verbatim("YEAR").typed(T::Never, R::FixedInteger(4)),
+        F::verbatim("MONTH").typed(T::Never, R::FixedInteger(2)),
+        F::verbatim("DAY").typed(T::Never, R::FixedInteger(2)),
+        F::verbatim("HOUR").typed(T::Never, R::FixedInteger(2)),
+        F::verbatim("MINUTE").typed(T::Never, R::FixedInteger(2)),
         F::verbatim("SECOND").typed(T::Never, R::Number),
-        F::verbatim("WEEK").typed(T::Never, R::Integer),
+        F::verbatim("WEEK").typed(T::Never, R::FixedInteger(2)),
         F::verbatim("DATE_TRUNC")
             .typed(T::Never, R::Truncated)
             .parameters(&[0]),
