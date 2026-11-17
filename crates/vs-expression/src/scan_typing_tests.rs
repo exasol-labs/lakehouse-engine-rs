@@ -743,39 +743,42 @@ fn text_where_exasol_takes_text_keeps_its_pushdown() {
 }
 
 #[test]
-fn exact_expression_type_is_the_type_the_request_states() {
-    let sum = scalar_fn("ADD", [col("I"), num_lit(1)]);
+fn infer_type_types_what_the_scan_declines() {
+    let date_text = scalar_fn("UPPER", [col("D")]);
     let cases = [
         (
-            "CAST",
-            cast_to(ExasolType::varchar(10), col("I")),
-            Some(ExasolType::varchar(10)),
-        ),
-        ("column", col("N"), Some(ExasolType::decimal(9, 2))),
-        ("other node", sum, None),
-        (
-            "SECOND of a TIMESTAMP(6)",
-            second(col("TS")),
-            Some(ExasolType::decimal(8, 6)),
+            "CAST of a DATE to text",
+            cast_to(ExasolType::varchar(30), col("D")),
+            Some(ExasolType::varchar(30)),
         ),
         (
-            "EXTRACT SECOND of a TIMESTAMP(9)",
-            extract("SECOND", timestamp_cast(9)),
-            Some(ExasolType::decimal(11, 9)),
+            "CASE of dates under a text condition",
+            case_when(
+                [predicate_equal(date_text.clone(), str_lit("X"))],
+                [col("D"), date_lit("2024-01-01")],
+            ),
+            Some(ExasolType::Date),
         ),
-        ("SECOND of a DATE", second(col("D")), None),
         (
-            "SECOND of a computed timestamp",
-            second(scalar_fn("DATE_TRUNC", [str_lit("minute"), col("TS")])),
+            "MAX over a CASE of timestamps under a text condition",
+            agg_item_expr(
+                "MAX",
+                case_when([date_like(col("D"))], [col("TS3"), col("TS")]),
+                false,
+            ),
+            Some(ExasolType::timestamp(6)),
+        ),
+        ("SUM over text", agg_item_expr("SUM", col("S"), false), None),
+        (
+            "EXTRACT SECOND of a DATE",
+            extract("SECOND", col("D")),
             None,
         ),
+        ("text of a DATE", date_text, None),
     ];
     for (label, node, expected) in cases {
-        assert_eq!(
-            exact_expression_type(&node, &columns()),
-            expected,
-            "{label}"
-        );
+        assert!(render(&node).is_err(), "{label} must decline in the scan");
+        assert_eq!(infer_type(&node, &columns()).exact(), expected, "{label}");
     }
 }
 
@@ -874,7 +877,9 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
 }
 
 fn type_of(expr: &Json) -> Inferred {
-    type_scan_tree(expr, &columns()).unwrap().1
+    let ty = type_scan_tree(expr, &columns()).unwrap().1;
+    assert_eq!(infer_type(expr, &columns()), ty, "{expr}");
+    ty
 }
 
 fn typed(expr: &Json) -> Json {
@@ -1099,9 +1104,9 @@ fn branches_of_integers_and_other_types_unify_as_exasol_does() {
             Inferred::Partial(Partial::Number),
         ),
         (
-            "CASE over an integer and a COUNT",
+            "CASE over DECIMAL(9,0) and a COUNT, which is DECIMAL(18,0)",
             case_when([col("B")], [col("I"), count_star()]),
-            Inferred::Partial(Partial::Integer),
+            integer(18),
         ),
         (
             "CASE over two texts",
@@ -1146,6 +1151,14 @@ fn timestamp_branches_cast_to_the_unit_holding_their_unified_precision() {
             case_when([col("B")], [col("D"), date_lit("2024-01-01")]),
             r#"(CASE WHEN "B" THEN "D" ELSE DATE '2024-01-01' END)"#,
         ),
+        (
+            case_when([col("B"), col("B")], [col("D"), col("TS3"), null_lit()]),
+            r#"(CASE WHEN "B" THEN CAST("D" AS TIMESTAMP(3)) WHEN "B" THEN CAST("TS3" AS TIMESTAMP(3)) ELSE NULL END)"#,
+        ),
+        (
+            case_when([col("B")], [col("D"), col("LTZ")]),
+            r#"(CASE WHEN "B" THEN "D" ELSE "LTZ" END)"#,
+        ),
     ];
     for (expr, expected) in cases {
         assert_eq!(render(&expr).unwrap(), expected);
@@ -1156,6 +1169,47 @@ fn timestamp_branches_cast_to_the_unit_holding_their_unified_precision() {
             .unwrap()
             .contains(r#"greatest(CAST("TS0" AS TIMESTAMP(6)), CAST("TS" AS TIMESTAMP(6)))"#)
     );
+    let least = scalar_fn("LEAST", [col("D"), col("TS")]);
+    assert!(
+        render(&least)
+            .unwrap()
+            .contains(r#"least(CAST("D" AS TIMESTAMP(6)), CAST("TS" AS TIMESTAMP(6)))"#)
+    );
+}
+
+#[test]
+fn a_date_compared_with_a_timestamp_casts_to_the_timestamp_unit() {
+    let ts_lit = || timestamp_lit("2020-01-01 00:00:00");
+    let cases = [
+        (
+            compare("predicate_less", col("D"), ts_lit()),
+            r#"(CAST("D" AS TIMESTAMP(0)) < arrow_cast('2020-01-01 00:00:00', 'Timestamp(Microsecond, None)'))"#,
+        ),
+        (
+            compare("predicate_greater", col("TS"), col("D")),
+            r#"("TS" > CAST("D" AS TIMESTAMP(6)))"#,
+        ),
+        (
+            between(col("D"), col("TS0"), col("TS3")),
+            r#"(CAST("D" AS TIMESTAMP(3)) BETWEEN "TS0" AND "TS3")"#,
+        ),
+        (
+            in_list(col("TS"), [date_lit("9999-12-31"), col("TS0")]),
+            r#"("TS" IN (CAST(DATE '9999-12-31' AS TIMESTAMP(6)), "TS0"))"#,
+        ),
+        (
+            nullif(col("D"), col("TS")),
+            r#"(CASE CAST("D" AS TIMESTAMP(6)) WHEN "TS" THEN NULL ELSE "D" END)"#,
+        ),
+        (
+            predicate_equal(col("D"), date_lit("9999-12-31")),
+            r#"("D" = DATE '9999-12-31')"#,
+        ),
+        (predicate_equal(col("D"), col("LTZ")), r#"("D" = "LTZ")"#),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected);
+    }
 }
 
 #[test]
@@ -1416,7 +1470,7 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
     }
 
     // ADD_MINUTES over a DATE is a TIMESTAMP(0); ADD_DAYS and ADD_WEEKS are a DATE, which
-    // DataFusion compares with the literal in nanoseconds.
+    // compares at the literal's unit.
     for (name, floored) in [
         ("ADD_MINUTES", true),
         ("ADD_DAYS", false),
@@ -1426,7 +1480,7 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         let expected = if floored {
             compare("predicate_notequal", typed_call.clone(), typed_call)
         } else {
-            predicate_equal(typed_call, over())
+            predicate_equal(cast_to(ExasolType::timestamp(9), typed_call), over())
         };
         assert_eq!(
             typed(&predicate_equal(
@@ -1494,4 +1548,55 @@ fn a_constant_count_at_the_limit_renders() {
         [col("D"), lit("literal_exactnumeric", "10000000000")],
     );
     assert!(render(&expr).is_ok(), "rendered {:?}", render(&expr));
+}
+
+#[test]
+fn an_aggregate_takes_exasols_result_type() {
+    let wide = || cast_to(ExasolType::decimal(30, 2), col("N"));
+    let cases = [
+        ("COUNT(*)", count_star(), integer(18)),
+        (
+            "SUM over DECIMAL(9,2) widens by 11 digits",
+            agg_item("SUM", Some("N"), false),
+            Inferred::Exact(ExasolType::decimal(20, 2)),
+        ),
+        (
+            "SUM over DECIMAL(30,2) caps at precision 36",
+            agg_item_expr("SUM", wide(), false),
+            Inferred::Exact(ExasolType::decimal(36, 2)),
+        ),
+        (
+            "SUM over DOUBLE stays DOUBLE",
+            agg_item("SUM", Some("F"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "AVG over a DECIMAL is DOUBLE",
+            agg_item("AVG", Some("N"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "STDDEV over a DECIMAL is DOUBLE",
+            agg_item("STDDEV", Some("N"), false),
+            Inferred::Exact(ExasolType::DoublePrecision),
+        ),
+        (
+            "MAX over a CAST takes the CAST's type, not the column's",
+            agg_item_expr("MAX", cast_to(ExasolType::decimal(5, 1), col("N")), false),
+            Inferred::Exact(ExasolType::decimal(5, 1)),
+        ),
+    ];
+    for (label, aggregate, expected) in cases {
+        assert_eq!(type_of(&aggregate), expected, "{label}");
+    }
+}
+
+/// A guessed type would break the merge of a split aggregate (#476).
+#[test]
+fn an_aggregate_over_an_argument_without_an_exact_type_has_no_exact_type() {
+    let sum = scalar_fn("ADD", [col("N"), num_lit(1)]);
+    for name in ["MAX", "SUM"] {
+        let aggregate = agg_item_expr(name, sum.clone(), false);
+        assert_eq!(type_of(&aggregate).exact(), None, "{name}");
+    }
 }

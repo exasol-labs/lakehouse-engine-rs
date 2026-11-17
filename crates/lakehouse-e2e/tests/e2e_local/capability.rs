@@ -3179,11 +3179,11 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
     ),
     (
         "SELECT YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T}",
-        PathCheck::Wrapper,
+        PathCheck::Split,
     ),
     (
         "SELECT C_BOOL, YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T} GROUP BY C_BOOL",
-        PathCheck::Wrapper,
+        PathCheck::Split,
     ),
     (
         "SELECT ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T}",
@@ -3279,6 +3279,67 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
         PathCheck::Wrapper,
     ),
+    (
+        "SELECT ADD_DAYS(MAX(CASE WHEN ID > 2 THEN C_DATE ELSE DATE '1900-03-01' END), 1) FROM {T}",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT C_BOOL, YEAR(MIN(LEAST(C_DATE, DATE '2024-01-02'))) FROM {T} GROUP BY C_BOOL",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT MONTH(MAX(COALESCE(C_TS, TIMESTAMP '9999-12-30 10:00:00.5'))) FROM {T}",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT SUM(GREATEST(ID, C_QTY)) + 1, MAX(CASE WHEN C_BOOL THEN 1 ELSE 10 END) * 2 FROM {T}",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY CASE WHEN ID > 2 THEN C_DATE ELSE DATE '2024-01-01' END",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY NVL(C_TS, TIMESTAMP '1960-01-01 00:00:00.12') \
+         HAVING NVL(C_TS, TIMESTAMP '1960-01-01 00:00:00.12') > TIMESTAMP '2024-01-02 00:00:00' \
+         OR COUNT(*) > 1 ORDER BY NVL(C_TS, TIMESTAMP '1960-01-01 00:00:00.12')",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT SUM(ID) FROM {T} GROUP BY GREATEST(ID, C_QTY) ORDER BY 1",
+        PathCheck::Split,
+    ),
+    // A predicate is BOOLEAN.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY C_QTY > 5",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY ID BETWEEN 2 AND 4 OR C_BOOL",
+        PathCheck::Split,
+    ),
+    // A union of DOUBLEs has no exact type: only dates, timestamps, and integers unify.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY COALESCE(C_DOUBLE, 2.5E0)",
+        PathCheck::Wrapper,
+    ),
+    (
+        "SELECT MAX(COALESCE(C_DOUBLE, 1E300)) + 1 FROM {T}",
+        PathCheck::Wrapper,
+    ),
+    (
+        "SELECT YEAR(MAX(CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END)) FROM {T}",
+        PathCheck::Wrapper,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY CASE WHEN ID > 6 THEN C_DATE ELSE C_TS END",
+        PathCheck::Wrapper,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY TO_TIMESTAMP(CASE WHEN ID > 2 \
+         THEN '2024-01-01 10:00:00' ELSE '1960-01-01 00:00:00' END, 'YYYY-MM-DD HH24:MI:SS')",
+        PathCheck::Wrapper,
+    ),
 ];
 
 /// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR, and
@@ -3331,6 +3392,7 @@ fn char_cast_cases() -> Vec<(String, Expect)> {
 /// Scenario: A merged aggregate under a scalar keeps its native type
 /// Scenario: A group key travels with its exact type
 /// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An unprojected group key with a derived exact type keeps the split
 /// Scenario: An unprojected group key without an exact type declines the split
 /// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]

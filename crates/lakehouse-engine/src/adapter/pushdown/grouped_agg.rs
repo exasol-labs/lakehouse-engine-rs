@@ -9,7 +9,7 @@ use super::scalar_over_agg::{
     substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
-    AggregationType, ColumnTypes, PushdownRequest, ScanTranslator, aggregation_type,
+    AggregationType, ColumnTypes, FanOut, PushdownRequest, ScanTranslator, aggregation_type,
     build_fan_out_inner, output_select_list, quote_ident, render_limit_offset,
 };
 use super::topn::sort_flags;
@@ -97,14 +97,20 @@ pub fn detect_group_by_aggregates(
     // Any group-key render failure collapses the whole result.
     let mut key_fragments = Vec::with_capacity(group_by.len());
     for node in group_by {
-        key_fragments.push(scan.expression(node)?);
+        let mut key = scan.expression(node)?;
+        // A constant key is staged as text whatever type the literal has (#550).
+        if node
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(is_literal_selectlist_item)
+        {
+            key.ty = Some(CONSTANT_KEY_EMIT_TYPE);
+        }
+        key_fragments.push(key);
     }
     let group_keys: Vec<String> = key_fragments.iter().map(|key| key.sql.clone()).collect();
 
-    let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
-    if list.is_empty() {
-        return None;
-    }
+    let list = pushdown.select_items()?;
 
     let mut plans = Vec::new();
     let mut plan_types = Vec::new();
@@ -167,9 +173,9 @@ pub fn detect_group_by_aggregates(
     })
 }
 
-/// A projected key takes its `selectListDataTypes` entry, an unprojected one its exact type
-/// (`exact_expression_type`), a constant [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any other key
-/// (#476, #551).
+/// A projected key takes its `selectListDataTypes` entry, an unprojected constant
+/// [`CONSTANT_KEY_EMIT_TYPE`], any other unprojected key its exact type (`infer_type`). `None`
+/// for a key without one (#476, #551).
 fn group_key_exasol_types(
     pushdown: &PushdownRequest,
     group_keys: &[SqlFragment],
@@ -187,21 +193,7 @@ fn group_key_exasol_types(
             *slot = Some(ty);
         }
     }
-    let group_by = pushdown.json().get("groupBy").and_then(|v| v.as_array());
-    types
-        .into_iter()
-        .enumerate()
-        .map(|(slot, typed)| {
-            typed.or_else(|| {
-                let node = group_by?.get(slot)?;
-                let constant = node
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(is_literal_selectlist_item);
-                constant.then_some(CONSTANT_KEY_EMIT_TYPE)
-            })
-        })
-        .collect()
+    types.into_iter().collect()
 }
 
 /// What HAVING and ORDER BY over the merge can reference: the merged aggregates and the `GK_*`
@@ -288,8 +280,6 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .chain(aggregates.emits.iter())
         .cloned()
         .collect();
-    let emits = all_emits.join(", ");
-
     // Exasol validates this SELECT positionally, so it follows `selectList` order,
     // not the inner keys-first fan-out order.
     let mut ordered = select_items.to_vec();
@@ -317,13 +307,8 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // structurally keeps LIMIT out of every per-shard partial.
     let mut common_template = spec_template.clone();
     common_template.common.limit = None;
-    let fan_out = build_fan_out_inner(
-        &common_template,
-        shards,
-        &emits,
-        udf_name,
-        distribute_udf_name,
-    );
+    let fan_out = FanOut::aggregate(common_template.common, &all_emits);
+    let fan_out = build_fan_out_inner(&fan_out, shards, udf_name, distribute_udf_name);
 
     let from = with_stat_grand_means(&fan_out, &aggregates.plans, &outer_group_by);
 

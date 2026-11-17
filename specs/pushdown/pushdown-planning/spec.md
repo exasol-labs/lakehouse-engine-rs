@@ -9,9 +9,11 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * The common spec carries a CONNECTION name or sealed envelope, never a plaintext credential: see `storage-access/scan-spec-credential-reference`.
 * The adapter schema-qualifies the UDF names from `ctx.script_schema()`. No VS property supplies the schema.
 * The adapter reads the node count from `UdfContext::node_count()` per pushdown, not from `adapterNotes`. It captures the value in `dispatch` before the tokio runtime is entered and passes it to planning as a plain integer. `node_count()` returns `0` only without a live handshake, and `0` maps to a node count of `1`.
-* The common spec's `projection` field carries the projected columns only for the row-scan and join paths. An aggregate or GROUP BY request leaves it empty: see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`.
+* The common spec's `projection` field carries the projected columns only for the row-scan and join paths. A single-table aggregate or GROUP BY request leaves it empty: see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`.
 * Exasol does not re-apply a predicate whose capability the adapter advertised, so the adapter's own SQL applies any predicate it cannot translate. See `pushdown/pushdown-declined-filter-self-apply`. An absent filter is omitted and the wrapper-free scan is unchanged. A declined filter routes to the qualified single-table wrapper, which applies the predicate in its `WHERE`.
 * Which expressions the scan computes is decided by `pushdown-types/pushdown-planning-scan-text-conversion`.
+* Exasol validates the pushed query's result positionally, and the request's `selectList` states the columns it expects in one of three forms. An absent or JSON-null `selectList` is `SELECT *`, one column per declared column. An empty `selectList` needs no column and accepts exactly one, whose value Exasol ignores. Any other `selectList` expects one column per item.
+* A scan below an Exasol wrapper emits only columns that a clause or a join condition of the request names. When the wrapper needs none of them, the scan emits one column the reader does not refuse, never the whole row. Only `SELECT *` emits every declared column.
 * The plan-time file-pruning predicate has a per-format owner. For Iceberg it is `iceberg::expr::Predicate`, owned by `file-planning/pushdown-file-pruning`. For Delta it is the Delta stats predicate, owned by `delta/delta-file-pruning`. Scenario clauses naming `iceberg::expr::Predicate` describe the Iceberg arm.
 
 ## Scenarios
@@ -23,7 +25,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF, in the shard-invariant common spec spliced once as the scalar scan UDF's first-argument literal shared by all shards
 * *AND* the projected column names SHALL be the current Iceberg logical names carried in the common spec's logical schema, so the UDF's registered table exposes them and the field-id adapter maps each to the correct physical column per file
 * *AND* the scalar scan UDF's declared EMITS column list SHALL match the projected items in order and type, named POSITIONALLY: a bare-column item SHALL keep its real (quoted) source-column name so an outer `ORDER BY` over a projected column still resolves, while an expression or literal item SHALL be named by a positional-unique synthetic EMITS identifier rather than its rendered SQL text, so two structurally identical expression or literal items never collapse into one column and never collide into a duplicate EMITS name Exasol rejects
-* *AND* the guarantee in this scenario SHALL govern ONLY the row-scan and join paths; an aggregate or GROUP BY request instead leaves the `projection` field empty (see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`), so an empty `projection` on an aggregate scan spec is expected, not a lost projection
+* *AND* the guarantee in this scenario SHALL govern ONLY the row-scan and join paths; a single-table aggregate or GROUP BY request instead leaves the `projection` field empty (see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`), so an empty `projection` on an aggregate scan spec is expected, not a lost projection
 
 ### Scenario: Filter predicate is pushed into the scan spec
 
@@ -96,6 +98,8 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *THEN* the adapter SHALL fail the query with an error that names the missing `selectListDataTypes` or the offending `dataType` object
 * *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, which Exasol 8.x omits, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, which Exasol sends only for ASCII, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
 * *AND* a request whose `selectList` holds one or more items SHALL fail the query when `selectListDataTypes` holds a different number of entries
+* *AND* a request whose `selectList` is neither an array, absent, nor JSON null SHALL fail the query
+* *AND* a request that carries an `aggregationType` beside an empty `selectList` SHALL fail the query, because Exasol sends an aggregating request at least one item
 
 ### Scenario: A column the request does not declare fails the request
 

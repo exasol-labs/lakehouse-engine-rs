@@ -610,19 +610,22 @@ fn guard_events() -> PushdownRequestBuilder {
     pushdown_request("EVENTS", &guard_col_types())
 }
 
-/// `projection_widened` is the dispatcher's routing flag (#196).
+/// `projection_wrapped` is the dispatcher's routing flag (#196).
 fn guard_dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
     proj_types: Vec<ExasolType>,
-    projection_widened: bool,
+    projection_wrapped: bool,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
 ) -> String {
     let result = dispatch_with(
         request,
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
+        if projection_wrapped {
+            RowProjection::Wrapped
+        } else {
+            RowProjection::Direct(projected_columns(&proj_cols, &proj_types))
+        },
         &column_types(&guard_col_types()),
         (None, None),
         limit,
@@ -640,8 +643,7 @@ fn guard_dispatch_sql(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with(
     request: &Json,
-    projection: Vec<ProjectedColumn>,
-    projection_widened: bool,
+    projection: RowProjection,
     col_types: &ColumnTypes,
     (filter, declined_filter): (Option<String>, Option<&Json>),
     limit: Option<u64>,
@@ -649,11 +651,13 @@ fn dispatch_with(
     scan_storage: &ScanStorage,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pd(request);
+    let pushdown = PushdownRequest::parse(pushdown_req.clone())?;
     build_dispatch_sql(
         request,
-        &PushdownRequest::parse(pushdown_req.clone())?,
+        &pushdown,
         projection,
-        projection_widened,
+        // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
+        &single_table_emission(request, &pushdown, col_types)?,
         scan_for(col_types, &pushdown_req),
         filter,
         declined_filter,
@@ -685,13 +689,11 @@ fn dispatch_planned(
     scan_storage: &ScanStorage,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pd(request);
-    let (proj_cols, proj_types, projection_widened) =
-        project_first_table(request, &pushdown_req).expect("the fixture must project");
+    let projection = project_first_table(request, &pushdown_req).expect("the fixture must project");
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     dispatch_with(
         request,
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
+        projection,
         col_types,
         scan_for(col_types, &pushdown_req).split_where(filter),
         extract_limit(&pushdown_req),
@@ -907,7 +909,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     );
     assert!(
         !sql.contains("REGION") && !sql.contains("AMOUNT") && !sql.contains("\"ID\""),
-        "the projection must NOT widen to the full base row: {sql}"
+        "the scan must not emit the full base row: {sql}"
     );
 }
 
@@ -1027,7 +1029,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     );
     assert!(
         !sql.contains("REGION") && !sql.contains("AMOUNT") && !sql.contains("\"ID\""),
-        "nothing must be appended or widened when the sort key is projected: {sql}"
+        "nothing must be appended when the sort key is projected: {sql}"
     );
     assert!(
         sql.contains(r#"ORDER BY "NAME""#) && sql.contains("LIMIT 5"),
@@ -1249,7 +1251,7 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
 }
 
 /// Select-list arity equals the base table's column count.
-fn widening_arity_coincidence_request() -> Json {
+fn wrapping_arity_coincidence_request() -> Json {
     guard_events()
         .order_by(serde_json::json!([order_by_element(
             table_col("EVENTS", "NAME"),
@@ -1264,7 +1266,7 @@ fn widening_arity_coincidence_request() -> Json {
         .0
 }
 
-fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
+fn wrapping_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
     let cols = guard_col_types()
         .into_iter()
         .map(|(name, ty)| (ProjectionItem::from(name), ty))
@@ -1276,9 +1278,9 @@ fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<ExasolTy
 }
 
 #[test]
-fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
-    let request = widening_arity_coincidence_request();
-    let (proj_cols, proj_types) = widening_arity_coincidence_projection();
+fn dispatch_wrapped_projection_at_matching_arity_routes_to_wrapper() {
+    let request = wrapping_arity_coincidence_request();
+    let (proj_cols, proj_types) = wrapping_arity_coincidence_projection();
     assert_eq!(
         proj_cols.len(),
         request["pushdownRequest"]["selectList"]
@@ -1292,7 +1294,7 @@ fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
 
     assert!(
         sql.contains(r#"AS "LHS_T0""#),
-        "a widened projection must route to the qualified single-table wrapper: {sql}"
+        "a wrapped projection must route to the qualified single-table wrapper: {sql}"
     );
     assert!(
         sql.contains(
@@ -1308,9 +1310,9 @@ fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
 }
 
 #[test]
-fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
-    let request = widening_arity_coincidence_request();
-    let (proj_cols, proj_types) = widening_arity_coincidence_projection();
+fn dispatch_unwrapped_projection_at_matching_arity_takes_scan_path() {
+    let request = wrapping_arity_coincidence_request();
+    let (proj_cols, proj_types) = wrapping_arity_coincidence_projection();
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
 
@@ -1656,14 +1658,16 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         .field("type", serde_json::json!("select"))
         .build();
     let pushdown_req = pd(&request);
-    let (proj_cols, proj_types, widened) =
+    let projection =
         project_first_table(&request, &pushdown_req).expect("the EVENTS fixture must project");
+    let pushdown = parsed_pushdown(&request);
+    let columns = column_types(&guard_col_types());
     let result = build_dispatch_sql(
         &request,
-        &parsed_pushdown(&request),
-        projected_columns(&proj_cols, &proj_types),
-        widened,
-        scan_for(&column_types(&guard_col_types()), &pushdown_req),
+        &pushdown,
+        projection,
+        &emitting(&columns),
+        scan_for(&columns, &pushdown_req),
         None,
         None,
         None,
@@ -1739,16 +1743,12 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         s3_max_connections: 8,
         binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
+        udf_name: SCAN_UDF_NAME,
+        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
     };
-    let join_sql = super::joins::build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        &tuning,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("a broadcast-eligible plan with an unbounded window must render");
+    let join_sql = super::joins::build_broadcast_join_sql(&sides, &rendered, &tuning)
+        .expect("selecting the wire storage must succeed")
+        .expect("a broadcast-eligible plan with an unbounded window must render");
     assert!(
         join_sql.contains(r#""partition_columns":["REGION"]"#),
         "the dimension side's OWN partition columns must reach JoinSpec, independent of \

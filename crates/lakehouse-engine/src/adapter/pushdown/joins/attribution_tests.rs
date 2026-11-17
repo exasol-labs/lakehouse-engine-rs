@@ -1,3 +1,4 @@
+use super::super::tests::self_join_legs;
 use super::*;
 use crate::adapter::pushdown::test_support::{
     PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, inner_join,
@@ -18,14 +19,6 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
         table_alias: table_alias.map(str::to_string),
         table_identifier: format!("lh.{}", table_name.to_ascii_lowercase()),
     }
-}
-
-/// `FROM FACT_ORDERS a JOIN FACT_ORDERS b` (#361's shape).
-fn self_join_legs() -> JoinLegs {
-    JoinLegs::from_leaves(&[
-        leaf("FACT_ORDERS", Some("A")),
-        leaf("FACT_ORDERS", Some("B")),
-    ])
 }
 
 fn two_table_legs() -> JoinLegs {

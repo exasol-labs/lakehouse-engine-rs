@@ -3,10 +3,11 @@ use serde_json::Value as Json;
 use vs_expression::render_expression_exasol;
 
 use super::support::{
-    AggregationType, BOUND_BY_TRANSLATOR, ColumnTypes, ProjectedColumn, aggregation_type,
+    AggregationType, Emitted, ProjectedColumn, PushdownRequest, aggregation_type,
     collect_all_column_names, column_node_ref, emits_ident, extract_limit, extract_offset,
     render_limit_offset,
 };
+use exasol_udf_sdk::error::UdfError;
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
 /// only. Expression sort keys use [`sort_flags`] instead.
@@ -106,11 +107,11 @@ pub(super) fn parse_order_by_keys(pushdown_req: &Json) -> Vec<ParsedSortKey> {
 /// `projection` must hold one column per select-list item, as the row-scan path does.
 pub(super) fn sort_by_select_items(
     keys: &mut [ParsedSortKey],
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     projection: &[ProjectedColumn],
 ) {
-    let items = pushdown_req.get("selectList").and_then(Json::as_array);
-    let elements = pushdown_req.get("orderBy").and_then(Json::as_array);
+    let items = pushdown.select_items();
+    let elements = pushdown.json().get("orderBy").and_then(Json::as_array);
     let (Some(items), Some(elements)) = (items, elements) else {
         return;
     };
@@ -214,8 +215,8 @@ pub(super) fn detect_topn(
 pub(super) fn extend_projection_with_sort_keys(
     projection: &mut Vec<ProjectedColumn>,
     keys: &[ParsedSortKey],
-    col_types: &ColumnTypes,
-) {
+    emitted: &Emitted,
+) -> Result<(), UdfError> {
     for column in keys.iter().flat_map(ParsedSortKey::referenced_columns) {
         let already_emitted = projection.iter().any(|projected| {
             matches!(&projected.item, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column)
@@ -223,14 +224,9 @@ pub(super) fn extend_projection_with_sort_keys(
         if already_emitted {
             continue;
         }
-        let column_type = col_types
-            .get(&ColumnRef::from(column))
-            .expect(BOUND_BY_TRANSLATOR);
-        projection.push(ProjectedColumn {
-            item: ProjectionItem::from(column),
-            exa_type: column_type.exa_type,
-        });
+        projection.push(emitted.project(&ColumnRef::from(column))?);
     }
+    Ok(())
 }
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the adapter must reproduce the

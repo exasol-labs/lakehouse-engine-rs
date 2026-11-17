@@ -104,17 +104,10 @@ impl<'a> JsonValueCall<'a> {
         else {
             return refuse(&format!("path {path} is outside the evaluated subset"));
         };
-        let returning = match node
-            .get("returningDataType")
-            .map(exasol_type_from_json)
-            .transpose()?
-        {
-            None => Returning::Text {
-                max_chars: MAX_VARCHAR_SIZE,
-            },
-            Some(ExasolType::Varchar { size, ascii: false }) => Returning::Text { max_chars: size },
-            Some(ExasolType::Boolean) => Returning::Boolean,
-            Some(other) => {
+        let returning = match returning_type(node)? {
+            ExasolType::Varchar { size, ascii: false } => Returning::Text { max_chars: size },
+            ExasolType::Boolean => Returning::Boolean,
+            other => {
                 return refuse(&format!(
                     "RETURNING {other} converts by the session's NLS settings or pads"
                 ));
@@ -127,6 +120,18 @@ impl<'a> JsonValueCall<'a> {
             on_empty: fallback(node.get("emptyBehavior"), returning)?,
             on_error: fallback(node.get("errorBehavior"), returning)?,
         })
+    }
+}
+
+/// The type a `JSON_VALUE` node returns. Without a RETURNING clause Exasol returns
+/// `VARCHAR(2000000) UTF8` (verified live with `TYPEOF`).
+pub(crate) fn returning_type(node: &Json) -> Result<ExasolType, UdfError> {
+    match node.get("returningDataType") {
+        Some(stated) => exasol_type_from_json(stated),
+        None => Ok(ExasolType::Varchar {
+            size: MAX_VARCHAR_SIZE,
+            ascii: false,
+        }),
     }
 }
 

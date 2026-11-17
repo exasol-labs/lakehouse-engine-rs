@@ -1,8 +1,8 @@
 use super::super::single_group_agg::single_group_merge_select;
 use super::super::support::projection_items;
 use super::super::support::{
-    AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
-    order_by_present, project_columns, shard_count,
+    AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, RowProjection, SCAN_UDF_NAME,
+    build_scan_driving_sql, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, single_group_plans};
@@ -16,7 +16,13 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let pushdown = parsed_pushdown(request);
     let pushdown_req = pushdown.json();
     let scan = scan_of(request);
-    let (mut projection, widened) = project_columns(&pushdown, scan).unwrap();
+    let emitted = emitting(scan.columns());
+    let projection = project_columns(&pushdown, scan, &emitted).unwrap();
+    let wrapped = projection == RowProjection::Wrapped;
+    let mut projection = match projection {
+        RowProjection::Direct(projection) => projection,
+        RowProjection::Wrapped => Vec::new(),
+    };
     let limit = extract_limit(pushdown_req);
     let has_order_by = order_by_present(pushdown_req);
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
@@ -38,11 +44,11 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             .expect("one merge item per select-list item is never empty")
     });
     let aggregates = plans.map(|(_, plans)| plans.plans);
-    // An aggregate select list always widens (aggregates stay off the projection), and
-    // production guards widening only on the `RowScan` arm.
+    // An aggregate select list always wraps (aggregates stay off the projection), and
+    // production guards wrapping only on the `RowScan` arm.
     assert!(
-        !widened || aggregates.is_some(),
-        "plan_scan_sql mirrors only the non-widened dispatch path; a widened row-scan fixture needs build_dispatch_sql, not this helper"
+        !wrapped || aggregates.is_some(),
+        "plan_scan_sql mirrors only the unwrapped dispatch path; a wrapped row-scan fixture needs build_dispatch_sql, not this helper"
     );
     let logical_schema = lineitem_logical_schema();
     let topn = if aggregates.is_none() {
@@ -68,8 +74,9 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let mut keys = parse_order_by_keys(pushdown_req);
-        sort_by_select_items(&mut keys, pushdown_req, &projection);
-        extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
+        sort_by_select_items(&mut keys, &pushdown, &projection);
+        extend_projection_with_sort_keys(&mut projection, &keys, &emitted)
+            .expect("the fan-out emits every sort key");
         keys
     } else {
         Vec::new()
