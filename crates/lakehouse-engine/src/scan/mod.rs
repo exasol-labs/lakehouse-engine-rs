@@ -62,7 +62,7 @@ mod row_deletes;
 mod scan_table;
 
 mod partition_values;
-pub(crate) use partition_values::{non_null_partition_value, partition_scalar};
+pub(crate) use partition_values::{hex_scalar, non_null_partition_value, partition_scalar};
 
 mod raw_scan;
 pub use raw_scan::{

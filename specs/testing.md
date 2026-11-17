@@ -51,7 +51,7 @@ Test code gets the same design care as production code. A test reads as the one 
 
 | Suite | Cargo feature | Test binaries | Make targets | CI job (check name) | Stack | In `release` needs |
 |-------|---------------|---------------|-------------|---------------------|-------|--------------------|
-| Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, plus one check per older Exasol version) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
+| Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, plus one check per older Exasol version and `E2E (Nano, arm64)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
 | Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make lakekeeper-up test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
 | Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make unity-up test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
 | Azure | `azure-e2e` | `e2e_azure_test` | `make azure-up test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
@@ -174,9 +174,20 @@ Test code gets the same design care as production code. A test reads as the one 
 - Every E2E Make target depends on `cross-udf-build`, so no suite runs against a stale `.so`. With `REBUILD_SO=0`, a missing or stale `.so` fails the target instead of rebuilding it.
 - Each stack in § E2E suites has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
 - Every E2E CI job needs only `build-so`, so a draft pull request skips it. It sets `REBUILD_SO=0` and runs its suite and stack through the Make targets. It compiles the suite between `<stack>-start` and `<stack>-wait`, with the same cargo flags as the Make test target, so compilation overlaps Exasol's boot.
-- The `e2e` job runs the local suite once per supported Exasol major version, each leg selecting its image through `EXASOL_IMAGE`. The leg on the newest version carries the required check name `E2E`, and `release` needs every leg. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
+- The `e2e` job runs the local suite once per supported Exasol major version, each leg selecting its image through `EXASOL_IMAGE`. The leg on the newest docker-db version carries the required check name `E2E`, and `release` needs every leg. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
+- A further `e2e` leg, `E2E (Nano, arm64)`, runs the local suite on Exasol Nano on an arm64 runner with the aarch64 `.so`.
 - `E2E (Azure)` and `E2E (Glue)` are neither required nor in `release`'s needs, so a cloud outage or a rotated key blocks no merge and no release.
-- E2E tests run only on x86_64, because `exasol/docker-db` publishes amd64-only images. The `arm64` job runs only `cargo test --workspace`.
+- The `arm64` job runs `cargo test --workspace`. Only the Nano leg runs an E2E suite on arm64 in CI.
+
+### Exasol image flavors
+
+- `exasol/docker-db` publishes amd64-only images, so every suite runs on one of two flavors. `docker-db` runs on x86_64 hosts. `nano` runs the multi-arch `exasol/nano` image, the default on arm64 hosts such as Apple Silicon.
+- `EXASOL_FLAVOR` (`docker-db` or `nano`) selects the flavor. When it is unset, the Makefile and `scripts/e2e-stack.sh` derive it from `EXASOL_IMAGE`, else from the host architecture. The harness reads `EXASOL_FLAVOR`, else the running container's image.
+- On `nano`, `scripts/e2e-stack.sh` applies `docker-compose.nano.yml` last, over every stack. It replaces docker-db's entrypoint, its `/etc/hosts` loop, and its healthcheck, because the Nano image holds no shell. Docker's DNS resolves the service names, and `wait` probes the SQL port from a sidecar in the container's network namespace.
+- Nano has no BucketFS HTTP endpoint. It serves each bucket from `/exa/bucketfs/bfsdefault/<bucket>/`, so the harness and `make install-slc bucketfs-upload-so` copy files in with `docker cp`, and unpack the SLC archive there.
+- The harness installs the SLC tarball of the host architecture, because Docker runs the host's native image.
+- A harness probe that needs a shell or `getent` inside the Exasol container runs on `nano` in a throwaway container that joins the Exasol container's network namespace.
+- A test that needs a stub adapter writes it in Lua, which every Exasol image has built in. Nano ships no Python script language container.
 
 ## Ops
 

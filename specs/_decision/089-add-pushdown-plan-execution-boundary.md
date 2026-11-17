@@ -8,7 +8,7 @@
 
 ### Context
 
-`EXPLAIN VIRTUAL` shows the full pushdown SQL, including filter and file list, to any user with `SELECT` on the virtual schema. What stops a reader from resubmitting or editing the plan is `EXECUTE ON SCRIPT` on the scan and distributor scripts, which `SELECT` does not confer. A role-wide `GRANT EXECUTE` would make every pushed predicate advisory.
+`EXPLAIN VIRTUAL` shows the full pushdown SQL, including filter and file list, to any user with `SELECT` on the virtual schema. Only `EXECUTE ON SCRIPT` on the scan and distributor scripts, which `SELECT` does not confer, stops a reader from resubmitting or editing that plan.
 
 ### Decision
 

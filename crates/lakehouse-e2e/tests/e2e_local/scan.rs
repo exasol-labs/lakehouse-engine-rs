@@ -10,7 +10,8 @@ use crate::common::seed::{
     DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE,
     E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_ODD_ROOT_TABLE, E2E_PART_TABLE,
     E2E_TABLE, E2E_TABLE_2, E2E_UUID_SIGNED_BOUNDS_TABLE, EVO_INITDEF_POST_ADD_IDS,
-    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
+    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_REFUSED_COL_BAD, EVO_INITDEF_REFUSED_COL_OK,
+    EVO_INITDEF_REFUSED_TABLE, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
     EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
     LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL,
     PART_FILE_NAME_URL_CHARS, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
@@ -18,11 +19,13 @@ use crate::common::seed::{
     SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
     TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, UUID_SIGNED_BOUNDS_ROWS,
     initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
-    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    seed_unreadable_initial_default, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
+    typed_id_avg_stddev,
 };
 use crate::common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, exasol_container, iceberg_catalog_url,
-    iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, ExasolFlavor, build_create_connection_sql, exasol_container,
+    exasol_flavor, iceberg_catalog_url, iceberg_catalog_url_internal,
+    local_stack_connection_password,
 };
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
@@ -660,6 +663,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
 }
 
 /// Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
+/// Scenario: An initial-default of a type without a native Arrow tag reads as a stored value of its column reads
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     lakehouse_vs();
@@ -745,6 +749,46 @@ fn e2e_added_columns_initial_default_fill_all_types() {
             );
         }
     }
+}
+
+/// Scenario: A primitive initial-default that cannot be read at its column's declared type refuses the column
+#[test]
+fn e2e_unreadable_initial_default_refuses_only_its_column() {
+    lakehouse_vs();
+
+    runtime().block_on(async {
+        seed_unreadable_initial_default(&iceberg_catalog_url(), "s3://warehouse/")
+            .await
+            .expect("seed initdef_refused (unreadable initial-default) table");
+    });
+
+    let mut conn = exa_conn();
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new("INITDEF_REFUSED_VS", E2E_NAMESPACE).with_parallelism_factor(1),
+    );
+    let table = format!(
+        "INITDEF_REFUSED_VS.{}",
+        EVO_INITDEF_REFUSED_TABLE.to_uppercase()
+    );
+    let bad = EVO_INITDEF_REFUSED_COL_BAD;
+
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT {} FROM {table}", bad.to_uppercase()),
+        &[&format!("'{bad}'"), "initial-default"],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT id, {} FROM {table} ORDER BY id",
+            EVO_INITDEF_REFUSED_COL_OK.to_uppercase()
+        ),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("42"), Some("42"), Some("42")],
+        ],
+    );
 }
 
 #[test]
@@ -1266,6 +1310,9 @@ fn docker_update_cpuset(container: &str, cpus: &str) -> Result<(), String> {
 }
 
 fn exasol_container_cpuset(container: &str) -> String {
+    if exasol_flavor() == ExasolFlavor::Nano {
+        return nano_container_cpuset(container);
+    }
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";
     let out = std::process::Command::new("docker")
         .args(["exec", container, "cat", path])
@@ -1283,6 +1330,37 @@ fn exasol_container_cpuset(container: &str) -> String {
         "{path} in {container} is empty, so the container is pinned to no CPU at all"
     );
     raw
+}
+
+/// Nano's image has no `cat`, so the CPU set comes from Docker: the configured set, or every
+/// CPU of the Docker host when none is configured.
+fn nano_container_cpuset(container: &str) -> String {
+    let docker = |args: &[&str]| {
+        let out = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "docker {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let configured = docker(&[
+        "inspect",
+        "--format",
+        "{{.HostConfig.CpusetCpus}}",
+        container,
+    ]);
+    if !configured.is_empty() {
+        return configured;
+    }
+    let cpus: usize = docker(&["info", "--format", "{{.NCPU}}"])
+        .parse()
+        .unwrap_or_else(|e| panic!("docker info reports no CPU count: {e}"));
+    format!("0-{}", cpus - 1)
 }
 
 fn cpu_ids(list: &str) -> Vec<usize> {

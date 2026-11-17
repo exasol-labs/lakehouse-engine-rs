@@ -31,7 +31,7 @@ The Iceberg, Delta, and Hive partition paths each walked the filter JSON, and ea
 
 ### Decision
 
-One parse turns the filter into a format-neutral pruning filter: comparisons, `IN` lists, null tests, and `LIKE` patterns over resolved columns, with every literal converted to the column's Arrow type, joined by `AND`, `OR`, and `NOT`, and an opaque node for anything else. Each path supplies only a column resolver. The Hive partition predicate evaluates the parsed filter under three-valued logic against each file's values. Iceberg and Delta lower it into their own predicate through a trait that builds a comparison, an `IN` list, a null test, a prefix test, and the junctions, and that tracks which nodes translated exactly.
+One parse turns the filter into a format-neutral pruning filter: comparisons, `IN` lists, null tests, and `LIKE` patterns over resolved columns, with every literal converted to the column's Arrow type, joined by `AND`, `OR`, and `NOT`, and an opaque node for anything else, and each path supplies only a column resolver. The Hive partition predicate evaluates the parsed filter under three-valued logic against each file's values. Iceberg and Delta lower it into their own predicate through a trait that builds each node shape and tracks which nodes translated exactly.
 
 ### Consequences
 

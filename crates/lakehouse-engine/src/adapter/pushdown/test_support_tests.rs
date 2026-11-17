@@ -1816,6 +1816,13 @@ impl PushdownRequestBuilder {
         self.field("limit", serde_json::json!({"numElements": num_elements}))
     }
 
+    pub(crate) fn limit_with_offset(self, num_elements: u64, offset: u64) -> Self {
+        self.field(
+            "limit",
+            serde_json::json!({"numElements": num_elements, "offset": offset}),
+        )
+    }
+
     /// The raw `selectListDataTypes` value, `None` to omit the key.
     pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
         self.raw_select_list_data_types = Some(raw);

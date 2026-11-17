@@ -2575,3 +2575,90 @@ fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
         assert_mentions(&user_message(error), &[column]);
     }
 }
+
+fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Option<Vec<Json>> {
+    let mut request = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .order_by(Json::Array(keys.to_vec()));
+    if let Some(offset) = offset {
+        request = request.limit_with_offset(3, offset);
+    }
+    request
+        .build_pushdown()
+        .json()
+        .get("orderBy")
+        .map(|keys| keys.as_array().expect("orderBy is an array").clone())
+}
+
+/// Sort keys, the request's offset, and the `orderBy` that remains.
+type SortKeyCase = (Vec<Json>, Option<u64>, Option<Vec<Json>>);
+
+#[test]
+fn parse_drops_constant_sort_keys() {
+    let id_key = order_by_element(table_col("EVENTS", "ID"), true, true);
+    // A literal type Exasol sends, plus `literal_interval`, which the select-list literal list omits.
+    let constants = [
+        num_lit(2),
+        lit("literal_double", 1.5),
+        str_lit("a"),
+        null_lit(),
+        bool_lit(true),
+        date_lit("2024-01-01"),
+        timestamp_lit("2024-01-01 00:00:00"),
+        lit("literal_interval", "1"),
+    ];
+    let mut cases: Vec<SortKeyCase> = constants
+        .iter()
+        .map(|constant| {
+            (
+                vec![
+                    order_by_element(constant.clone(), false, false),
+                    id_key.clone(),
+                ],
+                None,
+                Some(vec![id_key.clone()]),
+            )
+        })
+        .collect();
+    let random = order_by_element(scalar_fn("RAND", Vec::<Json>::new()), true, true);
+    cases.extend([
+        (
+            vec![random.clone(), id_key.clone()],
+            None,
+            Some(vec![random, id_key.clone()]),
+        ),
+        (Vec::new(), Some(2), Some(Vec::new())),
+        (vec![order_by_element(num_lit(2), true, true)], None, None),
+        (
+            vec![order_by_element(num_lit(2), true, true)],
+            Some(0),
+            None,
+        ),
+        (
+            vec![
+                order_by_element(num_lit(2), false, false),
+                order_by_element(str_lit("a"), true, true),
+            ],
+            Some(2),
+            Some(vec![order_by_element(bool_lit(false), false, false)]),
+        ),
+        (
+            vec![order_by_element(num_lit(2), true, true), id_key.clone()],
+            Some(2),
+            Some(vec![id_key.clone()]),
+        ),
+    ]);
+
+    for (keys, offset, expected) in cases {
+        assert_eq!(
+            parsed_order_by(&keys, offset),
+            expected,
+            "keys {keys:?}, offset {offset:?}"
+        );
+    }
+
+    let no_order_by = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .build_pushdown();
+    assert!(no_order_by.json().get("orderBy").is_none());
+}

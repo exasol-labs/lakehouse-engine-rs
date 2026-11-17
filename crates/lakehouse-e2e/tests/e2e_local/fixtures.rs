@@ -95,17 +95,20 @@ pub fn lakehouse_vs() {
 /// The adapter schema of a virtual schema whose properties [`persist_properties`] sets.
 pub const STUB_ADAPTER_SCHEMA: &str = "PV_STUB_ADAPTER";
 
-/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did.
-const PERSISTING_ADAPTER_BODY: &str = r#"import json
+/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did. Lua,
+/// because it is built into every Exasol image, while Nano ships no Python container.
+const PERSISTING_ADAPTER_BODY: &str = r#"local cjson = require("cjson")
 
-
-def adapter_call(request_json):
-    kind = json.loads(request_json)["type"]
-    if kind == "getCapabilities":
-        return json.dumps({"type": kind, "capabilities": []})
-    if kind == "setProperties":
-        return json.dumps({"type": kind})
-    raise Exception("the stub adapter answers only setProperties, got " + kind)
+function adapter_call(request_json)
+    local kind = cjson.decode(request_json)["type"]
+    if kind == "getCapabilities" then
+        return '{"type": "getCapabilities", "capabilities": []}'
+    end
+    if kind == "setProperties" then
+        return '{"type": "setProperties"}'
+    end
+    error("the stub adapter answers only setProperties, got " .. kind)
+end
 "#;
 
 /// Swaps the stub in, runs `ALTER VIRTUAL SCHEMA <vs> SET <set_clause>`, and puts the engine
@@ -113,7 +116,7 @@ def adapter_call(request_json):
 /// created `USING` [`STUB_ADAPTER_SCHEMA`], whose scripts must already exist.
 pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
     conn.execute(&format!(
-        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT \
+        "CREATE OR REPLACE LUA ADAPTER SCRIPT \
          {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
     ));
     conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} SET {set_clause}"));
@@ -122,6 +125,15 @@ pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
 
 pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
+}
+
+/// `SELECT <select> FROM <events> e JOIN <labels> l ON e.ID = l.ID <tail>` over one virtual schema.
+pub fn events_labels_join(vs_name: &str, select: &str, tail: &str) -> String {
+    format!(
+        "SELECT {select} FROM {} e JOIN {} l ON e.ID = l.ID {tail}",
+        vs_table(vs_name, E2E_TABLE),
+        vs_table(vs_name, E2E_TABLE_2)
+    )
 }
 
 pub fn events_table() -> String {
