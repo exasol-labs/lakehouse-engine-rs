@@ -2,120 +2,134 @@
 
 ## Summary
 - Axes checked: 6/6
-- Total findings: 15 (Blockers: 2, Findings: 13)
+- Total findings: 16 (Blockers: 1, Findings: 15)
 - Intent Fidelity blockers: 0
 
 ## Failure Modes
 
-1. Exasol's implicit conversion in `d = <text>` differs from `CAST(<text> AS DATE)` for some literal shape, or Exasol Nano 2026.2 types a date-part call differently. The scan then returns other rows than native, or the CI Nano leg fails. Routed to `[UNSTATED_ASSUMPTION]` and `[HIDDEN_DEPENDENCY]`.
-2. The split route's spec text stays out of step with current `main`, so the implementer builds against a stale requirement: the empty `selectList` clause that #632 changed. Routed to `[REQUIREMENT_CONFLICT]`.
-3. The marker plumbing is wired incompletely: the "request holds a marker character" flag never reaches the typed pass, or the marker loses its characters in serialization. Every converted query then fails. Routed to `[EFFORT_MISESTIMATION]` and `[INFORMATION_COUPLING]`.
+1. The implementer follows the task list, and three existing tests that encode the whole-WHERE decline fail: one E2E pruning case and two unit tests. Under time pressure, the pruning case is loosened to `Scan`, and the only test that proves pruning for a split filter loses its outer-WHERE check. Routed to `[HIDDEN_DEPENDENCY]` (BLOCKER).
+2. A date-part type is wrong on one engine flavor, for example Exasol Nano 2026.2 or `HOUR` over a DATE. No test asserts the declared group-key type, so a type that is too wide passes locally, and a version-specific type fails only the CI Nano leg. Routed to `[HIDDEN_DEPENDENCY]` and `[TRACEABILITY_GAP]`.
+3. The new `ScanWhere` variant is wired wrong at one consumer, for example the broadcast join keeps the rendered half instead of returning `Ok(None)`. No test sends a partly declined filter through a broadcast-eligible join, so the join returns extra rows. Routed to `[TRACEABILITY_GAP]` and `[INFORMATION_COUPLING]`.
 
 ## Intent Fidelity
 
-`[INTENT_DRIFT]` and `[SCOPE_CREEP]`: no objection, axis checked. Each of the four item-5 parts of #615 (DATE text literal, AND split, date-part types, #461 guard) has tasks. Every task traces to one of them, or to the `AGENTS.md` docs rule.
+`[INTENT_DRIFT]`: no objection, axis checked. #615 item 5 (`gh issue view 615`, OPEN) has four bullets. The plan delivers bullets 2 (WHERE split), 3 (date-part types), and 4 (DataFusion 55.2.0 lacks apache/datafusion#22906, confirmed by `cargo search datafusion`, so the plan adds the regression guard instead of deleting the floor). Bullet 1 is dropped by the user's decision in `## Interview` Q5.
 
-#### [SCOPE_REDUCTION] FINDINGS
-- Location: plan.md § Context, open-question bullet; decision-log.md § Interview and Decision [2]
-- Issue: #615 item 5 reads "Let Exasol convert constant text before the scan, so `d = '2024-01-02'` keeps the scan filter". It asks for constant text in general and gives a DATE example. The plan narrows the work to DATE (Decision [2]). It also states "Item 5 of #615 names them", but item 5 names no TIMESTAMP, DOUBLE, or DECIMAL. It states "The user confirmed the DATE-only scope", but `## Interview` records only "constant text keeps the scan filter". `Closes #615` then closes the issue, and only a `#TBD` issue that does not exist yet tracks the rest.
-- Fix: In plan.md § Context, replace "Item 5 of #615 names them" with "Item 5 of #615 asks for constant text in general, with a DATE example". If the user confirmed the DATE-only scope, add that Q/A to decision-log.md § Interview. Otherwise, list the narrowing as an open question for the user. In both cases, keep the open question saying that a human opens the follow-up issue before the implementing commit says `Closes #615`.
+`[SCOPE_CREEP]`: no objection, axis checked. Every task traces to one of the three groups or to the `AGENTS.md` docs rule. The empty-`selectList` rewrite in two scenarios aligns them with the recorded Background on current `main` (`OutputContract::AnyOneColumn`, `support.rs:886`).
+
+`[SCOPE_REDUCTION]`: no objection, axis checked. Group C removal is user-authorized. The `Closes #615` / `Refs #615` open question keeps the issue honest.
+
+Group C leftovers: none found. No marker, conversion task, `architecture.md`, `pushdown-types/` delta, or `docs/semantic-differences.md` task remains. Decision numbering holds only [1]. plan.md § Impact says `docs/semantic-differences.md` stays. The remaining DATE-text sentences (plan.md § Context bullets 2 and 9, § Out of scope bullet 1, `## Interview` Q1 and Q5) explain the drop, which is correct.
 
 ## Feasibility
 
-`[NFR_IGNORED]`: no objection, axis checked. Security: the literal travels hex-encoded and reaches SQL only inside one Exasol string literal, and a malformed-marker error quotes no spec text (3.4, 3.6). Performance: one CAST per marker per shard row. Checked against code: `build_fan_out_inner` (`support.rs:283`) is the only `to_common_json` call. The row scan, aggregate, `COUNT(DISTINCT)`, and grouped paths call it directly. The broadcast join (`joins/sql_builders.rs:463`), the N-scan legs (`:576`), and the wrapper (`:753`) reach it through `build_scan_driving_sql`. `Cargo.lock` pins DataFusion 55.2.0.
+`[NFR_IGNORED]`: no objection, axis checked. Performance improves (the scan filters rows that reached Exasol before). Security and migration are untouched: no property, CONNECTION field, credential path, or capability changes. File pruning keeps reading the raw `filter_json_raw` (`mod.rs:153` comment).
 
-#### [HIDDEN_DEPENDENCY] FINDINGS
-- Location: plan.md § 1.1, § 3.1, § Verification > Checklist
-- Issue: CI runs the local E2E suite on three images: `exasol/docker-db:2025.1.16`, `exasol/docker-db:8.29.13`, and `exasol/nano:2026.2.0-nano.8` (`.github/workflows/ci.yml`, check `E2E (Nano, arm64)`). `ExasolVersion::of` maps 2026 to the `Exasol2025` arm. Task 1.1 measures date-part types, and task 3.1 measures CAST and `TO_CHAR`, only on 8.29.13 and 2025.1.16. The checklist omits Nano. The new `SPLIT_AGGREGATE_CASES` rows and `text_conversion.rs` cases still run on Nano in CI.
-- Fix: Add `exasol/nano:2026.2.0-nano.8` to the measurements of 1.1 and 3.1. Add a checklist row "E2E on Exasol Nano | `make e2e-down; EXASOL_IMAGE=exasol/nano:2026.2.0-nano.8 make e2e-up test-e2e` | 0 failures". The image is multi-arch (`specs/testing.md` § Exasol image flavors).
-
-#### [UNSTATED_ASSUMPTION] FINDINGS
-- Location: plan.md § 3.1; `pushdown-types/pushdown-planning-scan-text-conversion` delta, scenario "Exasol converts a text literal compared with a DATE before the scan", second AND step
-- Issue: Decision [1] assumes that native `d = <text>`, `IN`, `BETWEEN`, and simple `CASE` compare with the value of `CAST(<text> AS DATE)` for every text literal. Task 3.1 checks only well-formed date literals under `DD.MM.YYYY` and `YYYY-DD-MM`. It does not check a literal with a time part (`'01.01.2024 10:00:00'`), a literal with surrounding blanks, one-digit day or month (`'1.1.2024'`), or a literal of blanks only. If native Exasol compares any of these differently, for example as a TIMESTAMP, the scan returns other rows. The scenario also requires "NULL where the literal converts to NULL", and task 3.4 builds a NULL branch. No task shows that a non-empty literal can convert to NULL, and Exasol sends `''` as `literal_null` (`file-planning/pruning-predicate-translation` Background).
-- Fix: In 3.1, list these literal shapes. For each one, record whether native `=`, `IN`, `BETWEEN`, and simple `CASE` agree with the CAST. A shape that disagrees keeps declining, and the delta lists it. Add one E2E case per agreeing shape to 3.7. In 3.1, also record whether any non-empty literal converts to NULL. If none does, drop the NULL clause from the scenario and the NULL branch from 3.4 and 3.6.
+#### [HIDDEN_DEPENDENCY] BLOCKER
+- Location: plan.md § Implementation Tasks group 2, § Dead Code Removal, § Verification > Checklist
+- Issue: Three existing tests assert that a WHERE with one declined conjunct and one rendered conjunct declines whole. Task 2.1 makes each assertion false, and the plan names none of them, so the checklist rows "Unit tests: 0 failures" and "E2E on Exasol 2025: 0 failures" fail as written. `specs/testing.md` § Regression guards requires each such test to be deleted or deliberately changed, never weakened.
+  - `crates/lakehouse-e2e/tests/common/pruning_cases.rs:364`: `Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", OuterWhere)`. `Placement::OuterWhere` holds only when the plan has `LHS_T0` and no `"filter":"` (`pruning_cases.rs:43`). `S LIKE 'xaa' ESCAPE 'a'` alone is a `Scan` case (line 363), so after the split the scan spec carries it and the case fails on Iceberg and Delta.
+  - `crates/lakehouse-engine/src/adapter/pushdown/support_tests.rs:1681` `nested_like_decline_routes_to_wrapper_where`: filter `STATUS = 'OPEN' AND AMOUNT LIKE '9%'`. The helper `declined_filter_wrapper_sql` panics unless `split_where` returns `ScanWhere::Declined`, and the test asserts "the wrapper WHERE must carry the WHOLE declined filter, both conjuncts".
+  - `crates/lakehouse-engine/src/adapter/pushdown/pushdown_tests.rs:890` `pruning_input_unchanged_when_df_render_declines`: filter `id > 5 AND SECOND(ts, 3) … AND LENGTH(amount) > 5`, asserts `ScanWhere::Declined(&filter)`. `id > 5` renders, so the new variant comes back.
+- Fix: Add a task to group 2, after 2.3: (a) in `pruning_cases.rs`, add a `Placement::Split` variant that holds when the plan has both `LHS_T0` and `"filter":"`, and set it on the line-364 case, keeping its scanned-file list `["a1", "a2", "b1"]`; map the pruning step of the changed scenario "A declined WHERE filter routes the single-table request to the qualified wrapper" to this case. (b) Delete `nested_like_decline_routes_to_wrapper_where`, because the 2.5 E2E test proves the split. (c) Rewrite `pruning_input_unchanged_when_df_render_declines` to assert that the new variant's declined half holds the original, un-rewritten `SECOND` and `LENGTH` conjuncts, which is the property the test name states. Add `pruning_cases.rs`, `support_tests.rs`, and `pushdown_tests.rs` to group B's Knowledge, and list (b) in § Dead Code Removal.
 
 #### [EFFORT_MISESTIMATION] FINDINGS
-- Location: plan.md § 3.2, § 3.5
-- Issue: Task 3.5 says "With one, no translator converts a literal", but no task says how the flag reaches the typed pass. The conversion happens in `compare_without_session_parse` inside `ScanTyping` (vs-expression). Code builds `ScanTyping` through `ScanTyping::new(columns, version)`, called from `ScanTranslator { columns, version }`. Five production sites build a translator or typing: `mod.rs:145`, `joins/mod.rs:103`, `joins/sql_builders.rs:85`, `joins/rendering.rs:36`, and `joins/rendering.rs:150`. About 35 test sites call `ScanTyping::new`. Task 3.5 keeps the signature of `build_fan_out_inner` but leaves the translator change unnamed.
-- Fix: Add to 3.2 how the typed pass learns the flag. One option: `ScanTranslator::over` takes the flag from the pushdown context and sets a `ScanTyping` field, and conversion stays enabled by default so test call sites keep compiling. List the production construction sites the task edits.
+- Location: plan.md § 1.2, § 2.1, § Parallelization row B
+- Issue: Four code edits that the task lines need are unstated.
+  - (a) `ResultRule` (`scalar_functions.rs:30`) has no variant that carries a fixed exact type. Task 1.2 must add one and its arm in `ScalarFunction::result_type` (`scan_typing.rs:335`).
+  - (b) `ScanWhere::declined()` returns `Option<&'a Json>` (`support.rs:716`). It cannot borrow the owned conjunction that task 2.1 puts in the new variant, so its signature changes, and `qualified_single_table_fallback_pushdown` (`joins/sql_builders.rs:804`) follows.
+  - (c) `joins/broadcast_policy.rs:7` imports `flatten_conjuncts` from `rendering`. The move in 2.1 edits that file, which group B's Knowledge omits.
+  - (d) Task 2.1 does not say what `split_where` returns when every conjunct renders alone but the whole filter declined.
+- Fix: In 1.2, add "add a `ResultRule` variant that holds a fixed exact type, and its arm in `result_type`". In 2.1, add "change `ScanWhere::declined()` to borrow from `&self`", "update the `flatten_conjuncts` import in `joins/broadcast_policy.rs`", and "when every conjunct renders, return `ScanWhere::Pushed` with the conjunction". Add `joins/broadcast_policy.rs` to group B's Knowledge.
 
 #### [HIDDEN_DEPENDENCY] FINDINGS
-- Location: plan.md § 2.4
-- Issue: Task 2.4 says the golden `group_by_fallback_rendering_filter.sql` is "generated before 2.1", but it appears after 2.1 to 2.3. An implementer who works through the list in order generates the golden from post-change output, so it guards nothing.
-- Fix: Renumber the task as 2.1, before the `split_where` change, and shift the later task numbers and the references to them in plan.md.
+- Location: plan.md § 1.1, § Verification > Checklist
+- Issue: CI runs the local E2E suite on three images (`.github/workflows/ci.yml:341-353`): `exasol/docker-db:2025.1.16`, `exasol/docker-db:8.29.13`, and `exasol/nano:2026.2.0-nano.8` on arm64. Task 1.1 measures the date-part types only on 8.29.13 and 2025.1.16, and the checklist omits Nano. The new `SPLIT_AGGREGATE_CASES` rows run on Nano in CI. The earlier review raised this, and the plan still lacks it.
+- Fix: Add `exasol/nano:2026.2.0-nano.8` to the measurements of 1.1. Add a checklist row "E2E on Exasol Nano | `make e2e-down; EXASOL_IMAGE=exasol/nano:2026.2.0-nano.8 make e2e-up test-e2e` | 0 failures".
+
+#### [UNSTATED_ASSUMPTION] FINDINGS
+- Location: plan.md § Context; declined-filter-self-apply delta, scenario "A single-table WHERE filter splits at AND between the scan and the wrapper", fourth AND step
+- Issue: The scenario promises a result equal to native Exasol for every shape. After the split, the scan evaluates a rendered conjunct over rows that a declined conjunct would exclude, so a rendered conjunct that can raise an error in DataFusion, such as an integer division by zero, now runs on those rows. Before the change, the whole WHERE ran in Exasol for such a filter. Exasol applies an unadvertised conjunct after the scan in the same way, so the plan likely accepts this, but it does not say so.
+- Fix: Add one sentence to plan.md § Context: "A rendered conjunct runs in the scan over rows that a declined conjunct excludes, as for a conjunct whose capability the adapter does not advertise." If a live check shows native Exasol succeeds where the split fails for realistic data, add the case to `docs/semantic-differences.md` in task 2.6.
 
 ## Requirement Quality
 
-Checked each delta against the current recorded spec. The split-aggregate-types, declined-filter, aggregate-extensions, and scan-text-conversion deltas build on the current scenario and Background text. Their unmarked Backgrounds match the recorded text word for word. `speq plan validate` passes. The pruning claim holds: `file-planning/pruning-predicate-translation` gives a date column only a literal of its own kind.
-
-#### [REQUIREMENT_CONFLICT] BLOCKER
-- Location: specs/_plans/change-pushdown-keep-more-in-scan/pushdown/pushdown-planning/spec.md § Scenario "A declined WHERE filter routes the single-table request to the qualified wrapper", third AND step
-- Issue: The CHANGED block keeps "an absent, JSON-null, or empty `selectList` SHALL return the FULL base row". On current `main`, an empty `selectList` returns one column. #632 (commit bdb25955) added `OutputContract::AnyOneColumn`, and `outer_wrapper_clauses` (`joins/sql_builders.rs`) takes one column for it: "Exasol counts the rows and rejects any width but one column". The recorded Background of the same spec says the same: "An empty `selectList` needs no column and accepts exactly one". The delta therefore restates behavior from before #632 in a block that this revision rewrote. The plan's NEW scenario cites the recorded scenario "A declined filter does not widen the wrapper's projection" (declined-filter-self-apply), which has the same stale clause ("an absent key, JSON null, an empty array, and a non-array value alike").
-- Fix: In the pushdown-planning delta, rewrite that AND step as: "the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares: the full base row for an absent or JSON-null `selectList`, and one column for an empty one, so the route never trips Exasol's positional `04000` validation". In the declined-filter-self-apply delta, add a DELTA:CHANGED block for "A declined filter does not widen the wrapper's projection" that states the same rule, and drop its implementation detail per `.speq/plan-hook.md`. In 2.5, add a case `SELECT RANDOM() FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1` whose row count matches the native copy. Map the changed scenario to `e2e_declined_filter_select_star_returns_full_row_shape` and that new case.
-
-#### [COMPLETENESS_GAP] FINDINGS
-- Location: scan-text-conversion delta, scenario "Exasol converts a text literal compared with a DATE before the scan", fourth AND step; plan.md § 3.8
-- Issue: "a literal that does not parse SHALL fail the query ... whenever a shard scans" says nothing about a scan with no shard. When the table has no file, or other conjuncts prune every file, the adapter returns the empty-result SQL (`empty_result_sql`, `mod.rs`). That SQL holds no `common` argument and so no CAST, and the query returns zero rows. Native Exasol may raise the conversion error instead, and 3.1 measures this for an empty table. Realistic data can hit this difference in whether a query succeeds (mission Core Capability 12).
-- Fix: Add an AND step that states the zero-file outcome as 3.1 measures it, for example "a query whose scan has no file SHALL return no rows and raise no conversion error". Add a 3.7 case whose other conjunct prunes every file. Make the section that 3.8 adds to `docs/semantic-differences.md` state the zero-file outcome.
+Every delta builds on the current recorded text. The unmarked Backgrounds of the pushdown-planning and aggregate-extensions deltas match the recorded text exactly (`diff`). `speq plan validate change-pushdown-keep-more-in-scan` passes with three AND-count warnings. `pushdown-types/pushdown-planning-scan-text-conversion` holds the scenario "A digits-only literal wider than the integer's precision runs in Exasol", which backs plan.md § Impact bullet 3.
 
 #### [AMBIGUOUS_REQUIREMENT] FINDINGS
-- Location: split-aggregate-types delta § Background (CHANGED); declined-filter-self-apply delta § Background (CHANGED)
-- Issue: The changed split-aggregate-types Background no longer names "the typed pass". Unchanged recorded scenarios still use the term: "An unprojected group key with a derived exact type keeps the split" ("that the typed pass gives an exact type (Background)") and "An unprojected SECOND group key takes the type of its argument's precision" ("in the typed scan pass"). The changed declined-filter Background drops "the scan translator", which the unchanged N-scan scenario uses ("the scan translator renders it against that side's own column metadata"). After the merge, these steps refer to terms that nothing in their spec defines.
-- Fix: In the split-aggregate-types delta, add DELTA:CHANGED blocks for those two scenarios. Replace "that the typed pass gives an exact type (Background)" with "that has an exact type (Background)", and "in the typed scan pass" with "as the Background derives it". In the declined-filter delta, change Background bullet 2 to "A conjunct declines when the scan translator, which decides what the scan computes, declines it (`pushdown-types/pushdown-planning-scan-text-conversion`)".
+- Location: split-aggregate-types delta § Background (DELTA:CHANGED); recorded `specs/pushdown-aggregates/pushdown-planning-split-aggregate-types/spec.md` lines 62 and 91
+- Issue: The changed Background no longer names "the typed pass". Two unchanged scenarios still depend on it: "An unprojected group key with a derived exact type keeps the split" ("that the typed pass gives an exact type (Background)") and "An unprojected SECOND group key takes the type of its argument's precision" ("in the typed scan pass"). After the merge, both steps cite a term the spec no longer defines. The earlier review raised this, and the delta still has it.
+- Fix: In the split-aggregate-types delta, add DELTA:CHANGED blocks for those two scenarios, copied from the recorded text. Replace "that the typed pass gives an exact type (Background)" with "that has an exact type (Background)", and "has the exact type `TIMESTAMP(p)` in the typed scan pass" with "has the exact type `TIMESTAMP(p)` (Background)".
+
+#### [AMBIGUOUS_REQUIREMENT] FINDINGS
+- Location: declined-filter-self-apply delta § Background bullet 2; recorded scenarios "A declined filter is applied before aggregation, grouping, and truncation" and "An N-scan side-local conjunct whose DataFusion render declines becomes a residual conjunct"
+- Issue: The changed Background drops "A filter declines when the scan translator declines it" and defines only "A conjunct declines when the scan cannot compute it". Two unchanged scenarios still use the dropped terms: "whose filter declines" (aggregation scenario GIVEN) and "the scan translator renders it" (N-scan scenario, second and fourth AND steps). After the merge, "a filter declines" can mean "every conjunct" or "any conjunct". The deltas also use a second name for the same concept: "the DataFusion-bound render declines".
+- Fix: Rewrite bullet 2 of the declined-filter delta Background as: "A conjunct declines when the scan translator, which decides what the scan computes, cannot render it (`pushdown-types/pushdown-planning-scan-text-conversion`). A filter declines when at least one of its top-level conjuncts declines. Exasol drops a `WHERE` that folds to `TRUE`, so it never sends a trivially-true filter."
+
+#### [AMBIGUOUS_REQUIREMENT] FINDINGS
+- Location: declined-filter-self-apply delta, scenario "A declined filter does not widen the wrapper's projection", THEN step
+- Issue: "SHALL emit only the columns that the request's select list, the wrapper's other clauses, and the declined conjuncts name, and no column because a conjunct declined" contradicts itself on a literal reading. The columns that the declined conjuncts name are emitted precisely because those conjuncts declined. "The wrapper's other clauses" also leaves open which clauses count.
+- Fix: Replace the THEN step with: "the wrapper's fan-out SHALL emit only the columns that the request's select list, GROUP BY, HAVING, and ORDER BY, and the declined conjuncts name".
+
+#### [AMBIGUOUS_REQUIREMENT] FINDINGS
+- Location: pushdown-planning delta, scenario "Filter predicate is pushed into the scan spec", THEN step; scenario "A declined WHERE filter routes the single-table request to the qualified wrapper", last AND step
+- Issue: (a) "SHALL translate a filter that does not render whole one top-level `AND` conjunct at a time" reads first as "render whole one top-level AND conjunct". The earlier review raised this, and the text is unchanged. (b) "byte-identical to its pre-change output" has no referent once the plan is recorded, so no test can be written from it. `pushdown-joins/pushdown-planning-join-fallback` line 65 already states the same requirement testably.
+- Fix: (a) Rewrite the THEN step as "the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, and, when the whole filter does not render, SHALL translate it one top-level `AND` conjunct at a time". (b) Replace "with the emitted SQL byte-identical to its pre-change output" with "and SHALL emit the SQL that the golden-SQL fixtures pin for that shape".
 
 #### [IMPLEMENTATION_DETAIL] FINDINGS
-- Location: pushdown-planning delta; recorded `specs/pushdown/pushdown-planning/spec.md` § Background, bullet "The plan-time file-pruning predicate has a per-format owner"
-- Issue: The CHANGED scenario "Filter predicate is pushed into the scan spec" drops the only step that names `iceberg::expr::Predicate`. The unchanged Background bullet still says "Scenario clauses naming `iceberg::expr::Predicate` describe the Iceberg arm". After the merge, no scenario step depends on that bullet, and the bullet names a Rust type.
-- Fix: Add a DELTA:CHANGED `## Background` block to the pushdown-planning delta that copies the current Background without that bullet. Per `.speq/plan-hook.md`, also leave out the bullets that are implementation detail and would otherwise be copied: the `dispatch` and tokio bullet, and the pushdown-context bullet. If that is too much for this plan, add the stale bullet to plan.md § Out of scope instead.
+- Location: pushdown-planning delta § Background (unmarked); recorded `specs/pushdown/pushdown-planning/spec.md` line 18
+- Issue: The CHANGED scenario "Filter predicate is pushed into the scan spec" drops line 38, the only scenario step that names `iceberg::expr::Predicate`. The Background sentence "Scenario clauses naming `iceberg::expr::Predicate` describe the Iceberg arm" then serves no scenario, and it names a Rust type. The earlier review raised this.
+- Fix: Mark the pushdown-planning delta's `## Background` as DELTA:CHANGED and delete that sentence. Per `.speq/plan-hook.md`, also drop the sentences that name internal structure in the copied block: the `UdfContext::node_count()` / `dispatch` / tokio bullet, and "Every planning path reads these values from it". If that rewrite is too large for this plan, add one plan.md § Out of scope sentence naming the orphaned Background sentence.
 
 #### [REQUIREMENT_CONFLICT] FINDINGS
-- Location: recorded `specs/pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback/spec.md` § Background bullet 2; plan.md § 2.2
-- Issue: That Background says the wrapper's inner raw scan projects "group keys, select-list aggregate arguments, filter columns, and HAVING and ORDER BY references". After task 2.2, the split route emits only the columns of the declined conjuncts. A grouped request with an undecomposable item and a partly declined filter then projects fewer columns than the filter names.
-- Fix: Add a delta for that feature whose CHANGED Background says "the columns of the filter conjuncts the wrapper applies" in place of "filter columns". If that is too much for this plan, list the mismatch in plan.md § Out of scope.
+- Location: recorded `specs/pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback/spec.md` § Background bullet 2; recorded `specs/pushdown-types/pushdown-planning-scan-text-conversion/spec.md` § Background bullet 6
+- Issue: Two recorded Backgrounds keep stating the whole-filter route. The grouped wrapper fallback says the inner raw scan projects "filter columns", but after task 2.2 a column that only a rendered conjunct names is not projected, as the new scenario states. The scan-text-conversion Background says "a WHERE filter runs in the qualified wrapper", but after the change only the declined conjuncts run there.
+- Fix: Add a delta for each feature with a DELTA:CHANGED Background: replace "filter columns" with "the columns of the filter conjuncts the wrapper applies", and replace "a WHERE filter runs in the qualified wrapper" with "a WHERE conjunct runs in the qualified wrapper's `WHERE`, and the other conjuncts stay in the scan". If the hook's rewrite of those Backgrounds is too large, add one plan.md § Out of scope sentence per stale phrase.
+
+#### [COMPLETENESS_GAP] FINDINGS
+- Location: plan.md § 2.6; `docs/capabilities.md` § Scalar functions, line 88
+- Issue: Task 2.6 fixes two sentences, but a third one still describes the removed behavior: "The scan computes these functions when DataFusion can render the whole filter or select list that contains them." After the split, a function in one renderable `AND` operand runs in the scan even when another operand declines.
+- Fix: Add to 2.6: in § Scalar functions, replace "when DataFusion can render the whole filter or select list that contains them" with "when DataFusion can render the WHERE condition or the whole select list that contains them". Add the sentence to § Dead Code Removal's doc-text row.
 
 ## Task Breakdown
 
-`[TASK_GRANULARITY]`: no objection, axis checked. Each task touches one module group for one reason. Groups B and C state their file-level dependencies on A and B.
+`[CLUSTER_INCOHERENCE]`: no objection, axis checked. Group A shares one spec delta and `scan_typing.rs`/`scalar_functions.rs`. Group B shares three deltas and the `adapter/pushdown/` modules. Group D stands alone. The A-to-B dependency is a file conflict on `capability.rs` and `docs/capabilities.md`, and the plan states it.
 
 #### [TRACEABILITY_GAP] FINDINGS
-- Location: plan.md § 1.3, § 3.6, § 3.7, § Verification > Scenario Coverage
-- Issue: Three mapped tests cannot fail when the behavior they cover breaks.
-  - (a) The 3.7 `NScan(2)` case with `a.C_DATE = '…'` passes whether or not the leg keeps the converted filter. A declined conjunct moves to the outer WHERE and returns the same rows. `specs/testing.md` § Correctness oracles says: "When a declined filter would return the same rows as a pushed one, the test also asserts the SQL". `Case.path` holds one `PathCheck`, so the case cannot also check `Has(SCAN_FILTER)`.
-  - (b) In 1.3, an unprojected key shows its declared type only in the `EMITS` clause. `PathCheck::Split` and the row oracle pass with any type wide enough, so the step "YEAR SHALL take DECIMAL(4,0)" is unproven for group keys.
-  - (c) The 3.6 test `marker_character_in_the_request_disables_the_conversion` in `pushdown_tests.rs` proves, through a synthesized request, a state that plain SQL reaches (a literal that holds the marker character) and that `EXPLAIN VIRTUAL` shows. `specs/testing.md` § Coverage rule puts that at the E2E layer.
-- Fix:
-  - (a) In 3.7, add a second row with the same N-scan query and `Has(SCAN_FILTER)`.
-  - (b) In 1.3, add a row per date-part key query with `Has(r#""GK_0" DECIMAL(4,0)"#)`, or `DECIMAL(2,0)` for the others, beside its `Split` row.
-  - (c) Replace the `pushdown_tests.rs` test with a 3.7 E2E case: `C_DATE = '…' AND C_VARCHAR = '<marker character>'` matches native, and its plan `Lacks("CAST(")`.
+- Location: plan.md § 1.3, § 2.5, § Verification > Scenario Coverage
+- Issue: Two THEN steps have no test that fails when they break.
+  - (a) "`YEAR` SHALL take `DECIMAL(4,0)`, and `MONTH`, `DAY`, `HOUR`, `MINUTE`, and `WEEK` SHALL take `DECIMAL(2,0)`". An unprojected key shows its type only in the `EMITS` clause. `PathCheck::Split` and the row oracle pass with any wider type, because `comparable_outcome` compares only the output columns. Only `MAX(DAY(C_DATE)) + 1` exposes a type. The earlier review raised this.
+  - (b) The last AND step of "A single-table WHERE filter splits at AND between the scan and the wrapper" (a broadcast-eligible join whose filter holds a declined conjunct takes the N-scan fallback). Every existing broadcast decline test (`join.rs:1101`, `join.rs:1190`) uses one declined conjunct, so none sends the new variant through `render_broadcast_join_emitting`.
+- Fix: (a) In 1.3, beside each `GROUP BY` date-part row, add a row with the same query and `PathCheck::Has(r#""GK_0" DECIMAL(4,0)"#)` for `YEAR`, and `DECIMAL(2,0)` for `MONTH`, `WEEK`, `HOUR`, and `EXTRACT(MINUTE …)`. (b) Add a task to group 2: in `join.rs`, a case over the fact and dimension join with `WHERE SECOND(o.O_ORDERDATE, 3) = 1 AND o.O_CUSTKEY > 0` that returns 0 rows, matches native, and takes `PathCheck::NScan(2)`. Map the step to that test in § Scenario Coverage.
 
-#### [CLUSTER_INCOHERENCE] FINDINGS
-- Location: plan.md § Parallelization row A; § 1.5
-- Issue: Task 1.5 (the DataFusion guard in `raw_scan_tests.rs`) shares no spec delta and no source module with 1.1 to 1.4. Group A's Knowledge lists `floor_timestamp_literals`, which no group A task edits.
-- Fix: Move 1.5 into a group D with "Depends on: none" and Knowledge `crates/lakehouse-engine/src/scan/raw_scan_tests.rs`. Drop `floor_timestamp_literals` from group A's Knowledge.
+#### [TASK_GRANULARITY] FINDINGS
+- Location: plan.md § 2.4
+- Issue: Task 2.4 says its golden is "generated before 2.1", but it is numbered after 2.1 to 2.3. An implementer who works in order generates the golden from post-change output, and it then guards nothing. The earlier review raised this.
+- Fix: Renumber 2.4 as 2.1, shift 2.1 to 2.3 to 2.2 to 2.4, and update the references to those numbers in plan.md.
 
 ## Design Depth
 
-`[ADR_OVERPROMOTION]`: no objection, axis checked. Decision [1] is the only `yes` entry. Its Rationale names criteria 1 and 4 and states the ADR search result. Its Decision holds no path, signature, or flag.
+`[ADR_OVERPROMOTION]`: no objection, axis checked. No entry promotes. Decision [1] and both review-finding entries say `Promotes to ADR: no`.
 
-`[ADR_CONFLICT]`: no objection, axis checked. Decision [1] supersedes `scan-never-converts-session-formatted-text` with `Supersedes:`. Decision [3] conforms to `typed-pass-infers-exasol-types` (one rule per function, exact only after a live check) and to `exact-types-follow-the-exasol-version`. Task 2.1 keeps the renderability screen at the render consumer (`screen-renderability-at-the-render-consumer-not-in-the-partition-classifier`).
+`[ARCHITECTURE_DRIFT]`: no objection, axis checked. No `yes` entry exists. plan.md § Context says "Architecture: no change" with a reason. `specs/architecture.md` states no whole-filter rule: its only related line is § Constraints line 94 (one scan translator), and the shared per-conjunct screen on `ScanTranslator` keeps that.
 
-The architecture delta's BASE matches `git hash-object specs/architecture.md` (a84eff5a). § Components and § Data Flow are copied in full, with the vs-expression line changed and one Data Flow line added.
-
-#### [ARCHITECTURE_DRIFT] BLOCKER
-- Location: plan.md § 3.5; specs/_plans/change-pushdown-keep-more-in-scan/architecture.md (no § Constraints block); decision-log.md Decision [1] `Architecture:` line
-- Issue: Task 3.5 adds a value derived from the request to the pushdown context: "The pushdown context (`context.rs`) records once per request whether the request JSON holds a marker character". `specs/architecture.md` § Constraints says: "Each pushdown request builds one pushdown context from its UDF handshake and its parsed properties: the CONNECTION, the scan UDF names, the node count, the tuning values, and the Exasol version. Planning reads these values only from that context." The new value comes from neither the handshake nor the properties, and the list omits it. The delta has no § Constraints block, and Decision [1]'s `Architecture:` line names only § Data Flow and § Components.
-- Fix: Add a DELTA:CHANGED `## Constraints` block to architecture.md that copies the full current section. Change the pushdown-context bullet to "builds one pushdown context from its UDF handshake, its parsed properties, and its request text: the CONNECTION, the scan UDF names, the node count, the tuning values, the Exasol version, and whether the request holds a converted-literal marker character". Add "§ Constraints" to Decision [1]'s `Architecture:` line.
+`[ADR_CONFLICT]`: no objection, axis checked. `no-exasol-side-fallback-for-an-advertised-capability`: every declined conjunct is still applied in the wrapper. `screen-renderability-at-the-render-consumer-not-in-the-partition-classifier`: the screen stays at the render consumer, and pruning keeps every conjunct. `typed-pass-infers-exasol-types`: one rule per function, exact only after the live check of 1.1. `exact-types-follow-the-exasol-version`: the E2E checklist runs Exasol 8 and 2025. `scan-never-converts-session-formatted-text`: group C is gone.
 
 #### [INFORMATION_COUPLING] FINDINGS
-- Location: plan.md § 3.3 to 3.5; decision-log.md Decision [1] Consequences, first bullet
-- Issue: Decision [1] says "the pushdown-planner does not know the encoding". In task 3.5, the pushdown context, which belongs to the pushdown-planner, tests the request JSON for "a marker character", so the planner must know the marker's characters. The flag also rides in `Shards`, whose doc reads "A table's files split into shards, with the UDFs that scan them". A property of the request text thus enters a file-sharding type, only so that one signature stays unchanged. The marker also relies on serde_json leaving its characters unescaped when `CommonScanSpec::to_common_json`, which scan-spec owns, serializes the filter. No test pins that round trip.
-- Fix: In 3.3, have `converted_literal.rs` export the predicate "this text holds a marker character", and in 3.5 have the context call it. Pass the flag to the function of 3.4 as a parameter, or as a field of `FanOut`, not on `Shards`. Add to 3.6 one lakehouse-engine unit test: serialize a common spec whose filter holds a marker with `to_common_json`, and assert the concatenation that the 3.4 function returns.
+- Location: plan.md § 2.1, § 2.2
+- Issue: The new `ScanWhere` variant holds a rendered half and a declined half, which is what `Pushed` and `Declined` each hold alone. Each consumer must now know that two variants route to the wrapper: the early return in `build_dispatch_sql` (`mod.rs:214`), the broadcast arm (`joins/sql_builders.rs:97-101`), and both accessors. The rule "recompute the emission over the declined half, for this variant only" lives in `build_dispatch_sql`, although `qualified_single_table_fallback_pushdown` already reads `scan_where` to place both halves. `.speq/plan-hook.md` asks to prefer widening an existing type and to give one line of reason when choosing the design with more moving parts. The plan gives none.
+- Fix: In 2.1, widen `ScanWhere` into one value with two optional halves (rendered scan SQL, declined tree) and route on "a declined half is present" in `build_dispatch_sql` and the broadcast join. Or keep the variant and add one line to 2.1 that says why it beats widening. In 2.2, compute the split emission inside `qualified_single_table_fallback_pushdown` from `scan_where`, so one function owns which columns the wrapper's fan-out emits.
 
 ## Prose Quality
 
-No em dashes in the plan artifacts. plan.md § Context and the decision log state current facts.
+No em dashes in the plan artifacts. plan.md § Summary leads with the result.
 
 #### [PROSE_UNCLEAR] FINDINGS
-- Location: pushdown-planning delta § Scenario "Filter predicate is pushed into the scan spec", THEN step
-- Issue: "SHALL translate a filter that does not render whole one top-level `AND` conjunct at a time" misleads on first reading: it reads as "render whole one top-level AND conjunct".
-- Fix: Rewrite as "and, when the whole filter does not render, SHALL translate it one top-level `AND` conjunct at a time".
+- Location: plan.md § Context bullet 3; decision-log.md § Interview Q3; plan.md § Verification > Manual Testing row 1
+- Issue: (a) "Neither item-5 behavior of this plan and no #461 regression guard is on `main`" mixes "neither" with "and no", so it needs a second read. (b) Interview Q3 cites "`specs/testing.md` § Regression guards, line 99". Line 99 sits in § Correctness oracles, which plan.md § Context cites correctly. (c) Row 1 expects the scan spec's `"filter":"` to hold `"ID" > 1`. The filter is a JSON string inside the scan call, so its quotes appear escaped as `\"ID\" > 1`, and a literal search for `"ID" > 1` finds nothing.
+- Fix: (a) Rewrite as "`main` has neither item-5 behavior of this plan nor a #461 regression guard." (b) Replace "§ Regression guards, line 99" with "§ Correctness oracles". (c) Change the expected output to "the scan spec's `"filter":"` holds `\"ID\" > 1`".
+
+#### [PROSE_BLOAT] FINDINGS
+- Location: plan.md § 2.5
+- Issue: Task 2.5 is one bullet of about 180 words. It mixes the case list, two plan assertions, two special cases, three scenario-line edits, and a unit-test edit, so a reader cannot check it off in parts.
+- Fix: Split 2.5 into sub-bullets: (1) the test and its case list; (2) the `EXPLAIN VIRTUAL` assertions, with the `SELECT C_VARCHAR` and `SELECT RANDOM()` special cases; (3) the `/// Scenario:` lines added to the three E2E tests and removed from `filter_in_common_arg`.
