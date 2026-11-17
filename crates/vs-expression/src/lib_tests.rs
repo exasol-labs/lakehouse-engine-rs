@@ -1252,6 +1252,7 @@ fn now_family_falls_through() {
         "CURRENT_DATE",
         "SYSDATE",
         "CURRENT_TIMESTAMP",
+        "LOCALTIMESTAMP",
         "SYSTIMESTAMP",
     ] {
         let expr = scalar_fn(name, []);

@@ -1,6 +1,7 @@
 use crate::scan::spec::AggregatePlan;
 use serde_json::Value as Json;
 
+use super::grouped_agg::is_literal_selectlist_item;
 use super::scalar_over_agg::{
     TypedPlans, arg_column_or_expr, classify_scalar_over_aggregate, fold_aggregate_plan,
     fold_nested_plans, parse_agg_item, render_scalar_over_merge,
@@ -55,15 +56,24 @@ pub fn detect_aggregates(
                 None => SingleGroupItem::Aggregate(parse_agg_item(item, scan)?),
             }
         } else {
+            // A constant, such as a folded clock function, carries no aggregate to merge.
+            let nested = match item.get("type").and_then(Json::as_str) {
+                Some(kind) if is_literal_selectlist_item(kind) => Vec::new(),
+                _ => classify_scalar_over_aggregate(item, scan)?,
+            };
             SingleGroupItem::ScalarOverAggregate {
                 node: item.clone(),
-                nested: classify_scalar_over_aggregate(item, scan)?,
+                nested,
             }
         };
         items.push(resolved);
     }
 
-    Some(items)
+    // A select list of constants alone has nothing to aggregate per shard.
+    let aggregates = items.iter().any(|item| {
+        !matches!(item, SingleGroupItem::ScalarOverAggregate { nested, .. } if nested.is_empty())
+    });
+    aggregates.then_some(items)
 }
 
 /// The partial plans of a single-group select list, typed and merged once per request.

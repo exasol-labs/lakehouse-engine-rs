@@ -905,7 +905,7 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
 
 /// Exasol rejects `OFFSET` without `ORDER BY` but accepts `ORDER BY FALSE`, which no select-list
 /// position can name, so a windowed all-constant `orderBy` keeps one `FALSE` key.
-fn drop_constant_sort_keys(json: &mut Json) {
+pub(super) fn drop_constant_sort_keys(json: &mut Json) {
     let offset = extract_offset(json);
     let Some(keys) = json.get_mut("orderBy").and_then(Json::as_array_mut) else {
         return;

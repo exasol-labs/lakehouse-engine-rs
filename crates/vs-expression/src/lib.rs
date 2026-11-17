@@ -483,9 +483,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             )));
         }
         "literal_timestamputc" => {
-            // Exasol's real wire name for a TSTZ literal. DataFusion keeps
-            // declining it: TSTZ coercion against a naive `timestamp_us` column is
-            // unverified (#242).
+            // Exasol's real wire name for a TSTZ literal. Its comparison depends on the
+            // session zone, so the adapter folds a compared one into a plain timestamp
+            // literal and the DataFusion dialect declines any left over.
             if dialect == Dialect::Exasol {
                 return Ok(Some(render_exasol_tstz_literal(value("value"))));
             }

@@ -4111,3 +4111,119 @@ pub async fn seed_ident_part_bytes(catalog_url: &str, warehouse: &str) -> Result
 #[cfg(test)]
 #[path = "seed_tests.rs"]
 mod tests;
+
+// Clock probe: fixed rows around 2024-03-01 10:00 Berlin (09:00 UTC), where a TIMESTAMP WITH
+// LOCAL TIME ZONE comparison compared in the wrong zone changes the rows, plus one row after
+// any test run, so a clock filter keeps a strict subset. Two data files.
+
+pub const E2E_CLOCK_NAMESPACE: &str = "e2e_clock";
+pub const E2E_CLOCK_TABLE: &str = "clock_probe";
+/// The same rows again, for a statement over two tables of one virtual schema.
+pub const E2E_CLOCK_TABLE_2: &str = "clock_probe_2";
+
+/// `(id, d, ts, tz, region)`; `tz` is a `timestamptz` holding the UTC instant of its text.
+pub const CLOCK_ROWS: [(i64, &str, &str, &str, &str); 4] = [
+    (
+        1,
+        "2024-03-01",
+        "2024-03-01 08:00:00",
+        "2024-03-01 08:00:00",
+        "eu",
+    ),
+    (
+        2,
+        "2024-03-01",
+        "2024-03-01 09:30:00",
+        "2024-03-01 09:30:00",
+        "eu",
+    ),
+    (
+        3,
+        "2024-03-02",
+        "2024-03-01 10:30:00",
+        "2024-03-01 10:30:00",
+        "us",
+    ),
+    (
+        4,
+        "2099-12-31",
+        "2099-12-31 12:00:00",
+        "2099-12-31 12:00:00",
+        "us",
+    ),
+];
+
+pub async fn seed_clock_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-clock").await?;
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "d", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::required(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            NestedField::required(4, "tz", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+            NestedField::required(5, "region", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build clock_probe Iceberg schema")?;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("d", DataType::Date32, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        // "+00:00", iceberg-rust's UTC label, as for every other timestamptz fixture.
+        Field::new(
+            "tz",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        ),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let days = |text: &str| {
+        let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("fixture date");
+        i32::try_from((date - chrono::DateTime::UNIX_EPOCH.date_naive()).num_days())
+            .expect("days fit i32")
+    };
+    let micros = |text: &str| {
+        chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .expect("fixture timestamp")
+            .and_utc()
+            .timestamp_micros()
+    };
+    let batch = |rows: &[(i64, &str, &str, &str, &str)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Date32Array::from_iter_values(
+                    rows.iter().map(|r| days(r.1)),
+                )),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    rows.iter().map(|r| micros(r.2)),
+                )),
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(rows.iter().map(|r| micros(r.3)))
+                        .with_timezone("+00:00"),
+                ),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.4))),
+            ],
+        )
+        .context("build clock_probe batch")
+    };
+    let (past, future) = CLOCK_ROWS.split_at(3);
+    for table in [E2E_CLOCK_TABLE, E2E_CLOCK_TABLE_2] {
+        create_and_append_files(
+            &catalog,
+            E2E_CLOCK_NAMESPACE,
+            table,
+            iceberg_schema.clone(),
+            [[batch(past)?], [batch(future)?]],
+        )
+        .await
+        .with_context(|| format!("seed {table}"))?;
+    }
+    Ok(())
+}
