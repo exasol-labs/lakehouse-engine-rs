@@ -8,7 +8,7 @@
 
 ### Context
 
-DataFusion's regex engine cannot reproduce Exasol's PCRE match. Exasol accepts a value only when the first match from the value's start ends at the value's end, while DataFusion matches anywhere. DataFusion also rejects look-around and backreferences, and its `\d`, `\w`, `\s`, and `\b` match Unicode where Exasol's match ASCII only.
+DataFusion's regex engine cannot reproduce Exasol's PCRE match, which accepts a value only when the first match from the value's start ends at the value's end, while DataFusion matches anywhere. DataFusion also rejects look-around and backreferences, and its `\d`, `\w`, `\s`, and `\b` match Unicode where Exasol's match ASCII only.
 
 ### Decision
 

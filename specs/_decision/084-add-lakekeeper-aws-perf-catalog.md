@@ -34,7 +34,7 @@ The stack creates a dedicated IAM user with object read, write, and delete on th
 
 ### Context
 
-The Lakekeeper box has a public and a private IP. Three callers reach it: the operator's laptop, the Exasol UDF inside the VPC, and an optional in-VPC EC2 caller. A same-VPC client reaching the public IP routes unreliably.
+The Lakekeeper box has a public and a private IP, and its callers are the operator's laptop, the Exasol UDF inside the VPC, and an optional in-VPC EC2 caller. A same-VPC client reaching the public IP routes unreliably.
 
 ### Decision
 
@@ -63,7 +63,7 @@ The warehouse key prefix is derived from the source tables after apply, so the a
 
 ### Decision
 
-The bucket-wide grant is an accepted risk bounded by four controls. The provisioning script has no destructive verb. The warehouse uses a soft delete profile with a 7-day expiration. The credential lives only as long as the ephemeral stack. The Exasol CONNECTION keeps the read-only key pair.
+The bucket-wide grant is an accepted risk. The provisioning script has no destructive verb, and the warehouse uses a soft delete profile with a 7-day expiration. The credential lives only as long as the ephemeral stack, and the Exasol CONNECTION keeps the read-only key pair.
 
 ### Options Considered
 
@@ -115,7 +115,7 @@ A credential in a process's argv is world-readable through `/proc/<pid>/cmdline`
 
 ### Decision
 
-No credential appears in the argv of any process the script spawns. Credentials reach `curl` through standard input or process substitution, and `jq` bodies read them from the environment. Tracing is banned. Response bodies live in a temp directory removed on exit and are never printed on an error path.
+No credential appears in the argv of any process the script spawns: credentials reach `curl` through standard input or process substitution, and `jq` bodies read them from the environment. Tracing is banned. Response bodies live in a temp directory removed on exit and are never printed on an error path.
 
 ### Options Considered
 

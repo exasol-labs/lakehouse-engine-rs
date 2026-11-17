@@ -8,7 +8,7 @@
 
 ### Context
 
-The Iceberg table spec states "Columns in Iceberg data files are selected by field id", and a field id a file does not hold resolves through partition metadata, `schema.name-mapping.default`, the `initial-default`, then "Return `null` in all other cases". The scan fell back to a physical column of the logical name. A dropped and re-added column then read the dropped column's values, and a name the mapping omits read the file's same-named column.
+The Iceberg table spec states "Columns in Iceberg data files are selected by field id", and a field id a file does not hold resolves through partition metadata, `schema.name-mapping.default`, the `initial-default`, then "Return `null` in all other cases". A fallback to a physical column of the logical name reads a dropped column's values for a re-added column, and a file's same-named column for a name the mapping omits.
 
 ### Decision
 
