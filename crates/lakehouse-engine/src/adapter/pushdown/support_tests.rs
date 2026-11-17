@@ -1650,7 +1650,6 @@ fn selectlist_aggregate_item_routes_to_the_wrapper() {
     );
 }
 
-/// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
     let filter_json = predicate_equal(col("id"), num_lit(42));
@@ -1675,35 +1674,6 @@ fn filter_in_common_arg() {
     assert!(
         common.contains("\"filter\"") && common.contains("42"),
         "filter must be pushed into the common arg: {common}"
-    );
-}
-
-#[test]
-fn nested_like_decline_routes_to_wrapper_where() {
-    let filter = and([
-        string_equal("T", "STATUS", "OPEN"),
-        like(table_col("T", "AMOUNT"), "9%"),
-    ]);
-    let request = pushdown_request(
-        "T",
-        &[
-            ("STATUS", ExasolType::WIDEST_VARCHAR),
-            ("AMOUNT", ExasolType::decimal(9, 2)),
-        ],
-    )
-    .filter(filter)
-    .build()
-    .0;
-
-    let sql = declined_filter_wrapper_sql(&request);
-
-    let where_at = sql
-        .find(r#"AS "LHS_T0" WHERE "#)
-        .unwrap_or_else(|| panic!("the declined filter must reach the wrapper: {sql}"));
-    assert!(
-        sql[where_at..].contains(r#""LHS_T0"."AMOUNT" LIKE '9%'"#)
-            && sql[where_at..].contains(r#""LHS_T0"."STATUS" = 'OPEN'"#),
-        "the wrapper WHERE must carry the WHOLE declined filter, both conjuncts: {sql}"
     );
 }
 

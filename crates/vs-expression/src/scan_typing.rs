@@ -337,6 +337,9 @@ impl ScalarFunction {
         match self.result {
             ResultRule::Text => partial(Partial::Text),
             ResultRule::Integer | ResultRule::IntegerOverIntegers => partial(Partial::Integer),
+            ResultRule::FixedInteger(precision) => {
+                Inferred::Exact(ExasolType::decimal(precision, 0))
+            }
             ResultRule::Number => partial(Partial::Number),
             ResultRule::Arithmetic if args.iter().all(|ty| ty.is_integer()) => {
                 partial(Partial::Integer)
@@ -459,6 +462,13 @@ impl<'a> ScanTyping<'a> {
     /// The type Exasol gives `node`, where the typed pass proves it. `None` leaves the type to Exasol.
     pub fn exact_type(self, node: &Json) -> Option<ExasolType> {
         self.infer_type(node).exact()
+    }
+
+    /// An operand of a top-level `AND`, rendered alone only where it renders inside the `AND`,
+    /// which refuses a text operand that Exasol rejects and DataFusion cannot combine.
+    pub fn render_conjunct(self, conjunct: &Json) -> Result<String, UdfError> {
+        refuse_implicit_text(conjunct, &[self.infer_type(conjunct)])?;
+        Ok(self.render_expression(conjunct)?.sql)
     }
 
     /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent

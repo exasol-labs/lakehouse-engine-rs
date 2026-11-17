@@ -1397,6 +1397,39 @@ fn date_trunc_over_a_date_returns_a_date() {
 }
 
 #[test]
+fn a_date_part_function_takes_its_fixed_native_type() {
+    for source in ["D", "TS", "TS0", "TS9"] {
+        for (name, ty) in [
+            ("YEAR", integer(4)),
+            ("MONTH", integer(2)),
+            ("DAY", integer(2)),
+            ("HOUR", integer(2)),
+            ("MINUTE", integer(2)),
+            ("WEEK", integer(2)),
+        ] {
+            assert_eq!(
+                type_of(&scalar_fn(name, [col(source)])),
+                ty,
+                "{name}({source})"
+            );
+        }
+        for (field, ty) in [
+            ("YEAR", integer(4)),
+            ("MONTH", integer(2)),
+            ("DAY", integer(2)),
+            ("HOUR", integer(2)),
+            ("MINUTE", integer(2)),
+        ] {
+            assert_eq!(
+                type_of(&extract(field, col(source))),
+                ty,
+                "EXTRACT({field} FROM {source})"
+            );
+        }
+    }
+}
+
+#[test]
 fn date_and_timestamp_text_conversion_declines() {
     let sources = [
         col("D"),

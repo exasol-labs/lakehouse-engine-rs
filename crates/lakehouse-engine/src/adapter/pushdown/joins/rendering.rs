@@ -3,12 +3,14 @@ use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ScanTyping, conjoin_scan_filters, render_expression_exasol,
-    strip_table_alias, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, ScanTyping, render_expression_exasol, strip_table_alias,
+    walk_column_nodes,
 };
 
 use super::super::context::PushdownContext;
-use super::super::support::{ColumnTypes, Emitted, OutputContract, ScanTranslator, quote_ident};
+use super::super::support::{
+    ColumnTypes, Emitted, OutputContract, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
+};
 use super::attribution::JoinLegs;
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
@@ -79,41 +81,14 @@ impl LegColumns {
     }
 }
 
-/// An OR is never split, so an OR spanning legs stays withheld from every leg.
-pub(super) fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
-    if filter.get("type").and_then(|t| t.as_str()) == Some("predicate_and")
-        && let Some(exprs) = filter.get("expressions").and_then(|e| e.as_array())
-    {
-        for expr in exprs {
-            flatten_conjuncts(expr, out);
-        }
-        return;
-    }
-    out.push(filter);
-}
-
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
-    let mut conjuncts = Vec::new();
-    flatten_conjuncts(filter, &mut conjuncts);
     conjoin(
-        conjuncts
+        flatten_conjuncts(filter)
             .into_iter()
             .filter(|&c| keep(c))
             .cloned()
             .collect(),
     )
-}
-
-/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
-fn conjoin(mut kept: Vec<Json>) -> Option<Json> {
-    match kept.len() {
-        0 => None,
-        1 => kept.pop(),
-        _ => Some(serde_json::json!({
-            "type": "predicate_and",
-            "expressions": kept,
-        })),
-    }
 }
 
 /// The conjuncts every column of which belongs to leg `leg` (by leg, never by table name,
@@ -135,28 +110,21 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// Returns `(leg_filter_sql, declined)`. Each conjunct renders once against the leg's own
-/// columns, so one declined conjunct costs only itself and no later render can decline the rest.
-/// `Err` as [`ScanTranslator::over`].
+/// Returns `(leg_filter_sql, declined)` through [`ScanTranslator::screen_conjuncts`] against the
+/// leg's own columns, so one declined conjunct costs only itself. `Err` as
+/// [`ScanTranslator::over`].
 pub(super) fn screen_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
     context: &PushdownContext<'_>,
 ) -> Result<(Option<String>, Option<Json>), UdfError> {
-    let mut conjuncts = Vec::new();
-    flatten_conjuncts(side_local, &mut conjuncts);
     // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
-    let bare: Vec<Json> = conjuncts.iter().map(|c| strip_table_alias(c)).collect();
-    let scan = ScanTranslator::over(col_types, context.version, &bare.iter().collect::<Vec<_>>())?;
-    let mut rendered = Vec::new();
-    let mut declined = Vec::new();
-    for (bare, conjunct) in bare.iter().zip(conjuncts) {
-        match scan.expression(bare) {
-            Some(fragment) => rendered.push(fragment.sql),
-            None => declined.push(conjunct.clone()),
-        }
-    }
-    Ok((conjoin_scan_filters(rendered), conjoin(declined)))
+    let scan = ScanTranslator::over(
+        col_types,
+        context.version,
+        &[&strip_table_alias(side_local)],
+    )?;
+    Ok(scan.screen_conjuncts(side_local, strip_table_alias))
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.
