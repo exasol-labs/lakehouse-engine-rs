@@ -86,6 +86,13 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *THEN* the writer SHALL succeed
 * *AND* the table SHALL hold the writer's rows exactly once
 
+### Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+
+* *GIVEN* a writer that checked a table, and another engine that then changes the table's current schema or default partition spec
+* *WHEN* the writer commits its data files
+* *THEN* the commit SHALL assert the schema ID and the partition spec ID that the writer checked
+* *AND* a commit retry that reloads the changed table SHALL fail with an error that names the table and what changed, and SHALL add no snapshot
+
 ### Scenario: Static and vended storage credentials both write the table
 
 * *GIVEN* one CONNECTION with static storage keys, and one CONNECTION that sets `"use_vended_credentials": true` and holds no storage keys

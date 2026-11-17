@@ -73,6 +73,8 @@ pub mod raw_parquet;
 ))]
 pub mod seed;
 pub mod stack;
+#[cfg(feature = "exasol-e2e")]
+pub mod table_state;
 #[cfg(any(feature = "exasol-e2e", feature = "unity-e2e", feature = "glue-e2e"))]
 pub mod timestamp_precision;
 #[cfg(feature = "exasol-e2e")]

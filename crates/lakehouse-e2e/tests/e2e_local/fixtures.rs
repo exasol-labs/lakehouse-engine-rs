@@ -1,9 +1,9 @@
 use crate::common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts,
-    create_schema_and_scripts, create_schema_and_scripts_in, create_virtual_schema,
-    create_virtual_schema_with_password, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, isolated_pushdown_statement, runtime,
-    upload_so,
+    ADAPTER_SCRIPT_NAME, DEFAULT_CATALOG_CONN_NAME, ExportRoute, SCAN_SCRIPT_NAME, SCHEMA_NAME,
+    VsProps, create_proxied_schema_and_scripts, create_schema_and_scripts,
+    create_schema_and_scripts_in, create_virtual_schema, create_virtual_schema_with_password,
+    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_n_scan_wrapper,
+    has_two_scan_wrapper, install_slc, isolated_pushdown_statement, runtime, upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
@@ -278,6 +278,19 @@ pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";
 pub const PROXY_ROLE_VS: &str = "PROXY_ROLE_VS";
 /// The CONNECTION of `PROXY_ICEBERG_VS`, which names the `-via-proxy` catalog and storage.
 pub const PROXY_ICEBERG_CREDS: &str = "PROXY_ICEBERG_CREDS";
+
+/// The export script and CONNECTION of the main adapter schema.
+pub const EXPORT_DIRECT: ExportRoute = ExportRoute {
+    script_schema: SCHEMA_NAME,
+    connection: DEFAULT_CATALOG_CONN_NAME,
+};
+
+/// The proxy-only scripts and CONNECTION of `proxy_virtual_schemas`, so a `scripts/proxy/filter`
+/// line can inject a catalog or storage fault.
+pub const EXPORT_PROXIED: ExportRoute = ExportRoute {
+    script_schema: PROXY_ADAPTER_SCHEMA,
+    connection: PROXY_ICEBERG_CREDS,
+};
 
 pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
     lakehouse_vs();

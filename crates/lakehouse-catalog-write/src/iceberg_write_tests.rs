@@ -699,7 +699,10 @@ async fn unknown_outcome_with_tagged_reload_commits_once() {
         let table = memory_write_table(20);
         let files = vec![data_file(table.table(), "w0")];
 
-        writes.append_files(&table, files, &tag()).await.unwrap();
+        writes
+            .append_files(&table, files, &tag(), table.table().metadata())
+            .await
+            .unwrap();
 
         assert_eq!(
             requests_starting(&requests, COMMIT_T).len(),
@@ -753,7 +756,10 @@ async fn conflict_with_untagged_reload_commits_again() {
     let table = memory_write_table(20);
     let files = vec![data_file(table.table(), "w0")];
 
-    writes.append_files(&table, files, &tag()).await.unwrap();
+    writes
+        .append_files(&table, files, &tag(), table.table().metadata())
+        .await
+        .unwrap();
 
     let commits = requests_starting(&requests, COMMIT_T);
     assert_eq!(commits.len(), 2);
@@ -792,7 +798,12 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
     let table = memory_write_table(20);
 
     writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
         .await
         .unwrap();
 
@@ -821,7 +832,12 @@ async fn a_commit_the_catalog_refuses_fails_at_once_without_a_reload() {
     let table = memory_write_table(20);
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
         .await
         .unwrap_err();
 
@@ -853,7 +869,12 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     let table = memory_write_table(20);
 
     writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
         .await
         .unwrap();
 
@@ -882,7 +903,12 @@ async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the
         let table = memory_write_table(1);
 
         let failed = writes
-            .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+            .append_files(
+                &table,
+                vec![data_file(table.table(), "w0")],
+                &tag(),
+                table.table().metadata(),
+            )
             .await
             .unwrap_err();
 
@@ -911,7 +937,12 @@ async fn a_failed_reload_after_a_lost_answer_keeps_the_outcome_unknown() {
     let table = memory_write_table(20);
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
         .await
         .unwrap_err();
 
@@ -992,4 +1023,204 @@ fn a_tag_is_on_a_table_only_when_one_snapshot_carries_both_ids() {
     assert!(tag().is_on(&tagged.metadata));
     assert!(!other_writer.is_on(&tagged.metadata));
     assert!(!other_export.is_on(&tagged.metadata));
+}
+
+/// [`LOAD_TABLE_NO_SNAPSHOTS`] whose current schema and default partition spec have the IDs
+/// `schema_id` and `spec_id`.
+fn load_table_with_ids(schema_id: i32, spec_id: i32) -> String {
+    let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+    let metadata = &mut answer["metadata"];
+    let mut schema = metadata["schemas"][0].clone();
+    schema["schema-id"] = schema_id.into();
+    metadata["schemas"].as_array_mut().unwrap().push(schema);
+    let spec = serde_json::json!({"spec-id": spec_id, "fields": []});
+    metadata["partition-specs"]
+        .as_array_mut()
+        .unwrap()
+        .push(spec);
+    metadata["current-schema-id"] = schema_id.into();
+    metadata["default-spec-id"] = spec_id.into();
+    answer.to_string()
+}
+
+fn memory_write_table_with_ids(schema_id: i32, spec_id: i32) -> WriteTable {
+    WriteTable {
+        table: memory_table(&load_table_with_ids(schema_id, spec_id), &ident("ns", "t")),
+        credentials: StorageCredentials::keys("", "", None, system_clock()),
+    }
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn every_append_commit_asserts_the_schema_and_partition_spec_the_writer_checked() {
+    let commit = in_turn(vec![(409, COMMIT_CONFLICT.into()), (200, "{}".into())]);
+    let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
+        if line.starts_with(COMMIT_T) {
+            commit()
+        } else {
+            (200, load_table_with_ids(3, 2))
+        }
+    })
+    .await;
+    let writes = static_writes(&uri).await;
+    let table = memory_write_table_with_ids(3, 2);
+
+    writes
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
+        .await
+        .unwrap();
+
+    let commits = requests_starting(&requests, COMMIT_T);
+    assert_eq!(commits.len(), 2);
+    for commit in &commits {
+        let requirements = json_body(commit)["requirements"].clone();
+        let pinned = [
+            serde_json::json!({"type": "assert-current-schema-id", "current-schema-id": 3}),
+            serde_json::json!({"type": "assert-default-spec-id", "default-spec-id": 2}),
+        ];
+        for requirement in pinned {
+            assert!(
+                requirements.as_array().unwrap().contains(&requirement),
+                "{requirement} is missing from {requirements}"
+            );
+        }
+    }
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn a_conflict_whose_reload_shows_another_schema_fails_without_another_commit() {
+    let (uri, requests) = catalog(
+        PREFIX_CONFIG,
+        routes(vec![
+            (COMMIT_T, (409, COMMIT_CONFLICT.into())),
+            (LOAD_T, (200, load_table_with_ids(1, 0))),
+        ]),
+    )
+    .await;
+    let writes = static_writes(&uri).await;
+    let table = memory_write_table(20);
+
+    let failed = writes
+        .append_files(
+            &table,
+            vec![data_file(table.table(), "w0")],
+            &tag(),
+            table.table().metadata(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failed.to_string(),
+        "the commit of the data files to table ns.t failed: its current schema ID changed from 0 \
+         to 1 after the writer checked the table; the catalog did not apply it"
+    );
+    assert_eq!(requests_starting(&requests, COMMIT_T).len(), 1);
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn a_table_that_changed_before_the_first_commit_fails_without_a_commit() {
+    let (uri, requests) =
+        catalog(PREFIX_CONFIG, routes(vec![(COMMIT_T, (200, "{}".into()))])).await;
+    let writes = static_writes(&uri).await;
+    let checked = memory_write_table(20);
+    let opened = memory_write_table_with_ids(1, 0);
+
+    let failed = writes
+        .append_files(
+            &opened,
+            vec![data_file(opened.table(), "w0")],
+            &tag(),
+            checked.table().metadata(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failed.to_string(),
+        "the commit of the data files to table ns.t failed: its current schema ID changed from 0 \
+         to 1 after the writer checked the table; the catalog did not apply it"
+    );
+    assert!(requests_starting(&requests, COMMIT_T).is_empty());
+}
+
+#[test]
+fn a_reloaded_table_takes_the_files_only_with_the_checked_schema_spec_and_version() {
+    let checked = TableShape {
+        schema_id: 4,
+        spec_id: 1,
+        format_version: FormatVersion::V2,
+    };
+    let cases = [
+        ("unchanged", checked, Ok(())),
+        (
+            "unchanged at format version 1",
+            TableShape {
+                format_version: FormatVersion::V1,
+                ..checked
+            },
+            Ok(()),
+        ),
+        (
+            "schema ID changed",
+            TableShape {
+                schema_id: 5,
+                ..checked
+            },
+            Err("its current schema ID changed from 4 to 5"),
+        ),
+        (
+            "spec ID changed",
+            TableShape {
+                spec_id: 0,
+                ..checked
+            },
+            Err("its default partition spec ID changed from 1 to 0"),
+        ),
+        (
+            "format version 3",
+            TableShape {
+                format_version: FormatVersion::V3,
+                ..checked
+            },
+            Err("it was upgraded to format version 3"),
+        ),
+        (
+            "schema and spec IDs changed",
+            TableShape {
+                schema_id: 5,
+                spec_id: 0,
+                ..checked
+            },
+            Err(
+                "its current schema ID changed from 4 to 5 and its default partition spec ID \
+                 changed from 1 to 0",
+            ),
+        ),
+        (
+            "everything changed",
+            TableShape {
+                schema_id: 5,
+                spec_id: 0,
+                format_version: FormatVersion::V3,
+            },
+            Err(
+                "its current schema ID changed from 4 to 5, its default partition spec ID \
+                 changed from 1 to 0, and it was upgraded to format version 3",
+            ),
+        ),
+    ];
+
+    for (case, reloaded, expected) in cases {
+        let expected =
+            expected.map_err(|change| format!("{change} after the writer checked the table"));
+        assert_eq!(refuse_changed(checked, reloaded), expected, "{case}");
+    }
 }

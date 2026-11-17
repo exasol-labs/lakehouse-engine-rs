@@ -7,7 +7,7 @@ use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_upda
 use crate::vended_refresh::{StorageCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Schema, TableMetadata};
+use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -371,8 +371,14 @@ impl TableWriteSession {
         table: &WriteTable,
         files: Vec<DataFile>,
         tag: &CommitTag,
+        checked: &TableMetadata,
     ) -> Result<(), CommitError> {
         let ident = table.table.identifier();
+        // `checked` is the table the files were written under. A fast append asserts neither its
+        // schema nor its partition spec, so every commit pins both.
+        let checked = TableShape::of(checked);
+        refuse_changed(checked, TableShape::of(table.table.metadata()))
+            .map_err(|change| CommitError::new(ident, change, false))?;
         let mut retries = Retries::new(commit_retries(table.table.metadata().properties()));
         let mut base = table.table.clone();
         let mut last_outcome_unknown = false;
@@ -380,7 +386,8 @@ impl TableWriteSession {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
                 .await
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
-            let body = commit_request(ident, captured.requirements, captured.updates)
+            let requirements = checked.pinned(captured.requirements);
+            let body = commit_request(ident, requirements, captured.updates)
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
@@ -398,6 +405,8 @@ impl TableWriteSession {
             if tag.is_on(&reloaded.metadata) {
                 return Ok(());
             }
+            refuse_changed(checked, TableShape::of(&reloaded.metadata))
+                .map_err(|change| CommitError::new(ident, change, false))?;
             if !may_retry {
                 return Err(exhausted_commit_error(ident, &retries, &failure));
             }
@@ -653,6 +662,67 @@ fn adls_refused() -> UdfError {
     UdfError::User(
         "an AWS credential loader signs only S3 storage requests, but the storage is ADLS".into(),
     )
+}
+
+/// What a writer's data files depend on: the field IDs of the current schema, the partition spec
+/// their partition values follow, and a format version the export writes, 1 or 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableShape {
+    schema_id: i32,
+    spec_id: i32,
+    format_version: FormatVersion,
+}
+
+impl TableShape {
+    fn of(metadata: &TableMetadata) -> Self {
+        Self {
+            schema_id: metadata.current_schema_id(),
+            spec_id: metadata.default_partition_spec_id(),
+            format_version: metadata.format_version(),
+        }
+    }
+
+    /// `requirements` plus the assertions that the table still has this schema and partition spec.
+    fn pinned(self, mut requirements: Vec<TableRequirement>) -> Vec<TableRequirement> {
+        requirements.push(TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: self.schema_id,
+        });
+        requirements.push(TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: self.spec_id,
+        });
+        requirements
+    }
+}
+
+/// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
+/// depend on did.
+fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), String> {
+    let mut changes = Vec::new();
+    if reloaded.schema_id != checked.schema_id {
+        changes.push(format!(
+            "its current schema ID changed from {} to {}",
+            checked.schema_id, reloaded.schema_id
+        ));
+    }
+    if reloaded.spec_id != checked.spec_id {
+        changes.push(format!(
+            "its default partition spec ID changed from {} to {}",
+            checked.spec_id, reloaded.spec_id
+        ));
+    }
+    if reloaded.format_version > FormatVersion::V2 {
+        changes.push(format!(
+            "it was upgraded to format version {}",
+            reloaded.format_version as u8
+        ));
+    }
+    let changed = match changes.as_slice() {
+        [] => return Ok(()),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    Err(format!("{changed} after the writer checked the table"))
 }
 
 /// What an HTTP status says about a state-changing request.

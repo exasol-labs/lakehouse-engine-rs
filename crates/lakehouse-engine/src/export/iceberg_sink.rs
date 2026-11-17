@@ -124,8 +124,8 @@ impl IcebergSink {
         UdfError::User(redact_error_text(&message, &secrets))
     }
 
-    /// Appends to the table reloaded with every writer's commits so far, or creates the staged
-    /// table with the files.
+    /// Appends to the table reloaded with every writer's commits so far, under the schema and
+    /// partition spec the files were written with, or creates the staged table with the files.
     async fn commit(&mut self, files: Vec<DataFile>) -> Result<(), UdfError> {
         let (committed, reloaded_secrets) = match &self.opened {
             OpenedTable::Created(created) => {
@@ -133,7 +133,10 @@ impl IcebergSink {
                     .session
                     .load_table(created.table().identifier())
                     .await?;
-                let committed = self.session.append_files(&table, files, &self.tag).await;
+                let committed = self
+                    .session
+                    .append_files(&table, files, &self.tag, created.table().metadata())
+                    .await;
                 (committed, table.secret_values())
             }
             OpenedTable::Staged(staged) => {
