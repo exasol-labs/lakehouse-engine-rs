@@ -126,6 +126,15 @@ pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
 }
 
+/// `SELECT <select> FROM <events> e JOIN <labels> l ON e.ID = l.ID <tail>` over one virtual schema.
+pub fn events_labels_join(vs_name: &str, select: &str, tail: &str) -> String {
+    format!(
+        "SELECT {select} FROM {} e JOIN {} l ON e.ID = l.ID {tail}",
+        vs_table(vs_name, E2E_TABLE),
+        vs_table(vs_name, E2E_TABLE_2)
+    )
+}
+
 pub fn events_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_TABLE)
 }

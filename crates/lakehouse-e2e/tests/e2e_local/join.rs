@@ -12,7 +12,10 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{JOIN_ORACLE, copy_join_tables_natively, events, stack, vs_table};
+use crate::fixtures::{
+    JOIN_ORACLE, assert_two_scan_join_wrapper, copy_join_tables_natively, events,
+    events_labels_join, stack, vs_table,
+};
 
 use parquet::file::statistics::Statistics;
 
@@ -459,6 +462,27 @@ fn e2e_above_threshold_result_matches_broadcast() {
         "unaccelerated fallback result must equal the broadcast result.\n\
          fallback:  {fallback:?}\nbroadcast: {broadcast:?}"
     );
+}
+
+/// Scenario: A constant sort key does not become a select-list position
+#[test]
+fn e2e_join_fallback_constant_sort_key_returns_the_native_order() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for constant in [1, 5] {
+        let query = events_labels_join(
+            VS_NAME_LOW,
+            &format!("e.ID, {constant}"),
+            "ORDER BY 2 DESC, 1 LIMIT 3",
+        );
+        assert_two_scan_join_wrapper(&mut conn, &query);
+        assert_eq!(
+            int_column(&conn.query_columns(&query)[0]),
+            [1, 2, 3],
+            "{query}"
+        );
+    }
 }
 
 fn aggregate_join_query(vs_name: &str) -> String {

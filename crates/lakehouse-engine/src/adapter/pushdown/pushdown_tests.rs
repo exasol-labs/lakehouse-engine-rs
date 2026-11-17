@@ -1206,7 +1206,6 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     );
 }
 
-/// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
 fn declined_order_by_renders_every_ordering_in_full() {
     let ordered = guard_events()
