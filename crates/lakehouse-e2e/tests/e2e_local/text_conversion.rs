@@ -245,6 +245,21 @@ const CASES: &[Case] = &[
     },
     Case {
         setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(CASE WHEN ID > 2 THEN C_QTY ELSE ID END AS VARCHAR(21)) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(CASE WHEN ID > 2 THEN 7 ELSE -12 END AS VARCHAR(3)) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, CAST(GREATEST(7, ID) AS VARCHAR(2)) FROM {T}",
+        path: Lacks(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_BOOL AS VARCHAR(4)) FROM {T} WHERE C_BOOL",
         path: Lacks(SCAN_ITEM),
     },
@@ -512,7 +527,7 @@ fn json_value_fast_read_differs_from_native_as_documented() {
 /// Scenario: A group key travels with its exact type
 /// Scenario: A CAST of text to CHAR runs in Exasol
 /// Scenario: String scalar functions translate to DataFusion string calls
-/// Scenario: A widened derived projection routes to a native wrapper on every path
+/// Scenario: A wrapped derived projection routes to a native wrapper on every path
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
 /// Scenario: A numeric aggregate over text or BOOLEAN runs in Exasol
 /// Scenario: A numeric aggregate over a bare NULL runs in Exasol

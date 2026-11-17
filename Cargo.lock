@@ -3526,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.58.3"
+version = "0.58.5"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3545,6 +3545,7 @@ dependencies = [
  "iceberg",
  "jiter",
  "lakehouse-catalog",
+ "lakehouse-catalog-write",
  "minijinja",
  "object_store",
  "parquet",

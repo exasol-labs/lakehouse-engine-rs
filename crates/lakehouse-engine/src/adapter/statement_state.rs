@@ -6,10 +6,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 
+use crate::adapter::properties::VsProperties;
 use crate::adapter::pushdown::{LoadedTable, ScanCatalog};
 use crate::adapter::{ResolvedConnectionConfig, construct_catalog_client};
 
@@ -93,9 +93,9 @@ type SharedLoad = Arc<OnceCell<Arc<dyn LoadedTable>>>;
 impl StatementCatalog {
     /// Builds `connection`'s catalog client, which issues no request, with no table admitted or
     /// loaded yet.
-    pub(crate) fn open(
+    pub(super) fn open(
         connection: ResolvedConnectionConfig,
-        props: &Json,
+        props: &VsProperties,
         catalog_prefix: Option<String>,
     ) -> Result<Self, UdfError> {
         let client = construct_catalog_client(&connection, props, catalog_prefix)?;

@@ -10,7 +10,8 @@ use crate::common::seed::{
     DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE,
     E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_ODD_ROOT_TABLE, E2E_PART_TABLE,
     E2E_TABLE, E2E_TABLE_2, E2E_UUID_SIGNED_BOUNDS_TABLE, EVO_INITDEF_POST_ADD_IDS,
-    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
+    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_REFUSED_COL_BAD, EVO_INITDEF_REFUSED_COL_OK,
+    EVO_INITDEF_REFUSED_TABLE, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
     EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
     LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL,
     PART_FILE_NAME_URL_CHARS, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
@@ -18,21 +19,24 @@ use crate::common::seed::{
     SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
     TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, UUID_SIGNED_BOUNDS_ROWS,
     initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
-    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    seed_unreadable_initial_default, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
+    typed_id_avg_stddev,
 };
 use crate::common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, exasol_container, iceberg_catalog_url,
-    iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, ExasolFlavor, build_create_connection_sql, exasol_container,
+    exasol_flavor, iceberg_catalog_url, iceberg_catalog_url_internal,
+    local_stack_connection_password,
 };
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
     LAKEHOUSE_VS, TYPED_COLUMNS, emits_clause, events_table, explain_virtual_pushdown_sql,
-    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
+    lakehouse_vs, pushed_scan_spec, spec_u64, typed_table, vs_dim_table, vs_fact_table,
+    vs_lineitem_table,
 };
 
-/// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
+/// Its pushed `df_threads_per_udf` reads back the core count the adapter VM detected.
 const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
 fn vs_labels_table() -> String {
@@ -659,6 +663,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
 }
 
 /// Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
+/// Scenario: An initial-default of a type without a native Arrow tag reads as a stored value of its column reads
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     lakehouse_vs();
@@ -744,6 +749,46 @@ fn e2e_added_columns_initial_default_fill_all_types() {
             );
         }
     }
+}
+
+/// Scenario: A primitive initial-default that cannot be read at its column's declared type refuses the column
+#[test]
+fn e2e_unreadable_initial_default_refuses_only_its_column() {
+    lakehouse_vs();
+
+    runtime().block_on(async {
+        seed_unreadable_initial_default(&iceberg_catalog_url(), "s3://warehouse/")
+            .await
+            .expect("seed initdef_refused (unreadable initial-default) table");
+    });
+
+    let mut conn = exa_conn();
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new("INITDEF_REFUSED_VS", E2E_NAMESPACE).with_parallelism_factor(1),
+    );
+    let table = format!(
+        "INITDEF_REFUSED_VS.{}",
+        EVO_INITDEF_REFUSED_TABLE.to_uppercase()
+    );
+    let bad = EVO_INITDEF_REFUSED_COL_BAD;
+
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT {} FROM {table}", bad.to_uppercase()),
+        &[&format!("'{bad}'"), "initial-default"],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT id, {} FROM {table} ORDER BY id",
+            EVO_INITDEF_REFUSED_COL_OK.to_uppercase()
+        ),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("42"), Some("42"), Some("42")],
+        ],
+    );
 }
 
 #[test]
@@ -1120,27 +1165,13 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// Scenario: createVirtualSchema adapterNotes omit the cluster node count
-/// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: Schema-level adapterNotes hold only the skipped tables and the catalog prefix
 /// Scenario: The Iceberg REST catalog prefix is recorded at schema level
 #[test]
-fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
+fn schema_notes_hold_the_skipped_tables_and_the_catalog_prefix() {
     const NOTES_VS: &str = "LHVS_NOTE_KEYS";
     const NOTES_DIRECT_CONN: &str = "LHVS_NOTE_KEYS_DIRECT";
-    const EXPECTED_KEYS: [&str; 12] = [
-        "CATALOG_PREFIX",
-        "DF_BATCH_SIZE",
-        "DF_TARGET_PARTITIONS",
-        "DF_THREADING_MODE",
-        "DF_THREADS_PER_UDF",
-        "INSTANCE_OVERHEAD_MB",
-        "JOIN_BROADCAST_MAX_BYTES",
-        "MEMORY_POOL_FRACTION",
-        "METADATA_READ_CONCURRENCY",
-        "PARALLELISM_FACTOR",
-        "S3_MAX_CONNECTIONS",
-        "SKIPPED_TABLES",
-    ];
+    const EXPECTED_KEYS: [&str; 2] = ["CATALOG_PREFIX", "SKIPPED_TABLES"];
 
     lakehouse_vs();
     let mut conn = exa_conn();
@@ -1152,8 +1183,8 @@ fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
         keys.sort_unstable();
         assert_eq!(
             keys, EXPECTED_KEYS,
-            "ADAPTER_NOTES after {after} must hold exactly the tuning keys, SKIPPED_TABLES, \
-             and CATALOG_PREFIX, with no node count or core count: {notes:?}"
+            "ADAPTER_NOTES after {after} must hold exactly SKIPPED_TABLES and CATALOG_PREFIX: \
+             {notes:?}"
         );
         assert_eq!(
             notes["CATALOG_PREFIX"], "",
@@ -1225,17 +1256,12 @@ fn adapter_detects_container_cpuset() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE));
 
-    let notes = schema_notes(&mut conn, CPU_PROBE_VS_NAME);
-    let detected: usize = notes
-        .get("DF_THREADS_PER_UDF")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry DF_THREADS_PER_UDF: {notes:?}"))
-        .parse()
-        .unwrap_or_else(|e| panic!("DF_THREADS_PER_UDF must be an integer ({e}): {notes:?}"));
+    let spec = pushed_scan_spec(&mut conn, CPU_PROBE_VS_NAME);
+    let detected = spec_u64(&spec, "df_threads_per_udf") as usize;
 
     assert_eq!(
         detected, cpuset_cores,
-        "the recorded DF_THREADS_PER_UDF is the core count the adapter VM \
+        "the pushed df_threads_per_udf is the core count the adapter VM \
          detected; it must equal the number of CPUs in the \
          container's CPU set ({cpuset_cores}), and so be neither the \
          undetectable-platform fallback of 1 nor the host's {host_cores} cores"
@@ -1284,6 +1310,9 @@ fn docker_update_cpuset(container: &str, cpus: &str) -> Result<(), String> {
 }
 
 fn exasol_container_cpuset(container: &str) -> String {
+    if exasol_flavor() == ExasolFlavor::Nano {
+        return nano_container_cpuset(container);
+    }
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";
     let out = std::process::Command::new("docker")
         .args(["exec", container, "cat", path])
@@ -1301,6 +1330,37 @@ fn exasol_container_cpuset(container: &str) -> String {
         "{path} in {container} is empty, so the container is pinned to no CPU at all"
     );
     raw
+}
+
+/// Nano's image has no `cat`, so the CPU set comes from Docker: the configured set, or every
+/// CPU of the Docker host when none is configured.
+fn nano_container_cpuset(container: &str) -> String {
+    let docker = |args: &[&str]| {
+        let out = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "docker {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let configured = docker(&[
+        "inspect",
+        "--format",
+        "{{.HostConfig.CpusetCpus}}",
+        container,
+    ]);
+    if !configured.is_empty() {
+        return configured;
+    }
+    let cpus: usize = docker(&["info", "--format", "{{.NCPU}}"])
+        .parse()
+        .unwrap_or_else(|e| panic!("docker info reports no CPU count: {e}"));
+    format!("0-{}", cpus - 1)
 }
 
 fn cpu_ids(list: &str) -> Vec<usize> {
@@ -2887,51 +2947,35 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
     }
 }
 
-// #52: Exasol flattens `COUNT(*) FROM (SELECT k, COUNT(*) ... GROUP BY k)` into one
-// group_by request with a literal-only select list; the scan must keep the GROUP BY
-// so Exasol's outer COUNT(*) counts group rows.
-
+/// Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     lakehouse_vs();
     let mut conn = exa_conn();
+    let events = events_table();
 
-    // Must be 4, not the 20 a row-scan fallback would return; `GROUP BY id` alone cannot
-    // tell the two apart.
-    let sql_duplicate_keys = format!(
-        "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
-        events_table()
-    );
-    let cols = conn.query_columns(&sql_duplicate_keys);
-    assert_eq!(
-        cols.len(),
-        1,
-        "nested COUNT(*) must return one column: {cols:?}"
-    );
-    assert_eq!(
-        cols[0].len(),
-        1,
-        "nested COUNT(*) must return one row: {cols:?}"
-    );
-    let distinct_group_count = parse_int(&cols[0][0]);
-    assert_eq!(
-        distinct_group_count, 4,
-        "COUNT(*) over (GROUP BY MOD(id,4)) sub-select must be 4 (distinct groups), \
-         got {distinct_group_count} — 20 would indicate an unsafe row-scan fallback \
-         instead of a correctly preserved grouped scan"
-    );
-
-    let sql_unique_key = format!(
-        "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
-        events_table()
-    );
-    let cols_unique = conn.query_columns(&sql_unique_key);
-    let unique_group_count = parse_int(&cols_unique[0][0]);
-    assert_eq!(
-        unique_group_count, 20,
-        "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
-         got {unique_group_count}"
-    );
+    // Exasol flattens each into one group_by request with a literal-only select list (#52).
+    // `MOD(id, 4)` tells a kept GROUP BY (4) from a row-scan fallback (20); `id` alone cannot.
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {events} GROUP BY MOD(id, 4))"
+            ),
+            4,
+        ),
+        (
+            format!("SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {events} GROUP BY id)"),
+            20,
+        ),
+    ] {
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            (cols.len(), cols[0].len()),
+            (1, 1),
+            "must return one column and one row: {sql}\n{cols:?}"
+        );
+        assert_eq!(parse_int(&cols[0][0]), expected, "{sql}");
+    }
 }
 
 // ORDER BY ... LIMIT n OFFSET m coverage (#191) for each wrapper site routed through
@@ -3095,6 +3139,27 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
         vec![5, 5],
         "every group's 5 ids are distinct, so COUNT(DISTINCT id) == 5 per \
          group, got {counts:?}"
+    );
+}
+
+#[test]
+fn offset_without_order_by_is_rejected_by_exasol() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT * FROM {} LIMIT 3 OFFSET 2", events_table());
+    let resp = conn.try_execute(&sql);
+
+    let msg = error_text(&resp, &format!("LIMIT ... OFFSET with no ORDER BY ({sql})"));
+    assert_eq!(
+        resp["exception"]["sqlCode"].as_str(),
+        Some("42000"),
+        "expected sqlCode 42000, got: {resp}"
+    );
+    assert!(
+        msg.contains("OFFSET") && msg.contains("ORDER BY"),
+        "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \
+         message, got: {msg}"
     );
 }
 

@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn session_config_applies_batch_size_and_clamps_floor() {
     let mut spec = minimal_spec();
-    spec.common.df_batch_size = 4096;
+    spec.common.tuning.df_batch_size = 4096;
     let config = session_config_for_spec(&spec);
     assert_eq!(
         config.batch_size(),
@@ -12,7 +12,7 @@ fn session_config_applies_batch_size_and_clamps_floor() {
         "SessionConfig must use df_batch_size from spec"
     );
 
-    spec.common.df_batch_size = 0;
+    spec.common.tuning.df_batch_size = 0;
     let config_clamped = session_config_for_spec(&spec);
     assert_eq!(
         config_clamped.batch_size(),
@@ -64,7 +64,7 @@ fn session_config_enables_parquet_pruning_flags() {
 #[test]
 fn session_config_uses_spec_target_partitions() {
     let mut spec = minimal_spec();
-    spec.common.df_target_partitions = 4;
+    spec.common.tuning.df_target_partitions = 4;
     let config = session_config_for_spec(&spec);
     assert_eq!(
         config.target_partitions(),
@@ -148,7 +148,7 @@ fn run_scan_one_redacts_a_secret_from_an_unredacted_inner_error() {
         &mut ctx,
         minimal_spec(),
         &storage,
-        |_, _, _| {
+        |_, _, _, _| {
             Err(UdfError::User(format!(
                 "failed to register table: {secret}"
             )))

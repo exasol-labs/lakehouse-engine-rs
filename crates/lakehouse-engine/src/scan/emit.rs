@@ -4,11 +4,11 @@ use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
 use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
-use crate::types::mapping::TimestampPrecision;
+use crate::types::mapping::{arrow_time_unit, emitted_unit};
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -18,6 +18,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use futures::StreamExt;
 use std::sync::Arc;
+use vs_expression::timestamp::TimestampUnit;
 
 /// Each batch is emitted then dropped before the next fetch, never collected. Every column is
 /// coerced to the Arrow type its declared `ExaType` accepts: the physical Parquet type can
@@ -164,6 +165,7 @@ pub(crate) fn coerce_column(
     declared: &ColumnInfo,
     target: &DataType,
 ) -> Result<ArrayRef, UdfError> {
+    let target = &emitted_target(column.data_type(), target);
     if column.data_type() == target {
         return Ok(column.clone());
     }
@@ -188,6 +190,19 @@ pub(crate) fn coerce_column(
     })
 }
 
+/// `target`, except that a timestamp coarser than it widens only to milliseconds: the SLC emits
+/// any finer unit, and nanoseconds would add their 1677 to 2262 range (`emitted_unit`).
+fn emitted_target(column: &DataType, target: &DataType) -> DataType {
+    match (column, target) {
+        (DataType::Timestamp(held, None), DataType::Timestamp(declared, None))
+            if held < declared =>
+        {
+            DataType::Timestamp((*held).max(TimeUnit::Millisecond), None)
+        }
+        _ => target.clone(),
+    }
+}
+
 /// The scan's layer over the one column-metadata reader: the integer bins emit as the
 /// `Int32` and `Int64` Exasol reported, and an unrecognized column as `Utf8` JSON text.
 pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfError> {
@@ -209,7 +224,7 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
         ExasolType::Date => DataType::Date32,
         ExasolType::Timestamp { precision }
         | ExasolType::TimestampWithLocalTimeZone { precision } => DataType::Timestamp(
-            TimestampPrecision::from_declared_digits(precision.into()).arrow_unit(),
+            arrow_time_unit(emitted_unit(TimestampUnit::holding(precision))),
             None,
         ),
         _ => DataType::Utf8,

@@ -1,15 +1,32 @@
 use super::*;
+use crate::ExasolVersion;
 use crate::scalar_functions::{SCALAR_FUNCTIONS, ScalarFunction};
 use crate::test_support::*;
 use serde_json::json;
 
 fn scan_filter(filter: &Json) -> Result<String, UdfError> {
-    render_scan_filter(filter, &typed_columns::<&str>(&[]))
+    ScanTyping::new(&typed_columns::<&str>(&[]), ExasolVersion::Exasol2025).render_filter(filter)
 }
 
 /// Exasol's `CAST("X" AS data_type)` node.
 fn cast(data_type: Json) -> Json {
     cast_json(data_type, col("x"))
+}
+
+fn microsecond_ts() -> TypedColumns {
+    typed_columns(&[("ts", ExasolType::timestamp(6))])
+}
+
+/// The DataFusion dialect of `expr` over a TIMESTAMP(6) `ts` and a VARCHAR `s`, through the typed
+/// pass, which alone knows SECOND's fraction and TO_TIMESTAMP's digits.
+fn typed_scan(expr: &Json) -> Result<String, UdfError> {
+    let columns = typed_columns(&[
+        ("ts", ExasolType::timestamp(6)),
+        ("s", ExasolType::WIDEST_VARCHAR),
+    ]);
+    ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+        .render_expression(expr)
+        .map(|fragment| fragment.sql)
 }
 
 #[test]
@@ -230,17 +247,43 @@ fn renders_like_without_escape() {
 }
 
 #[test]
-fn renders_like_with_escape() {
-    let expr = json!({
-        "type": "predicate_like",
-        "expression": col("name"),
-        "pattern": str_lit("A!%"),
-        "escape_char": "!"
-    });
-    let sql = render_expression(&expr).unwrap();
-    assert!(sql.contains("LIKE"), "LIKE not found: {sql}");
-    assert!(sql.contains("ESCAPE"), "ESCAPE not found: {sql}");
-    assert!(sql.contains("'!'"), "escape char not found: {sql}");
+fn renders_like_escape_in_the_exasol_dialect_as_sent() {
+    assert_eq!(
+        render_expression_exasol(&like_escape(col("name"), "A!%", "!")),
+        r#"("NAME" LIKE 'A!%' ESCAPE '!')"#
+    );
+}
+
+/// DataFusion's LIKE takes only `\` as its escape, so another escape is rewritten to it.
+#[test]
+fn renders_like_escape_in_the_datafusion_dialect_as_a_backslash_pattern() {
+    let cases = [
+        ("A!%", "!", r"A\%"),
+        ("A!_b%", "!", r"A\_b%"),
+        ("xaa", "a", r"x\a"),
+        (r"a\b!%", "!", r"a\\b\%"),
+        (r"a\%", r"\", r"a\%"),
+    ];
+    for (pattern, escape, rewritten) in cases {
+        assert_eq!(
+            render_expression(&like_escape(col("name"), pattern, escape)).unwrap(),
+            format!(r#"("NAME" LIKE '{rewritten}')"#),
+            "{pattern} ESCAPE {escape}"
+        );
+    }
+}
+
+#[test]
+fn a_like_escape_the_datafusion_dialect_cannot_rewrite_declines() {
+    for (pattern, escape) in [("A!", "!"), ("A%", "!!")] {
+        assert!(
+            render_expression(&like_escape(col("name"), pattern, escape)).is_err(),
+            "{pattern} ESCAPE {escape}"
+        );
+    }
+    let mut column_pattern = like_escape(col("name"), "A%", "!");
+    column_pattern["pattern"] = col("other");
+    assert!(render_expression(&column_pattern).is_err());
 }
 
 #[test]
@@ -1142,6 +1185,8 @@ fn renders_case_without_else() {
     );
 }
 
+/// Scenario: EXTRACT translates to the DataFusion date_part call
+/// Scenario: The untyped DataFusion walker declines SECOND
 #[test]
 fn renders_extract() {
     let expr = extract("YEAR", col("ts"));
@@ -1155,8 +1200,11 @@ fn renders_extract() {
         render_expression(&expr2).unwrap(),
         r#"date_part('MONTH', "TS")"#
     );
+
+    assert!(render_expression(&extract("SECOND", col("ts"))).is_err());
 }
 
+/// Scenario: EXTRACT renders Exasol's EXTRACT FROM form in the Exasol dialect
 #[test]
 fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
     let expr = extract("DAY", col("ts"));
@@ -1165,11 +1213,17 @@ fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
         render_expression(&expr).unwrap(),
         r#"date_part('DAY', "TS")"#
     );
+    assert_eq!(
+        render_expression_exasol(&extract("SECOND", col("ts"))),
+        r#"EXTRACT(SECOND FROM "TS")"#
+    );
 }
 
+/// Scenario: Field-shortcut date functions translate to date_part of the matching field
+/// Scenario: The untyped DataFusion walker declines SECOND
 #[test]
 fn renders_year_month_day_extract() {
-    let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
+    let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE"];
     for field in shortcuts {
         let expr = scalar_fn(field, [col("ts")]);
         let sql = render_expression(&expr).unwrap();
@@ -1179,6 +1233,7 @@ fn renders_year_month_day_extract() {
             "failed for {field}"
         );
     }
+    assert!(render_expression(&scalar_fn("SECOND", [col("ts")])).is_err());
 }
 
 #[test]
@@ -1228,8 +1283,8 @@ fn renders_to_date_to_timestamp() {
 
     let expr4 = scalar_fn("TO_TIMESTAMP", [col("s"), str_lit("YYYY-MM-DD HH24:MI:SS")]);
     assert_eq!(
-        render_expression(&expr4).unwrap(),
-        r#"to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S')"#
+        typed_scan(&expr4).unwrap(),
+        r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S', 0)"#
     );
 }
 
@@ -1316,6 +1371,7 @@ fn between_fns_reject_wrong_arity() {
     }
 }
 
+/// Scenario: A refused argument count declines for DataFusion and renders for Exasol
 #[test]
 fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     let expr = scalar_fn("SECOND", [col("ts"), num_lit(3)]);
@@ -1323,6 +1379,12 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     assert!(
         render_expression(&expr).is_err(),
         "SECOND(ts, 3) must decline under the DataFusion dialect"
+    );
+    assert!(
+        ScanTyping::new(&microsecond_ts(), ExasolVersion::Exasol2025)
+            .render_expression(&expr)
+            .is_err(),
+        "SECOND(ts, 3) must decline even where the typed pass knows the argument's precision"
     );
     assert_eq!(render_expression_exasol(&expr), r#"SECOND("TS", 3)"#);
 }
@@ -1436,14 +1498,11 @@ fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
     }
 }
 
+/// Scenario: Unsupported date functions fall through as unsupported nodes
 #[test]
 fn unsupported_date_functions_decline_in_the_datafusion_dialect() {
     let unsupported = [
-        "ADD_HOURS",
-        "ADD_MINUTES",
-        "ADD_DAYS",
         "ADD_SECONDS",
-        "ADD_WEEKS",
         "ADD_MONTHS",
         "ADD_YEARS",
         "MONTHS_BETWEEN",
@@ -1756,6 +1815,7 @@ fn renders_nullif_verbatim_in_exasol_dialect() {
     );
 }
 
+/// Scenario: Field-shortcut date functions render verbatim in the Exasol dialect
 #[test]
 fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
     for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
@@ -1765,8 +1825,10 @@ fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
             format!(r#"{field}("TS")"#),
             "the Exasol dialect must render {field} verbatim"
         );
+    }
+    for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE"] {
         assert_eq!(
-            render_expression(&expr).unwrap(),
+            render_expression(&scalar_fn(field, [col("ts")])).unwrap(),
             format!(r#"date_part('{field}', "TS")"#),
             "the DataFusion dialect must stay unchanged for {field}"
         );
@@ -1798,7 +1860,13 @@ fn renders_date_trunc_verbatim_in_exasol_dialect() {
 
 #[test]
 fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
-    for (exasol_name, df_name) in [("TO_DATE", "to_date"), ("TO_TIMESTAMP", "to_timestamp")] {
+    for (exasol_name, df_call) in [
+        ("TO_DATE", r#"to_date(nullif("S", ''), '%Y-%m-%d')"#),
+        (
+            "TO_TIMESTAMP",
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0)"#,
+        ),
+    ] {
         let bare = scalar_fn(exasol_name, [col("s")]);
         assert_eq!(
             render_expression_exasol(&bare),
@@ -1817,8 +1885,8 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
             "the Exasol dialect must forward {exasol_name}'s format model verbatim"
         );
         assert_eq!(
-            render_expression(&formatted).unwrap(),
-            format!(r#"{df_name}(nullif("S", ''), '%Y-%m-%d')"#),
+            typed_scan(&formatted).unwrap(),
+            df_call,
             "the DataFusion dialect must translate the format of {exasol_name}"
         );
     }
@@ -1982,6 +2050,10 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     }
     fixtures.push(verbatim("DIV", vec![col("a"), col("b")]));
 
+    for name in ["ADD_DAYS", "ADD_WEEKS", "ADD_HOURS", "ADD_MINUTES"] {
+        fixtures.push(verbatim(name, vec![col("d"), col("n")]));
+    }
+
     fixtures.extend([
         shaped(
             "ADD",
@@ -2076,8 +2148,13 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             .find(|f| f.name == *declared_name)
             .expect("fixture completeness is asserted above");
         // The only call that reaches the per-name arms: Exasol `VerbatimCall`s return
-        // ahead of them.
-        if let Err(err) = render_expression(&fixture.node) {
+        // ahead of them. SECOND and TO_TIMESTAMP render only from the typed scan pass.
+        let datafusion = if matches!(*declared_name, "SECOND" | "TO_TIMESTAMP") {
+            typed_scan(&fixture.node)
+        } else {
+            render_expression(&fixture.node)
+        };
+        if let Err(err) = datafusion {
             panic!(
                 "{declared_name} is declared in SCALAR_FUNCTIONS, which gates BOTH \
                  dialects from one lookup, so it MUST render in the DataFusion dialect too; \
@@ -2299,4 +2376,120 @@ fn a_binary_literal_renders_only_as_hex() {
         "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
     );
     assert!(render_expression(&binary_lit("0a'")).is_err());
+}
+
+const DATE_ADDITIONS: [(&str, &str); 4] = [
+    ("ADD_DAYS", "vs_add_days"),
+    ("ADD_WEEKS", "vs_add_weeks"),
+    ("ADD_HOURS", "vs_add_hours"),
+    ("ADD_MINUTES", "vs_add_minutes"),
+];
+
+/// Scenario: ADD_DAYS and ADD_WEEKS over a DATE return a DATE from the scan
+/// Scenario: ADD_HOURS and ADD_MINUTES over a DATE return a timestamp from the scan
+#[test]
+fn date_addition_renders_scan_function_calls() {
+    let columns = typed_columns(&[
+        ("D", ExasolType::Date),
+        ("TS", ExasolType::timestamp(3)),
+        ("S", ExasolType::WIDEST_VARCHAR),
+    ]);
+    for (exasol_name, scan_name) in DATE_ADDITIONS {
+        let date_column = scalar_fn(exasol_name, [col("d"), num_lit(2)]);
+        assert_eq!(
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&date_column)
+                .unwrap()
+                .sql,
+            format!("{scan_name}(CAST(\"D\" AS DATE), 2)"),
+            "{exasol_name} over a DATE column"
+        );
+        let timestamp_column = scalar_fn(exasol_name, [col("ts"), num_lit(2)]);
+        assert_eq!(
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&timestamp_column)
+                .unwrap()
+                .sql,
+            format!("{scan_name}(CAST(\"TS\" AS TIMESTAMP(6)), 2)"),
+            "{exasol_name} over a TIMESTAMP column"
+        );
+        let date_literal = scalar_fn(exasol_name, [date_lit("2024-02-28"), num_lit(1)]);
+        assert_eq!(
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&date_literal)
+                .unwrap()
+                .sql,
+            format!("{scan_name}(CAST(DATE '2024-02-28' AS DATE), 1)"),
+            "{exasol_name} over a DATE literal"
+        );
+        let timestamp_literal = scalar_fn(
+            exasol_name,
+            [timestamp_lit("2024-01-01 00:00:00.5"), num_lit(30)],
+        );
+        assert_eq!(
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&timestamp_literal)
+                .unwrap()
+                .sql,
+            format!(
+                "{scan_name}(CAST(arrow_cast('2024-01-01 00:00:00.5', 'Timestamp(Microsecond, None)') AS TIMESTAMP(6)), 30)"
+            ),
+            "{exasol_name} over a TIMESTAMP literal"
+        );
+        let cast = scalar_fn(
+            exasol_name,
+            [cast_to(ExasolType::Date, col("ts")), num_lit(1)],
+        );
+        assert_eq!(
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&cast)
+                .unwrap()
+                .sql,
+            format!("{scan_name}(CAST(CAST(\"TS\" AS DATE) AS DATE), 1)"),
+            "{exasol_name} over a CAST"
+        );
+    }
+    let nested = scalar_fn(
+        "ADD_HOURS",
+        [scalar_fn("ADD_DAYS", [col("d"), num_lit(1)]), num_lit(2)],
+    );
+    assert_eq!(
+        ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+            .render_expression(&nested)
+            .unwrap()
+            .sql,
+        "vs_add_hours(CAST(vs_add_days(CAST(\"D\" AS DATE), 1) AS DATE), 2)"
+    );
+    let over_a_timestamp_result = scalar_fn(
+        "ADD_DAYS",
+        [scalar_fn("ADD_HOURS", [col("d"), num_lit(1)]), num_lit(2)],
+    );
+    assert_eq!(
+        ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+            .render_expression(&over_a_timestamp_result)
+            .unwrap()
+            .sql,
+        "vs_add_days(CAST(vs_add_hours(CAST(\"D\" AS DATE), 1) AS TIMESTAMP(6)), 2)"
+    );
+}
+
+/// Scenario: The four functions render verbatim in the Exasol dialect
+#[test]
+fn date_addition_renders_verbatim_in_the_exasol_dialect() {
+    for (exasol_name, scan_name) in DATE_ADDITIONS {
+        let expr = scalar_fn(exasol_name, [col("d"), col("n")]);
+        let sql = render_expression_exasol(&expr);
+        assert_eq!(sql, format!("{exasol_name}(\"D\", \"N\")"));
+        assert!(!sql.contains(scan_name), "Exasol has no {scan_name}: {sql}");
+    }
+}
+
+#[test]
+fn date_addition_with_one_argument_fails_in_the_datafusion_dialect() {
+    for (exasol_name, _) in DATE_ADDITIONS {
+        assert!(
+            render_expression(&scalar_fn(exasol_name, [col("d")])).is_err(),
+            "the DataFusion dialect needs 2 arguments for {exasol_name}"
+        );
+    }
 }

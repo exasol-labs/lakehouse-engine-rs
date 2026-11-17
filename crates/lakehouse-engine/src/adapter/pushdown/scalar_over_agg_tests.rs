@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, cast_to, col, column_types,
-    count_star, float_div, num_lit, round_of, scalar_fn, scan_over, typed_scan,
+    AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, col, count_star, float_div, round_of, scalar_fn,
+    typed_scan,
 };
 
 /// The translator these node-level units take: the aggregate fixtures' columns and the key a
@@ -375,67 +375,4 @@ fn sum_widens_a_decimal_to_precision_36_keeps_a_double_and_types_nothing_else() 
         };
         assert_eq!(sum_emit_type(exa_type), expected, "{exa_type}");
     }
-}
-
-fn nested_type_of(agg_node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
-    let plan = parse_agg_item(agg_node, scan_over(col_types))
-        .expect("test aggregate must parse to a plan");
-    nested_aggregate_type(agg_node, &plan, scan_over(col_types))
-}
-
-#[test]
-fn nested_aggregate_type_is_exasols_result_type_of_the_aggregate() {
-    let col_types = column_types(&[
-        ("X", ExasolType::decimal(9, 2)),
-        ("W", ExasolType::decimal(30, 2)),
-        ("F", ExasolType::DoublePrecision),
-    ]);
-    let cases = [
-        ("COUNT(*)", count_star(), ExasolType::decimal(18, 0)),
-        (
-            "SUM over DECIMAL(9,2) widens by 11 digits",
-            agg_item("SUM", Some("X"), false),
-            ExasolType::decimal(20, 2),
-        ),
-        (
-            "SUM over DECIMAL(30,2) caps at precision 36",
-            agg_item("SUM", Some("W"), false),
-            ExasolType::decimal(36, 2),
-        ),
-        (
-            "SUM over DOUBLE stays DOUBLE",
-            agg_item("SUM", Some("F"), false),
-            ExasolType::DoublePrecision,
-        ),
-        (
-            "AVG over a DECIMAL is DOUBLE",
-            agg_item("AVG", Some("X"), false),
-            ExasolType::DoublePrecision,
-        ),
-        (
-            "STDDEV over a DECIMAL is DOUBLE",
-            agg_item("STDDEV", Some("X"), false),
-            ExasolType::DoublePrecision,
-        ),
-        (
-            "MAX over a CAST takes the CAST's type, not the column's",
-            agg_item_expr("MAX", cast_to(ExasolType::decimal(5, 1), col("X")), false),
-            ExasolType::decimal(5, 1),
-        ),
-    ];
-    for (label, agg_node, expected) in cases {
-        assert_eq!(
-            nested_type_of(&agg_node, &col_types),
-            Some(expected),
-            "{label}"
-        );
-    }
-}
-
-#[test]
-fn nested_aggregate_type_declines_an_argument_without_an_exact_type() {
-    let col_types = column_types(&[("X", ExasolType::decimal(9, 2))]);
-    let max_of_expression = agg_item_expr("MAX", scalar_fn("ADD", [col("X"), num_lit(1)]), false);
-
-    assert_eq!(nested_type_of(&max_of_expression, &col_types), None);
 }

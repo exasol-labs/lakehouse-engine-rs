@@ -3,7 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment};
+use vs_expression::{ColumnNode, SqlFragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -35,8 +35,10 @@ pub(super) fn fold_aggregate_plan(
     }
 }
 
-/// A slot a top-level item declares keeps that type; a nested-only slot takes
-/// [`nested_aggregate_type`], so the outcome does not depend on select-list order.
+/// A slot a top-level item declares keeps that type; a nested-only slot takes Exasol's result
+/// type of its aggregate, so the outcome does not depend on select-list order. A slot stays
+/// untyped when that type depends on an argument without an exact type: a guessed partial type
+/// breaks the merge (#476).
 pub(super) fn fold_nested_plans(
     plans: &mut Vec<AggregatePlan>,
     plan_types: &mut Vec<Option<ExasolType>>,
@@ -46,42 +48,8 @@ pub(super) fn fold_nested_plans(
     for (plan, agg) in nested {
         let slot = fold_aggregate_plan(plans, plan_types, plan.clone(), None);
         if plan_types[slot].is_none() {
-            plan_types[slot] = nested_aggregate_type(agg, plan, scan);
+            plan_types[slot] = scan.exact_type(agg);
         }
-    }
-}
-
-/// Exasol's result type of an aggregate the select list does not type. `None` when it depends on
-/// an argument without an exact type: a guessed partial type breaks the merge (#476).
-pub(super) fn nested_aggregate_type(
-    agg: &Json,
-    plan: &AggregatePlan,
-    scan: ScanTranslator<'_>,
-) -> Option<ExasolType> {
-    match plan.kind {
-        AggKind::Count | AggKind::CountCol => Some(ExasolType::decimal(18, 0)),
-        AggKind::Sum | AggKind::Min | AggKind::Max => {
-            let arg = agg.get("arguments")?.as_array()?.first()?;
-            let arg_type = exact_expression_type(arg, scan.columns())?;
-            if plan.kind == AggKind::Sum {
-                sum_result_type(arg_type)
-            } else {
-                Some(arg_type)
-            }
-        }
-        _ => Some(ExasolType::DoublePrecision),
-    }
-}
-
-/// Exasol types `SUM` over `DECIMAL(p,s)` as `DECIMAL(min(p+11, 36), s)`.
-fn sum_result_type(arg_type: ExasolType) -> Option<ExasolType> {
-    match arg_type {
-        ExasolType::DoublePrecision => Some(arg_type),
-        ExasolType::Decimal(decimal) => Some(ExasolType::decimal(
-            (decimal.precision() + 11).min(MAX_DECIMAL_PRECISION),
-            decimal.scale(),
-        )),
-        _ => None,
     }
 }
 
@@ -146,7 +114,7 @@ pub(super) fn sentinelize_aggregates(
     })
 }
 
-/// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
+/// Each plan comes with its aggregate node, which [`fold_nested_plans`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
     scan: ScanTranslator<'_>,
@@ -164,7 +132,8 @@ pub(super) fn classify_scalar_over_aggregate(
 }
 
 /// Renders through the translator with sentinel columns, then substitutes each `merged` slot, so
-/// it cannot drift from the translator; the type comes from the scalar's own CAST.
+/// it cannot drift from the translator. A sentinel column has no type, so the scalar gets an exact
+/// type only where it does not depend on an aggregate's, such as under its own CAST.
 pub(super) fn render_scalar_over_merge(
     node: &Json,
     plans: &[AggregatePlan],
@@ -176,7 +145,7 @@ pub(super) fn render_scalar_over_merge(
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    let SqlFragment { mut sql, ty } = render_exasol_fragment(&sentinel_tree, scan.columns());
+    let SqlFragment { mut sql, ty } = scan.exasol_fragment(&sentinel_tree);
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;

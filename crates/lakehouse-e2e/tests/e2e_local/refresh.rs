@@ -6,8 +6,8 @@ use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::rest_replace_current_schema;
 use crate::common::stack::{
-    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
-    iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
+    iceberg_catalog_url_internal, local_stack_connection_password, proxy_url_internal,
 };
 use crate::fixtures::{
     append_file, drop_table_if_exists, ensure_id_val_table, id_val_schema, load, seed_catalog,
@@ -438,23 +438,26 @@ fn pushdown_over_a_table_dropped_from_the_catalog_names_the_table() {
 
 /// Hands out the same three tables as the engine adapter's listing, but writes no table-level
 /// identifier note, as an adapter that predates it did.
-const LEGACY_ADAPTER_BODY: &str = r#"import json
+const LEGACY_ADAPTER_BODY: &str = r#"local cjson = require("cjson")
 
-COLUMNS = [
-    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 20, "scale": 0}},
-    {"name": "VAL", "dataType": {"type": "DOUBLE"}},
-]
+local COLUMNS = '[{"name": "ID", "dataType": {"type": "DECIMAL", "precision": 20, "scale": 0}}, '
+    .. '{"name": "VAL", "dataType": {"type": "DOUBLE"}}]'
 
-
-def adapter_call(request_json):
-    kind = json.loads(request_json)["type"]
-    if kind == "getCapabilities":
-        return json.dumps({"type": kind, "capabilities": []})
-    if kind == "createVirtualSchema":
-        names = ["TABLE_ONE", "TABLE_TWO", "TABLE_THREE"]
-        tables = [{"name": name, "columns": COLUMNS} for name in names]
-        return json.dumps({"type": kind, "schemaMetadata": {"tables": tables}})
-    return json.dumps({"type": kind})
+function adapter_call(request_json)
+    local kind = cjson.decode(request_json)["type"]
+    if kind == "getCapabilities" then
+        return '{"type": "getCapabilities", "capabilities": []}'
+    end
+    if kind == "createVirtualSchema" then
+        local tables = {}
+        for _, name in ipairs({"TABLE_ONE", "TABLE_TWO", "TABLE_THREE"}) do
+            tables[#tables + 1] = '{"name": "' .. name .. '", "columns": ' .. COLUMNS .. '}'
+        end
+        return '{"type": "createVirtualSchema", "schemaMetadata": {"tables": ['
+            .. table.concat(tables, ", ") .. ']}}'
+    end
+    return cjson.encode({type = kind})
+end
 "#;
 
 /// A schema of its own, so replacing the adapter script cannot touch the shared one.
@@ -473,7 +476,7 @@ fn create_legacy_virtual_schema(conn: &mut ExaConn) {
         "CREATE SCHEMA IF NOT EXISTS {PARTIAL_ADAPTER_SCHEMA}"
     ));
     conn.execute(&format!(
-        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{LEGACY_ADAPTER_BODY}\n/"
+        "CREATE OR REPLACE LUA ADAPTER SCRIPT {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{LEGACY_ADAPTER_BODY}\n/"
     ));
     crate::common::e2e_harness::create_virtual_schema(
         conn,
@@ -575,7 +578,7 @@ fn refresh_tables_heals_and_refreshes_only_the_requested_tables() {
     create_proxied_schema_and_scripts(
         &mut conn,
         PARTIAL_ADAPTER_SCHEMA,
-        &[("HTTP_PROXY", PROXY_URL_INTERNAL)],
+        &[("HTTP_PROXY", proxy_url_internal().as_str())],
         &[],
         &[],
     );

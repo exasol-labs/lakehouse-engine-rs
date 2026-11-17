@@ -120,7 +120,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
 #[test]
 fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     let mut spec = minimal_spec();
-    spec.common.s3_max_connections = 0;
+    spec.common.tuning.s3_max_connections = 0;
     assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
 }
 
@@ -1087,7 +1087,9 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     )]);
     let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
 
-    let session = build_session_context(&spec, &storage, 0).expect("the session must build");
+    let session =
+        build_session_context(&spec, &storage, 0, crate::scan::CountArithmetic::default())
+            .expect("the session must build");
     let mut ctx = SinkCtx;
     let mut timers = diagnostics::PhaseTimers::start();
     let error = run_raw_scan_with_session(&mut ctx, &session, &spec, &storage, &mut timers)

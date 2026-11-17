@@ -102,6 +102,65 @@ pub fn exasol_container() -> String {
     "lakehouse-engine-rs-exasol-1".to_string()
 }
 
+/// Which Exasol image runs the stack. `docker-db` is amd64-only, so arm64 hosts run `nano`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExasolFlavor {
+    DockerDb,
+    Nano,
+}
+
+/// `EXASOL_FLAVOR` (`docker-db` or `nano`) when set, else read from the container's image.
+pub fn exasol_flavor() -> ExasolFlavor {
+    static FLAVOR: std::sync::OnceLock<ExasolFlavor> = std::sync::OnceLock::new();
+    *FLAVOR.get_or_init(|| {
+        if let Ok(declared) = std::env::var("EXASOL_FLAVOR")
+            && !declared.trim().is_empty()
+        {
+            return match declared.trim() {
+                "docker-db" => ExasolFlavor::DockerDb,
+                "nano" => ExasolFlavor::Nano,
+                other => panic!("EXASOL_FLAVOR must be `docker-db` or `nano`, got {other:?}"),
+            };
+        }
+        let image = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.Config.Image}}",
+                &exasol_container(),
+            ])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if image.contains("exasol/nano") {
+            ExasolFlavor::Nano
+        } else {
+            ExasolFlavor::DockerDb
+        }
+    })
+}
+
+/// A command that runs `args` in the Exasol container's network namespace. Nano's image has no
+/// shell or `getent`, so there a throwaway container joins that namespace and its name resolution.
+fn in_exasol_network(container: &str, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("docker");
+    match exasol_flavor() {
+        ExasolFlavor::DockerDb => command.args(["exec", container]),
+        ExasolFlavor::Nano => command.args([
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{container}"),
+            NETWORK_PROBE_IMAGE,
+        ]),
+    };
+    command.args(args);
+    command
+}
+
+/// Has bash and `getent`; `scripts/e2e-stack.sh` probes Nano's readiness with the same image.
+const NETWORK_PROBE_IMAGE: &str = "debian:trixie-slim";
+
 pub fn bucketfs_write_password() -> String {
     if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD")
         && !p.is_empty()
@@ -178,8 +237,31 @@ pub fn wait_for_iceberg_catalog() {
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
-pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
-pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
+/// Defaults match `docker-compose.yml`; overridable so a parallel stack can use its own network.
+fn env_or(env_var: &str, default: &str) -> String {
+    std::env::var(env_var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+pub fn network_name() -> String {
+    env_or("LH_NETWORK", "lakehouse-engine")
+}
+
+pub fn proxy_host_internal() -> String {
+    format!("{}.0.12", env_or("LH_SUBNET_PREFIX", "10.84"))
+}
+
+pub fn proxy_url_internal() -> String {
+    format!("http://{}:8888", proxy_host_internal())
+}
+
+pub fn closed_proxy_url_internal() -> String {
+    format!("http://{}:1", proxy_host_internal())
+}
+
 /// Only the forward proxy resolves a `-via-proxy` host, so a request that bypasses it fails.
 pub const ICEBERG_REST_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
 pub const SEAWEEDFS_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
@@ -206,16 +288,13 @@ pub fn url_host(url: &str) -> &str {
 /// Probes from the Exasol container, because only the UDFs there reach the proxy.
 pub fn wait_for_proxy() {
     let container = exasol_container();
+    let probe = format!(
+        "timeout 3 bash -c '</dev/tcp/{}/8888'",
+        proxy_host_internal()
+    );
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
-        let reachable = std::process::Command::new("docker")
-            .args([
-                "exec",
-                &container,
-                "bash",
-                "-c",
-                "timeout 3 bash -c '</dev/tcp/10.84.0.12/8888'",
-            ])
+        let reachable = in_exasol_network(&container, &["bash", "-c", &probe])
             .status()
             .is_ok_and(|s| s.success());
         if reachable {
@@ -223,7 +302,8 @@ pub fn wait_for_proxy() {
         }
         assert!(
             Instant::now() < deadline,
-            "forward proxy at {PROXY_URL_INTERNAL} unreachable from {container}; start the `proxy` Compose service"
+            "forward proxy at {} unreachable from {container}; start the `proxy` Compose service",
+            proxy_url_internal()
         );
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -233,10 +313,9 @@ pub fn wait_for_proxy() {
 /// there cannot prove a request went through the proxy.
 pub fn assert_resolves_only_through_proxy(host: &str) {
     let container = exasol_container();
-    let out = std::process::Command::new("docker")
-        .args(["exec", &container, "getent", "hosts", host])
+    let out = in_exasol_network(&container, &["getent", "hosts", host])
         .output()
-        .unwrap_or_else(|e| panic!("docker exec {container} getent hosts {host}: {e}"));
+        .unwrap_or_else(|e| panic!("getent hosts {host} in {container}'s network: {e}"));
     assert!(
         !out.status.success(),
         "{host} resolves inside {container}, so a passing query would not prove the proxy was used: {}",
@@ -254,13 +333,14 @@ pub fn proxy_log_mark() -> String {
 }
 
 pub fn proxy_log_since(since: &str) -> String {
+    let network = network_name();
     let out = std::process::Command::new("docker")
         .args([
             "ps",
             "--filter",
             "label=com.docker.compose.service=proxy",
             "--filter",
-            "network=lakehouse-engine",
+            &format!("network={network}"),
             "--format",
             "{{.Names}}",
         ])
@@ -271,7 +351,7 @@ pub fn proxy_log_since(since: &str) -> String {
         .next()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .expect("no running `proxy` Compose service on the lakehouse-engine network")
+        .unwrap_or_else(|| panic!("no running `proxy` Compose service on the {network} network"))
         .to_string();
     let out = std::process::Command::new("docker")
         .args(["logs", "--since", since, &container])
@@ -320,6 +400,10 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
 
 /// The bytes surface inside the DB at `/buckets/bfsdefault/default/<name>`.
 pub fn put_to_bucketfs(bytes: Vec<u8>, bucketfs_path: &str) {
+    if exasol_flavor() == ExasolFlavor::Nano {
+        copy_into_nano_bucketfs(&bytes, bucketfs_path);
+        return;
+    }
     let password = bucketfs_write_password();
     let url = format!(
         "https://{}:{}{}",
@@ -369,6 +453,83 @@ pub fn put_to_bucketfs(bytes: Vec<u8>, bucketfs_path: &str) {
         "BucketFS PUT to {url} returned {} (expected 2xx)",
         resp.status()
     );
+}
+
+/// Nano serves BucketFS from `/exa/bucketfs/bfsdefault/<bucket>/` and has no HTTP endpoint, so
+/// the bytes are copied in, and a `.tar.gz` lands extracted as docker-db's BucketFS unpacks it.
+fn copy_into_nano_bucketfs(bytes: &[u8], bucketfs_path: &str) {
+    let container = exasol_container();
+    let relative = bucketfs_path.trim_start_matches('/');
+    let (target, archive) = match relative.strip_suffix(".tar.gz") {
+        Some(dir) => (dir, true),
+        None => (relative, false),
+    };
+    let staging = std::env::temp_dir().join(format!(
+        "lh-bucketfs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos()
+    ));
+    let staged = staging.join(target);
+    let staged_dir = if archive {
+        staged.as_path()
+    } else {
+        staged.parent().expect("a BucketFS path names a bucket")
+    };
+    std::fs::create_dir_all(staged_dir).unwrap_or_else(|e| panic!("create {staged_dir:?}: {e}"));
+    if !archive {
+        std::fs::write(&staged, bytes).unwrap_or_else(|e| panic!("write {staged:?}: {e}"));
+    }
+    // `docker cp` creates no missing parent, so the staged tree carries every directory.
+    let staged_tree = format!("{}/.", staging.display());
+    let copied = docker_cp(
+        &[&staged_tree, &format!("{container}:{NANO_BUCKETFS_ROOT}/")],
+        None,
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    copied.unwrap_or_else(|e| panic!("{e}"));
+    if archive {
+        // The daemon gunzips and unpacks a tar streamed to `docker cp -`.
+        let dest = format!("{container}:{NANO_BUCKETFS_ROOT}/{target}");
+        docker_cp(&["-", &dest], Some(bytes)).unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+const NANO_BUCKETFS_ROOT: &str = "/exa/bucketfs/bfsdefault";
+
+fn docker_cp(args: &[&str], stdin: Option<&[u8]>) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("docker")
+        .arg("cp")
+        .args(args)
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker cp {args:?}: {e}"))?;
+    if let Some(bytes) = stdin {
+        let mut pipe = child.stdin.take().expect("stdin is piped");
+        pipe.write_all(bytes)
+            .map_err(|e| format!("docker cp {args:?}: writing stdin: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("docker cp {args:?}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "docker cp {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(any(

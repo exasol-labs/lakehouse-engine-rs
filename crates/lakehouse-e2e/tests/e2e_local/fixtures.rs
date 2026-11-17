@@ -2,21 +2,23 @@ use crate::common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts,
     create_schema_and_scripts, create_schema_and_scripts_in, create_virtual_schema,
     create_virtual_schema_with_password, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, runtime, upload_so,
+    has_n_scan_wrapper, has_two_scan_wrapper, install_slc, isolated_pushdown_statement, runtime,
+    upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_JSON_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, build_seed_catalog, seed_all_types,
+    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, build_seed_catalog, seed_all_types,
     seed_complex_types_probe, seed_distinct_probe, seed_events, seed_high_card_probe,
     seed_ident_part_bytes, seed_json_docs, seed_typed_distinct_probe,
 };
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY,
-    PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
-    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+    PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
+    local_stack_connection_password, proxy_url_internal, wait_for_exasol, wait_for_iceberg_catalog,
+    wait_for_seaweedfs,
 };
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -93,17 +95,20 @@ pub fn lakehouse_vs() {
 /// The adapter schema of a virtual schema whose properties [`persist_properties`] sets.
 pub const STUB_ADAPTER_SCHEMA: &str = "PV_STUB_ADAPTER";
 
-/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did.
-const PERSISTING_ADAPTER_BODY: &str = r#"import json
+/// Persists whatever `ALTER ... SET` names, as an adapter that predates the check did. Lua,
+/// because it is built into every Exasol image, while Nano ships no Python container.
+const PERSISTING_ADAPTER_BODY: &str = r#"local cjson = require("cjson")
 
-
-def adapter_call(request_json):
-    kind = json.loads(request_json)["type"]
-    if kind == "getCapabilities":
-        return json.dumps({"type": kind, "capabilities": []})
-    if kind == "setProperties":
-        return json.dumps({"type": kind})
-    raise Exception("the stub adapter answers only setProperties, got " + kind)
+function adapter_call(request_json)
+    local kind = cjson.decode(request_json)["type"]
+    if kind == "getCapabilities" then
+        return '{"type": "getCapabilities", "capabilities": []}'
+    end
+    if kind == "setProperties" then
+        return '{"type": "setProperties"}'
+    end
+    error("the stub adapter answers only setProperties, got " .. kind)
+end
 "#;
 
 /// Swaps the stub in, runs `ALTER VIRTUAL SCHEMA <vs> SET <set_clause>`, and puts the engine
@@ -111,7 +116,7 @@ def adapter_call(request_json):
 /// created `USING` [`STUB_ADAPTER_SCHEMA`], whose scripts must already exist.
 pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
     conn.execute(&format!(
-        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT \
+        "CREATE OR REPLACE LUA ADAPTER SCRIPT \
          {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
     ));
     conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} SET {set_clause}"));
@@ -120,6 +125,15 @@ pub fn persist_properties(conn: &mut ExaConn, vs: &str, set_clause: &str) {
 
 pub fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
+}
+
+/// `SELECT <select> FROM <events> e JOIN <labels> l ON e.ID = l.ID <tail>` over one virtual schema.
+pub fn events_labels_join(vs_name: &str, select: &str, tail: &str) -> String {
+    format!(
+        "SELECT {select} FROM {} e JOIN {} l ON e.ID = l.ID {tail}",
+        vs_table(vs_name, E2E_TABLE),
+        vs_table(vs_name, E2E_TABLE_2)
+    )
 }
 
 pub fn events_table() -> String {
@@ -154,14 +168,14 @@ pub fn vs_lineitem_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_LINEITEM_TABLE)
 }
 
-/// Holds native copies of the fact and dimension tables under their virtual names, so a join
-/// query that names its schema `{T}` runs over either.
+/// Holds native copies of the fact, dimension, events, and labels tables under their virtual
+/// names, so a join query that names its schema `{T}` runs over either.
 pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
 
-/// Copies the fact and dimension tables of `source_vs` into [`JOIN_ORACLE`].
+/// Copies the fact, dimension, events, and labels tables of `source_vs` into [`JOIN_ORACLE`].
 pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
-    for table in [E2E_FACT_TABLE, E2E_DIM_TABLE] {
+    for table in [E2E_FACT_TABLE, E2E_DIM_TABLE, E2E_TABLE, E2E_TABLE_2] {
         conn.execute(&format!(
             "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
             vs_table(JOIN_ORACLE, table),
@@ -262,6 +276,8 @@ pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
 pub const PROXY_ICEBERG_VS: &str = "PROXY_ICEBERG_VS";
 pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";
 pub const PROXY_ROLE_VS: &str = "PROXY_ROLE_VS";
+/// The CONNECTION of `PROXY_ICEBERG_VS`, which names the `-via-proxy` catalog and storage.
+pub const PROXY_ICEBERG_CREDS: &str = "PROXY_ICEBERG_CREDS";
 
 pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
     lakehouse_vs();
@@ -300,7 +316,8 @@ pub fn refresh(vs_name: &str) {
 pub fn proxy_virtual_schemas() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
-        let proxy = [("HTTP_PROXY", PROXY_URL_INTERNAL)];
+        let proxy_url = proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         setup_proxy(PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
         write_parquet_fixture(
             &format!("{BASE_DIRECT}rows/file1.parquet"),
@@ -318,7 +335,7 @@ pub fn proxy_virtual_schemas() {
 
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied("PROXY_ICEBERG_CREDS"),
+            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied(PROXY_ICEBERG_CREDS),
             ICEBERG_REST_VIA_PROXY,
             &local_stack_connection_password().via_proxy(),
         );
@@ -432,4 +449,26 @@ pub async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, b
     crate::common::seed::write_one_file_append(catalog, &loaded, table, [batch])
         .await
         .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
+}
+
+/// The common scan spec a `SELECT *` over `vs`.`E2E_TABLE` pushes into `LAKEHOUSE_SCAN`.
+pub fn pushed_scan_spec(conn: &mut ExaConn, vs: &str) -> serde_json::Value {
+    let statement =
+        isolated_pushdown_statement(conn, &format!("SELECT * FROM {}", vs_table(vs, E2E_TABLE)));
+    let (_, rest) = statement
+        .split_once("LAKEHOUSE_SCAN('")
+        .unwrap_or_else(|| panic!("the pushdown calls the scan: {statement}"));
+    let literal = rest
+        .split("', ")
+        .next()
+        .expect("the common spec is the scan's first argument")
+        .replace("''", "'");
+    serde_json::from_str(&literal)
+        .unwrap_or_else(|e| panic!("the common spec is JSON ({e}): {literal}"))
+}
+
+pub fn spec_u64(spec: &serde_json::Value, key: &str) -> u64 {
+    spec[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the scan spec must hold {key}: {spec}"))
 }

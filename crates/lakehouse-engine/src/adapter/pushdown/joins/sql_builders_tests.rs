@@ -1,30 +1,26 @@
-use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
+use super::super::plan_broadcast_join;
 use super::super::planning::{
     JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
 };
 use super::super::tests::{
-    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    nq3_join_request, request_legs, resolved_side, self_join_request, three_table_join_request,
-    two_scan_tuning,
+    broadcast_projection, built_join, customer_orders_request, customer_orders_request_declaring,
+    customer_orders_request_over, customer_orders_sides, detected_join, equi_condition,
+    join_request, legs_from_leaves, nq3_join_request, request_legs, resolved_side,
+    self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
+use crate::adapter::tuning::Tuning;
+use crate::scan::spec::{ColumnRef, ScanStorage, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    build_n_scan_join_sql(
+    full_row_n_scan_sql(
         &parsed_pushdown(request),
         &detected_join(request),
-        &request_typed(request, &sides),
+        &customer_orders_sides(request, 10, 100),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
 }
 
@@ -86,7 +82,7 @@ fn q1_join_request() -> Json {
 }
 
 #[test]
-fn broadcast_join_declines_widened_projection() {
+fn broadcast_join_declines_wrapped_projection() {
     let mut request = join_request(Json::Null, equi_condition());
     request = selecting(
         request,
@@ -105,38 +101,41 @@ fn broadcast_join_declines_widened_projection() {
     let mut ok_req = request.clone();
     ok_req["pushdownRequest"]["selectListDataTypes"] =
         serde_json::json!([exasol_type_to_json(&ExasolType::varchar(100))]);
-    let (_, _, ok_widened) = broadcast_projection(&ok_req);
-    assert!(!ok_widened, "the control fixture must NOT widen");
+    let projection = broadcast_projection(&ok_req);
+    let ok_wrapped = projection == RowProjection::Wrapped;
+    assert!(!ok_wrapped, "the control fixture must NOT wrap");
     assert!(
         render_broadcast_join(
             &parsed_pushdown(&ok_req),
             &detected,
-            &request_sides(&ok_req, &detected)
+            &request_sides(&ok_req, &detected),
+            &test_context()
         )
         .expect("the control must not error")
         .is_some(),
-        "the control must render a broadcast plan, so only the widening differs"
+        "the control must render a broadcast plan, so only the wrapping differs"
     );
 
     request["pushdownRequest"]["selectListDataTypes"] = serde_json::json!([exasol_type_to_json(
         &ExasolType::TimestampWithLocalTimeZone { precision: 3 }
     )]);
-    let (projection, _, widened) = broadcast_projection(&request);
+    let projection = broadcast_projection(&request);
+    let wrapped = projection == RowProjection::Wrapped;
     assert!(
-        widened && projection.len() == 4,
-        "precondition: the one-item select list must widen to the 4-column \
-         two-table base row"
+        wrapped,
+        "precondition: the one-item select list must be one only Exasol computes"
     );
 
     assert!(
         render_broadcast_join(
             &parsed_pushdown(&request),
             &detected,
-            &request_sides(&request, &detected)
+            &request_sides(&request, &detected),
+            &test_context()
         )
-        .expect("a widened projection is a clean decline, NOT an error")
+        .expect("a wrapped projection is a clean decline, NOT an error")
         .is_none(),
-        "a widened projection must decline broadcast rendering (Ok(None)) so the \
+        "a wrapped projection must decline broadcast rendering (Ok(None)) so the \
          request falls through to the unified N-scan fallback"
     );
 }
@@ -152,7 +151,8 @@ fn broadcast_declines_on_a_declined_filter() {
         render_broadcast_join(
             &parsed_pushdown(&request),
             &detected,
-            &request_sides(&request, &detected)
+            &request_sides(&request, &detected),
+            &test_context()
         )
         .expect("a declined filter is a clean decline, not an error")
         .is_none(),
@@ -178,6 +178,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("a type-declined filter is a clean decline, not an error");
     assert!(
@@ -196,6 +197,7 @@ fn broadcast_absent_filter_stays_eligible() {
         &parsed_pushdown(&absent_request),
         &absent_detected,
         &request_sides(&absent_request, &absent_detected),
+        &test_context(),
     )
     .expect("an absent filter must not error")
     .expect("an absent filter must keep the broadcast plan");
@@ -223,6 +225,20 @@ fn a_lone_true_residual_renders_as_the_outer_where() {
     let sql = n_scan_sql(&request).expect("a lone TRUE residual must render, not error");
 
     assert!(sql.ends_with(" WHERE (TRUE)"), "{sql}");
+}
+
+/// Exasol rejects any other width with "Expected number of columns is 1" (verified live).
+#[test]
+fn an_empty_select_list_selects_the_first_emitted_column() {
+    let request =
+        built_join(customer_orders_request(Json::Null, equi_condition()).empty_select_list());
+
+    let sql = n_scan_sql(&request).expect("an empty select list must build the wrapper");
+
+    assert!(
+        sql.starts_with(r#"SELECT "LHS_T0"."C_CUSTKEY" FROM"#),
+        "{sql}"
+    );
 }
 
 #[test]
@@ -303,13 +319,11 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the qualified unified fallback must build despite the column-name collision");
 
@@ -337,13 +351,11 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("an all-inner N-scan wrapper must build, never Err");
 
@@ -384,13 +396,11 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
         resolved_side("REGION", vec![("s3://w/r-0.parquet", 2)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
 
@@ -423,13 +433,11 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 5)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 3)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
 
@@ -511,13 +519,11 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
         resolved_side("TAGS", vec![("s3://w/t-0.parquet", 10)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("three tables sharing an ID column must still build, never Err");
 
@@ -543,13 +549,11 @@ fn self_join_renders_each_occurrence_as_its_own_leg() {
             resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
             resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         ];
-        let sql = build_n_scan_join_sql(
+        let sql = full_row_n_scan_sql(
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_typed(&request, &sides),
             &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
         )
         .expect("a two-leg self-join must build through the unified fallback, never Err");
 
@@ -575,13 +579,11 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f2.parquet", 10)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("a three-leg self-join must build through the unified fallback, never Err");
 
@@ -632,13 +634,11 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("every clause must render against its own occurrence's leg");
 
@@ -673,13 +673,11 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("a fully leg-partitioned self-join filter must build");
 
@@ -750,13 +748,11 @@ fn three_table_join_inner_join_on_chain() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the three-table inner-join chain must build");
 
@@ -831,13 +827,11 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
         resolved_side("N2", vec![("s3://w/n2-0.parquet", 10)]),
         resolved_side("FACT", vec![("s3://w/f-0.parquet", 500)]),
     ];
-    let sql = build_n_scan_join_sql(
+    let sql = full_row_n_scan_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("the star-shape greedy-attach fallback must build");
 
@@ -891,6 +885,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &test_context(),
     )
     .expect("a VARCHAR LIKE subject must not error")
     .expect("a VARCHAR LIKE subject must keep the broadcast plan");
@@ -953,13 +948,13 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
             ),
         ],
     );
-
-    assert!(matches!(
-        classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("single_group");
 
     let sql = n_scan_sql(&request).expect("aggregate-over-join must build the unified wrapper");
+    assert!(
+        sql.ends_with(" GROUP BY ()"),
+        "a single-group request aggregates to one row: {sql}"
+    );
 
     assert!(sql.contains("COUNT(*)"), "COUNT(*) must be rendered: {sql}");
     assert!(
@@ -967,9 +962,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
         "MIN must qualify its argument to the owning side: {sql}"
     );
     assert!(
-        sql.starts_with(
-            r#"SELECT CAST(COUNT(*) AS DECIMAL(18,0)), CAST(MIN("LHS_T1"."O_ORDERDATE") AS DATE) FROM"#
-        ),
+        sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_T1"."O_ORDERDATE") FROM"#),
         "the outer SELECT must be exactly the two aggregate columns: {sql}"
     );
     assert!(
@@ -1107,12 +1100,12 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
             (table_col("ORDERS", "O_ORDERDATE"), ExasolType::Date),
         ],
     );
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+    request["pushdownRequest"]["groupBy"] = serde_json::json!([
+        table_col("CUSTOMER", "C_NAME"),
+        table_col("ORDERS", "O_ORDERDATE")
+    ]);
     request["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
-
-    assert!(matches!(
-        classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
 
     let sql =
         n_scan_sql(&request).expect("a CAST-to-CHAR select item must build the unified wrapper");
@@ -1163,7 +1156,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
 
     assert!(matches!(
         classify_join_window(&pd(&request)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
 
     let sql = n_scan_sql(&request)
@@ -1176,7 +1169,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
 }
 
 #[test]
-fn join_window_classification_covers_every_forcing_and_served_shape() {
+fn join_window_classification_covers_every_unservable_and_served_shape() {
     let plain = join_request(Json::Null, equi_condition());
     assert!(matches!(
         classify_join_window(&pd(&plain)),
@@ -1195,7 +1188,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
         serde_json::json!({"numElements": 10, "offset": 5});
     assert!(matches!(
         classify_join_window(&pd(&offset_without_order)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
 
     let mut ordered = join_request(Json::Null, equi_condition());
@@ -1217,38 +1210,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ),]);
     assert!(matches!(
         classify_join_window(&pd(&ordered_by_expression)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut aggregate_item = join_request(Json::Null, equi_condition());
-    aggregate_item = selecting(
-        aggregate_item,
-        &[(count_star(), ExasolType::decimal(18, 0))],
-    );
-    assert!(matches!(
-        classify_join_window(&pd(&aggregate_item)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut grouped = join_request(Json::Null, equi_condition());
-    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
-    assert!(matches!(
-        classify_join_window(&pd(&grouped)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut group_by_aggregation = join_request(Json::Null, equi_condition());
-    group_by_aggregation["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
-    assert!(matches!(
-        classify_join_window(&pd(&group_by_aggregation)),
-        JoinWindowPlan::ExasolPostProcessed
-    ));
-
-    let mut having = join_request(Json::Null, equi_condition());
-    having["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(1));
-    assert!(matches!(
-        classify_join_window(&pd(&having)),
-        JoinWindowPlan::ExasolPostProcessed
+        JoinWindowPlan::BroadcastUnservable
     ));
 }
 
@@ -1257,7 +1219,7 @@ fn golden_broadcast_join_sql_unchanged() {
     let fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
     let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
     // Deliberately distinct from the fact side's backend.
-    dimension.effective_storage = StorageBackend::S3(StorageProps {
+    dimension.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-dim:9000".into(),
         region: "us-east-2".into(),
         access_key: "dimadmin".into(),
@@ -1282,10 +1244,9 @@ fn golden_broadcast_join_sql_unchanged() {
             ],
         )
     };
-    let actual =
-        build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
-            .expect("selecting the wire storage must succeed")
-            .expect("an unbounded broadcast join must build");
+    let actual = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
         r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":[{"relation":"LHS_T0","name":"L_ORDERKEY"},{"relation":"LHS_T1","name":"O_ORDERDATE"}],"filter":"(\"LHS_T0\".\"L_QUANTITY\" > 5)","logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","fact_alias":"LHS_T0","dimension_alias":"LHS_T1","condition":"(\"LHS_T0\".\"L_ORDERKEY\" = \"LHS_T1\".\"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("LHS_T0_L_ORDERKEY" DECIMAL(20,0), "LHS_T1_O_ORDERDATE" DATE)"#
@@ -1295,7 +1256,7 @@ fn golden_broadcast_join_sql_unchanged() {
 #[test]
 fn broadcast_carries_each_sides_own_storage() {
     let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
-    fact.effective_storage = StorageBackend::S3(StorageProps {
+    fact.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-fact:9000".into(),
         region: "us-east-1".into(),
         access_key: "factadmin".into(),
@@ -1304,7 +1265,7 @@ fn broadcast_carries_each_sides_own_storage() {
         ..Default::default()
     });
     let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    dimension.effective_storage = StorageBackend::S3(StorageProps {
+    dimension.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-dim:9000".into(),
         region: "us-east-2".into(),
         access_key: "dimadmin".into(),
@@ -1323,12 +1284,10 @@ fn broadcast_carries_each_sides_own_storage() {
     let sql = build_broadcast_join_sql(
         &sides,
         &rendered,
-        &JoinScanRequestConfig {
+        &PushdownContext {
             connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
             ..two_scan_tuning()
         },
-        "SCAN",
-        "DISTRIBUTE",
     )
     .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
@@ -1340,12 +1299,12 @@ fn broadcast_carries_each_sides_own_storage() {
         (
             "common.storage",
             &common["storage"],
-            &fact.effective_storage,
+            &fact.scan.effective_storage,
         ),
         (
             "join.storage",
             &common["join"]["storage"],
-            &dimension.effective_storage,
+            &dimension.scan.effective_storage,
         ),
     ] {
         let selected: ScanStorage =
@@ -1393,7 +1352,7 @@ fn broadcast_sql_projecting(
             projection,
         )
     };
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -1577,6 +1536,7 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
             &parsed_pushdown(request),
             &detected_join(request),
             &request_sides(request, &detected_join(request)),
+            &test_context(),
         )
         .expect("renders")
         .expect("an ordered equi-join renders");
@@ -1728,21 +1688,19 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
-    let col_types = first_table_column_types(&request);
-    let fan_out = FanOutProjection::new(fan_out_spec, &col_types);
     let actual = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
-        &fan_out,
-        &[vec![("s3://w/c-0.parquet".to_string(), 10u64)]],
-        "SCAN",
-        "DISTRIBUTE",
+        fan_out_spec,
+        &emitting(&first_table_column_types(&request)),
+        &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
         None,
+        &test_context(),
     )
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -1787,17 +1745,22 @@ fn fallback_projection_narrows_to_referenced_columns() {
         [string_equal("T", "REGION", "R"), num_lit(1), num_lit(0)],
     );
     let sum_case = agg_item_expr("SUM", region_flag, false);
-    let rich_req = pushdown_request("T", &all_cols)
+    let rich_request = pushdown_request("T", &all_cols)
         .group_by(vec![table_col("T", "GK")])
         .field("having", having)
         .order_by(order_by)
         .filter(predicate_equal(table_col("T", "FCOL"), num_lit(5)))
         .column(table_col("T", "GK"))
         .item(sum_case.clone(), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (proj, types) = split_projection(
-        &referenced_columns(rich_req.json(), &column_types(&all_cols)).projection(),
-    );
+        .build()
+        .0;
+    let rich = single_table_emission(
+        &rich_request,
+        &parsed_pushdown(&rich_request),
+        &column_types(&all_cols),
+    )
+    .expect("the request names no refused column");
+    let (proj, types) = split_projection(&rich.projection());
     let names = proj_names(&proj);
     for expected in ["GK", "REGION", "HCOL", "OCOL", "FCOL"] {
         assert!(
@@ -1835,7 +1798,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let grouped_req = parsed_pushdown(&grouped_request);
-    let grouped = referenced_columns(grouped_req.json(), &column_types(&grouped_all));
+    let grouped =
+        single_table_emission(&grouped_request, &grouped_req, &column_types(&grouped_all))
+            .expect("the request names no refused column");
     let (gproj, _) = split_projection(&grouped.projection());
     assert_eq!(
         proj_names(&gproj),
@@ -1843,15 +1808,14 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the grouped inner scan narrows to GK + REGION (nested in SUM(CASE ...)), \
          never IRRELEVANT_COL"
     );
-    let gfan_out = FanOutProjection::new(fan_out_base(), &grouped);
     let gsql = build_qualified_single_table_fallback_sql(
         &grouped_request,
         &grouped_req,
-        &gfan_out,
-        &shards,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        fan_out_base(),
+        &emitting_named(&column_types(&grouped_all), &["GK", "REGION"]),
+        &unqualified_shards(shards.to_vec()),
         None,
+        &test_context(),
     )
     .expect("grouped decline wrapper must build");
     assert!(
@@ -1881,22 +1845,22 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let sg_req = parsed_pushdown(&sg_request);
-    let single_group = referenced_columns(sg_req.json(), &column_types(&sg_all));
+    let single_group = single_table_emission(&sg_request, &sg_req, &column_types(&sg_all))
+        .expect("the request names no refused column");
     let (sproj, _) = split_projection(&single_group.projection());
     assert_eq!(
         proj_names(&sproj),
         vec!["A".to_string(), "B".to_string()],
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
-    let sfan_out = FanOutProjection::new(fan_out_base(), &single_group);
     let ssql = build_qualified_single_table_fallback_sql(
         &sg_request,
         &sg_req,
-        &sfan_out,
-        &shards,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        fan_out_base(),
+        &emitting_named(&column_types(&sg_all), &["A", "B"]),
+        &unqualified_shards(shards.to_vec()),
         None,
+        &test_context(),
     )
     .expect("single-group Case 2/3 wrapper must build");
     assert!(
@@ -1915,85 +1879,86 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
 }
 
-#[test]
-fn no_select_list_wire_forms_all_keep_the_full_base_row() {
-    let all_cols = vec![
-        ("GK".to_string(), ExasolType::varchar(10)),
-        ("FCOL".to_string(), ExasolType::decimal(18, 0)),
-        ("IRRELEVANT_COL".to_string(), ExasolType::varchar(10)),
-    ];
-    let filter = predicate_equal(table_col("T", "FCOL"), num_lit(5));
-    let full_row: Vec<ProjectionItem> = all_cols
+/// The names [`single_table_emission`] answers for `request` over `columns`.
+fn wrapper_emission_names(request: &Json, columns: &ColumnTypes) -> Vec<String> {
+    single_table_emission(request, &parsed_pushdown(request), columns)
+        .expect("the request names no refused column")
+        .columns()
         .iter()
-        .map(|(name, _)| ProjectionItem::from(name.clone()))
-        .collect();
-    let full_types: Vec<ExasolType> = all_cols.iter().map(|(_, ty)| *ty).collect();
-
-    for req in [
-        serde_json::json!({"filter": filter.clone()}),
-        serde_json::json!({"selectList": [], "filter": filter.clone()}),
-        serde_json::json!({"selectList": null, "filter": filter.clone()}),
-        serde_json::json!({"selectList": "*", "filter": filter.clone()}),
-    ] {
-        let (proj, types) =
-            split_projection(&referenced_columns(&req, &column_types(&all_cols)).projection());
-        assert_eq!(
-            proj, full_row,
-            "no select list ⇒ `SELECT *` ⇒ the full base row, so the wrapper's own \
-             no-select-list SELECT arm and this projection agree on the arity \
-             Exasol validates: {req}"
-        );
-        assert_eq!(
-            types, full_types,
-            "types stay positionally aligned with the full base row: {req}"
-        );
-    }
+        .map(|(column, _)| column.name.clone())
+        .collect()
 }
 
 #[test]
-fn referenced_columns_narrows_with_a_real_select_list() {
+fn the_wrapper_fan_out_emits_the_whole_row_only_for_select_star() {
     let all_cols = [
         ("GK", ExasolType::varchar(10)),
         ("FCOL", ExasolType::decimal(18, 0)),
         ("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
-    let req = pushdown_request("T", &all_cols)
-        .filter(predicate_equal(table_col("T", "FCOL"), num_lit(5)))
-        .column(table_col("T", "GK"))
-        .build_pushdown();
-
-    let (proj, types) =
-        split_projection(&referenced_columns(req.json(), &column_types(&all_cols)).projection());
-    assert_eq!(
-        proj,
-        vec![ProjectionItem::from("GK"), ProjectionItem::from("FCOL"),],
-        "select-list ∪ filter columns only — the unreferenced column stays out"
-    );
-    assert_eq!(
-        types,
-        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
-    );
+    let table = || pushdown_request("T", &all_cols);
+    let filtered = || table().filter(predicate_equal(table_col("T", "FCOL"), num_lit(5)));
+    let full_row: &[&str] = &["GK", "FCOL", "IRRELEVANT_COL"];
+    for (case, request, expected) in [
+        ("an absent select list", filtered(), full_row),
+        (
+            "a null select list",
+            filtered().field("selectList", Json::Null),
+            full_row,
+        ),
+        (
+            "an empty select list emits the column the wrapper's WHERE names",
+            filtered().empty_select_list(),
+            &["FCOL"],
+        ),
+        (
+            "an empty select list beside no clause emits one column",
+            table().empty_select_list(),
+            &["GK"],
+        ),
+        (
+            "a select list emits the columns the request names",
+            filtered().column(table_col("T", "GK")),
+            &["GK", "FCOL"],
+        ),
+    ] {
+        let request = request.build().0;
+        assert_eq!(
+            wrapper_emission_names(&request, &column_types(&all_cols)),
+            expected,
+            "{case}"
+        );
+    }
 }
 
 #[test]
-fn referenced_columns_falls_back_to_first_column() {
-    let all_cols = vec![
-        ("A".to_string(), ExasolType::decimal(18, 0)),
-        ("B".to_string(), ExasolType::varchar(10)),
+fn the_wrapper_fan_out_emits_the_first_column_the_reader_does_not_refuse() {
+    let all_cols = [
+        ("A", ExasolType::decimal(18, 0)),
+        ("B", ExasolType::varchar(10)),
     ];
-    let req = pushdown_request("T", NO_COLUMNS)
+    let request = pushdown_request("T", NO_COLUMNS)
         .filter(serde_json::json!(null))
         .field("having", serde_json::json!(null))
         .item(num_lit(1), ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (proj, types) =
-        split_projection(&referenced_columns(req.json(), &column_types(&all_cols)).projection());
-    assert_eq!(
-        proj,
-        vec![ProjectionItem::from("A")],
-        "no referenced source column ⇒ exactly one column, the first of all_cols"
-    );
-    assert_eq!(types, vec![ExasolType::decimal(18, 0)]);
+        .build()
+        .0;
+    for (refused, expected) in [
+        (vec![], ("A", ExasolType::decimal(18, 0))),
+        (
+            vec![unread_refused("Parquet", "a", None, "geometry")],
+            ("B", ExasolType::varchar(10)),
+        ),
+    ] {
+        let all_cols = refusing_column_types(&all_cols, &refused);
+        let emitted = single_table_emission(&request, &parsed_pushdown(&request), &all_cols)
+            .expect("a readable column is left");
+
+        let (proj, types) = split_projection(&emitted.projection());
+
+        assert_eq!(proj, vec![ProjectionItem::from(expected.0)], "{refused:?}");
+        assert_eq!(types, vec![expected.1], "{refused:?}");
+    }
 }
 
 /// The qualified single-table wrapper over one shard of `request`'s first table.
@@ -2003,16 +1968,15 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
+    let pushdown = parsed_pushdown(&request);
     qualified_single_table_fallback_pushdown(
         &request,
-        &parsed_pushdown(&request),
+        &pushdown,
         &base,
-        None,
-        &[vec![FileEntry::new("s3://w/f-0.parquet", 10)]],
-        &first_table_column_types(&request),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
+        &ScanWhere::Absent,
+        &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
+        &emitting(&first_table_column_types(&request)),
+        &test_context(),
     )
 }
 
@@ -2138,10 +2102,16 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     .build()
     .0;
     let (pushdown_req, legs) = planned(&request);
-    let leg = first_table_column_types(&request);
+    let leg = emitting(&first_table_column_types(&request));
 
-    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[&leg])
-        .expect("a renderable expression sort key must render, not decline");
+    let clauses = outer_wrapper_clauses(
+        &pushdown_req,
+        &legs,
+        &[leg],
+        LegColumns::Relations,
+        &test_context(),
+    )
+    .expect("a renderable expression sort key must render, not decline");
 
     assert!(
         clauses
@@ -2168,14 +2138,20 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 
 /// The wrapper's trailing clauses for `request`, whose every leg is an `EVENTS` occurrence.
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
-    let events = column_types(&events_columns());
+    let events = emitting(&column_types(&events_columns()));
     let (pushdown, legs) = planned(request);
     let leg_count = match detect_join(request, pushdown.json()).expect("a plannable request") {
         JoinShape::Join(join) => join.tables.len(),
         JoinShape::NotAJoin => 1,
     };
-    outer_wrapper_clauses(&pushdown, &legs, &vec![&events; leg_count])
-        .map(|clauses| clauses.trailing)
+    outer_wrapper_clauses(
+        &pushdown,
+        &legs,
+        &vec![events; leg_count],
+        LegColumns::Relations,
+        &test_context(),
+    )
+    .map(|clauses| clauses.trailing)
 }
 
 fn events_columns() -> [(&'static str, ExasolType); 3] {
@@ -2392,11 +2368,15 @@ fn shared_names_broadcast_sql_over(
     labels: ResolvedJoinSide,
 ) -> Option<String> {
     let typed = request_typed(request, &[events, labels]);
-    let rendered =
-        render_broadcast_join(&parsed_pushdown(request), &detected_join(request), &typed)
-            .expect("a well-formed request renders without error")?;
+    let rendered = render_broadcast_join(
+        &parsed_pushdown(request),
+        &detected_join(request),
+        &typed,
+        &test_context(),
+    )
+    .expect("a well-formed request renders without error")?;
     let sides = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -2479,9 +2459,9 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
 #[test]
 fn binary_detection_resolves_a_shared_column_name_per_leg() {
     let mut events = resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]);
-    events.logical_schema = vec![nullable_field("payload", "binary")];
+    events.scan.logical_schema = vec![nullable_field("payload", "binary")];
     let mut labels = resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]);
-    labels.logical_schema = vec![nullable_field("payload", "utf8")];
+    labels.scan.logical_schema = vec![nullable_field("payload", "utf8")];
     let filter_on = |column: Json| {
         let request = shared_names_request(
             &[events_column("ID"), labels_column("ID")],
@@ -2519,6 +2499,7 @@ fn output_name_over_identifier_limit_declines_broadcast() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            &test_context(),
         )
         .expect("an identifier-limit decline is not an error")
     };
@@ -2548,6 +2529,7 @@ fn self_join_renders_each_occurrence_as_its_own_relation() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            &test_context(),
         )
         .expect("renders")
         .expect("a self-join is no reason to decline");
@@ -2572,16 +2554,16 @@ fn join_block_names_the_dimension_legs_alias() {
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_sides(&request, &detected_join(&request)),
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");
     let aliases_with = |customer_bytes: u64, orders_bytes: u64| {
-        let sides = select_broadcast_sides(
-            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
-            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
-            u64::MAX,
-        );
-        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "S", "D")
+        let [customer, orders] = customer_orders_sides(&request, customer_bytes, orders_bytes)
+            .try_into()
+            .expect("two sides");
+        let sides = select_broadcast_sides(customer, orders);
+        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
             .expect("selecting the wire storage must succeed")
             .expect("an unbounded join builds");
         let join = broadcast_common_blob(&sql)["join"].clone();
@@ -2597,4 +2579,183 @@ fn join_block_names_the_dimension_legs_alias() {
         (serde_json::json!("LHS_T1"), serde_json::json!("LHS_T0")),
         "the smaller first leg is the dimension"
     );
+}
+
+/// The broadcast plan of `request` over one CUSTOMER and one ORDERS file of the given sizes.
+fn aggregating_broadcast_plan(
+    request: &Json,
+    customer_bytes: u64,
+    orders_bytes: u64,
+) -> Option<String> {
+    let sides = customer_orders_sides(request, customer_bytes, orders_bytes);
+    plan_broadcast_join(
+        &parsed_pushdown(request),
+        &detected_join(request),
+        &sides,
+        &PushdownContext {
+            tuning: Tuning {
+                join_broadcast_max_bytes: u64::MAX,
+                ..two_scan_tuning().tuning
+            },
+            ..two_scan_tuning()
+        },
+    )
+    .expect("a declined broadcast is not an error")
+}
+
+/// [`aggregating_broadcast_plan`] with CUSTOMER the smaller side.
+fn aggregating_broadcast_sql(request: &Json) -> String {
+    aggregating_broadcast_plan(request, 10, 100)
+        .expect("a renderable aggregating join must stay on the broadcast path")
+}
+
+#[test]
+fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_CUSTKEY"))
+            .item(
+                agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
+                ExasolType::Date,
+            )
+            .group_by(vec![table_col("CUSTOMER", "C_CUSTKEY")])
+            .order_by(serde_json::json!([order_by_element(
+                table_col("CUSTOMER", "C_CUSTKEY"),
+                false,
+                true
+            )]))
+            .limit(1),
+    );
+
+    let sql = aggregating_broadcast_sql(&request);
+
+    assert!(
+        sql.starts_with(
+            r#"SELECT "LHS_T0_C_CUSTKEY", MIN("LHS_T1_O_ORDERDATE") FROM (SELECT SCAN("#
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.ends_with(
+            r#") GROUP BY "LHS_T0_C_CUSTKEY" ORDER BY "LHS_T0_C_CUSTKEY" DESC NULLS LAST LIMIT 1"#
+        ),
+        "{sql}"
+    );
+    let common = broadcast_common_blob(&sql);
+    assert!(common["join"].get("post_join_limit").is_none(), "{common}");
+    assert!(
+        common["join"].get("post_join_order_by").is_none(),
+        "{common}"
+    );
+}
+
+/// The first declared column may be one the reader refuses, so the fan-out emits a join key.
+#[test]
+fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
+    let key = ("C_CUSTKEY", ExasolType::decimal(20, 0));
+    let name = ("C_NAME", ExasolType::varchar(100));
+    for customer_columns in [[key, name], [name, key]] {
+        let request = built_join(
+            customer_orders_request_declaring(&customer_columns, Json::Null, equi_condition())
+                .count_star()
+                .single_group(),
+        );
+
+        let sql = aggregating_broadcast_sql(&request);
+
+        assert!(
+            sql.starts_with("SELECT COUNT(*) FROM (SELECT SCAN("),
+            "{sql}"
+        );
+        assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
+        assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
+    }
+}
+
+/// A `SELECT *` emits every declared column whatever the GROUP BY names, so the outer SELECT
+/// must not name a column the fan-out lacks.
+#[test]
+fn aggregating_broadcast_wrapper_selects_only_columns_the_fan_out_emits() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .group_by(vec![table_col("ORDERS", "O_CUSTKEY")]),
+    );
+
+    let sql = aggregating_broadcast_plan(&request, 100, 10)
+        .expect("ORDERS, the dimension, holds no unbounded text column");
+
+    let emitted: Vec<&str> = emits_clause(&sql)
+        .split(", ")
+        .filter_map(|column| column.split(' ').next())
+        .collect();
+    let selected: Vec<&str> = outer_select_list(&sql).split(", ").collect();
+    assert_eq!(selected, emitted, "{sql}");
+    assert_eq!(
+        emitted.len(),
+        first_table_column_types(&request).iter().count()
+            + request_sides(&request, &detected_join(&request))[1]
+                .column_types
+                .iter()
+                .count(),
+        "{sql}"
+    );
+}
+
+/// Exasol rejects any other width with "Expected number of columns is 1" (verified live).
+#[test]
+fn an_empty_select_list_over_a_declined_filter_emits_only_the_filter_column() {
+    let declined = compare(
+        "predicate_greater",
+        table_col("T", "C_TS"),
+        lit("literal_timestamputc", "2024-03-01 09:00:00"),
+    );
+    let request = declined_filter_table()
+        .filter(declined)
+        .empty_select_list()
+        .build()
+        .0;
+
+    assert_eq!(
+        wrapper_emission_names(&request, &first_table_column_types(&request)),
+        ["C_TS"]
+    );
+}
+
+/// The fan-out repeats a dimension column once per joined row, so only an unbounded text column
+/// of the dimension, never of the fact side, keeps the N-scan.
+#[test]
+fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .count_star()
+            .group_by(vec![table_col("CUSTOMER", "C_NAME")]),
+    );
+
+    assert_eq!(
+        aggregating_broadcast_plan(&request, 10, 100),
+        None,
+        "CUSTOMER is the dimension"
+    );
+    assert!(
+        aggregating_broadcast_plan(&request, 100, 10).is_some(),
+        "CUSTOMER is the fact side"
+    );
+}
+
+/// The width rule judges the columns the aggregation reads, never the placeholder join key.
+#[test]
+fn aggregating_broadcast_keeps_a_column_free_aggregation_over_a_text_keyed_leading_dimension() {
+    let code = [("CODE", ExasolType::varchar(100))];
+    let on_code = predicate_equal(table_col("CUSTOMER", "CODE"), table_col("ORDERS", "CODE"));
+    let request = built_join(
+        customer_orders_request_over(&code, &code, Json::Null, on_code)
+            .single_group()
+            .count_star(),
+    );
+
+    let sql = aggregating_broadcast_plan(&request, 10, 100)
+        .expect("CUSTOMER, the dimension and first leg, lends only its join key");
+
+    assert_eq!(emits_clause(&sql), r#""LHS_T0_CODE" VARCHAR(100)"#, "{sql}");
 }

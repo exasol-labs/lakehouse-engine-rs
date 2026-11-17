@@ -7,6 +7,7 @@ use arrow::datatypes::DataType;
 use iceberg::spec::{PrimitiveType, Type};
 use lakehouse_catalog::ColumnSourceType;
 use serde_json::json;
+use vs_expression::timestamp::TimestampUnit;
 
 /// Scenario: Compatible Arrow types map to their Exasol type
 #[test]
@@ -1057,13 +1058,10 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
         ("7.1.20", MillisecondOnly, "TIMESTAMP"),
     ];
     for (version, expected, expected_declaration) in cases {
-        let resolved = EngineTimestampSupport::from_database_version(version);
+        let resolved = EngineTimestampSupport::from(ExasolVersion::of(version));
         assert_eq!(resolved, expected, "version={version}");
         assert_eq!(
-            resolved
-                .clamp(TimestampPrecision::Microsecond)
-                .declaration()
-                .to_string(),
+            resolved.declaration(TimestampUnit::Microsecond).to_string(),
             expected_declaration,
             "version={version}"
         );
@@ -1073,25 +1071,19 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
 #[test]
 fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
-        let resolved = EngineTimestampSupport::from_database_version(version);
+        let resolved = EngineTimestampSupport::from(ExasolVersion::of(version));
         assert_eq!(
             resolved,
             EngineTimestampSupport::DeclaredPrecision,
             "version={version:?}"
         );
         assert_eq!(
-            resolved
-                .clamp(TimestampPrecision::Microsecond)
-                .declaration()
-                .to_string(),
+            resolved.declaration(TimestampUnit::Microsecond).to_string(),
             "TIMESTAMP(6)",
             "version={version:?}"
         );
         assert_eq!(
-            resolved
-                .clamp(TimestampPrecision::Nanosecond)
-                .declaration()
-                .to_string(),
+            resolved.declaration(TimestampUnit::Nanosecond).to_string(),
             "TIMESTAMP(9)",
             "version={version:?}"
         );
@@ -1143,29 +1135,6 @@ fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
                 .to_string(),
             "TIMESTAMP",
             "{variant:?} on an engine that emits milliseconds only"
-        );
-    }
-}
-
-#[test]
-fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
-    let cases = [
-        (0, TimeUnit::Millisecond),
-        (1, TimeUnit::Millisecond),
-        (2, TimeUnit::Millisecond),
-        (3, TimeUnit::Millisecond),
-        (4, TimeUnit::Microsecond),
-        (5, TimeUnit::Microsecond),
-        (6, TimeUnit::Microsecond),
-        (7, TimeUnit::Nanosecond),
-        (8, TimeUnit::Nanosecond),
-        (9, TimeUnit::Nanosecond),
-    ];
-    for (digits, expected_unit) in cases {
-        assert_eq!(
-            TimestampPrecision::from_declared_digits(digits).arrow_unit(),
-            expected_unit,
-            "declared precision={digits}"
         );
     }
 }

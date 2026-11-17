@@ -24,7 +24,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, LogicalField, ProjectionItem,
-    ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    ScanSpec, ScanStorage, ScanTuning, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -139,7 +139,10 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)
@@ -174,7 +177,10 @@ fn scan_spec_with_logical_schema(
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
         ..Default::default()
     }
@@ -774,7 +780,7 @@ fn scan_delete_reads_bounded_by_connection_budget() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);
     let rows = block_on(async {
@@ -817,7 +823,7 @@ fn scan_delete_reads_serial_when_budget_is_one() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.common.s3_max_connections = 1;
+    spec.common.tuning.s3_max_connections = 1;
 
     let (store, peak) = tracking_store_with_probe(needles, 1);
     let rows = block_on(async {
@@ -931,7 +937,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
         ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
     ];
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
         files: vec![dim_entry],
         condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
@@ -1397,7 +1403,7 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     }
 
     let mut spec = scan_spec_with_logical_schema(entries, None, None);
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
 
     let (store, peak) = tracking_store_with_probe(needles.clone(), BUDGET);
 
@@ -1618,7 +1624,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
     ];
     spec.common.logical_schema = logical_fields(&[("o_key", "int64"), ("o_data", "utf8")]);
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
         files: dim_entries,
         logical_schema: logical_fields(&[("c_key", "int64"), ("c_data", "utf8")]),

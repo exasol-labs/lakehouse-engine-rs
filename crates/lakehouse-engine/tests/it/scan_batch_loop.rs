@@ -19,12 +19,12 @@ use exasol_udf_sdk::test_support::{NextPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, StorageBackend,
-    StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, ScanTuning,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    ResolvedScanStorage, build_scan_runtime, read_scan_spec, run_raw_scan_with_session,
-    run_scan_one, session_config_for_spec,
+    CountArithmetic, ResolvedScanStorage, build_scan_runtime, read_scan_spec,
+    run_raw_scan_with_session, run_scan_one, session_config_for_spec,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -79,7 +79,10 @@ fn spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -161,7 +164,10 @@ fn nested_spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -181,7 +187,10 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -198,6 +207,7 @@ fn local_session(
     spec: &ScanSpec,
     _storage: &ResolvedScanStorage,
     _memory_limit_bytes: u64,
+    _count_arithmetic: CountArithmetic,
 ) -> Result<SessionContext, UdfError> {
     Ok(SessionContext::new_with_config(session_config_for_spec(
         spec,
@@ -272,7 +282,7 @@ fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<R
         emits,
     );
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
-    let rt = counting_build_runtime(reconstituted.common.df_threads_per_udf, built);
+    let rt = counting_build_runtime(reconstituted.common.tuning.df_threads_per_udf, built);
     let storage = scan_fixture::resolved_storage(&reconstituted);
     let result = rt.block_on(run_scan_one(
         &mut ctx,
@@ -367,8 +377,13 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
             )),
             &id_name_emits(),
         );
-        let session =
-            local_session(&spec, &scan_fixture::resolved_storage(&spec), 0).expect("session");
+        let session = local_session(
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+            0,
+            CountArithmetic::default(),
+        )
+        .expect("session");
         let mut timers = PhaseTimers::start();
         run_raw_scan_with_session(
             &mut ctx,

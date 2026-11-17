@@ -1,7 +1,8 @@
+use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, ScanTuning, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::exasol_type_to_json;
 
@@ -87,11 +88,11 @@ fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
 #[test]
 fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
     let spec_template = delete_spec_template();
-    let shards = vec![vec![FileEntry::with_deletes(
+    let shards = unqualified_shards(vec![vec![FileEntry::with_deletes(
         "data/part-0.parquet",
         1000,
         vec![pos_delete("data/deletes/del-0.parquet", 50)],
-    )]];
+    )]]);
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
@@ -101,8 +102,6 @@ fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
         ),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         sql.contains("del-0.parquet"),
@@ -127,7 +126,8 @@ fn fan_out_primitive_wraps_distributor_in_ungrouped_scalar_scan() {
         vec![FileEntry::new("data/part-1.parquet", 2000)],
     ];
     let emits = r#""ID" DECIMAL(20,0)"#;
-    let sql = build_fan_out_inner(&spec, &shards, emits, "SCAN", "DISTRIBUTE");
+    let fan_out = FanOut::aggregate(spec.common.clone(), &[emits.to_string()]);
+    let sql = build_fan_out_inner(&fan_out, &scan_distribute_shards(shards.clone()));
 
     assert!(
         sql.contains("DISTRIBUTE(files) FROM (VALUES"),
@@ -164,7 +164,8 @@ fn single_shard_short_circuits_distributor_fromless() {
     let spec = delete_spec_template();
     let shards = vec![vec![FileEntry::new("data/part-0.parquet", 1000)]];
     let emits = r#""ID" DECIMAL(20,0)"#;
-    let sql = build_fan_out_inner(&spec, &shards, emits, "SCAN", "DISTRIBUTE");
+    let fan_out = FanOut::aggregate(spec.common.clone(), &[emits.to_string()]);
+    let sql = build_fan_out_inner(&fan_out, &scan_distribute_shards(shards.clone()));
 
     assert!(
         sql.starts_with("SELECT SCAN("),
@@ -494,38 +495,6 @@ fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
 }
 
 #[test]
-fn project_columns_fallback_is_duplicate_free() {
-    let (names, types, _widened) = projected(
-        pushdown_request(
-            "EVENTS",
-            &[
-                ("id", ExasolType::decimal(20, 0)),
-                ("name", ExasolType::WIDEST_VARCHAR),
-            ],
-        )
-        .item(like(col("id"), "1%"), ExasolType::Boolean)
-        .item(count_star(), ExasolType::decimal(20, 0)),
-    );
-
-    let unique: std::collections::HashSet<_> = names.iter().map(|p| p.emit_name()).collect();
-    assert_eq!(
-        unique.len(),
-        names.len(),
-        "projection must be duplicate-free, got: {names:?}"
-    );
-    assert_eq!(
-        names,
-        vec!["ID", "NAME"],
-        "fallback must project the full base-table column set"
-    );
-    assert_eq!(
-        names.len(),
-        types.len(),
-        "names and types must stay aligned"
-    );
-}
-
-#[test]
 fn aggregate_query_builds_partial_agg_spec() {
     let agg_plans = vec![column_plan(AggKind::Sum, "AMOUNT"), count_plan()];
     let merge_inputs = AggregateMergeInputs::new(
@@ -547,15 +516,13 @@ fn aggregate_query_builds_partial_agg_spec() {
     }
     .with_files(vec![]);
 
-    let shards = vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]]);
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&["AMOUNT".into()], &[ExasolType::DoublePrecision]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
 
     let spec_json = {
@@ -664,14 +631,17 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
         storage: ScanStorage::Inline(sample_storage()),
-        s3_max_connections: distinctive_s3_max_connections,
+        tuning: ScanTuning {
+            s3_max_connections: distinctive_s3_max_connections,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![]);
 
     let common = spec_template.to_common();
     assert_eq!(
-        common.s3_max_connections, distinctive_s3_max_connections,
+        common.tuning.s3_max_connections, distinctive_s3_max_connections,
         "s3_max_connections must carry from ScanSpec into CommonScanSpec"
     );
 
@@ -679,15 +649,16 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
         .into_iter()
         .map(|p: String| FileEntry::new(p, 1))
         .collect();
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, 3);
+    let shards = unqualified_shards(crate::adapter::sharding::partition_files_by_bytes(
+        files_with_sizes,
+        3,
+    ));
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
 
     let needle = format!("\"s3_max_connections\":{distinctive_s3_max_connections}");
@@ -724,12 +695,10 @@ fn build_agg_sql(
         .expect("a bare-aggregate merge SELECT is never empty");
     build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards),
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     )
 }
 
@@ -747,7 +716,7 @@ fn aggregate_merge_renders_having_then_request_limit() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]);
     let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, Some(0))
         .expect("a bare-aggregate merge SELECT is never empty")
         .with_having(Some("(1 > 0)".to_string()));
@@ -757,8 +726,6 @@ fn aggregate_merge_renders_having_then_request_limit() {
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(sql.ends_with(") HAVING (1 > 0) LIMIT 0"), "{sql}");
 }
@@ -887,7 +854,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+    let shards = unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]);
     let merge_select = vec![r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4))"#.to_string()];
     let merge_inputs = AggregateMergeInputs::new(
         vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()],
@@ -901,8 +868,6 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
         &projected_columns(&[], &[]),
         None,
         Some(&merge_inputs),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4)) FROM ("#),
@@ -1003,15 +968,18 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
         vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
         vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
     ];
+    let shards = Shards {
+        files: shards,
+        udfs: super::super::ScanUdfs::in_schema(Some("VS_SCHEMA")),
+    };
     let sql = build_count_distinct_scan_sql(
         &base_spec,
         &shards,
         &items,
-        &column_types(&col_types),
+        &emitting(&column_types(&col_types)),
         None,
-        r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
-        r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
-    );
+    )
+    .expect("the distinct column is readable");
 
     assert!(
         sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
@@ -1029,8 +997,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
     assert!(
         sql.contains(r#""VS_SCHEMA".LAKEHOUSE_SCAN"#)
             && sql.contains(r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#),
-        "both the scan and distributor UDFs must be schema-qualified from the \
-         names passed in: {sql}"
+        "both the scan and distributor UDFs must be schema-qualified: {sql}"
     );
     assert!(
         !sql.to_uppercase().contains("LISTAGG") && !sql.contains("DISTINCT_MERGE"),
@@ -1041,9 +1008,6 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
 
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
-    use super::super::joins::{
-        FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
-    };
     use super::super::single_group_agg::{has_distinct, is_lone_count_distinct};
 
     let cdist = |col: &str| agg_item_expr("COUNT", table_col("T", col), true);
@@ -1072,17 +1036,14 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
 
     // Mirrors the `mod.rs` Case 2/3 guard.
 
-    let referenced = referenced_columns(pushdown.json(), &column_types(&all_cols));
-
-    let fan_out = FanOutProjection::new(count_distinct_base_spec().common, &referenced);
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown,
-        &fan_out,
-        &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        count_distinct_base_spec().common,
+        &emitting(&column_types(&all_cols)),
+        &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         None,
+        &test_context(),
     )
     .expect("Case 2/3 qualified wrapper must build");
 
@@ -1115,11 +1076,6 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         "the removed per-shard JSON-array LISTAGG merge-UDF shape must never \
          appear: {sql}"
     );
-    assert!(
-        !sql.contains("IRRELEVANT_COL"),
-        "issue #160: the narrowed inner scan must project only referenced columns \
-         (CATEGORY, REGION), never the full base-table schema: {sql}"
-    );
 }
 
 #[test]
@@ -1136,10 +1092,10 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         ("A".to_string(), ExasolType::decimal(20, 0)),
         ("B".to_string(), ExasolType::decimal(20, 0)),
     ];
-    let shards = vec![
+    let shards = unqualified_shards(vec![
         vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
         vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
-    ];
+    ]);
 
     let assert_only_outer_limit_no_order_by = |sql: &str, case: &str| {
         assert!(
@@ -1172,11 +1128,10 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         &poisoned_base_spec,
         &shards,
         &case1_items,
-        &column_types(&col_types),
+        &emitting(&column_types(&col_types)),
         Some(1),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    );
+    )
+    .expect("the distinct column is readable");
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
 }
 
@@ -1371,12 +1326,10 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards.to_vec()),
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         !sql.contains("IPROC()"),
@@ -1405,12 +1358,10 @@ fn single_shard_collapses_to_single_invocation() {
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
-        &shards,
+        &unqualified_shards(shards.to_vec()),
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
         None,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
         !sql.contains("IPROC()"),
@@ -1442,7 +1393,7 @@ fn id_name_request() -> PushdownRequestBuilder {
 }
 
 /// [`project_first_table`] over the built `request`.
-fn projected(request: PushdownRequestBuilder) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
+fn projected(request: PushdownRequestBuilder) -> RowProjection {
     let (request, _) = request.build();
     project_first_table(&request, &pd(&request)).unwrap()
 }
@@ -1450,8 +1401,8 @@ fn projected(request: PushdownRequestBuilder) -> (Vec<ProjectionItem>, Vec<Exaso
 #[test]
 fn selectlist_scalar_expression_rendered_in_emits() {
     let upper_expr = scalar_fn("UPPER", [col("NAME")]);
-    let (proj_cols, proj_types, _widened) =
-        projected(id_name_request().item(upper_expr, ExasolType::WIDEST_VARCHAR));
+    let projection = projected(id_name_request().item(upper_expr, ExasolType::WIDEST_VARCHAR));
+    let (proj_cols, proj_types) = direct_columns(&projection);
     // An `Expr`, not a `Column`, so the scan splices it instead of quoting a phantom identifier.
     assert_eq!(proj_cols.len(), 1);
     assert!(
@@ -1469,8 +1420,8 @@ fn selectlist_scalar_expression_rendered_in_emits() {
 #[test]
 fn selectlist_cast_node_rendered_in_emits() {
     let cast_expr = cast_to(ExasolType::varchar(100), col("ID"));
-    let (proj_cols, _proj_types, _widened) =
-        projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
+    let projection = projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
+    let (proj_cols, _proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1491,7 +1442,7 @@ fn selectlist_cast_node_rendered_in_emits() {
 #[test]
 fn selectlist_extract_node_rendered_in_emits() {
     let extract_expr = extract("YEAR", col("EVENT_DATE"));
-    let (proj_cols, _proj_types, _widened) = projected(
+    let projection = projected(
         pushdown_request(
             "T",
             &[
@@ -1501,6 +1452,7 @@ fn selectlist_extract_node_rendered_in_emits() {
         )
         .item(extract_expr, ExasolType::WIDEST_VARCHAR),
     );
+    let (proj_cols, _proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1524,7 +1476,7 @@ fn selectlist_case_node_rendered_in_emits() {
         [compare("predicate_less", col("SCORE"), num_lit("50"))],
         [str_lit("low"), str_lit("high")],
     );
-    let (proj_cols, _proj_types, _widened) = projected(
+    let projection = projected(
         pushdown_request(
             "T",
             &[
@@ -1534,6 +1486,7 @@ fn selectlist_case_node_rendered_in_emits() {
         )
         .item(case_expr, ExasolType::WIDEST_VARCHAR),
     );
+    let (proj_cols, _proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1552,34 +1505,28 @@ fn selectlist_case_node_rendered_in_emits() {
 }
 
 #[test]
-fn selectlist_untranslatable_cast_falls_back_to_full_row() {
+fn selectlist_untranslatable_cast_routes_to_the_wrapper() {
     let cast_expr = cast_to(
         ExasolType::TimestampWithLocalTimeZone { precision: 3 },
         col("ID"),
     );
-    let (proj_cols, proj_types, _widened) =
-        projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
-    assert_eq!(
-        proj_cols,
-        vec![
-            ProjectionItem::Column("ID".into()),
-            ProjectionItem::Column("NAME".into()),
-        ],
-        "an untranslatable CAST target must fall back to the full base row: {proj_cols:?}"
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
+    let projection = projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
+    let (proj_cols, _) = direct_columns(&projection);
+    let wrapped = projection == RowProjection::Wrapped;
+    assert!(
+        wrapped,
+        "an untranslatable CAST target must route to the wrapper: {proj_cols:?}"
     );
 }
 
 #[test]
 fn selectlist_literal_rendered_as_positional_expr() {
     let literal = num_lit(1);
-    let (proj_cols, proj_types, _widened) = projected(
+    let projection = projected(
         pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
             .item(literal, ExasolType::decimal(18, 0)),
     );
+    let (proj_cols, proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1597,12 +1544,13 @@ fn selectlist_literal_rendered_as_positional_expr() {
 fn selectlist_duplicate_literals_keep_distinct_positions() {
     let literal = num_lit(1);
     let column = col("NAME");
-    let (proj_cols, _proj_types, _widened) = projected(
+    let projection = projected(
         id_name_request()
             .item(literal.clone(), ExasolType::decimal(18, 0))
             .column(column)
             .item(literal, ExasolType::decimal(18, 0)),
     );
+    let (proj_cols, _proj_types) = direct_columns(&projection);
 
     assert_eq!(
         proj_cols.len(),
@@ -1636,8 +1584,8 @@ fn selectlist_duplicate_literals_keep_distinct_positions() {
 #[test]
 fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
     let literal = str_lit("x");
-    let (proj_cols, _proj_types, _widened) =
-        projected(id_name_request().item(literal, ExasolType::varchar(100)));
+    let projection = projected(id_name_request().item(literal, ExasolType::varchar(100)));
+    let (proj_cols, _proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1648,10 +1596,11 @@ fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
     let literal = timestamp_lit("2024-03-01 10:00:00");
-    let (proj_cols, proj_types, _widened) = projected(
+    let projection = projected(
         pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
             .item(literal, ExasolType::BARE_TIMESTAMP),
     );
+    let (proj_cols, proj_types) = direct_columns(&projection);
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1665,9 +1614,9 @@ fn selectlist_plain_timestamp_literal_rendered_as_expr() {
 }
 
 #[test]
-fn project_columns_widens_for_a_cast_to_char_item() {
+fn project_columns_wraps_for_a_cast_to_char_item() {
     let cast_item = cast_to(ExasolType::char(20), col("c_varchar"));
-    let (_, _, widened) = projected(
+    let projection = projected(
         pushdown_request(
             "T",
             &[
@@ -1678,42 +1627,32 @@ fn project_columns_widens_for_a_cast_to_char_item() {
         .column(col("id"))
         .item(cast_item, ExasolType::char(20)),
     );
+    let wrapped = projection == RowProjection::Wrapped;
 
     assert!(
-        widened,
+        wrapped,
         "the scan does not blank-pad, so a CAST to CHAR runs in Exasol"
     );
 }
 
 #[test]
-fn selectlist_untranslatable_item_falls_back_to_column() {
+fn selectlist_aggregate_item_routes_to_the_wrapper() {
     let bad_expr = agg_item("SUM", Some("AMOUNT"), false);
-    let (proj_cols, proj_types, _widened) = projected(
+    let projection = projected(
         pushdown_request("T", &[("AMOUNT", ExasolType::decimal(18, 2))])
             .item(bad_expr, ExasolType::WIDEST_VARCHAR),
     );
-    assert_eq!(proj_cols.len(), 1);
-    assert_eq!(proj_cols[0], "AMOUNT");
-    assert_eq!(proj_types[0], ExasolType::decimal(18, 2));
+    let (proj_cols, _) = direct_columns(&projection);
+    let wrapped = projection == RowProjection::Wrapped;
+    assert!(
+        wrapped,
+        "an aggregate is never projected per shard: {proj_cols:?}"
+    );
 }
 
 /// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
-    use crate::adapter::iceberg_predicate::to_iceberg_predicate;
-    use iceberg::spec::{NestedField, Schema, Type};
-    use std::sync::Arc;
-
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![Arc::new(NestedField::required(
-            1,
-            "id",
-            Type::Primitive(iceberg::spec::PrimitiveType::Int),
-        ))])
-        .build()
-        .unwrap();
-
     let filter_json = predicate_equal(col("id"), num_lit(42));
 
     let df_filter = scan_filter_sql(
@@ -1723,13 +1662,6 @@ fn filter_in_common_arg() {
     assert!(
         df_filter.is_some(),
         "translatable filter must produce a DataFusion SQL string"
-    );
-
-    let iceberg_pred =
-        to_iceberg_predicate(&filter_json, &declared_logical_schema(&schema), &schema);
-    assert!(
-        iceberg_pred.is_some(),
-        "translatable filter must produce an Iceberg predicate"
     );
 
     let sql = build_sql_for_fixture(
@@ -1790,87 +1722,6 @@ fn declined_like_on_date_column_routes_to_wrapper_where() {
     );
 }
 
-#[test]
-fn expr_tree_applies_f_to_children_before_their_parent() {
-    let tree = serde_json::json!({
-        "type": "outer",
-        "expression": {"type": "inner"},
-    });
-
-    let out = rewrite_expr_tree(&tree, &|node| {
-        let mut out = node.clone();
-        if node.get("type").and_then(|t| t.as_str()) == Some("inner") {
-            out["type"] = Json::from("inner_rewritten");
-        } else {
-            out["child_type_seen"] = node["expression"]["type"].clone();
-        }
-        out
-    });
-
-    assert_eq!(
-        out["child_type_seen"],
-        Json::from("inner_rewritten"),
-        "the parent must see its already-rewritten child: {out}"
-    );
-}
-
-#[test]
-fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
-    let tree = serde_json::json!({
-        "type": "root",
-        "dataType": {"type": "VARCHAR"},
-        "arguments": {"type": "not_an_array"},
-        "pattern": "not_an_object",
-        "expression": {"type": "curated_single"},
-        "results": [{"type": "curated_array"}],
-    });
-
-    let out = rewrite_expr_tree(&tree, &|node| {
-        let mut out = node.clone();
-        out["visited"] = Json::Bool(true);
-        out
-    });
-
-    assert_eq!(
-        out["expression"]["visited"],
-        Json::Bool(true),
-        "curated field `expression` must be descended into: {out}"
-    );
-    assert_eq!(
-        out["results"][0]["visited"],
-        Json::Bool(true),
-        "curated field `results` must be descended into: {out}"
-    );
-    for skipped in ["dataType", "arguments"] {
-        assert_eq!(
-            out[skipped]["visited"],
-            Json::Null,
-            "`{skipped}` must not be descended into: {out}"
-        );
-    }
-    assert_eq!(
-        out["pattern"],
-        Json::from("not_an_object"),
-        "a non-object single-child field must be left untouched: {out}"
-    );
-}
-
-#[test]
-fn expr_tree_applies_f_to_a_non_object_node() {
-    for leaf in [
-        Json::Null,
-        serde_json::json!("UPPER"),
-        serde_json::json!(7),
-        serde_json::json!([1, 2]),
-    ] {
-        assert_eq!(
-            rewrite_expr_tree(&leaf, &|_| Json::from("touched")),
-            Json::from("touched"),
-            "a non-object node must be handed to `f`: {leaf}"
-        );
-    }
-}
-
 fn mixed_col_types() -> Vec<(String, ExasolType)> {
     vec![
         ("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2)),
@@ -1891,8 +1742,9 @@ fn a_text_to_text_cast_renders_unchanged() {
             ExasolType::varchar(20),
         )
         .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&mixed_col_types())).expect("must project");
+    let projection =
+        project_row(&pushdown_req, &column_types(&mixed_col_types())).expect("must project");
+    let (items, _types) = direct_columns(&projection);
 
     assert_eq!(
         items.len(),
@@ -1909,7 +1761,7 @@ fn a_text_to_text_cast_renders_unchanged() {
 }
 
 #[test]
-fn selectlist_items_the_scan_declines_widen_to_the_full_base_row() {
+fn selectlist_items_the_scan_declines_route_to_the_wrapper() {
     let col_types = mixed_col_types();
     let text = ExasolType::WIDEST_VARCHAR;
     let cases = [
@@ -1970,21 +1822,15 @@ fn selectlist_items_the_scan_declines_widen_to_the_full_base_row() {
             ExasolType::Boolean,
         ),
     ];
-    let expected_names: Vec<ProjectionItem> = col_types
-        .iter()
-        .map(|(n, _)| ProjectionItem::from(n.clone()))
-        .collect();
-    let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
     for (label, item, declared) in cases {
         let pushdown_req = pushdown_request("T", &col_types)
             .item(item, declared)
             .build_pushdown();
-        let (items, types, widened) =
-            project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
+        let projection =
+            project_row(&pushdown_req, &column_types(&col_types)).expect("must project");
+        let wrapped = projection == RowProjection::Wrapped;
 
-        assert!(widened, "{label}");
-        assert_eq!(items, expected_names, "{label}");
-        assert_eq!(types, expected_types, "{label}");
+        assert!(wrapped, "{label}");
     }
 }
 
@@ -2023,9 +1869,9 @@ fn selectlist_predicate_node_projects_as_expr() {
         let pushdown_req = pushdown_request("T", &mixed_col_types())
             .item(item, ExasolType::Boolean)
             .build_pushdown();
-        let (items, types, _widened) =
-            project_split(&pushdown_req, &column_types(&mixed_col_types()))
-                .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
+        let projection = project_row(&pushdown_req, &column_types(&mixed_col_types()))
+            .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
+        let (items, types) = direct_columns(&projection);
 
         assert_eq!(
             items.len(),
@@ -2050,35 +1896,20 @@ fn selectlist_predicate_node_projects_as_expr() {
 }
 
 #[test]
-fn selectlist_function_aggregate_still_widens_to_full_row() {
+fn selectlist_function_aggregate_routes_to_the_wrapper() {
     let item = count_star();
     let col_types = mixed_col_types();
     let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(item, ExasolType::decimal(20, 0))
         .build_pushdown();
-    let (items, types, widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
+    let projection = project_row(&pushdown_req, &column_types(&col_types)).expect("must project");
+    let wrapped = projection == RowProjection::Wrapped;
 
     assert!(
-        widened,
-        "the widening must be REPORTED, not only performed: the dispatcher routes on \
+        wrapped,
+        "the wrapping must be REPORTED, not only performed: the dispatcher routes on \
          this flag alone (#196)"
     );
-    assert_eq!(
-        items.len(),
-        col_types.len(),
-        "function_aggregate must widen to the full base row, not project as an Expr: {items:?}"
-    );
-    let expected_names: Vec<ProjectionItem> = col_types
-        .iter()
-        .map(|(n, _)| ProjectionItem::from(n.clone()))
-        .collect();
-    assert_eq!(
-        items, expected_names,
-        "the full-row fallback must project every base column unchanged"
-    );
-    let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-    assert_eq!(types, expected_types);
 }
 
 #[test]
@@ -2091,10 +1922,12 @@ fn selectlist_like_over_integer_or_boolean_projects_its_text() {
         let pushdown_req = pushdown_request("T", &col_types)
             .item(like(col(subject), "1%"), ExasolType::Boolean)
             .build_pushdown();
-        let (items, types, widened) =
-            project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
+        let projection =
+            project_row(&pushdown_req, &column_types(&col_types)).expect("must project");
+        let (items, types) = direct_columns(&projection);
+        let wrapped = projection == RowProjection::Wrapped;
 
-        assert!(!widened, "{subject}");
+        assert!(!wrapped, "{subject}");
         let [ProjectionItem::Expr { expr }] = items.as_slice() else {
             panic!("{subject} must project one expression: {items:?}");
         };
@@ -2104,7 +1937,7 @@ fn selectlist_like_over_integer_or_boolean_projects_its_text() {
 }
 
 #[test]
-fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
+fn selectlist_like_inside_case_over_decimal_routes_to_the_wrapper() {
     let col_types = mixed_col_types();
     let case_expr = case_when(
         [like(col("c_decimal_a"), "1%")],
@@ -2113,28 +1946,14 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(case_expr, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
-    let (items, types, widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let projection =
+        project_row(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let wrapped = projection == RowProjection::Wrapped;
 
     assert!(
-        widened,
-        "a LIKE nested inside a CASE over a DECIMAL subject must widen the whole select list"
+        wrapped,
+        "a LIKE nested inside a CASE over a DECIMAL subject must wrap the whole select list"
     );
-    assert_eq!(
-        items.len(),
-        col_types.len(),
-        "must fall back to the full base row, not a truncated projection: {items:?}"
-    );
-    let expected_names: Vec<ProjectionItem> = col_types
-        .iter()
-        .map(|(n, _)| ProjectionItem::from(n.clone()))
-        .collect();
-    assert_eq!(
-        items, expected_names,
-        "the full-row fallback must project every base column unchanged"
-    );
-    let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-    assert_eq!(types, expected_types);
 }
 
 #[test]
@@ -2155,104 +1974,96 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     );
 }
 
-fn assert_widens_to_full_base_row(select_item: Json, declared_type: ExasolType, why: &str) {
+fn assert_routes_to_the_wrapper(select_item: Json, declared_type: ExasolType, why: &str) {
     let col_types = mixed_col_types();
     let pushdown_req = pushdown_request("T", &col_types)
         .item(select_item, declared_type)
         .build_pushdown();
 
-    let (items, types, widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let projection =
+        project_row(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let (items, _) = direct_columns(&projection);
+    let wrapped = projection == RowProjection::Wrapped;
 
-    assert!(widened, "{why}: {items:?}");
-    let expected_names: Vec<ProjectionItem> = col_types
-        .iter()
-        .map(|(n, _)| ProjectionItem::from(n.clone()))
-        .collect();
-    assert_eq!(
-        items, expected_names,
-        "the widened projection must be the full base row, not a per-item projection"
-    );
-    let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-    assert_eq!(types, expected_types, "EMITS types must be the base row's");
+    assert!(wrapped, "{why}: {items:?}");
 }
 
 #[test]
-fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
+fn project_columns_wraps_on_aggregate_nested_in_scalar_item() {
     let select_item = scalar_fn(
         "ROUND",
         [agg_item("SUM", Some("c_decimal_a"), false), num_lit(2)],
     );
     let declared_type = ExasolType::decimal(18, 2);
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "an aggregate nested under a scalar item must widen the derived projection",
+        "an aggregate nested under a scalar item must wrap the derived projection",
     );
 }
 
 #[test]
-fn project_columns_top_level_aggregate_widening_is_unchanged_by_the_subtree_probe() {
+fn project_columns_top_level_aggregate_wrapping_is_unchanged_by_the_subtree_probe() {
     let select_item = agg_item("SUM", Some("c_decimal_a"), false);
     let declared_type = ExasolType::decimal(18, 2);
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "a top-level aggregate must still widen",
+        "a top-level aggregate must still wrap",
     );
 }
 
 #[test]
-fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
+fn project_columns_wraps_on_aggregate_nested_in_function_scalar_cast_item() {
     let select_item = cast_to(ExasolType::varchar(100), agg_item("SUM", Some("id"), false));
     let declared_type = ExasolType::varchar(100);
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "an aggregate nested under a function_scalar_cast item must widen",
+        "an aggregate nested under a function_scalar_cast item must wrap",
     );
 }
 
 #[test]
-fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
+fn project_columns_wraps_on_aggregate_nested_in_function_scalar_case_item() {
     let select_item = case_when(
         [compare("predicate_less", col("ID"), num_lit(10))],
         [count_star(), num_lit(0)],
     );
     let declared_type = ExasolType::decimal(20, 0);
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "an aggregate nested in a CASE result branch must widen",
+        "an aggregate nested in a CASE result branch must wrap",
     );
 }
 
 #[test]
-fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
+fn project_columns_wraps_on_aggregate_nested_in_arithmetic_node() {
     let select_item = scalar_fn(
         "ADD",
         [agg_item("SUM", Some("c_decimal_a"), false), num_lit(1)],
     );
     let declared_type = ExasolType::decimal(18, 2);
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "an aggregate nested under an arithmetic node must widen",
+        "an aggregate nested under an arithmetic node must wrap",
     );
 }
 
 #[test]
-fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
+fn project_columns_wraps_on_aggregate_nested_in_predicate_node() {
     let select_item = compare(
         "predicate_less",
         agg_item("SUM", Some("id"), false),
         num_lit(10),
     );
     let declared_type = ExasolType::Boolean;
-    assert_widens_to_full_base_row(
+    assert_routes_to_the_wrapper(
         select_item,
         declared_type,
-        "an aggregate nested under a predicate node must widen",
+        "an aggregate nested under a predicate node must wrap",
     );
 }
 
@@ -2266,12 +2077,14 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
         )
         .build_pushdown();
 
-    let (items, _types, widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let projection =
+        project_row(&pushdown_req, &column_types(&col_types)).expect("must project (Ok)");
+    let (items, _types) = direct_columns(&projection);
+    let wrapped = projection == RowProjection::Wrapped;
 
     assert!(
-        !widened,
-        "a scalar item with no nested aggregate must not widen: {items:?}"
+        !wrapped,
+        "a scalar item with no nested aggregate must not wrap: {items:?}"
     );
     assert_eq!(
         items.len(),
@@ -2405,27 +2218,6 @@ fn shared_name_universe() -> ColumnTypes {
 }
 
 #[test]
-fn only_a_plain_timestamp_declares_timestamp_digits() {
-    for exa_type in EXASOL_TYPE_SPELLINGS {
-        let expected = match exa_type {
-            ExasolType::Timestamp { precision } => Some(precision),
-            ExasolType::Boolean
-            | ExasolType::Decimal(_)
-            | ExasolType::DoublePrecision
-            | ExasolType::Date
-            | ExasolType::TimestampWithLocalTimeZone { .. }
-            | ExasolType::IntervalYearToMonth { .. }
-            | ExasolType::IntervalDayToSecond { .. }
-            | ExasolType::Geometry { .. }
-            | ExasolType::Hashtype { .. }
-            | ExasolType::Char { .. }
-            | ExasolType::Varchar { .. } => None,
-        };
-        assert_eq!(exa_type.fractional_digits(), expected, "{exa_type}");
-    }
-}
-
-#[test]
 fn output_select_list_casts_an_untyped_item_to_every_declared_type() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
         assert_eq!(
@@ -2494,7 +2286,7 @@ fn the_column_type_map_takes_each_binary_layout_from_the_declared_field() {
     ];
 
     assert_eq!(
-        layouts_of(&ColumnTypes::of(&involved, &declared, false)),
+        layouts_of(&ColumnTypes::of(&involved, &declared, &[], false)),
         vec![
             ("B", hex, Some(BinaryLayout::Variable)),
             ("U", fixed_hex, Some(BinaryLayout::Fixed(2))),
@@ -2504,7 +2296,7 @@ fn the_column_type_map_takes_each_binary_layout_from_the_declared_field() {
         "the request's types in declaration order; a column no field declares binary reads as text"
     );
     assert_eq!(
-        layouts_of(&ColumnTypes::of(&involved, &declared, true)),
+        layouts_of(&ColumnTypes::of(&involved, &declared, &[], true)),
         vec![
             ("B", hex, None),
             ("U", fixed_hex, Some(BinaryLayout::Fixed(2))),
@@ -2526,32 +2318,18 @@ fn the_column_type_map_takes_the_first_declared_field_of_a_case_folded_name() {
     let text_first = [nullable_field("B", "utf8"), nullable_field("b", "binary")];
 
     assert_eq!(
-        layouts_of(&ColumnTypes::of(&involved, &binary_first, false)),
+        layouts_of(&ColumnTypes::of(&involved, &binary_first, &[], false)),
         vec![("B", hex, Some(BinaryLayout::Variable))]
     );
     assert_eq!(
-        layouts_of(&ColumnTypes::of(&involved, &text_first, false)),
+        layouts_of(&ColumnTypes::of(&involved, &text_first, &[], false)),
         vec![("B", hex, None)]
     );
 }
 
-#[test]
-fn a_concatenation_lists_each_map_in_turn() {
-    let left = column_types(&[("A", ExasolType::Boolean), ("B", ExasolType::Date)]);
-    let right = column_types(&[("C", ExasolType::DoublePrecision)]);
-
-    assert_eq!(
-        layouts_of(&ColumnTypes::concat([&left, &right])),
-        vec![
-            ("A", ExasolType::Boolean, None),
-            ("B", ExasolType::Date, None),
-            ("C", ExasolType::DoublePrecision, None),
-        ]
-    );
-}
-
-/// The types a request's select list parses to, or a phrase its refusal names.
-type ParseOutcome = Result<Vec<ExasolType>, String>;
+/// The output contract and the types a request's select list parses to, or a phrase its refusal
+/// names.
+type ParseOutcome = Result<(OutputContract, Vec<ExasolType>), String>;
 
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
@@ -2563,7 +2341,7 @@ fn select_list_data_types_check_answers_per_request_shape() {
     let full_row = vec![ExasolType::decimal(20, 0), ExasolType::varchar(10)];
     let one_item = || pushdown_request("T", &columns).column(col("ID"));
     let invalid_entry = serde_json::json!({"type": "decimal", "precision": 37, "scale": 0});
-    let cases: [(&str, PushdownRequestBuilder, ParseOutcome); 7] = [
+    let cases: [(&str, PushdownRequestBuilder, ParseOutcome); 10] = [
         (
             "an absent list",
             one_item().select_list_data_types(None),
@@ -2588,30 +2366,132 @@ fn select_list_data_types_check_answers_per_request_shape() {
             Err("0 selectListDataTypes entries for 1 selectList items".into()),
         ),
         (
+            "a selectList with items",
+            one_item(),
+            Ok((OutputContract::Items, vec![ExasolType::decimal(20, 0)])),
+        ),
+        (
             "an absent selectList",
             pushdown_request("T", &columns),
-            Ok(full_row.clone()),
+            Ok((OutputContract::WholeRow, full_row.clone())),
         ),
         (
             "a JSON-null selectList",
             pushdown_request("T", &columns).field("selectList", Json::Null),
-            Ok(full_row),
+            Ok((OutputContract::WholeRow, full_row)),
         ),
         (
             "an empty selectList",
             pushdown_request("T", &columns).empty_select_list(),
-            Ok(Vec::new()),
+            Ok((OutputContract::AnyOneColumn, Vec::new())),
+        ),
+        (
+            "a selectList that is no array",
+            pushdown_request("T", &columns).field("selectList", "*"),
+            Err("neither an array nor absent".into()),
+        ),
+        (
+            "an empty selectList beside an aggregationType",
+            pushdown_request("T", &columns)
+                .empty_select_list()
+                .single_group(),
+            Err("aggregates under an empty selectList".into()),
         ),
     ];
     for (shape, request, expected) in cases {
-        let parsed = PushdownRequest::parse(pd(&request.build().0))
-            .map(|parsed| parsed.select_types().to_vec());
+        let parsed = PushdownRequest::parse(pd(&request.build_unchecked().0))
+            .map(|parsed| (parsed.output(), parsed.select_types().to_vec()));
         match (parsed, expected) {
-            (Ok(types), Ok(expected)) => assert_eq!(types, expected, "{shape}"),
+            (Ok(parsed), Ok(expected)) => assert_eq!(parsed, expected, "{shape}"),
             (Err(UdfError::User(message)), Err(named)) => {
                 assert!(message.contains(&named), "{shape}: {message}");
             }
             (outcome, expected) => panic!("{shape}: got {outcome:?}, expected {expected:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_whole_row_of_another_width_than_exasol_declares_is_an_adapter_error() {
+    let columns = [
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::varchar(10)),
+    ];
+    let pushdown = pushdown_request("T", &columns).build_pushdown();
+
+    assert_eq!(pushdown.whole_row(vec!["ID", "NAME"]).unwrap().len(), 2);
+    let message = user_message(pushdown.whole_row(vec!["ID"]).unwrap_err());
+    assert!(message.contains("internal adapter error"), "{message}");
+}
+
+/// A `project_columns` case: the request, the emitted columns, and the projected column names
+/// or a phrase of the error.
+type RowProjectionCase<'a> = (
+    &'a str,
+    PushdownRequestBuilder,
+    &'a [&'a str],
+    Result<&'a [&'a str], &'a str>,
+);
+
+#[test]
+fn a_row_projection_draws_its_columns_from_the_emission() {
+    let columns = [
+        ("SHAPE", ExasolType::WIDEST_VARCHAR),
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::varchar(10)),
+    ];
+    let table = || pushdown_request("T", &columns);
+    let cases: [RowProjectionCase; 5] = [
+        (
+            "SELECT * projects the whole emission",
+            table(),
+            &["SHAPE", "ID", "NAME"],
+            Ok(&["SHAPE", "ID", "NAME"]),
+        ),
+        (
+            "SELECT * over a narrower emission is an adapter error",
+            table(),
+            &["ID", "NAME"],
+            Err("internal adapter error"),
+        ),
+        (
+            "an empty select list projects the first emitted column, never the row",
+            table().empty_select_list(),
+            &["ID", "NAME"],
+            Ok(&["ID"]),
+        ),
+        (
+            "an item projects its emitted column",
+            table().column(col("NAME")),
+            &["ID", "NAME"],
+            Ok(&["NAME"]),
+        ),
+        (
+            "an item the fan-out does not emit is an adapter error",
+            table().column(col("SHAPE")),
+            &["ID", "NAME"],
+            Err("internal adapter error"),
+        ),
+    ];
+    for (case, request, emitted, expected) in cases {
+        let all_cols = column_types(&columns);
+        let pushdown = request.build_pushdown();
+        let projection = project_columns(
+            &pushdown,
+            scan_for(&all_cols, pushdown.json()),
+            &emitting_named(&all_cols, emitted),
+        );
+        match (projection, expected) {
+            (Ok(RowProjection::Direct(projection)), Ok(expected)) => {
+                let expected: Vec<ProjectionItem> =
+                    expected.iter().map(|name| (*name).into()).collect();
+                assert_eq!(split_projection(&projection).0, expected, "{case}");
+            }
+            (Err(error), Err(fragment)) => {
+                let message = user_message(error);
+                assert!(message.contains(fragment), "{case}: {message}");
+            }
+            (actual, expected) => panic!("{case}: got {actual:?}, expected {expected:?}"),
         }
     }
 }
@@ -2644,140 +2524,26 @@ fn involved_column_with_an_unparsable_type_fails() {
 }
 
 #[test]
-fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
-    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let lit = timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = timestamp_lit("2025-06-01 00:00:00.123");
-    for (op, mirrored, want_op, want_right) in [
-        ("predicate_equal", false, "predicate_notequal", col("ts")),
-        ("predicate_notequal", false, "predicate_equal", col("ts")),
-        (
-            "predicate_less",
-            false,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-        (
-            "predicate_lessequal",
-            false,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-        (
-            "predicate_greater",
-            false,
-            "predicate_greater",
-            floor.clone(),
-        ),
-        (
-            "predicate_greaterequal",
-            false,
-            "predicate_greater",
-            floor.clone(),
-        ),
-        ("predicate_less", true, "predicate_greater", floor.clone()),
-        (
-            "predicate_greaterequal",
-            true,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-    ] {
-        let filter = if mirrored {
-            compare(op, lit.clone(), col("ts"))
-        } else {
-            compare(op, col("ts"), lit.clone())
-        };
-        assert_eq!(
-            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
-            compare(want_op, col("ts"), want_right),
-            "{op} mirrored={mirrored}"
-        );
-    }
-}
-
-#[test]
-fn timestamp_literal_within_the_column_precision_is_unchanged() {
-    for (declared, value) in [
-        (ExasolType::BARE_TIMESTAMP, "2025-06-01 00:00:00.123000"),
-        (ExasolType::timestamp(6), "2025-06-01 00:00:00.123456"),
-        (ExasolType::timestamp(9), "2025-06-01 00:00:00.123456789"),
-        (ExasolType::timestamp(3), "2025-06-01 00:00:00"),
-    ] {
-        let col_types = vec![("TS".to_string(), declared)];
-        let filter = predicate_equal(col("ts"), timestamp_lit(value));
-        assert_eq!(
-            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
-            filter.clone(),
-            "{declared} = {value}"
-        );
-    }
-}
-
-#[test]
-fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
-    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let fits = || timestamp_lit("2025-06-01 00:00:00.122");
-    let over = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
-
-    let bounded = between(col("ts"), fits(), over());
-    assert_eq!(
-        rewrite_overprecise_timestamp_comparisons(&bounded, &column_types(&col_types)),
-        and([
-            compare("predicate_greaterequal", col("ts"), fits()),
-            compare("predicate_lessequal", col("ts"), floor())
-        ])
-    );
-
-    let listed = in_list(col("ts"), [over(), fits()]);
-    assert_eq!(
-        rewrite_overprecise_timestamp_comparisons(&listed, &column_types(&col_types)),
-        or([
-            compare("predicate_notequal", col("ts"), col("ts")),
-            predicate_equal(col("ts"), fits())
-        ])
-    );
-
-    let fitting_in = in_list(col("ts"), [fits()]);
-    assert_eq!(
-        rewrite_overprecise_timestamp_comparisons(&fitting_in, &column_types(&col_types)),
-        fitting_in.clone()
-    );
-}
-
-#[test]
-fn selectlist_tstz_literal_widens_via_emits_type_gate() {
+fn selectlist_tstz_literal_wraps_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
         typed_scan(NO_COLUMNS).expression(&literal).is_some(),
         "literal_timestamp_utc must render through the scan translator"
     );
-    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+    let projection = projected(id_name_request().item(
         literal,
         ExasolType::TimestampWithLocalTimeZone { precision: 3 },
     ));
+    let wrapped = projection == RowProjection::Wrapped;
     assert!(
-        widened,
-        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
+        wrapped,
+        "a TIMESTAMP WITH LOCAL TIME ZONE literal must wrap the projection \
          so the RowScan dispatcher routes it to the qualified wrapper"
-    );
-    assert_eq!(
-        proj_cols,
-        vec![
-            ProjectionItem::Column("ID".into()),
-            ProjectionItem::Column("NAME".into()),
-        ],
-        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen to the full base row: {proj_cols:?}"
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
     );
 }
 
 #[test]
-fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
+fn selectlist_real_wire_name_tstz_literal_wraps_and_routes() {
     let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
         typed_scan(NO_COLUMNS).expression(&literal).is_none(),
@@ -2785,25 +2551,15 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"
     );
-    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+    let projection = projected(id_name_request().item(
         literal,
         ExasolType::TimestampWithLocalTimeZone { precision: 3 },
     ));
+    let wrapped = projection == RowProjection::Wrapped;
     assert!(
-        widened,
-        "the real-wire-name TSTZ literal must widen the projection so the \
+        wrapped,
+        "the real-wire-name TSTZ literal must wrap the projection so the \
          RowScan dispatcher routes it to the qualified wrapper"
-    );
-    assert_eq!(
-        proj_cols,
-        vec![
-            ProjectionItem::Column("ID".into()),
-            ProjectionItem::Column("NAME".into()),
-        ]
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
     );
 }
 
@@ -2814,8 +2570,95 @@ fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
     let wrong_relation = alias_col("LHS_T2", "X");
 
     for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
-        let error = ScanTranslator::over(&universe, &[&tree])
+        let error = ScanTranslator::over(&universe, ExasolVersion::Exasol2025, &[&tree])
             .expect_err("a column no entry binds is an adapter bug, never a decline");
         assert_mentions(&user_message(error), &[column]);
     }
+}
+
+fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Option<Vec<Json>> {
+    let mut request = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .order_by(Json::Array(keys.to_vec()));
+    if let Some(offset) = offset {
+        request = request.limit_with_offset(3, offset);
+    }
+    request
+        .build_pushdown()
+        .json()
+        .get("orderBy")
+        .map(|keys| keys.as_array().expect("orderBy is an array").clone())
+}
+
+/// Sort keys, the request's offset, and the `orderBy` that remains.
+type SortKeyCase = (Vec<Json>, Option<u64>, Option<Vec<Json>>);
+
+#[test]
+fn parse_drops_constant_sort_keys() {
+    let id_key = order_by_element(table_col("EVENTS", "ID"), true, true);
+    // A literal type Exasol sends, plus `literal_interval`, which the select-list literal list omits.
+    let constants = [
+        num_lit(2),
+        lit("literal_double", 1.5),
+        str_lit("a"),
+        null_lit(),
+        bool_lit(true),
+        date_lit("2024-01-01"),
+        timestamp_lit("2024-01-01 00:00:00"),
+        lit("literal_interval", "1"),
+    ];
+    let mut cases: Vec<SortKeyCase> = constants
+        .iter()
+        .map(|constant| {
+            (
+                vec![
+                    order_by_element(constant.clone(), false, false),
+                    id_key.clone(),
+                ],
+                None,
+                Some(vec![id_key.clone()]),
+            )
+        })
+        .collect();
+    let random = order_by_element(scalar_fn("RAND", Vec::<Json>::new()), true, true);
+    cases.extend([
+        (
+            vec![random.clone(), id_key.clone()],
+            None,
+            Some(vec![random, id_key.clone()]),
+        ),
+        (Vec::new(), Some(2), Some(Vec::new())),
+        (vec![order_by_element(num_lit(2), true, true)], None, None),
+        (
+            vec![order_by_element(num_lit(2), true, true)],
+            Some(0),
+            None,
+        ),
+        (
+            vec![
+                order_by_element(num_lit(2), false, false),
+                order_by_element(str_lit("a"), true, true),
+            ],
+            Some(2),
+            Some(vec![order_by_element(bool_lit(false), false, false)]),
+        ),
+        (
+            vec![order_by_element(num_lit(2), true, true), id_key.clone()],
+            Some(2),
+            Some(vec![id_key.clone()]),
+        ),
+    ]);
+
+    for (keys, offset, expected) in cases {
+        assert_eq!(
+            parsed_order_by(&keys, offset),
+            expected,
+            "keys {keys:?}, offset {offset:?}"
+        );
+    }
+
+    let no_order_by = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
+        .column(col("ID"))
+        .build_pushdown();
+    assert!(no_order_by.json().get("orderBy").is_none());
 }

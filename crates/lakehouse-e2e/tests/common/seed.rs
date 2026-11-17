@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::pruning_fixture::{
-    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, iceberg_file_prefix,
-    pruning_batch, pruning_writer_properties,
+    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE,
+    PRUNING_TYPED_PARTITION_COLUMN, decimal_unscaled, iceberg_file_prefix, pruning_batch,
+    pruning_writer_properties,
 };
 use super::raw_parquet::{encode_parquet_message, write_parquet_column};
 
@@ -465,20 +466,24 @@ fn unpartitioned() -> UnboundPartitionSpec {
     UnboundPartitionSpec::builder().with_spec_id(0).build()
 }
 
-/// The partition field needs an explicit field-id (partition ids start at 1000): an
+/// Each partition field needs an explicit field-id (partition ids start at 1000): an
 /// unbound spec serializes `field-id: null`, which the REST catalog rejects.
-fn identity_partition_spec(source_id: i32, column: &str) -> Result<UnboundPartitionSpec> {
-    let field = UnboundPartitionField::builder()
-        .source_ids(vec![source_id])
-        .field_id(1000)
-        .name(column.to_string())
-        .transform(Transform::Identity)
-        .build()
-        .with_context(|| format!("build the {column} partition field"))?;
+fn identity_partition_spec(columns: &[(i32, &str)]) -> Result<UnboundPartitionSpec> {
+    let fields = (1000..)
+        .zip(columns)
+        .map(|(field_id, (source_id, column))| {
+            UnboundPartitionField::builder()
+                .source_ids(vec![*source_id])
+                .field_id(field_id)
+                .name(column.to_string())
+                .transform(Transform::Identity)
+                .build()
+                .with_context(|| format!("build the {column} partition field"))
+        });
     Ok(UnboundPartitionSpec::builder()
         .with_spec_id(1)
-        .add_partition_fields([field])
-        .with_context(|| format!("build the {column} partition spec"))?
+        .add_partition_fields(fields.collect::<Result<Vec<_>>>()?)
+        .context("build the identity partition spec")?
         .build())
 }
 
@@ -1273,7 +1278,7 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
         E2E_NAMESPACE,
         E2E_PART_TABLE,
         regions_iceberg_schema()?,
-        identity_partition_spec(2, PART_COL)?,
+        identity_partition_spec(&[(2, PART_COL)])?,
         HashMap::new(),
         files,
     )
@@ -1379,6 +1384,27 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
             NestedField::optional(4, "s", Type::Primitive(PrimitiveType::String)).into(),
             NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Double)).into(),
             NestedField::optional(6, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            NestedField::optional(
+                7,
+                PRUNING_TYPED_PARTITION_COLUMN,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 4,
+                    scale: 1,
+                }),
+            )
+            .into(),
+            NestedField::optional(
+                8,
+                "d",
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                }),
+            )
+            .into(),
+            NestedField::optional(9, "f", Type::Primitive(PrimitiveType::Float)).into(),
+            NestedField::optional(10, "dt", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::optional(11, "tz", Type::Primitive(PrimitiveType::Timestamptz)).into(),
         ])
         .build()
         .context("build pruning fixture Iceberg schema")?;
@@ -1387,7 +1413,10 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
         PRUNING_NAMESPACE,
         PRUNING_TABLE,
         iceberg_schema,
-        identity_partition_spec(2, PRUNING_PARTITION_COLUMN)?,
+        identity_partition_spec(&[
+            (2, PRUNING_PARTITION_COLUMN),
+            (7, PRUNING_TYPED_PARTITION_COLUMN),
+        ])?,
         HashMap::new(),
     )
     .await?
@@ -1401,7 +1430,11 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
             write_data_files(
                 &table,
                 &iceberg_file_prefix(file),
-                Struct::from_iter([file.partition.map(Literal::string)]),
+                Struct::from_iter([
+                    file.partition.map(Literal::string),
+                    file.typed_partition
+                        .map(|value| Literal::decimal(decimal_unscaled(value))),
+                ]),
                 pruning_writer_properties(),
                 [pruning_batch(file)],
             )
@@ -1568,6 +1601,13 @@ pub const EVO_INITDEF_COL_DATE: &str = "c_date";
 pub const EVO_INITDEF_COL_TS: &str = "c_ts";
 pub const EVO_INITDEF_COL_DECIMAL: &str = "c_decimal";
 pub const EVO_INITDEF_COL_TSTZ: &str = "c_tstz";
+pub const EVO_INITDEF_COL_TIME: &str = "c_time";
+/// Added REQUIRED-with-default of a type whose Arrow tag is `utf8`.
+pub const EVO_INITDEF_COL_TIME_REQ: &str = "c_time_req";
+pub const EVO_INITDEF_COL_DEC38: &str = "c_dec38";
+pub const EVO_INITDEF_COL_BINARY: &str = "c_binary";
+pub const EVO_INITDEF_COL_FIXED: &str = "c_fixed";
+pub const EVO_INITDEF_COL_UUID: &str = "c_uuid";
 
 /// Greater than `i32::MAX`, so a Long/Int mix-up is caught.
 const INITDEF_LONG_DEFAULT: i64 = 4_200_000_000;
@@ -1582,6 +1622,12 @@ const INITDEF_REAL_TS_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 *
 /// Deliberately the same UTC instant as `c_ts`'s default.
 const INITDEF_DEFAULT_TSTZ_MICROS: i64 = BASE_TS_MICROS + 12 * MICROS_PER_HOUR;
 const INITDEF_REAL_TSTZ_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 * MICROS_PER_HOUR;
+/// 22:31:08.123456. A rendered-default column stores its default as the post-add value too, so
+/// one expected text proves a pre-add row reads exactly as a stored value of the column.
+const INITDEF_TIME_MICROS: i64 = (22 * 3600 + 31 * 60 + 8) * 1_000_000 + 123_456;
+const INITDEF_BINARY: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+const INITDEF_FIXED: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+const INITDEF_UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
 pub enum ExpectedValue {
     Bool(bool),
@@ -1686,20 +1732,113 @@ pub fn initdef_columns() -> Vec<InitDefColumn> {
             default: ExpectedValue::DatePrefix("2024-01-01"),
             real: ExpectedValue::DatePrefix("2024-07-01"),
         },
+        rendered_initdef_column(EVO_INITDEF_COL_TIME, false, "22:31:08.123456"),
+        rendered_initdef_column(EVO_INITDEF_COL_TIME_REQ, true, "22:31:08.123456"),
+        rendered_initdef_column(EVO_INITDEF_COL_DEC38, false, "123.45"),
+        rendered_initdef_column(EVO_INITDEF_COL_BINARY, false, "deadbeef"),
+        rendered_initdef_column(EVO_INITDEF_COL_FIXED, false, "01020304"),
+        rendered_initdef_column(
+            EVO_INITDEF_COL_UUID,
+            false,
+            "0123456789abcdef0123456789abcdef",
+        ),
     ]
+}
+
+fn rendered_initdef_column(
+    name: &'static str,
+    required: bool,
+    text: &'static str,
+) -> InitDefColumn {
+    InitDefColumn {
+        name,
+        required,
+        default: ExpectedValue::Text(text),
+        real: ExpectedValue::Text(text),
+    }
 }
 
 /// Not idempotent: drops and recreates `initdef` so every run starts clean.
 pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &str) -> Result<()> {
-    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-initdef").await?;
+    seed_v3_added_columns(
+        catalog_url,
+        warehouse,
+        EVO_INITDEF_TABLE,
+        initdef_post_add_schema,
+        Some(make_initdef_full_batch),
+    )
+    .await
+}
+
+pub const EVO_INITDEF_REFUSED_TABLE: &str = "initdef_refused";
+/// Readable sibling of the refused column, so a query that skips the refused column still reads.
+pub const EVO_INITDEF_REFUSED_COL_OK: &str = "c_ok";
+/// `decimal(5,10)`: Arrow holds no decimal whose scale exceeds its precision, so its default
+/// cannot be read at the declared type and the adapter refuses the column.
+pub const EVO_INITDEF_REFUSED_COL_BAD: &str = "c_bad";
+
+/// One pre-add file of ids 1 to 3, then `c_ok` and `c_bad` added with an `initial-default`. No
+/// post-add file, because Arrow cannot write a `decimal(5,10)` value.
+pub async fn seed_unreadable_initial_default(catalog_url: &str, warehouse: &str) -> Result<()> {
+    seed_v3_added_columns(
+        catalog_url,
+        warehouse,
+        EVO_INITDEF_REFUSED_TABLE,
+        |schema_id| {
+            IcebergSchema::builder()
+                .with_schema_id(schema_id)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        2,
+                        EVO_INITDEF_REFUSED_COL_OK,
+                        Type::Primitive(PrimitiveType::Int),
+                    )
+                    .with_initial_default(Literal::int(42))
+                    .into(),
+                    NestedField::optional(
+                        3,
+                        EVO_INITDEF_REFUSED_COL_BAD,
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 5,
+                            scale: 10,
+                        }),
+                    )
+                    .with_initial_default(Literal::decimal(1234))
+                    .into(),
+                ])
+                .build()
+                .context("build initdef_refused post-add Iceberg schema")
+        },
+        None,
+    )
+    .await
+}
+
+/// A format-version 3 table (non-null `initial-default` values need v3) whose first file holds
+/// only `id` 1 to 3, after which `post_add_schema` becomes current and `post_add_batch`, when
+/// given, lands as a second file. Drops and recreates the table so every run starts clean.
+async fn seed_v3_added_columns(
+    catalog_url: &str,
+    warehouse: &str,
+    table_name: &str,
+    post_add_schema: impl Fn(i32) -> Result<IcebergSchema>,
+    post_add_batch: Option<fn(i64, i64) -> RecordBatch>,
+) -> Result<()> {
+    let catalog = build_seed_catalog(
+        catalog_url,
+        warehouse,
+        &format!("lakehouse-e2e-seed-{table_name}"),
+    )
+    .await?;
 
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let ident = TableIdent::new(ns.clone(), EVO_INITDEF_TABLE.to_string());
+    let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
     if !catalog
         .namespace_exists(&ns)
         .await
-        .context("check namespace for initdef")?
+        .with_context(|| format!("check namespace for {table_name}"))?
     {
         let _ = catalog.create_namespace(&ns, HashMap::new()).await;
     }
@@ -1707,20 +1846,19 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     if catalog
         .table_exists(&ident)
         .await
-        .context("check initdef table exists")?
+        .with_context(|| format!("check {table_name} table exists"))?
     {
         catalog
             .drop_table(&ident)
             .await
-            .context("drop existing initdef table")?;
+            .with_context(|| format!("drop existing {table_name} table"))?;
     }
 
-    // Iceberg requires v3 for non-null `initial-default` values. The REST catalog takes the
-    // format version only from the `format-version` property, so it is set there and
-    // asserted below.
+    // The REST catalog takes the format version only from the `format-version` property, so it
+    // is set there and asserted below.
     let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
     let creation = TableCreation::builder()
-        .name(EVO_INITDEF_TABLE.to_string())
+        .name(table_name.to_string())
         .schema(initdef_pre_add_schema()?)
         .partition_spec(partition_spec)
         .properties(HashMap::from([(
@@ -1732,11 +1870,11 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     let table = catalog
         .create_table(&ns, creation)
         .await
-        .context("create initdef table")?;
+        .with_context(|| format!("create {table_name} table"))?;
     assert_eq!(
         table.metadata().format_version(),
         FormatVersion::V3,
-        "initdef table was not created at format-version 3 (non-null initial-default \
+        "{table_name} table was not created at format-version 3 (non-null initial-default \
          requires v3); the REST catalog ignored the format-version request"
     );
 
@@ -1744,49 +1882,44 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     write_one_file_append(
         &catalog,
         &table,
-        EVO_INITDEF_TABLE,
+        table_name,
         [make_initdef_id_only_batch(a0, a1)],
     )
     .await
-    .context("append initdef file A (pre-add)")?;
+    .with_context(|| format!("append {table_name} file A (pre-add)"))?;
 
     let table = catalog
         .load_table(&ident)
         .await
-        .context("reload initdef before add-columns")?;
+        .with_context(|| format!("reload {table_name} before add-columns"))?;
     let current_schema_id = table.metadata().current_schema_id();
+    let new_schema = post_add_schema(current_schema_id + 1)?;
+    let added_fields = new_schema.as_struct().fields().len();
     rest_replace_current_schema(
         catalog_url,
         E2E_NAMESPACE,
-        EVO_INITDEF_TABLE,
+        table_name,
         current_schema_id,
-        initdef_post_add_schema(current_schema_id + 1)?,
+        new_schema,
     )
     .await
-    .context("REST add-columns commit for initdef")?;
+    .with_context(|| format!("REST add-columns commit for {table_name}"))?;
 
     let table = catalog
         .load_table(&ident)
         .await
-        .context("reload initdef after add-columns")?;
+        .with_context(|| format!("reload {table_name} after add-columns"))?;
     assert_eq!(
-        table
-            .metadata()
-            .current_schema()
-            .field_by_id(2)
-            .map(|f| f.name.as_str()),
-        Some(EVO_INITDEF_COL_BOOL),
-        "REST add-columns did not take effect: field-id 2 is not '{EVO_INITDEF_COL_BOOL}'"
+        table.metadata().current_schema().as_struct().fields().len(),
+        added_fields,
+        "REST add-columns did not take effect on {table_name}"
     );
-    let (b0, b1) = EVO_INITDEF_POST_ADD_IDS;
-    write_one_file_append(
-        &catalog,
-        &table,
-        EVO_INITDEF_TABLE,
-        [make_initdef_full_batch(b0, b1)],
-    )
-    .await
-    .context("append initdef file B (post-add)")?;
+    if let Some(post_add_batch) = post_add_batch {
+        let (b0, b1) = EVO_INITDEF_POST_ADD_IDS;
+        write_one_file_append(&catalog, &table, table_name, [post_add_batch(b0, b1)])
+            .await
+            .with_context(|| format!("append {table_name} file B (post-add)"))?;
+    }
 
     Ok(())
 }
@@ -1876,6 +2009,53 @@ fn initdef_post_add_schema(schema_id: i32) -> Result<IcebergSchema> {
             )
             .with_initial_default(Literal::timestamptz(INITDEF_DEFAULT_TSTZ_MICROS))
             .into(),
+            NestedField::optional(
+                12,
+                EVO_INITDEF_COL_TIME,
+                Type::Primitive(PrimitiveType::Time),
+            )
+            .with_initial_default(Literal::time(INITDEF_TIME_MICROS))
+            .into(),
+            NestedField::required(
+                13,
+                EVO_INITDEF_COL_TIME_REQ,
+                Type::Primitive(PrimitiveType::Time),
+            )
+            .with_initial_default(Literal::time(INITDEF_TIME_MICROS))
+            .into(),
+            NestedField::optional(
+                14,
+                EVO_INITDEF_COL_DEC38,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                }),
+            )
+            .with_initial_default(Literal::decimal(INITDEF_DECIMAL_DEFAULT_UNSCALED))
+            .into(),
+            NestedField::optional(
+                15,
+                EVO_INITDEF_COL_BINARY,
+                Type::Primitive(PrimitiveType::Binary),
+            )
+            .with_initial_default(Literal::binary(INITDEF_BINARY))
+            .into(),
+            NestedField::optional(
+                16,
+                EVO_INITDEF_COL_FIXED,
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            )
+            .with_initial_default(Literal::fixed(INITDEF_FIXED))
+            .into(),
+            NestedField::optional(
+                17,
+                EVO_INITDEF_COL_UUID,
+                Type::Primitive(PrimitiveType::Uuid),
+            )
+            .with_initial_default(
+                Literal::uuid_from_str(INITDEF_UUID).context("parse initdef uuid default")?,
+            )
+            .into(),
         ])
         .build()
         .context("build initdef post-add Iceberg schema")
@@ -1920,7 +2100,28 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             true,
         ),
+        Field::new(
+            EVO_INITDEF_COL_TIME,
+            DataType::Time64(TimeUnit::Microsecond),
+            true,
+        ),
+        Field::new(
+            EVO_INITDEF_COL_TIME_REQ,
+            DataType::Time64(TimeUnit::Microsecond),
+            false,
+        ),
+        Field::new(EVO_INITDEF_COL_DEC38, DataType::Decimal128(38, 2), true),
+        Field::new(EVO_INITDEF_COL_BINARY, DataType::LargeBinary, true),
+        Field::new(EVO_INITDEF_COL_FIXED, DataType::FixedSizeBinary(4), true),
+        Field::new(EVO_INITDEF_COL_UUID, DataType::FixedSizeBinary(16), true),
     ]));
+
+    let uuid_bytes = u128::from_str_radix(&INITDEF_UUID.replace('-', ""), 16)
+        .expect("initdef uuid is hex")
+        .to_be_bytes();
+    let dec38 = Decimal128Array::from(vec![INITDEF_DECIMAL_DEFAULT_UNSCALED; n])
+        .with_precision_and_scale(38, 2)
+        .expect("initdef decimal(38,2) precision/scale is valid");
 
     let decimals = Decimal128Array::from(vec![INITDEF_DECIMAL_REAL_UNSCALED; n])
         .with_precision_and_scale(9, 2)
@@ -1945,6 +2146,18 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             Arc::new(
                 TimestampMicrosecondArray::from(vec![INITDEF_REAL_TSTZ_MICROS; n])
                     .with_timezone("+00:00"),
+            ),
+            Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
+            Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
+            Arc::new(dec38),
+            Arc::new(LargeBinaryArray::from_iter_values(vec![INITDEF_BINARY; n])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(vec![INITDEF_FIXED; n].into_iter())
+                    .expect("initdef fixed(4) values"),
+            ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(vec![uuid_bytes; n].into_iter())
+                    .expect("initdef uuid values"),
             ),
         ],
     )

@@ -1,17 +1,15 @@
-use super::super::test_support::{UNREACHABLE_CATALOG, endpoint_storage, statement_over};
+use super::super::test_support::{
+    UNREACHABLE_CATALOG, endpoint_storage, statement_over, test_context,
+};
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::permission::PermissionSettings;
-use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
 
 fn lakekeeper_check() -> PermissionCheck {
-    PermissionSettings::parse(&serde_json::json!({
-        PERMISSION_CHECK: "LAKEKEEPER",
-        USER_MAPPING: "oidc~{{ user }}",
-    }))
-    .unwrap()
-    .check_for(|| Some("ALICE".into()))
-    .unwrap()
+    PermissionSettings::parse(Some("LAKEKEEPER"), Some("oidc~{{ user }}"))
+        .unwrap()
+        .check_for(|| Some("ALICE".into()))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -49,7 +47,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_by_its_kinds_
             &statement,
             &lakekeeper_check(),
             &identifiers,
-            &Json::Null,
+            &test_context(),
         )
         .await
         .err()
@@ -78,7 +76,8 @@ async fn an_enforced_check_reads_no_table_that_no_check_admitted() {
         endpoint_storage(UNREACHABLE_CATALOG),
     );
     let check = lakekeeper_check();
-    let resolver = TableScanResolver::for_request(&statement, &check, &["events"], &Json::Null)
+    let context = test_context();
+    let resolver = TableScanResolver::for_request(&statement, &check, &["events"], &context)
         .await
         .expect("a kind that runs no check admits nothing and fails nothing");
 

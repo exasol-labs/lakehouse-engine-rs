@@ -8,17 +8,22 @@ mod fragment;
 mod json_value;
 mod scalar_functions;
 mod scan_typing;
+pub mod timestamp;
+mod version;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-use datetime_format::{FormatTarget, strftime_pattern};
+use datetime_format::{FormatTarget, format_literal, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use json_value::{Fallback, JsonValueCall, Returning};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
-use scan_typing::{BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
-pub use scan_typing::{
-    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
+use scan_typing::{
+    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
+    seconds_type, timestamp_digits,
 };
+pub use scan_typing::{ColumnTypeLookup, ScanTyping};
+use timestamp::{TimestampLiteral, TimestampUnit};
+pub use version::ExasolVersion;
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -50,10 +55,6 @@ fn binary_op(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn is_empty_opt(value: Option<&str>) -> bool {
-    matches!(value, None | Some(""))
-}
-
 /// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
 /// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
@@ -68,6 +69,34 @@ fn quote_literal(value: Option<&Json>) -> String {
     }
 }
 
+/// DataFusion's `LIKE` accepts only `\` as its escape (apache/datafusion#13291), so a pattern written
+/// with another escape is rewritten to it. `None` unless both are string literals and the escape is
+/// one character that never ends the pattern.
+fn backslash_escaped_pattern(pattern: &Json, escape: &Json) -> Option<String> {
+    fn string(node: &Json) -> Option<&str> {
+        (node.get("type")?.as_str()? == "literal_string").then_some(())?;
+        node.get("value")?.as_str()
+    }
+    let mut escape_chars = string(escape)?.chars();
+    let escape = escape_chars.next()?;
+    if escape_chars.next().is_some() {
+        return None;
+    }
+    let mut rewritten = String::new();
+    let mut chars = string(pattern)?.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c == escape => {
+                rewritten.push('\\');
+                rewritten.push(chars.next()?);
+            }
+            '\\' => rewritten.push_str("\\\\"),
+            c => rewritten.push(c),
+        }
+    }
+    Some(rewritten)
+}
+
 /// Shared by `literal_timestamp` and `literal_timestamp_utc` so they cannot drift.
 /// Exasol's literal format has no offset field (22018 on `+00:00`), and
 /// `TIMESTAMP NULL` is a syntax error (42000), so NULL renders bare.
@@ -79,9 +108,8 @@ fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
 }
 
 fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
-    let fraction = value.and_then(Json::as_str).and_then(|v| v.split_once('.'));
-    match fraction {
-        Some((_, digits)) if digits.trim_end_matches('0').len() > 6 => "Nanosecond",
+    match value.and_then(Json::as_str).map(TimestampLiteral) {
+        Some(literal) if !literal.fits(TimestampUnit::Microsecond) => "Nanosecond",
         _ => "Microsecond",
     }
 }
@@ -132,15 +160,17 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
 }
 
 /// Renders only a `literal_string` format the translation covers, and errs otherwise so the
-/// caller declines.
+/// caller declines. `digits` are the fractional digits a `TO_TIMESTAMP` keeps, which only the
+/// typed pass knows.
 fn render_to_datetime(
     target: FormatTarget,
     args: Option<&Vec<Json>>,
+    digits: Option<u8>,
     dialect: Dialect,
 ) -> Result<Option<String>, UdfError> {
-    let (node, function) = match target {
-        FormatTarget::Date => ("TO_DATE", "to_date"),
-        FormatTarget::Timestamp => ("TO_TIMESTAMP", "to_timestamp"),
+    let node = match target {
+        FormatTarget::Date => "TO_DATE",
+        FormatTarget::Timestamp => "TO_TIMESTAMP",
     };
     let args =
         args.ok_or_else(|| UdfError::User(format!("function_scalar {node} missing 'arguments'")))?;
@@ -152,11 +182,7 @@ fn render_to_datetime(
             "function_scalar {node} without a format parses by the session's NLS settings"
         ))),
         [source, format] => {
-            let pattern = format
-                .get("type")
-                .and_then(Json::as_str)
-                .filter(|kind| *kind == "literal_string")
-                .and_then(|_| format.get("value").and_then(Json::as_str))
+            let pattern = format_literal(format)
                 .and_then(|model| strftime_pattern(model, target))
                 .ok_or_else(|| {
                     UdfError::User(format!(
@@ -164,10 +190,16 @@ fn render_to_datetime(
                     ))
                 })?;
             let source = render_conversion_source(node, source, dialect)?;
-            Ok(Some(format!(
-                "{function}(nullif({source}, ''), '{}')",
-                sql_escape(&pattern)
-            )))
+            let pattern = sql_escape(&pattern);
+            Ok(Some(match target {
+                FormatTarget::Date => format!("to_date(nullif({source}, ''), '{pattern}')"),
+                FormatTarget::Timestamp => {
+                    let digits = digits.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {node} carries no typed digits"))
+                    })?;
+                    format!("{TO_TIMESTAMP_FN}(nullif({source}, ''), '{pattern}', {digits})")
+                }
+            }))
         }
         _ => Err(UdfError::User(format!(
             "function_scalar {node} accepts at most 2 arguments, got {}",
@@ -221,6 +253,42 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
     })
 }
 
+/// Only the typed scan pass knows the fractional digits a one-argument SECOND keeps.
+const UNTYPED_SECOND: &str = "SECOND renders only as a one-argument call through the typed scan pass, which knows the argument's precision";
+
+/// The seconds of `arg` with their first `fraction` digits, cut beyond as Exasol does. An exact
+/// decimal product scales them, because Arrow's decimal quotient keeps only the scale s1 + 4.
+fn render_seconds(arg: &str, fraction: u8) -> Result<String, UdfError> {
+    let (unit, unit_digits) = match fraction {
+        0 => {
+            return Ok(format!(
+                "CAST(date_part('second', {arg}) AS {})",
+                seconds_type(0)
+            ));
+        }
+        1..=6 => ("microsecond", 6),
+        7..=9 => ("nanosecond", 9),
+        _ => {
+            return Err(UdfError::User(format!(
+                "SECOND cannot keep {fraction} fractional digits"
+            )));
+        }
+    };
+    let units = format!("date_part('{unit}', {arg})");
+    let cut = match 10u32.pow(u32::from(unit_digits - fraction)) {
+        1 => units,
+        divisor => format!("({units} / {divisor})"),
+    };
+    let whole = ExasolType::decimal(2 + fraction, 0);
+    let step = ExasolType::decimal(fraction, fraction);
+    let width = usize::from(fraction);
+    Ok(format!(
+        "CAST((CAST({cut} AS {whole}) * CAST('0.{:0>width$}' AS {step})) AS {})",
+        1,
+        seconds_type(fraction)
+    ))
+}
+
 /// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as, registered
 /// by `lakehouse-engine`. It MUST take two arguments coerced to `Float64` (Exasol's
 /// `FN_FLOAT_DIV` is always float division), return `Float64`, propagate `NULL`, and
@@ -231,6 +299,23 @@ pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 /// The scalar UDF the DataFusion dialect renders `DIV` as, registered by `lakehouse-engine`.
 /// It raises on a zero divisor, so division by zero fails in a filter exactly as in a projection.
 pub const CHECKED_INT_DIV_FN: &str = "vs_checked_int_div";
+
+/// The scalar UDFs the DataFusion dialect renders `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and
+/// `ADD_MINUTES` as, registered by `lakehouse-engine`. Each MUST take a first argument of `Date32`,
+/// `Timestamp(Microsecond, None)`, or `Timestamp(Nanosecond, None)`, which the typed pass casts
+/// to, and a number as its second.
+pub const ADD_DAYS_FN: &str = "vs_add_days";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_WEEKS_FN: &str = "vs_add_weeks";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_HOURS_FN: &str = "vs_add_hours";
+/// See [`ADD_DAYS_FN`].
+pub const ADD_MINUTES_FN: &str = "vs_add_minutes";
+
+/// The scalar UDF the DataFusion dialect renders `TO_TIMESTAMP(text, format)` as, registered by
+/// `lakehouse-engine`. It takes the text, a strftime pattern, and the fractional digits to keep,
+/// and returns `Timestamp(Microsecond, None)` for up to 6 digits, else nanoseconds.
+pub const TO_TIMESTAMP_FN: &str = "vs_to_timestamp";
 
 fn render_cast(
     args: Option<&Vec<Json>>,
@@ -496,25 +581,35 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }
         }
         "predicate_like" => {
+            let pattern = value("pattern").unwrap_or(&Json::Null);
             let left =
                 render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
-            let pattern =
-                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?;
-            match (left, pattern) {
-                (Some(l), Some(p)) => {
-                    let escape = value("escape_char").and_then(|e| e.as_str());
-                    if !is_empty_opt(escape) {
-                        Ok(Some(format!(
-                            "({l} LIKE {p} ESCAPE {})",
-                            quote_literal(value("escape_char"))
-                        )))
-                    } else {
-                        Ok(Some(format!("({l} LIKE {p})")))
-                    }
-                }
-                _ => Err(UdfError::User(
+            let (Some(l), Some(p)) = (left, render_expression_inner(pattern, dialect)?) else {
+                return Err(UdfError::User(
                     "predicate_like missing 'expression' or 'pattern'".into(),
-                )),
+                ));
+            };
+            match value("escapeChar") {
+                None => Ok(Some(format!("({l} LIKE {p})"))),
+                Some(escape) if dialect == Dialect::Exasol => {
+                    let escape = render_expression_inner(escape, dialect)?.ok_or_else(|| {
+                        UdfError::User("predicate_like with a null 'escapeChar'".into())
+                    })?;
+                    Ok(Some(format!("({l} LIKE {p} ESCAPE {escape})")))
+                }
+                Some(escape) => {
+                    let rewritten =
+                        backslash_escaped_pattern(pattern, escape).ok_or_else(|| {
+                            UdfError::User(
+                                "LIKE ESCAPE needs a string pattern and a one-character escape"
+                                    .into(),
+                            )
+                        })?;
+                    Ok(Some(format!(
+                        "({l} LIKE {})",
+                        quote_literal(Some(&Json::String(rewritten)))
+                    )))
+                }
             }
         }
         "function_scalar_extract" => {
@@ -538,6 +633,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
             Ok(Some(match dialect {
                 Dialect::Exasol => format!("EXTRACT({field} FROM {src})"),
+                Dialect::DataFusion if field == "SECOND" => {
+                    return Err(UdfError::User(UNTYPED_SECOND.into()));
+                }
                 // DataFusion has no EXTRACT(field FROM expr) planner by default.
                 Dialect::DataFusion => format!("date_part('{field}', {src})"),
             }))
@@ -597,7 +695,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             render_cast(args, value("dataType"), dialect)
         }
         // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE
+        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE | SECOND_NODE
             if dialect == Dialect::DataFusion =>
         {
             let arg = value("arguments")
@@ -609,6 +707,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(match kind {
                 INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
                 BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                SECOND_NODE => {
+                    let fraction = second_fraction(expr)
+                        .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;
+                    render_seconds(&inner, fraction)?
+                }
                 _ => format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)"),
             }))
         }
@@ -903,7 +1006,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("NULLIF second argument is null".into()))?;
                     Ok(Some(format!("nullif({left}, {right})")))
                 }
-                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" => {
+                "SECOND" => Err(UdfError::User(UNTYPED_SECOND.into())),
+                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
@@ -949,11 +1053,32 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
                     Ok(Some(format!("date_trunc({unit}, {src})")))
                 }
-                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, dialect),
-                "TO_TIMESTAMP" => render_to_datetime(FormatTarget::Timestamp, args, dialect),
-                // ADD_HOURS/ADD_MINUTES are not translated: Exasol types ADD_HOURS(DATE, n) as
-                // TIMESTAMP(0), and the typed pass does not tell a DATE from a TIMESTAMP.
-                //
+                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, None, dialect),
+                "TO_TIMESTAMP" => render_to_datetime(
+                    FormatTarget::Timestamp,
+                    args,
+                    timestamp_digits(expr),
+                    dialect,
+                ),
+                "ADD_DAYS" | "ADD_WEEKS" | "ADD_HOURS" | "ADD_MINUTES" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let scan_fn = match fn_name.as_str() {
+                        "ADD_DAYS" => ADD_DAYS_FN,
+                        "ADD_WEEKS" => ADD_WEEKS_FN,
+                        "ADD_HOURS" => ADD_HOURS_FN,
+                        _ => ADD_MINUTES_FN,
+                    };
+                    let rendered = render_args(args, dialect)?;
+                    Ok(Some(format!("{scan_fn}({})", rendered.join(", "))))
+                }
                 // DATE - DATE yields an Int64 day count in DataFusion; Exasol uses only
                 // the date part of a timestamp.
                 "DAYS_BETWEEN" => {
@@ -1064,33 +1189,32 @@ fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String 
 
 /// The only DataFusion-dialect entry point, so every scan expression is typed first. `Err` declines.
 /// A CHAR or VARCHAR CAST renders unsized, so its fragment type is the widest VARCHAR.
-pub fn render_scan_expression(
-    expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-) -> Result<SqlFragment, UdfError> {
-    let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
-    let ty = exact_expression_type(expr, columns).map(|ty| {
-        if ty.is_character() {
-            ExasolType::WIDEST_VARCHAR
-        } else {
-            ty
-        }
-    });
-    Ok(SqlFragment::new(render_expression(&typed)?, ty))
+impl ScanTyping<'_> {
+    pub fn render_expression(self, expr: &Json) -> Result<SqlFragment, UdfError> {
+        let (typed, inferred) = self.type_scan_tree(expr)?;
+        let ty = inferred.exact().map(|ty| {
+            if ty.is_character() {
+                ExasolType::WIDEST_VARCHAR
+            } else {
+                ty
+            }
+        });
+        Ok(SqlFragment::new(render_expression(&typed)?, ty))
+    }
+
+    /// [`Self::render_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
+    /// filter it sends renders as `TRUE`.
+    pub fn render_filter(self, filter_expr: &Json) -> Result<String, UdfError> {
+        Ok(null_keeps_no_row(self.render_expression(filter_expr)?.sql))
+    }
+
+    /// [`render_expression_exasol`] for an output select item, with its [`Self::exact_type`].
+    pub fn exasol_fragment(self, expr: &Json) -> SqlFragment {
+        SqlFragment::new(render_expression_exasol(expr), self.exact_type(expr))
+    }
 }
 
-/// [`render_scan_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
-/// filter it sends renders as `TRUE`.
-pub fn render_scan_filter(
-    filter_expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-) -> Result<String, UdfError> {
-    Ok(null_keeps_no_row(
-        render_scan_expression(filter_expr, columns)?.sql,
-    ))
-}
-
-/// The filter [`render_scan_filter`] renders for the `AND` of conjuncts rendered one by one.
+/// The filter [`ScanTyping::render_filter`] renders for the `AND` of conjuncts rendered one by one.
 pub fn conjoin_scan_filters(conjuncts: Vec<String>) -> Option<String> {
     if conjuncts.is_empty() {
         return None;
@@ -1103,7 +1227,7 @@ fn null_keeps_no_row(sql: String) -> String {
     if sql == "NULL" { "FALSE".into() } else { sql }
 }
 
-/// DataFusion dialect, untyped. Use [`render_scan_expression`].
+/// DataFusion dialect, untyped. Use [`ScanTyping::render_expression`].
 pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
@@ -1125,15 +1249,6 @@ pub fn render_expression_exasol(expr: &Json) -> String {
 
 const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
 
-/// [`render_expression_exasol`] for an output select item, typed where the request states the
-/// type: the Exasol dialect renders a CAST's target and a column as they are.
-pub fn render_exasol_fragment(expr: &Json, columns: &dyn ColumnTypeLookup) -> SqlFragment {
-    SqlFragment::new(
-        render_expression_exasol(expr),
-        exact_expression_type(expr, columns),
-    )
-}
-
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
@@ -1141,3 +1256,7 @@ mod tests;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "test_support_tests.rs"]
 pub mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "udf_column_test_support_tests.rs"]
+pub mod udf_column_test_support;

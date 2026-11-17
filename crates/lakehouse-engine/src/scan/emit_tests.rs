@@ -448,6 +448,33 @@ fn nanosecond_column_declared_timestamp_9_keeps_every_digit() {
     assert_eq!(values.value(0), nanos);
 }
 
+/// A coarser column declared TIMESTAMP(9) emits without nanoseconds, so 9999-12-31 fits.
+#[test]
+fn coarser_column_declared_timestamp_9_widens_at_most_to_milliseconds() {
+    let column = &declared(&[("TS", ExaType::Timestamp { precision: 9 })])[0];
+    let target = target_arrow_type(column).expect("TIMESTAMP(9) must resolve");
+    let far_future_seconds = 253_402_214_400;
+    let cases: [(ArrayRef, DataType); 2] = [
+        (
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                far_future_seconds * 1_000_000,
+            ])),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ),
+        (
+            Arc::new(arrow::array::TimestampSecondArray::from(vec![
+                far_future_seconds,
+            ])),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+    ];
+    for (source, emitted) in cases {
+        let coerced = coerce_column(&source, column, &target)
+            .unwrap_or_else(|e| panic!("{:?} must emit: {e}", source.data_type()));
+        assert_eq!(coerced.data_type(), &emitted, "{:?}", source.data_type());
+    }
+}
+
 #[test]
 fn coerce_batch_casts_every_column_to_declared_exatype() {
     use arrow::array::{

@@ -327,9 +327,10 @@ jobs:
 
   # `name:` comes from the matrix so the 2025.x leg keeps the exact required
   # check name `E2E`. The 8.29.x leg is not yet in the ruleset (#364).
+  # The Nano leg runs the arm64 path that contributors on Apple Silicon use.
   e2e:
     name: ${{ matrix.check_name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     # build-so only: lint/unit-tests/licenses are separately required, and
     # `release` lists them explicitly.
     needs: [build-so]
@@ -340,15 +341,26 @@ jobs:
           - image: exasol/docker-db:2025.1.16
             check_name: E2E
             log_artifact: exa-logs
+            runner: ubuntu-latest
+            arch: x86_64
           - image: exasol/docker-db:8.29.13
             check_name: E2E (8.29.x)
             log_artifact: exa-logs-8x
+            runner: ubuntu-latest
+            arch: x86_64
+          - image: exasol/nano:2026.2.0-nano.8
+            check_name: E2E (Nano, arm64)
+            log_artifact: exa-logs-nano
+            runner: ubuntu-24.04-arm
+            arch: aarch64
     timeout-minutes: 45
     env:
       EXASOL_IMAGE: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
+        with:
+          arch: ${{ matrix.arch }}
 
       - name: Pull stack images
         run: docker compose pull --quiet

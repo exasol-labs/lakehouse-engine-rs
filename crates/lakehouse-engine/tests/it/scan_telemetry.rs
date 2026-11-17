@@ -13,7 +13,7 @@ use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, ScanTuning, StorageBackend, StorageProps,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -67,7 +67,10 @@ fn scan_spec(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])

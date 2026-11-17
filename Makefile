@@ -1,10 +1,18 @@
 SHELL := /bin/bash
 
+# docker-db is amd64-only, so arm64 hosts run the multi-arch Exasol Nano image instead.
+HOST_ARCH := $(shell uname -m)
+ifneq ($(filter arm64 aarch64,$(HOST_ARCH)),)
+EXASOL_IMAGE     ?= exasol/nano:2026.2.0-nano.8
+else
 EXASOL_IMAGE     ?= exasol/docker-db:2025.1.16
-# The docker-db image's built-in SYS default; it has no password env var.
+endif
+EXASOL_FLAVOR    ?= $(if $(findstring exasol/nano,$(EXASOL_IMAGE)),nano,docker-db)
+# Both images' built-in SYS default; neither has a password env var.
 EXASOL_SYS_PASSWORD ?= exasol
 
 export EXASOL_IMAGE
+export EXASOL_FLAVOR
 export EXASOL_SYS_PASSWORD
 
 LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -107,7 +115,7 @@ test-e2e-glue: cross-udf-build
 # Manual equivalent of the E2E harness's in-process `setup_e2e` SLC install.
 # Set BUCKETFS_WRITE_PASS to skip extracting it from EXAConf via docker exec.
 SLC_VERSION ?= $(shell sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
-ARCH ?= x86_64
+ARCH ?= $(HOST_ARCH)
 ARCH_NORMALIZED := $(if $(filter arm64,$(ARCH)),aarch64,$(ARCH))
 ifeq ($(ARCH_NORMALIZED),x86_64)
 SLC_ARCH_SUFFIX :=
@@ -118,15 +126,24 @@ $(error ARCH must be 'x86_64' or 'aarch64'; got '$(ARCH)')
 endif
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
+# Nano has no BucketFS HTTP endpoint: it serves each bucket from a directory, and `docker cp`
+# creates no missing parent, so uploads stage their whole directory tree.
+NANO_BUCKETFS_ROOT := /exa/bucketfs/bfsdefault
 
 # Single owner of the SLC version expression; bench/run.sh consumes it.
 print-slc-version:
 	@echo $(SLC_VERSION)
 
 install-slc:
-	@echo "=== install-slc: downloading SLC rootfs lc-rust-$(SLC_VERSION).tar.gz ==="
+	@echo "=== install-slc: downloading SLC rootfs lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz ==="
 	curl -fsSL "$(SLC_RELEASE_URL)" -o /tmp/lakehouse-rustslc.tar.gz
 	@test -s /tmp/lakehouse-rustslc.tar.gz || (echo "ERROR: SLC tarball not downloaded"; exit 1)
+ifeq ($(EXASOL_FLAVOR),nano)
+	@echo "=== install-slc: unpacking SLC into Nano's BucketFS directory ==="
+	rm -rf /tmp/lakehouse-bfs-stage && mkdir -p /tmp/lakehouse-bfs-stage/default/slc/lakehouse-rustslc
+	docker cp /tmp/lakehouse-bfs-stage/. $(EXASOL_CONTAINER):$(NANO_BUCKETFS_ROOT)/
+	docker cp - $(EXASOL_CONTAINER):$(NANO_BUCKETFS_ROOT)/default/slc/lakehouse-rustslc < /tmp/lakehouse-rustslc.tar.gz
+else
 	@echo "=== install-slc: extracting BucketFS write password ==="
 	$(eval BFSPASS := $(shell \
 	  if [ -n "$$BUCKETFS_WRITE_PASS" ]; then \
@@ -142,6 +159,7 @@ install-slc:
 	    -T /tmp/lakehouse-rustslc.tar.gz \
 	    "https://$(EXASOL_HOST):$(LH_BUCKETFS_PORT)/default/slc/lakehouse-rustslc.tar.gz" \
 	    --insecure
+endif
 	@echo "=== install-slc: registering RUST language alias (clean replace) ==="
 	@set -e; \
 	CURRENT=$$(exapump sql \
@@ -160,6 +178,12 @@ install-slc:
 SO_BUCKETFS_PATH := /default/udf/liblakehouse_engine.so
 
 bucketfs-upload-so: $(VS_SO)
+ifeq ($(EXASOL_FLAVOR),nano)
+	@echo "=== bucketfs-upload-so: copying liblakehouse_engine.so into Nano's BucketFS directory ==="
+	rm -rf /tmp/lakehouse-bfs-stage && mkdir -p /tmp/lakehouse-bfs-stage$(dir $(SO_BUCKETFS_PATH))
+	cp $(VS_SO) /tmp/lakehouse-bfs-stage$(SO_BUCKETFS_PATH)
+	docker cp /tmp/lakehouse-bfs-stage/. $(EXASOL_CONTAINER):$(NANO_BUCKETFS_ROOT)/
+else
 	@echo "=== bucketfs-upload-so: extracting BucketFS write password ==="
 	$(eval BFSPASS := $(shell \
 	  if [ -n "$$BUCKETFS_WRITE_PASS" ]; then \
@@ -175,6 +199,7 @@ bucketfs-upload-so: $(VS_SO)
 	    -T $(VS_SO) \
 	    "https://$(EXASOL_HOST):$(LH_BUCKETFS_PORT)$(SO_BUCKETFS_PATH)" \
 	    --insecure
+endif
 	@echo "=== bucketfs-upload-so: done ==="
 
 fmt:

@@ -18,7 +18,7 @@ use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ProjectionItem,
-    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
+    ScanSpec, ScanStorage, ScanTuning, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
@@ -192,7 +192,10 @@ fn join_spec(
         }),
         storage: ScanStorage::Inline(storage()),
         // Above one target partition DataFusion defaults joins to `Partitioned` mode.
-        df_target_partitions: 4,
+        tuning: ScanTuning {
+            df_target_partitions: 4,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(fact_files.into_iter().map(FileEntry::from).collect())

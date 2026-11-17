@@ -35,7 +35,7 @@ services:
       - "${LH_KEYCLOAK_PORT:-28080}:8080"
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.30
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.30
 
   lakekeeper-db:
     image: "${LH_LAKEKEEPER_DB_IMAGE:-postgres:17}"
@@ -51,7 +51,7 @@ services:
       start_period: 5s
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.31
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.31
 
   openfga-db:
     image: "${LH_OPENFGA_DB_IMAGE:-postgres:17}"
@@ -67,7 +67,7 @@ services:
       start_period: 5s
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.33
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.33
 
   openfga-migrate:
     image: "${LH_OPENFGA_IMAGE:-openfga/openfga:v1.14.2}"
@@ -103,7 +103,7 @@ services:
         condition: service_healthy
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.34
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.34
 
   lakekeeper-migrate:
     image: "${LH_LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.1}"
@@ -160,28 +160,28 @@ services:
       - "${LH_LAKEKEEPER_PORT:-28181}:8181"
     networks:
       lakehouse:
-        ipv4_address: 10.84.0.32
+        ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.32
 
   proxy:
     extra_hosts:
-      - "keycloak-via-proxy:10.84.0.30"
-      - "lakekeeper-via-proxy:10.84.0.32"
+      - "keycloak-via-proxy:${LH_SUBNET_PREFIX:-10.84}.0.30"
+      - "lakekeeper-via-proxy:${LH_SUBNET_PREFIX:-10.84}.0.32"
 
   # Re-declares the base /etc/hosts loop to add keycloak and lakekeeper.
   exasol:
     extra_hosts:
-      - "keycloak:10.84.0.30"
-      - "lakekeeper:10.84.0.32"
+      - "keycloak:${LH_SUBNET_PREFIX:-10.84}.0.30"
+      - "lakekeeper:${LH_SUBNET_PREFIX:-10.84}.0.32"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ]; then
-              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 seaweedfs\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])keycloak([[:space:]]|$)' /etc/hosts || printf '10.84.0.30 keycloak\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])lakekeeper([[:space:]]|$)' /etc/hosts || printf '10.84.0.32 lakekeeper\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.10 seaweedfs\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.11 iceberg-rest\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])keycloak([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.30 keycloak\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])lakekeeper([[:space:]]|$)' /etc/hosts || printf '${LH_SUBNET_PREFIX:-10.84}.0.32 lakekeeper\n' >> /etc/hosts
             fi
             sleep 2
           done ) &

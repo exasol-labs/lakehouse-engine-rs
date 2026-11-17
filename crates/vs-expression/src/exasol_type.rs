@@ -16,7 +16,7 @@ const MAX_CHAR_SIZE: u32 = 2000;
 pub const MAX_DECIMAL_PRECISION: u8 = 36;
 
 /// The most fractional-second digits a TIMESTAMP or an INTERVAL DAY TO SECOND holds.
-const MAX_FRACTIONAL_DIGITS: u8 = 9;
+pub(crate) const MAX_FRACTIONAL_DIGITS: u8 = 9;
 
 /// The widest leading field an INTERVAL declares, as in `INTERVAL DAY(9) TO SECOND`.
 const MAX_INTERVAL_PRECISION: u8 = 9;
@@ -134,14 +134,6 @@ impl ExasolType {
 
     pub fn is_character(&self) -> bool {
         matches!(self, Self::Char { .. } | Self::Varchar { .. })
-    }
-
-    /// The fractional-second digits a plain `TIMESTAMP` holds.
-    pub fn fractional_digits(&self) -> Option<u8> {
-        match self {
-            Self::Timestamp { precision } => Some(*precision),
-            _ => None,
-        }
     }
 
     /// Whether a scan UDF can declare this type in `EMITS`. Exasol rejects `TIMESTAMP WITH

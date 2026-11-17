@@ -1,6 +1,7 @@
 use super::*;
+use crate::ExasolVersion;
 use crate::test_support::*;
-use crate::{exact_expression_type, render_expression_exasol, render_scan_expression};
+use crate::{ScanTyping, render_expression_exasol};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -98,7 +99,13 @@ fn session_free_calls_render_to_the_scan_functions() {
         ),
     ];
     for (call, sql) in cases {
-        assert_eq!(render_scan_expression(&call, &columns()).unwrap().sql, sql);
+        assert_eq!(
+            ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                .render_expression(&call)
+                .unwrap()
+                .sql,
+            sql
+        );
     }
 }
 
@@ -154,7 +161,9 @@ fn calls_the_scan_cannot_compute_decline() {
     ];
     for (case, call) in cases {
         assert!(
-            render_scan_expression(&call, &columns()).is_err(),
+            ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                .render_expression(&call)
+                .is_err(),
             "{case} must decline"
         );
     }
@@ -185,7 +194,7 @@ fn the_returning_type_is_the_exact_type() {
         null(),
     );
     assert_eq!(
-        exact_expression_type(&call, &columns()),
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).exact_type(&call),
         Some(ExasolType::decimal(18, 0))
     );
 }

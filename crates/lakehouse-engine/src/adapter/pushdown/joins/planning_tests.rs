@@ -211,8 +211,6 @@ fn unaliased_two_table_join_leaves_carry_no_alias() {
     assert_eq!(leaf_keys(&join), [("CUSTOMER", None), ("ORDERS", None)]);
 }
 
-const BROADCAST_MAX: u64 = 134_217_728;
-
 #[test]
 fn resolved_side_sums_file_bytes_saturating() {
     assert_eq!(
@@ -230,30 +228,32 @@ fn resolved_side_sums_file_bytes_saturating() {
 fn dimension_is_left_when_left_side_is_smaller() {
     let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
     let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
-    let sides = select_broadcast_sides(customer, orders, BROADCAST_MAX);
+    let sides = select_broadcast_sides(customer, orders);
 
     assert_eq!(sides.dimension.table_name, "CUSTOMER");
     assert_eq!(sides.fact.table_name, "ORDERS");
     assert_eq!((sides.dimension_leg, sides.fact_leg()), (0, 1));
     assert_eq!(sides.dimension.total_bytes, 1_000);
     assert_eq!(sides.fact.total_bytes, 100_000);
-    assert!(
-        sides.broadcast_eligible,
-        "1000 bytes is well under the 128 MiB threshold"
-    );
     assert_eq!(sides.dimension.table_identifier, "lh.customer");
     assert_eq!(sides.fact.table_identifier, "lh.orders");
-    assert_eq!(sides.dimension.files, vec![FileEntry::new("c1", 1_000)]);
-    assert_eq!(sides.dimension.table_root, "s3://warehouse/lh/customer");
-    assert_eq!(sides.dimension.logical_schema.len(), 1);
-    assert_eq!(sides.dimension.effective_storage, sample_storage());
+    assert_eq!(
+        sides.dimension.scan.files,
+        vec![crate::scan::spec::FileEntry::new("c1", 1_000)]
+    );
+    assert_eq!(
+        sides.dimension.scan.table_root,
+        "s3://warehouse/lh/customer"
+    );
+    assert_eq!(sides.dimension.scan.logical_schema.len(), 1);
+    assert_eq!(sides.dimension.scan.effective_storage, sample_storage());
 }
 
 #[test]
 fn dimension_is_right_when_right_side_is_smaller() {
     let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
     let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
-    let sides = select_broadcast_sides(orders, customer, BROADCAST_MAX);
+    let sides = select_broadcast_sides(orders, customer);
 
     assert_eq!(sides.dimension.table_name, "CUSTOMER");
     assert_eq!(sides.fact.table_name, "ORDERS");
@@ -263,66 +263,24 @@ fn dimension_is_right_when_right_side_is_smaller() {
         "the dimension's leg is recorded, so the join block names its own relation alias"
     );
     assert_eq!(sides.dimension.total_bytes, 1_000);
-    assert!(sides.broadcast_eligible);
 }
 
 #[test]
-fn dimension_over_threshold_is_not_broadcast_eligible() {
-    let part = resolved_side("PART", vec![("p1", 200)]);
-    let lineitem = resolved_side("LINEITEM", vec![("l1", 900)]);
-    let sides = select_broadcast_sides(part, lineitem, 100);
-
-    assert_eq!(
-        sides.dimension.table_name, "PART",
-        "PART (200 bytes) is the smaller side"
-    );
-    assert_eq!(sides.fact.table_name, "LINEITEM");
-    assert!(
-        !sides.broadcast_eligible,
-        "dimension total 200 > threshold 100: not broadcast-eligible"
-    );
-}
-
-#[test]
-fn threshold_boundary_is_inclusive() {
-    let at = select_broadcast_sides(
-        resolved_side("DIM", vec![("d", 100)]),
-        resolved_side("FACT", vec![("f", 10_000)]),
-        100,
-    );
-    assert!(
-        at.broadcast_eligible,
-        "dimension == threshold must be eligible"
-    );
-
-    let over = select_broadcast_sides(
-        resolved_side("DIM", vec![("d", 101)]),
-        resolved_side("FACT", vec![("f", 10_000)]),
-        100,
-    );
-    assert!(
-        !over.broadcast_eligible,
-        "dimension == threshold + 1 must not be eligible"
-    );
-}
-
-#[test]
-fn empty_side_is_the_eligible_dimension() {
+fn empty_side_is_the_dimension() {
     let empty = resolved_side("EMPTYDIM", vec![]);
     let fact = resolved_side("FACT", vec![("f", 5_000)]);
-    let sides = select_broadcast_sides(empty, fact, BROADCAST_MAX);
+    let sides = select_broadcast_sides(empty, fact);
 
     assert_eq!(sides.dimension.table_name, "EMPTYDIM");
     assert_eq!(sides.dimension.total_bytes, 0);
-    assert!(sides.dimension.files.is_empty());
-    assert!(sides.broadcast_eligible);
+    assert!(sides.dimension.scan.files.is_empty());
 }
 
 #[test]
 fn equal_size_tie_breaks_to_first_argument() {
     let a = resolved_side("SELF_A", vec![("s", 4_242)]);
     let b = resolved_side("SELF_B", vec![("s", 4_242)]);
-    let sides = select_broadcast_sides(a, b, BROADCAST_MAX);
+    let sides = select_broadcast_sides(a, b);
 
     assert_eq!(sides.dimension.table_name, "SELF_A");
     assert_eq!(

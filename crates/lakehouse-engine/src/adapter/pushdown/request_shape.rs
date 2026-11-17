@@ -11,7 +11,7 @@ use super::grouped_agg::{
 };
 use super::scalar_over_agg::TypedPlans;
 use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plans};
-use super::support::{PushdownRequest, ScanTranslator};
+use super::support::{AggregationType, PushdownRequest, ScanTranslator, aggregation_type};
 use super::{GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates};
 
 #[derive(Debug)]
@@ -67,7 +67,7 @@ pub(super) fn classify_request_shape(
         };
     }
 
-    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by") {
+    if aggregation_type(pushdown_req) == Some(AggregationType::GroupBy) {
         return RequestShape::GroupByWrapper;
     }
 
@@ -76,9 +76,7 @@ pub(super) fn classify_request_shape(
         let aggregates = single_group_plans(&items, pushdown.select_types(), scan)?;
         Some((items, aggregates))
     }) else {
-        return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
-            == Some("single_group")
-        {
+        return if aggregation_type(pushdown_req) == Some(AggregationType::SingleGroup) {
             RequestShape::SingleGroupWrapper
         } else {
             RequestShape::RowScan

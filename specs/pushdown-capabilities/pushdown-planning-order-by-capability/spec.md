@@ -11,8 +11,8 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * A non-zero `limit.offset` always arrives with a non-empty `orderBy`, because Exasol withholds `limit` when it cannot delegate the ordering. Exasol never pushes `offset: 0`. It pushes no `orderBy` on an ungrouped aggregate request, because a one-row result admits one ordering.
 * The single-group aggregate merge SELECT takes the request's raw `limit` as its own input. The per-shard partial scan never reads `limit`.
 * The row-scan declined path withholds the per-shard `LIMIT` and re-applies the request's `LIMIT` on its outer wrapper after the global `ORDER BY`. A per-shard limit would truncate rows before the global ordering.
-* The derived projection is the projection-item list the adapter builds from the select list, one item per select-list item. Exasol validates the returned column count positionally against the original `selectList`, so a projection widened to the full base row fails with `sqlCode 04000`. A sort-key column absent from the derived projection is appended as a hidden scan column after every existing item, and the declined wrapper names the pre-extension items explicitly by their EMITS identifiers instead of `SELECT *`.
-* A request whose derived projection is already widened to the full base row routes to the qualified single-table wrapper before the declined-`ORDER BY` path runs.
+* The derived projection is the projection-item list the adapter builds from the select list, one item per select-list item. Exasol validates the returned column count positionally against the original `selectList`, so a result of another column count fails with `sqlCode 04000`. A sort-key column absent from the derived projection is appended as a hidden scan column after every existing item, and the declined wrapper names the pre-extension items explicitly by their EMITS identifiers instead of `SELECT *`.
+* A request whose derived projection is wrapped (`pushdown/pushdown-planning-selectlist-expressions`) routes to the qualified single-table wrapper before the declined-`ORDER BY` path runs.
 * A select-list item's quoted EMITS identifier is the source-column name for a bare column and `_LH_PROJ_{index}` for a rendered expression. The per-shard EMITS clause and the outer wrapper's column list use the same seam.
 * Column Exasol types come from `involvedTables[0].columns`. Exasol declares no type for a sort-key expression, so an expression sort key is rendered over columns whose types are known.
 
@@ -34,7 +34,7 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * *GIVEN* a row-scan `pushdown` request that the adapter cannot serve as a bounded top-N, carrying an `orderBy` whose parsed bare-column sort key is NOT a bare-column item of the adapter's derived projection, a different column entirely (`SELECT score FROM t WHERE id = 1 ORDER BY id`), a column referenced only inside a projected expression (`SELECT id || '-' || name FROM t WHERE id <= 3 ORDER BY id`), or a literal-only select list (`SELECT 1 FROM t ORDER BY name LIMIT 5`)
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL append each such sort-key column, resolved by name from `involvedTables[0].columns`, to the per-shard scan's projection and its declared EMITS list AFTER every item the derivation already produced, so every pre-existing item keeps its position and its unchanged EMITS identifier
-* *AND* the adapter MUST NOT widen the derived projection to the full base row, because the returned query would then carry one column per base-table column where Exasol positionally expects one per select-list item, which Exasol rejects with `sqlCode 04000`
+* *AND* the adapter MUST NOT return the full base row, because the returned query would then carry one column per base-table column where Exasol positionally expects one per select-list item, which Exasol rejects with `sqlCode 04000`
 * *AND* the declined-`ORDER BY` wrapper SHALL name the derived projection's pre-extension items EXPLICITLY by their EMITS identifiers rather than using `SELECT *`, so each appended sort-key column is visible to the outer `ORDER BY` but absent from the returned result, and the returned column count and order EQUAL the derived projection's pre-extension column count and order
 * *AND* the returned result SHALL equal the same query evaluated over all matching rows on a single node, in the requested sort-key order, direction, and NULL placement, EXCEPT for a sort key whose column requires the JSON-fallback VARCHAR cast, which orders on the emitted JSON string rather than the native value
 
@@ -69,12 +69,12 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 
 ### Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 
-* *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`, and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, an expression or aggregate sort key, or a request that also carries aggregates / group keys / a `having`)
+* *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`, and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a non-constant sort key that is not a bare projected column, such as an expression or aggregate sort key, or a request that also carries aggregates / group keys / a `having`)
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL fall back to the unoptimized declined path for that shape, carrying neither a per-shard row limit nor per-shard sort keys ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
 * *AND* the adapter SHALL render the ordering ITSELF, as a self-contained global `ORDER BY` (plus the request's full retained window, `LIMIT n`, and `OFFSET m` when non-zero) wrapping the unbounded fan-out, and SHALL NOT rely on Exasol re-applying an `ORDER BY` it retains, once a sort-key capability is advertised Exasol delegates the pushed `orderBy` and does not re-sort the returned rows, and once `LIMIT_WITH_OFFSET` is advertised it re-applies neither bound of the window either, so rendering the `LIMIT` alone returns the wrong window
 * *AND* that wrapper SHALL preserve the derived projection's pre-extension column count and order, emitting any column the ordering needs but the projection lacks as a hidden scan column, so a declined `ORDER BY` never becomes an Exasol column-count rejection nor a reference to a column the scan does not emit
-* *AND* every reachable ordered shape SHALL be rendered faithfully, because Exasol states both sort flags on every `orderBy` element and the Exasol dialect renders every sort key Exasol sends, so the result is never silently unordered and never carries a column the client did not select
+* *AND* every reachable ordered shape SHALL be rendered faithfully, because Exasol states both sort flags on every `orderBy` element and the Exasol dialect renders every non-constant sort key Exasol sends, so the result is never silently unordered and never carries a column the client did not select
 
 ### Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
 
@@ -92,3 +92,19 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * *GIVEN* a pushdown request through this feature's path
 * *WHEN* the adapter generates the pushdown SQL
 * *THEN* the credential-reference guarantee of `storage-access/scan-spec-credential-reference` SHALL apply, so no credential value appears in generated SQL or error messages
+
+### Scenario: A constant sort key does not become a select-list position
+
+* *GIVEN* a row-scan, grouped-aggregate, or join query whose `ORDER BY` names a constant, either a select-list position that points to a constant item (`SELECT id, 1 FROM t ORDER BY 2 DESC, 1 LIMIT 3`) or a constant expression (`SELECT id FROM t ORDER BY 1+0 DESC, id LIMIT 3`), which Exasol pushes as a literal sort key
+* *WHEN* the adapter builds the pushdown SQL
+* *THEN* the adapter SHALL leave every constant sort key that Exasol pushes out of the ordering it renders, except the one constant that an `ORDER BY` of constants only keeps for a non-zero `OFFSET`, because Exasol reads a bare integer in `ORDER BY` as a select-list position and a constant does not change the order
+* *AND* the query SHALL return the rows of the same query on a single node in the same order, ids 1, 2, 3 for the `LIMIT 3` queries above, and ids 1 to 5 in that order for `SELECT id, 1 FROM t WHERE id <= 5 ORDER BY 2 DESC, 1`
+* *AND* a constant larger than the select-list item count (`SELECT id, 5 FROM t ORDER BY 2 DESC, 1 LIMIT 3`) SHALL return those rows instead of failing with `Too large value 5 as select list column reference in ORDER BY`
+* *AND* a sort key that calls a function, such as `ABS(score)` in `SELECT id, 1 FROM t ORDER BY 2 DESC, ABS(score) LIMIT 3`, SHALL keep its place in the ordering
+
+### Scenario: An ORDER BY of constants only keeps its OFFSET window
+
+* *GIVEN* a row-scan, grouped-aggregate, or join query whose every `ORDER BY` key is a constant and that carries `LIMIT n OFFSET m` with a non-zero `m` (`SELECT id, 1 FROM t ORDER BY 2 LIMIT 3 OFFSET 18` over a 20-row table)
+* *WHEN* the adapter builds the pushdown SQL
+* *THEN* the adapter SHALL order by one constant that Exasol does not read as a select-list position, because Exasol rejects an `OFFSET` without an `ORDER BY`
+* *AND* the query SHALL return the row count of the same query on a single node, 2 rows for the query above

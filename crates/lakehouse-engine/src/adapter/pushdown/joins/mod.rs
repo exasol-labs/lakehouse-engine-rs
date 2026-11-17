@@ -1,5 +1,4 @@
 use crate::adapter::permission::PermissionCheck;
-use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::statement_state::StatementCatalog;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
@@ -7,16 +6,18 @@ use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
 
+use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, PushdownRequest, SCAN_UDF_NAME,
-    project_columns, quote_ident,
+    ColumnTypes, Emitted, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
+    project_columns, pushdown_response,
 };
 
 mod attribution;
+mod broadcast_policy;
 mod planning;
 mod rendering;
 mod sql_builders;
@@ -26,19 +27,21 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
-pub(super) use sql_builders::{EmptyRelation, qualified_single_table_fallback_pushdown};
+pub(super) use sql_builders::{
+    EmptyRelation, n_scan_emission, qualified_single_table_fallback_pushdown, single_table_emission,
+};
+// The dispatch-golden sibling module drives the broadcast and N-scan builders directly.
 #[cfg(test)]
 pub(super) use sql_builders::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
+    build_broadcast_join_sql, build_qualified_single_table_fallback_sql,
 };
 
+use broadcast_policy::{BroadcastFacts, n_scan_reason};
 pub(super) use planning::{JoinWindowPlan, involved_table};
 use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
-use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
-// `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
-pub(super) use sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
-};
+use rendering::{leg_local_filter, possible_side_column_names};
+pub(super) use sql_builders::build_n_scan_join_sql;
+use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emission};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
 /// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
@@ -57,50 +60,64 @@ pub(crate) fn ensure_columns_declared(
     legs.ensure_columns_declared(pushdown, declared)
 }
 
-/// The generated SQL runs outside the adapter script's schema, so an unqualified name would
-/// not resolve.
-pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
-    match scan_schema {
-        Some(schema) if !schema.is_empty() => format!("{}.{}", quote_ident(schema), udf),
-        _ => udf.to_string(),
-    }
-}
-
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
-/// the other side's same-named column. With no explicit select list, each side's whole
-/// declared row is charged.
-///
-/// Lives here rather than in `planning`, which must not depend on `rendering`.
+/// the other side's same-named column. `SELECT *` names no column, so it charges every one.
 fn ensure_no_side_refuses_a_referenced_column(
     request: &Json,
-    pushdown_req: &Json,
+    output: OutputContract,
     sides: &[ResolvedJoinSide],
 ) -> Result<(), UdfError> {
-    if sides.iter().all(|side| side.refused_columns.is_empty()) {
-        return Ok(());
-    }
-    let emits_unnamed_row = has_no_explicit_select_list(pushdown_req);
     for side in sides {
         let mut touched = possible_side_column_names(request, &side.table_name);
-        if emits_unnamed_row {
-            touched.extend(
-                side.column_types
+        match output {
+            OutputContract::WholeRow => touched.extend(
+                side.scan
+                    .refused_columns
                     .iter()
-                    .map(|(column, _)| column.name.clone()),
-            );
+                    .map(|column| column.column_name.to_uppercase()),
+            ),
+            OutputContract::AnyOneColumn | OutputContract::Items => {}
         }
-        ensure_no_touched_column_is_refused(&touched, &side.refused_columns)?;
+        ensure_no_touched_column_is_refused(&touched, &side.scan.refused_columns)?;
     }
     Ok(())
+}
+
+/// The empty result of a join with a fileless side. Every column binds leg-qualified, so a name
+/// two legs share reads its own leg's type and refusal.
+fn empty_join_sql(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    emitted: Vec<Emitted>,
+    context: &PushdownContext<'_>,
+) -> Result<Json, UdfError> {
+    let legs = join.legs();
+    let col_types = ColumnTypes::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
+    );
+    let bound = pushdown.with_json(legs.qualify(pushdown.json()));
+    let scan = ScanTranslator::over(&col_types, context.version, &[bound.json()])?;
+    let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
+    empty_result_sql(
+        pushdown,
+        &bound,
+        &projection,
+        scan,
+        &EmptyRelation::join(join, emitted),
+        context,
+    )
 }
 
 /// Resolves each table once (never per shard), pruned by its leg-local WHERE conjuncts. Any
 /// empty side short-circuits to the shape-correct empty result, since an inner join is then
 /// empty.
 ///
-/// Broadcast is an optimization inside this one path: taken only for an N = 2 equi-join
-/// whose smaller side fits `join_broadcast_max_bytes`, whose window the broadcast path can
-/// serve, and whose leg-qualified render succeeds. The legs may share column names or be one
+/// Broadcast is an optimization inside this one path, taken when [`plan_broadcast_join`] yields
+/// a plan. The legs may share column names or be one
 /// table joined to itself. Everything else takes the sole fallback,
 /// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
 /// A column that binds no single leg, or that its leg does not declare, fails the request
@@ -109,24 +126,13 @@ fn ensure_no_side_refuses_a_referenced_column(
 /// No plan-time check compares the sides' storage backends: each side reads through its own
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
 /// different stores) is owned by the scan's `validate_sides_share_one_store`.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     statement: &StatementCatalog,
     permission: &PermissionCheck,
-    props: &Json,
-    scan_schema: Option<&str>,
-    cluster_nodes: usize,
-    parallelism_factor: usize,
-    df_target_partitions: usize,
-    df_batch_size: usize,
-    df_threads_per_udf: usize,
-    memory_pool_fraction: f64,
-    instance_overhead_mb: u64,
-    s3_max_connections: usize,
-    join_broadcast_max_bytes: u64,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
@@ -151,7 +157,7 @@ pub(super) async fn plan_join(
         &involved.iter().collect::<Vec<_>>(),
     )?;
     let resolver =
-        TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
+        TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
@@ -170,69 +176,61 @@ pub(super) async fn plan_join(
         ))
         .await?;
 
-    ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
+    // Both before the zero-files return: a refused column must error, never yield an empty
+    // result.
+    ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
+    let emitted = n_scan_emission(pushdown, join, &sides)?;
 
-    if sides.iter().any(|s| s.files.is_empty()) {
-        let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let scan = ScanTranslator::over(&combined, &[pushdown_req])?;
-        let (projection, widened) = project_columns(pushdown, scan)?;
-        let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
-        return empty_result_sql(
-            pushdown,
-            &projection,
-            widened,
-            scan,
-            &EmptyRelation::join(join, cols_per_leg),
-        );
+    if sides.iter().any(|s| s.scan.files.is_empty()) {
+        return empty_join_sql(pushdown, join, &sides, emitted, context);
     }
 
-    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
-    let inputs = JoinScanRequestConfig {
-        cluster_nodes,
-        parallelism_factor,
-        df_target_partitions,
-        df_batch_size,
-        df_threads_per_udf,
-        memory_pool_fraction,
-        instance_overhead_mb,
-        s3_max_connections,
-        binary_as_string: resolve_binary_as_string(props),
-        connection: statement.connection(),
-    };
+    if let Some(sql) = plan_broadcast_join(pushdown, join, &sides, context)? {
+        return Ok(pushdown_response(sql));
+    }
 
-    // The window is classified before sizing and rendering, so a request Exasol must
-    // post-process never reaches `render_broadcast_join`. A decline falls through to the N-scan
-    // fallback.
+    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, context)?;
+    Ok(pushdown_response(sql))
+}
+
+/// The broadcast plan of `join`, or `None` to keep the N-scan. Three things can say no, in this
+/// order: the shape (two legs, an equi-join, a window the path can serve), the policy
+/// ([`n_scan_reason`]), and a render decline of the builder.
+fn plan_broadcast_join(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    context: &PushdownContext<'_>,
+) -> Result<Option<String>, UdfError> {
+    let pushdown_req = pushdown.json();
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
-    let window = classify_join_window(pushdown_req);
-    if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
-        let candidate =
-            select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
-        if candidate.broadcast_eligible
-            && let Some(rendered) = render_broadcast_join(pushdown, join, &sides)?
-            && let Some(sql) = build_broadcast_join_sql(
-                &candidate,
-                &rendered,
-                &inputs,
-                &udf_name,
-                &distribute_udf_name,
-            )?
-        {
-            return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
-        }
+    // Exasol renders an aggregating request's window over the broadcast fan-out, so only a
+    // request that does not aggregate has a window the path may be unable to serve.
+    let window_servable = aggregation_type(pushdown_req).is_some()
+        || !matches!(
+            classify_join_window(pushdown_req),
+            JoinWindowPlan::BroadcastUnservable
+        );
+    if join.tables.len() != 2 || !is_equi || !window_servable {
+        return Ok(None);
     }
-
-    let sql = build_n_scan_join_sql(
-        pushdown,
-        join,
-        &sides,
-        &inputs,
-        &udf_name,
-        &distribute_udf_name,
-    )?;
-    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+    let candidate = select_broadcast_sides(sides[0].clone(), sides[1].clone());
+    let reads = aggregation_reads(pushdown, join, sides)?;
+    let facts = BroadcastFacts {
+        dimension_bytes: candidate.dimension.total_bytes,
+        max_bytes: context.tuning.join_broadcast_max_bytes,
+        legs: &join.legs(),
+        dimension_leg: candidate.dimension_leg,
+        filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
+        aggregation_reads: reads
+            .as_ref()
+            .map(|read| read[candidate.dimension_leg].columns()),
+    };
+    if n_scan_reason(&facts).is_some() {
+        return Ok(None);
+    }
+    build_broadcast_plan_sql(pushdown, join, sides, &candidate, reads, context)
 }
 
 #[cfg(test)]

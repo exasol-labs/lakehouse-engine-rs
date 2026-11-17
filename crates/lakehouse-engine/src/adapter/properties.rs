@@ -1,8 +1,10 @@
 //! The virtual schema property catalog: every property name the adapter reads, and the value
-//! rule of each tuning property and of EXCLUDED_CAPABILITIES.
+//! rule of each tuning property and of EXCLUDED_CAPABILITIES. No other module reads a property
+//! by name.
 
 use super::capabilities::{CAPABILITIES, excluded_capability_entries};
-use super::nonempty_str;
+use super::catalog_kind::CatalogKind;
+use super::permission::PermissionSettings;
 use super::table_filter::{TableFilter, parse_patterns};
 pub(super) use crate::exasol::parse_boolean;
 use crate::exasol::{WholeNumber, parse_whole_number};
@@ -16,7 +18,7 @@ pub(super) const PROP_CATALOG_KIND: &str = "CATALOG_KIND";
 // CONNECTION whose address is the catalog URI and whose password is the credential JSON.
 pub(super) use crate::exasol::CATALOG_CONNECTION as PROP_CATALOG_CONNECTION;
 pub(super) const PROP_NAMESPACE: &str = "NAMESPACE";
-pub(super) const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
+const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 pub(super) const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 pub(super) const PROP_DF_THREADING_MODE: &str = "DATAFUSION_THREADING_MODE";
 pub(super) const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
@@ -29,7 +31,7 @@ pub(super) const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
 pub(super) const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 // Mirrors the native `IMPORT FROM PARQUET` `MaxConnections` knob.
 pub(super) const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
-pub(super) const PROP_METADATA_READ_CONCURRENCY: &str = "METADATA_READ_CONCURRENCY";
+const PROP_METADATA_READ_CONCURRENCY: &str = "METADATA_READ_CONCURRENCY";
 pub(super) const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
 pub(super) const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 // Like Spark's `spark.sql.parquet.binaryAsString`, for writers that store text as binary.
@@ -93,53 +95,95 @@ pub(super) struct TuningProperties {
     pub(super) metadata_read_concurrency: Option<NonZeroU8>,
 }
 
-/// The checked values that the create-time resolution reads without parsing a string again.
+/// The values this module checks. A rejected or absent boolean is `false`.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct CheckedProperties {
+    pub(super) allow_http: bool,
+    pub(super) binary_as_string: bool,
     pub(super) tuning: TuningProperties,
     pub(super) table_filter: TableFilter,
 }
 
-/// Rejects every unknown property name, every invalid tuning or table pattern value, and every
-/// unadvertised EXCLUDED_CAPABILITIES entry in one error. Each value is checked on its own: no
-/// property's validity depends on another property.
-pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfError> {
+/// How a request treats an unknown property name or a rejected value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Check {
+    /// createVirtualSchema, refresh, and setProperties fail with one error listing every one.
+    Strict,
+    /// Every other request reads a rejected value as absent, so a virtual schema persisted before
+    /// a check existed still plans.
+    Lenient,
+}
+
+/// A request's virtual schema properties, parsed once per request and never kept, so a SET
+/// applies from the next request. The value rules of `MERGE_SCHEMA` and `HIVE_PARTITIONING`
+/// belong to direct storage, which alone reads them.
+pub(super) struct VsProperties {
+    pub(super) catalog_kind: CatalogKind,
+    pub(super) catalog_connection: Option<String>,
+    pub(super) namespace: Option<String>,
+    pub(super) merge_schema: Option<String>,
+    pub(super) hive_partitioning: Option<String>,
+    /// The raw value: `capabilities` owns the entry syntax.
+    pub(super) excluded_capabilities: Option<String>,
+    pub(super) permission: PermissionSettings,
+    pub(super) checked: CheckedProperties,
+}
+
+impl VsProperties {
+    pub(super) fn parse(props: &Json, check: Check) -> Result<Self, UdfError> {
+        let checked = checked_values(props, check)?;
+        let text = |name| nonempty_str(props, name).map(str::to_string);
+        let permission = PermissionSettings::parse(
+            nonempty_str(props, PERMISSION_CHECK),
+            nonempty_str(props, USER_MAPPING),
+        )?;
+        Ok(Self {
+            catalog_kind: CatalogKind::parse(nonempty_str(props, PROP_CATALOG_KIND))?,
+            catalog_connection: text(PROP_CATALOG_CONNECTION),
+            namespace: text(PROP_NAMESPACE),
+            merge_schema: text(PROP_MERGE_SCHEMA),
+            hive_partitioning: text(PROP_HIVE_PARTITIONING),
+            excluded_capabilities: text(PROP_EXCLUDED_CAPABILITIES),
+            permission,
+            checked,
+        })
+    }
+}
+
+/// Under [`Check::Strict`], rejects every unknown property name, every invalid tuning or table
+/// pattern value, and every unadvertised EXCLUDED_CAPABILITIES entry in one error. Each value is
+/// checked on its own: no property's validity depends on another property.
+pub(super) fn checked_values(props: &Json, check: Check) -> Result<CheckedProperties, UdfError> {
+    let mut checker = TuningChecker::new(props);
+    let checked = CheckedProperties {
+        allow_http: checker.boolean(PROP_ALLOW_HTTP),
+        binary_as_string: checker.boolean(PROP_BINARY_AS_STRING),
+        tuning: checker.tuning(),
+        table_filter: checker.table_filter(),
+    };
+    checker.excluded_capabilities();
+    if check == Check::Lenient {
+        return Ok(checked);
+    }
     let mut entries: Vec<String> = unknown_names(props)
         .into_iter()
         .map(unknown_entry)
         .collect();
-    match check_values(props) {
-        Ok(checked) if entries.is_empty() => return Ok(checked),
-        Ok(_) => {}
-        Err(invalid) => entries.extend(invalid),
+    entries.extend(checker.invalid.into_values());
+    if entries.is_empty() {
+        Ok(checked)
+    } else {
+        Err(UdfError::User(format!(
+            "{ERROR_PREFIX}{}",
+            entries.join("; ")
+        )))
     }
-    Err(UdfError::User(format!(
-        "{ERROR_PREFIX}{}",
-        entries.join("; ")
-    )))
 }
 
-pub(super) fn resolve_allow_http(props: &Json) -> bool {
-    resolve_boolean(props, PROP_ALLOW_HTTP)
-}
-
-/// Read at every pushdown, so a SET applies from the next query.
-pub(super) fn resolve_binary_as_string(props: &Json) -> bool {
-    resolve_boolean(props, PROP_BINARY_AS_STRING)
-}
-
-/// Read at every `getCapabilities` request, so a SET applies from the next query. It is the raw
-/// value: `capabilities` owns the entry syntax.
-pub(super) fn resolve_excluded_capabilities(props: &Json) -> Option<&str> {
-    nonempty_str(props, PROP_EXCLUDED_CAPABILITIES)
-}
-
-/// Applies the TRUE/FALSE rule that `check_properties` applies. A rejected value counts as
-/// `false`, which only a pushdown on a schema persisted before the check can reach.
-fn resolve_boolean(props: &Json, name: &str) -> bool {
-    nonempty_str(props, name)
-        .and_then(parse_boolean)
-        .unwrap_or(false)
+fn nonempty_str<'a>(obj: &'a Json, key: &str) -> Option<&'a str> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 fn unknown_names(props: &Json) -> BTreeSet<&str> {
@@ -203,22 +247,6 @@ fn edit_distance(a: &[char], b: &[char]) -> usize {
     previous[b.len()]
 }
 
-/// One entry per rejected value, in alphabetical order of the name.
-fn check_values(props: &Json) -> Result<CheckedProperties, Vec<String>> {
-    let mut checker = TuningChecker::new(props);
-    let tuning = checker.tuning();
-    let table_filter = checker.table_filter();
-    checker.excluded_capabilities();
-    if checker.invalid.is_empty() {
-        Ok(CheckedProperties {
-            tuning,
-            table_filter,
-        })
-    } else {
-        Err(checker.invalid.into_values().collect())
-    }
-}
-
 struct TuningChecker<'a> {
     props: &'a Json,
     /// Keyed by property name, so the entries read in alphabetical order.
@@ -233,9 +261,11 @@ impl<'a> TuningChecker<'a> {
         }
     }
 
+    fn boolean(&mut self, name: &'static str) -> bool {
+        self.value(name, check_boolean).unwrap_or(false)
+    }
+
     fn tuning(&mut self) -> TuningProperties {
-        self.value(PROP_ALLOW_HTTP, check_boolean);
-        self.value(PROP_BINARY_AS_STRING, check_boolean);
         TuningProperties {
             parallelism_factor: self.whole_number(PROP_PARALLELISM_FACTOR),
             threading_mode: self.value(PROP_DF_THREADING_MODE, parse_threading_mode),
@@ -258,7 +288,7 @@ impl<'a> TuningChecker<'a> {
     }
 
     fn excluded_capabilities(&mut self) {
-        let Some(raw) = resolve_excluded_capabilities(self.props) else {
+        let Some(raw) = nonempty_str(self.props, PROP_EXCLUDED_CAPABILITIES) else {
             return;
         };
         let mut unadvertised: Vec<&str> = Vec::new();

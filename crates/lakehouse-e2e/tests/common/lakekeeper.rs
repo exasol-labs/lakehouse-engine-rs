@@ -487,6 +487,40 @@ pub fn load_table_with_vended_credentials(
         .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} is not a LoadTableResult: {e}"))
 }
 
+/// The metadata of `table`, a `<namespace>.<table>` name, with every snapshot and the
+/// `metadata-log`, or `None` when the warehouse holds no such table.
+pub fn table_metadata(warehouse_name: &str, table: &str) -> Option<serde_json::Value> {
+    let token = keycloak_client_credentials_token();
+    let prefix = warehouse_prefix(warehouse_name);
+    let (namespace, name) = table
+        .rsplit_once('.')
+        .unwrap_or_else(|| panic!("{table} is not a <namespace>.<table> name"));
+    // The Iceberg REST path joins namespace levels with the unit separator.
+    let namespace = namespace.replace('.', "%1F");
+    let url = format!(
+        "{}/v1/{prefix}/namespaces/{namespace}/tables/{name}",
+        catalog_uri_host()
+    );
+    let resp = http_client()
+        .get(&url)
+        .query(&[("snapshots", "all")])
+        .bearer_auth(&token)
+        .send()
+        .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} failed to send: {e}"));
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+    assert!(
+        status.is_success(),
+        "Lakekeeper loadTable {url} returned {status}"
+    );
+    let body: serde_json::Value = resp
+        .json()
+        .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} is not JSON: {e}"));
+    Some(body["metadata"].clone())
+}
+
 /// The longest `storage-credentials` prefix matching `location` wins, else the top-level
 /// `config`, as the Iceberg REST spec describes.
 pub fn vended_storage_config<'a>(

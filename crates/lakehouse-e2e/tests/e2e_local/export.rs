@@ -1,15 +1,31 @@
-//! `EXPORT ... INTO SCRIPT` through the export script. The local stack has one node, so
-//! the writer count is `WRITERS_PER_NODE`, capped at 300.
+//! `EXPORT ... INTO SCRIPT` through the export script into the local Iceberg REST catalog. The
+//! local stack has one node, so the writer count is `WRITERS_PER_NODE`, capped at 300.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, OnceLock};
+
+use futures::TryStreamExt;
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use object_store::ObjectStore;
+use object_store::path::Path as ObjectStorePath;
 
 use crate::common::e2e_harness::{
-    DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, SCHEMA_NAME, error_text, exa_conn,
+    DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
+    VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
+    declared_types, exa_conn, export_error, exported_rows, failing_source, local_stack_s3_store,
+    run_namespace, runtime,
 };
 use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
-use crate::common::stack::{exasol_host, exasol_sql_port, local_stack_connection_password};
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
+use crate::common::stack::{
+    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY,
+    build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url_internal,
+    local_stack_connection_password, proxy_log_during,
+};
+use crate::fixtures::{
+    LAKEHOUSE_VS, PROXY_ICEBERG_CREDS, lakehouse_vs, proxy_virtual_schemas, seed_catalog, stack,
+    vs_table,
+};
 
 const EXPORT_SCHEMA: &str = "EXPORT_E2E";
 const SOURCE_TABLE: &str = "EXPORT_E2E.SRC_ROWS";
@@ -21,12 +37,12 @@ const MAX_WRITERS: i64 = 300;
 const EXPORTER_PASSWORD: &str = "ExportE2eUser2026x";
 const ROLE_EXPORTER: &str = "EXPORT_E2E_ROLE_EXPORTER";
 const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
+const WAREHOUSE_BUCKET: &str = "warehouse";
 
-/// Every row raises when read, so an error without the read error proves the export
-/// failed before reading the source.
-const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.SRC_ROWS)";
-const SOURCE_READ_ERROR: &str = "division by zero";
+static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
+const AZURE_ACCOUNT_KEY: &str = "ZXhwb3J0LWUyZS1henVyZS1rZXk=";
+
 fn setup() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
@@ -36,7 +52,8 @@ fn setup() {
         sys.execute(&format!(
             "CREATE OR REPLACE TABLE {SOURCE_TABLE} AS SELECT \
                CAST(LEVEL AS DECIMAL(9,0)) AS ID, \
-               CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL \
+               CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL, \
+               CAST(MOD(LEVEL, 7) AS DECIMAL(9,0)) AS GRP \
              FROM DUAL CONNECT BY LEVEL <= {SOURCE_ROWS}"
         ));
         sys.execute(&format!(
@@ -92,26 +109,35 @@ fn missing_grant_error(user: &str) -> String {
     )
 }
 
-fn export_into(source: &str, tail: &str) -> String {
-    format!("EXPORT {source} INTO SCRIPT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME} {tail}")
-}
-
-/// A valid export of `source` with `options` after `TABLE_NAME`.
-fn export_sql(source: &str, options: &str) -> String {
-    export_into(
-        source,
-        &format!(
-            "WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t' {options}"
-        ),
+/// A table no earlier export wrote.
+fn new_table() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "{}.t{}",
+        run_namespace("misc"),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
 
-#[track_caller]
-fn exported_rows(conn: &mut ExaConn, sql: &str) -> i64 {
-    let resp = conn.execute(sql);
-    resp["responseData"]["results"][0]["rowCount"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("expected a rowCount from:\n{sql}\n\nResponse: {resp}"))
+const DIRECT: ExportRoute = ExportRoute {
+    script_schema: SCHEMA_NAME,
+    connection: DEFAULT_CATALOG_CONN_NAME,
+};
+
+/// The proxy-only scripts and CONNECTION of `proxy_virtual_schemas`, so a `scripts/proxy/filter`
+/// line can inject a catalog or storage fault.
+const PROXIED: ExportRoute = ExportRoute {
+    script_schema: PROXY_ADAPTER_SCHEMA,
+    connection: PROXY_ICEBERG_CREDS,
+};
+
+fn export_into(source: &str, tail: &str) -> String {
+    DIRECT.export_into(source, tail)
+}
+
+/// A valid export of `source` into a new table, with `options`.
+fn export_sql(source: &str, options: &str) -> String {
+    DIRECT.export(source, &new_table(), options)
 }
 
 /// The exported row count and the writer count of one export. A fresh session holds only
@@ -121,80 +147,103 @@ fn profiled_export(source: &str, options: &str) -> (i64, i64) {
     profiled_export_counts(&mut exa_conn(), &export_sql(source, options))
 }
 
-/// The error text of a failing export, checked to carry no value of the CONNECTION.
-#[track_caller]
-fn export_error(conn: &mut ExaConn, sql: &str) -> String {
-    let error = error_text(&conn.try_execute(sql), sql);
+/// The CONNECTION values no export error may carry.
+fn connection_secrets() -> [String; 2] {
     let password = local_stack_connection_password();
-    for secret in [&password.access_key, &password.secret_key] {
-        assert!(
-            !error.contains(secret.as_str()),
-            "a CONNECTION value leaked: {error}"
-        );
-    }
-    error
+    [password.access_key, password.secret_key]
 }
 
-#[track_caller]
-fn assert_refused_before_reading(
-    label: &str,
-    conn: &mut ExaConn,
-    sql: &str,
-    fragments: &[&str],
-) -> String {
-    let error = export_error(conn, sql);
-    assert!(
-        fragments.iter().all(|fragment| error.contains(fragment))
-            && !error.contains(SOURCE_READ_ERROR),
-        "{label}: {sql} must fail before reading the source, naming {fragments:?}: {error}"
-    );
-    error
+fn table_exists(table: &str) -> bool {
+    let ident = TableIdent::from_strs(table.split('.'))
+        .unwrap_or_else(|e| panic!("{table} is not a table name: {e}"));
+    runtime()
+        .block_on(seed_catalog(runtime(), "export").table_exists(&ident))
+        .unwrap_or_else(|e| panic!("check table {table}: {e}"))
 }
 
-/// Scenario: A whole-table export reports every source row
+fn namespace_exists(namespace: &str) -> bool {
+    let ident = NamespaceIdent::new(namespace.to_string());
+    runtime()
+        .block_on(seed_catalog(runtime(), "export").namespace_exists(&ident))
+        .unwrap_or_else(|e| panic!("check namespace {namespace}: {e}"))
+}
+
+/// The keys under `prefix` of the warehouse bucket.
+fn objects_under(prefix: &str) -> Vec<String> {
+    let store = local_stack_s3_store(WAREHOUSE_BUCKET);
+    let prefix = ObjectStorePath::from(prefix);
+    runtime()
+        .block_on(
+            store
+                .list(Some(&prefix))
+                .map_ok(|object| object.location.to_string())
+                .try_collect(),
+        )
+        .unwrap_or_else(|e| panic!("list {WAREHOUSE_BUCKET}/{prefix}: {e}"))
+}
+
+/// Scenario: A whole-table export writes every source row
 /// Scenario: A filtered query exports only the rows it returns
-/// Scenario: A column-list export reports every row of the table
+/// Scenario: A column-list export writes only the listed columns
 /// Scenario: A join of a virtual schema table and an Exasol table exports the joined rows
-/// Scenario: An empty source exports zero rows
 /// Scenario: All scripts resolve from the same uploaded artifact
 #[test]
-fn export_reports_every_source_row() {
+fn export_writes_every_source_row() {
     stack();
     setup();
     let mut sys = exa_conn();
+    let namespace = run_namespace("rows");
+    let read_vs = "EXPORT_E2E_READ_BACK";
     let join = format!(
         "SELECT e.ID, e.NAME, t.TAG FROM {} e JOIN {TAGS_TABLE} t ON e.ID = t.ID",
         vs_table(LAKEHOUSE_VS, E2E_TABLE)
     );
     // The even IDs of the 20 events join one tag each.
     assert_eq!(sys.query_row_count(&join), 10, "the join selects 10 rows");
+    let filtered = format!("SELECT ID, LABEL, GRP FROM {SOURCE_TABLE} WHERE MOD(ID, 4) = 0");
     let cases = [
-        ("whole table", SOURCE_TABLE.to_string(), SOURCE_ROWS),
         (
-            "filtered query",
-            format!("(SELECT * FROM {SOURCE_TABLE} WHERE MOD(ID, 4) = 0)"),
+            "whole_table",
+            SOURCE_TABLE.to_string(),
+            format!("SELECT ID, LABEL, GRP FROM {SOURCE_TABLE}"),
+            SOURCE_ROWS,
+        ),
+        (
+            "filtered_rows",
+            format!("({filtered})"),
+            filtered.clone(),
             SOURCE_ROWS / 4,
         ),
         (
-            "column list",
-            format!("{SOURCE_TABLE} (ID, LABEL)"),
+            "listed_columns",
+            format!("{SOURCE_TABLE} (LABEL, ID)"),
+            format!("SELECT LABEL, ID FROM {SOURCE_TABLE}"),
             SOURCE_ROWS,
         ),
-        ("virtual schema join", format!("({join})"), 10),
-        (
-            "empty source",
-            format!("(SELECT * FROM {SOURCE_TABLE} WHERE ID < 0)"),
-            0,
-        ),
+        ("joined_rows", format!("({join})"), join.clone(), 10),
     ];
 
-    for (case, source, expected) in cases {
-        assert_eq!(
-            exported_rows(&mut sys, &export_sql(&source, "")),
-            expected,
-            "{case}"
-        );
+    for (table, source, _, expected) in &cases {
+        let sql = DIRECT.export(source, &format!("{namespace}.{table}"), "");
+        assert_eq!(exported_rows(&mut sys, &sql), *expected, "{table}");
     }
+    create_virtual_schema(
+        &mut sys,
+        &VsProps::new(read_vs, &namespace).with_catalog_conn_name("EXPORT_E2E_READ_CREDS"),
+    );
+
+    for (table, _, query, expected) in &cases {
+        assert_holds_rows(&mut sys, &vs_table(read_vs, table), query, *expected);
+    }
+    let listed: Vec<String> = declared_types(&mut sys, read_vs, "listed_columns")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        listed,
+        ["LABEL", "ID"],
+        "only the listed columns, in list order"
+    );
 }
 
 /// Scenario: WRITERS_PER_NODE sets the writer count
@@ -277,41 +326,53 @@ fn export_refuses_invalid_statements_before_reading() {
         "AT 'http://catalog:8181' USER 'exporter' IDENTIFIED BY '{INLINE_PASSWORD}' \
          WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t'"
     );
-    let appends_only =
-        |clause: &str| format!("{clause} is not supported, because the export only appends rows");
+    let never_rewrites = |clause: &str| {
+        format!("{clause} is not supported, because the export never truncates or replaces a table")
+    };
     let cases = [
         (
             "WRITERS_PER_NODE with SINGLE_COMMIT",
             export_sql(
-                FAILING_SOURCE,
+                &FAILING_SOURCE,
                 "WRITERS_PER_NODE = '2' SINGLE_COMMIT = 'true'",
             ),
             vec!["WRITERS_PER_NODE cannot be combined with SINGLE_COMMIT = 'true'".to_string()],
         ),
         (
             "unknown option",
-            export_sql(FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
+            export_sql(&FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
             vec![
-                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT"
+                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, and ALLOW_HTTP"
                     .to_string(),
             ],
         ),
         (
             "WRITERS_PER_NODE of 0",
-            export_sql(FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
+            export_sql(&FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
             vec![
                 "WRITERS_PER_NODE = '0' is not a whole number from 1 to".to_string(),
                 "WRITERS_PER_NODE = '4'".to_string(),
             ],
         ),
         (
+            "ALLOW_HTTP of yes",
+            export_into(
+                &FAILING_SOURCE,
+                &format!(
+                    "WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t' \
+                     ALLOW_HTTP = 'yes'"
+                ),
+            ),
+            vec!["ALLOW_HTTP = 'yes' is not 'true' or 'false'".to_string()],
+        ),
+        (
             "no CATALOG_CONNECTION",
-            export_into(FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
+            export_into(&FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
             vec!["option CATALOG_CONNECTION is required".to_string()],
         ),
         (
             "named AT clause",
-            export_into(FAILING_SOURCE, &named_at),
+            export_into(&FAILING_SOURCE, &named_at),
             vec![
                 "the AT clause is not supported".to_string(),
                 use_option.to_string(),
@@ -319,7 +380,7 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "inline AT clause",
-            export_into(FAILING_SOURCE, &inline),
+            export_into(&FAILING_SOURCE, &inline),
             vec![
                 "the AT clause is not supported".to_string(),
                 use_option.to_string(),
@@ -327,34 +388,255 @@ fn export_refuses_invalid_statements_before_reading() {
         ),
         (
             "TRUNCATE",
-            export_sql(FAILING_SOURCE, "TRUNCATE"),
-            vec![appends_only("TRUNCATE")],
+            export_sql(&FAILING_SOURCE, "TRUNCATE"),
+            vec![never_rewrites("TRUNCATE")],
         ),
         (
             "REPLACE",
-            export_sql(FAILING_SOURCE, "REPLACE"),
-            vec![appends_only("REPLACE")],
+            export_sql(&FAILING_SOURCE, "REPLACE"),
+            vec![never_rewrites("REPLACE")],
         ),
         (
             "CREATED BY",
-            export_sql(FAILING_SOURCE, "CREATED BY 'CREATE TABLE ns.t (x INT)'"),
-            vec![appends_only("CREATED BY")],
+            export_sql(&FAILING_SOURCE, "CREATED BY 'CREATE TABLE ns.t (x INT)'"),
+            vec![never_rewrites("CREATED BY")],
         ),
     ];
 
     for (case, sql, fragments) in cases {
         let fragments: Vec<&str> = fragments.iter().map(String::as_str).collect();
-        let error = assert_refused_before_reading(case, &mut exa_conn(), &sql, &fragments);
+        let error = assert_refused_before_reading(
+            case,
+            &mut exa_conn(),
+            &sql,
+            &fragments,
+            &connection_secrets(),
+        );
         assert!(
             !error.contains(INLINE_PASSWORD),
             "{case}: the inline password leaked: {error}"
         );
     }
-    let read_error = export_error(&mut exa_conn(), &export_sql(FAILING_SOURCE, ""));
+    let read_error = export_error(
+        &mut exa_conn(),
+        &export_sql(&FAILING_SOURCE, ""),
+        &connection_secrets(),
+    );
     assert!(
         read_error.contains(SOURCE_READ_ERROR),
         "with valid options the export reads the failing source: {read_error}"
     );
+}
+
+/// Scenario: Plain HTTP needs ALLOW_HTTP
+#[test]
+fn export_plain_http_needs_allow_http() {
+    stack();
+    setup();
+    let conn = DEFAULT_CATALOG_CONN_NAME;
+    let without_allow_http = export_into(
+        &FAILING_SOURCE,
+        &format!(
+            "WITH CATALOG_CONNECTION = '{conn}' TABLE_NAME = '{}'",
+            new_table()
+        ),
+    );
+
+    assert_refused_before_reading(
+        "without ALLOW_HTTP",
+        &mut exa_conn(),
+        &without_allow_http,
+        &[
+            &format!("field address of CONNECTION '{conn}' names a plain HTTP address"),
+            "ALLOW_HTTP = 'true'",
+        ],
+        &connection_secrets(),
+    );
+    assert_eq!(
+        exported_rows(
+            &mut exa_conn(),
+            &export_sql(
+                &format!("(SELECT * FROM {SOURCE_TABLE} WHERE ID <= 10)"),
+                ""
+            )
+        ),
+        10,
+        "with ALLOW_HTTP = 'true' the same export of a readable source succeeds"
+    );
+}
+
+/// Scenario: A CONNECTION the export does not support is refused before any data is read
+/// Scenario: A source column name the new table cannot hold is refused before any data is read
+#[test]
+fn export_refuses_unwritable_connections_and_column_names() {
+    stack();
+    setup();
+    let mut sys = exa_conn();
+    let azure = CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        account_name: Some("exporte2e".to_string()),
+        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
+        ..Default::default()
+    };
+    let sigv4 = CatalogConnectionPassword {
+        use_sigv4: true,
+        ..local_stack_connection_password()
+    };
+    let catalog = iceberg_catalog_url_internal();
+    sys.execute(&build_create_connection_sql(
+        "EXPORT_E2E_AZURE_CREDS",
+        &catalog,
+        &azure,
+    ));
+    sys.execute(&build_create_connection_sql(
+        "EXPORT_E2E_SIGV4_CREDS",
+        &catalog,
+        &sigv4,
+    ));
+    let through = |connection: &'static str, options: &str| {
+        let table = new_table();
+        let route = ExportRoute {
+            connection,
+            ..DIRECT
+        };
+        (route.export(&FAILING_SOURCE, &table, options), table)
+    };
+    let azure_refusal = "supplies Azure storage field(s) account_name, account_key, but the export writes only to S3-compatible storage";
+    let sigv4_refusal =
+        "sets use_sigv4, but the export does not sign catalog requests with AWS SigV4";
+    let repeated_name = new_table();
+    let cases = [
+        (
+            "Azure storage",
+            through("EXPORT_E2E_AZURE_CREDS", ""),
+            azure_refusal,
+        ),
+        (
+            "Azure storage, SINGLE_COMMIT",
+            through("EXPORT_E2E_AZURE_CREDS", "SINGLE_COMMIT = 'true'"),
+            azure_refusal,
+        ),
+        (
+            "SigV4 signing",
+            through("EXPORT_E2E_SIGV4_CREDS", ""),
+            sigv4_refusal,
+        ),
+        (
+            "SigV4 signing, SINGLE_COMMIT",
+            through("EXPORT_E2E_SIGV4_CREDS", "SINGLE_COMMIT = 'true'"),
+            sigv4_refusal,
+        ),
+        // Exasol refuses the repeated name itself, before the export hook runs.
+        (
+            "repeated column name",
+            (
+                DIRECT.export(
+                    "(SELECT 1 / (ID - ID) AS A, 2 AS A FROM EXPORT_E2E.SRC_ROWS)",
+                    &repeated_name,
+                    "",
+                ),
+                repeated_name.clone(),
+            ),
+            "duplicate column name: A",
+        ),
+    ];
+
+    for (case, (sql, table), refusal) in cases {
+        let error =
+            assert_refused_before_reading(case, &mut sys, &sql, &[refusal], &connection_secrets());
+        assert!(
+            !error.contains(AZURE_ACCOUNT_KEY),
+            "{case}: the account key leaked: {error}"
+        );
+        assert!(!table_exists(&table), "{case}: {table} must not exist");
+    }
+}
+
+/// Scenario: SINGLE_COMMIT on a catalog without staged creation fails and creates no table
+#[test]
+fn export_single_commit_on_catalog_refusing_stage_create_fails() {
+    stack();
+    setup();
+    proxy_virtual_schemas();
+    // The `scripts/proxy/filter` line answers HTTP 403 to every table creation in this namespace.
+    let refused_table = "e2e_export_no_stage.t";
+
+    let error = export_error(
+        &mut exa_conn(),
+        &PROXIED.export(SOURCE_TABLE, refused_table, "SINGLE_COMMIT = 'true'"),
+        &connection_secrets(),
+    );
+
+    // The proxy resets the connection after its 403, so the answer's body breaks off.
+    assert!(
+        error.contains(&format!("staged creation of table {refused_table} failed"))
+            && error.contains(&format!("{ICEBERG_REST_VIA_PROXY}/"))
+            && error.contains("HTTP 403")
+            && error.contains("SINGLE_COMMIT needs a catalog that accepts staged table creation"),
+        "the writer must fail naming the catalog and staged creation: {error}"
+    );
+    assert!(
+        !table_exists(refused_table),
+        "{refused_table} must not exist"
+    );
+}
+
+/// Scenario: A failed SINGLE_COMMIT export leaves no table
+#[test]
+fn export_failed_single_commit_leaves_no_table() {
+    stack();
+    setup();
+    proxy_virtual_schemas();
+    let source_error = run_namespace("sc_fail_source");
+    let error = export_error(
+        &mut exa_conn(),
+        &DIRECT.export(
+            &format!("(SELECT ID, 1 / (ID - 500) AS X FROM {SOURCE_TABLE})"),
+            &format!("{source_error}.t"),
+            "SINGLE_COMMIT = 'true'",
+        ),
+        &connection_secrets(),
+    );
+    assert!(
+        error.contains(SOURCE_READ_ERROR),
+        "a source error at row 500 fails the statement: {error}"
+    );
+    // The `scripts/proxy/filter` line answers HTTP 403 under `<namespace>/t/metadata/`, so the
+    // writer fails at its first manifest write, after its data file.
+    let manifest_fault = run_namespace("sc_fail_manifest");
+    let location = format!("{WAREHOUSE_BUCKET}/{manifest_fault}/t");
+    let log = proxy_log_during(|| {
+        export_error(
+            &mut exa_conn(),
+            &PROXIED.export(
+                SOURCE_TABLE,
+                &format!("{manifest_fault}.t"),
+                "SINGLE_COMMIT = 'true'",
+            ),
+            &connection_secrets(),
+        );
+    });
+    assert!(
+        log.lines().any(|line| {
+            line.contains(&format!("PUT {SEAWEEDFS_VIA_PROXY}/{location}/data/"))
+                && line.contains(".parquet")
+        }),
+        "the writer must have written a data file under {location}/data/: {log}"
+    );
+
+    for namespace in [source_error, manifest_fault] {
+        let table = format!("{namespace}.t");
+        assert!(!table_exists(&table), "{table} must not exist");
+        assert!(
+            namespace_exists(&namespace),
+            "the namespace {namespace} the export created must remain"
+        );
+        let data_files = objects_under(&format!("{namespace}/t/data/"));
+        assert!(
+            data_files.is_empty(),
+            "the writer's data files must be gone: {data_files:?}"
+        );
+    }
 }
 
 /// Scenario: A user who holds the export privileges exports rows
@@ -383,8 +665,9 @@ fn export_missing_script_grant_fails_named() {
     assert_refused_before_reading(
         "no script grant",
         &mut exporter_conn(NO_ACCESS_EXPORTER),
-        &export_sql(FAILING_SOURCE, ""),
+        &export_sql(&FAILING_SOURCE, ""),
         &[&missing_grant_error(NO_ACCESS_EXPORTER)],
+        &connection_secrets(),
     );
 }
 
@@ -395,11 +678,22 @@ fn export_errors_carry_no_connection_password() {
     setup();
     exporters();
     // A direct call skips the export hook, so only the writer's own check refuses it.
-    let forged_writer_call = format!(
-        r#"SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{{"connection":"{DEFAULT_CATALOG_CONN_NAME}"}}', 1) FROM DUAL"#
-    );
+    let writer_spec = serde_json::json!({
+        "connection": DEFAULT_CATALOG_CONN_NAME,
+        "table": new_table(),
+        "export_id": "0".repeat(32),
+        "columns": ["X"],
+        "single_commit": false,
+        "allow_http": true,
+    });
+    let forged_writer_call =
+        format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");
 
-    let error = export_error(&mut exporter_conn(NO_ACCESS_EXPORTER), &forged_writer_call);
+    let error = export_error(
+        &mut exporter_conn(NO_ACCESS_EXPORTER),
+        &forged_writer_call,
+        &connection_secrets(),
+    );
 
     assert!(
         error.contains(&missing_grant_error(NO_ACCESS_EXPORTER)),

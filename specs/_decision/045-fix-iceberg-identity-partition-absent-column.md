@@ -13,9 +13,7 @@ The Iceberg table spec applies its "Column Projection" rule (1) to field ids "no
 
 ### Decision
 
-A file whose own spec has an `identity` field on a column reads that partition value for the column, through the partition-value mechanism Delta and Hive tables already use, where the file's value wins over the data file. Other files resolve the column through binding, then the `initial-default`, then NULL for a nullable field or a clean error for a required one. A null partition value is present and reads as NULL. `write-default` is never read.
-
-This departs from the letter of rule (1) only for a file that holds the column under its field id with values other than its partition value, which the spec forbids: "Partition values for a data file must be the same for all records stored in the data file". It is a scoped exception.
+A file whose own spec has an `identity` field on a column reads that partition value for the column, a null value included, through the partition-value mechanism Delta and Hive tables use, so the file's value wins over the data file. Other files resolve the column through binding, then the `initial-default`, then NULL for a nullable field or a clean error for a required one, and `write-default` is never read. This departs from rule (1) only for a file that holds the column under its field id with other values, which the spec forbids ("Partition values for a data file must be the same for all records stored in the data file"), and is a scoped exception.
 
 ### Options Considered
 

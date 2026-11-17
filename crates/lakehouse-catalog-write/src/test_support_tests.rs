@@ -6,13 +6,11 @@ use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, 
 use iceberg::table::Table;
 use iceberg::{Runtime, TableIdent};
 use iceberg_catalog_rest::LoadTableResult;
-use lakehouse_catalog::exported_test_support::spawn_server;
 use lakehouse_catalog::{CatalogSession, ConnectionCreds};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-/// A freshly created table of the vended warehouse, loaded with `snapshots=all`.
-pub(crate) const LOAD_TABLE_NO_SNAPSHOTS: &str =
-    include_str!("testdata/load_table_no_snapshots.json");
+pub(crate) use crate::exported_test_support::{LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog};
+
 /// [`LOAD_TABLE_NO_SNAPSHOTS`] after `append_files` committed one snapshot tagged with
 /// [`TAGGED_EXPORT_ID`] and [`TAGGED_WRITER_ID`].
 pub(crate) const LOAD_TABLE_TAGGED: &str = include_str!("testdata/load_table_tagged_snapshot.json");
@@ -39,8 +37,6 @@ pub(crate) const RECORDED_PLACEHOLDERS: [&str; 6] = [
 /// only `storage-credentials` entry covers.
 pub(crate) const STAGED_LOCATION: &str =
     "s3://warehouse/lakehouse_vended/01a1bf3b-af23-7020-ac26-0a0912b927ee";
-
-pub(crate) const PREFIX_CONFIG: &str = r#"{"defaults":{"prefix":"p"}}"#;
 
 pub(crate) fn ident(namespace: &str, name: &str) -> TableIdent {
     TableIdent::from_strs([namespace, name]).unwrap()
@@ -75,22 +71,6 @@ pub(crate) fn data_file(table: &Table, name: &str) -> DataFile {
         .partition(Struct::empty())
         .build()
         .unwrap()
-}
-
-/// A fake catalog: `/v1/config` answers `config`, and every other request the answer `route`
-/// gives it, by request line.
-pub(crate) async fn catalog(
-    config: &'static str,
-    route: impl Fn(&str) -> (u16, String) + Send + 'static,
-) -> (String, Arc<Mutex<Vec<String>>>) {
-    spawn_server("application/json", move |request| {
-        if request.starts_with("GET /v1/config") {
-            (200, config.to_string())
-        } else {
-            route(request.lines().next().unwrap_or_default())
-        }
-    })
-    .await
 }
 
 /// A session over the catalog at `uri` for a CONNECTION that does or does not vend.

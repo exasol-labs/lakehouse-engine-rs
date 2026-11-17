@@ -6,9 +6,11 @@
 //!
 //! Two distinct OAuth2 client-credentials implementations are verified:
 //! `iceberg-catalog-rest`'s built-in client (createVirtualSchema enumeration) and
-//! the adapter's own `oauth2_client_credentials_grant` (scan/file resolution).
+//! the adapter's own `ClientCredentialsGrant` (scan/file resolution).
 
 mod common;
+#[path = "e2e_lakekeeper/export_write.rs"]
+mod export_write;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_decimal_orders_numerically,
@@ -1505,12 +1507,11 @@ fn a_union_statement_checks_every_table_its_pushdowns_read() {
     grant_only(DENIED_USER, &[select_table(E2E_TABLE)]);
     let events = format!("{VS_PERMISSION}.{}", E2E_TABLE.to_uppercase());
     let other = format!("{VS_PERMISSION}.{}", E2E_DIM_TABLE.to_uppercase());
-    let union_all = |left: &str, right: &str| {
-        format!("SELECT COUNT(*) FROM (SELECT 1 FROM {left} UNION ALL SELECT 1 FROM {right})")
-    };
+    let union_all =
+        |left: &str, right: &str| format!("SELECT 1 FROM {left} UNION ALL SELECT 1 FROM {right}");
 
     assert_eq!(
-        connect_as(ALLOWED_USER).query_scalar_i64(&union_all(&events, &events)),
+        connect_as(ALLOWED_USER).query_row_count(&union_all(&events, &events)),
         2 * SEED_TOTAL_ROWS as i64,
         "a user granted the table reads both branches"
     );
@@ -1569,7 +1570,7 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
 
     for (shape, branches, expected_rows, expected_batch_checks) in cases {
         let branches: Vec<&str> = branches.into_iter().map(String::as_str).collect();
-        let sql = format!("SELECT COUNT(*) FROM ({})", branches.join(" UNION ALL "));
+        let sql = branches.join(" UNION ALL ");
         let mut rows = 0;
 
         let [tokens, configs, batch_checks, loads] = stack::count_proxy_requests(
@@ -1579,7 +1580,7 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
                 batch_check.as_str(),
                 loads_events.as_str(),
             ],
-            || rows = connect_as(ALLOWED_USER).query_scalar_i64(&sql),
+            || rows = connect_as(ALLOWED_USER).query_row_count(&sql),
         );
 
         assert_eq!(rows, expected_rows, "{shape}: rows");
@@ -1603,7 +1604,8 @@ fn create_proxy_virtual_schema() {
     DONE.get_or_init(|| {
         setup();
         permission_setup();
-        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let proxy_url = stack::proxy_url_internal();
+        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
         let password = lakekeeper_connection_password(WAREHOUSE_AUTHZ, false).via_proxy();
         let token_uri = password
             .oauth2_server_uri

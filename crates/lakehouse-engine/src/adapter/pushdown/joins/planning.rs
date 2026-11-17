@@ -1,14 +1,13 @@
 use crate::adapter::table_identity::read_identifier;
-use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use super::super::ResolvedScan;
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
     ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
-use super::super::{RefusedColumn, ResolvedScan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinLeaf {
@@ -92,19 +91,10 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 pub(crate) struct ResolvedJoinSide {
     pub table_name: String,
     pub table_identifier: String,
-    /// Empty ⇒ every `files` path is absolute.
-    pub table_root: String,
-    /// Includes each file's delete mechanisms, so the scan applies them per side.
-    pub files: Vec<FileEntry>,
-    pub logical_schema: Vec<LogicalField>,
-    /// Empty when the table has no name-mapping property, and on every Delta side.
-    pub name_mapping: Vec<NameMappingEntry>,
-    pub effective_storage: StorageBackend,
-    /// Empty on every Iceberg side.
-    pub partition_columns: Vec<String>,
+    /// Per side, never merged: files carry their own delete mechanisms, and a refused column
+    /// belongs to the table that raised it.
+    pub scan: ResolvedScan,
     pub total_bytes: u64,
-    /// Per side, not merged: a refusal belongs to the table that raised it.
-    pub refused_columns: Vec<RefusedColumn>,
     /// Unqualified.
     pub column_types: ColumnTypes,
 }
@@ -114,39 +104,25 @@ impl ResolvedJoinSide {
     pub(super) fn new(
         table_name: String,
         table_identifier: String,
-        resolved: ResolvedScan,
+        scan: ResolvedScan,
         column_types: ColumnTypes,
     ) -> Self {
-        let ResolvedScan {
-            files,
-            effective_storage,
-            logical_schema,
-            table_root,
-            name_mapping,
-            partition_columns,
-            refused_columns,
-        } = resolved;
-        let total_bytes = files
+        let total_bytes = scan
+            .files
             .iter()
             .fold(0u64, |acc, entry| acc.saturating_add(entry.size));
         Self {
             table_name,
             table_identifier,
-            table_root,
-            files,
-            logical_schema,
-            name_mapping,
-            effective_storage,
-            partition_columns,
+            scan,
             total_bytes,
-            refused_columns,
             column_types,
         }
     }
 }
 
-/// Both sides stay fully resolved because the N-scan fallback scans both;
-/// `broadcast_eligible` only routes between the two builders and is never an error.
+/// Both sides stay fully resolved because the N-scan fallback scans both. The roles say nothing
+/// about whether the join is broadcast: `broadcast_policy` decides that.
 ///
 /// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
 /// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
@@ -158,7 +134,6 @@ pub(crate) struct JoinSides {
     pub fact: ResolvedJoinSide,
     /// Smaller side by bytes, the broadcast candidate.
     pub dimension: ResolvedJoinSide,
-    pub broadcast_eligible: bool,
     /// The dimension's leg in FROM-tree order, which names its relation alias.
     pub dimension_leg: usize,
 }
@@ -172,21 +147,15 @@ impl JoinSides {
 
 /// `a` is leg 0 and `b` leg 1. On an exact byte tie `a`, the first leg in FROM-tree order,
 /// becomes the dimension, so the choice of the sharded occurrence is deterministic.
-pub(super) fn select_broadcast_sides(
-    a: ResolvedJoinSide,
-    b: ResolvedJoinSide,
-    join_broadcast_max_bytes: u64,
-) -> JoinSides {
+pub(super) fn select_broadcast_sides(a: ResolvedJoinSide, b: ResolvedJoinSide) -> JoinSides {
     let (dimension, fact, dimension_leg) = if a.total_bytes <= b.total_bytes {
         (a, b, 0)
     } else {
         (b, a, 1)
     };
-    let broadcast_eligible = dimension.total_bytes <= join_broadcast_max_bytes;
     JoinSides {
         fact,
         dimension,
-        broadcast_eligible,
         dimension_leg,
     }
 }
@@ -224,30 +193,8 @@ pub(in super::super) fn involved_table<'r>(
     })
 }
 
-/// The broadcast in-UDF join renders only projection, filter, and join condition, so any
-/// aggregation must be executed by Exasol over the materialized join.
-fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
-    let has_aggregate_item = pushdown_req
-        .get("selectList")
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| {
-            list.iter()
-                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
-        });
-    let has_group_by = pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    let is_group_by_aggregation =
-        pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by");
-    let has_having = pushdown_req
-        .get("having")
-        .filter(|h| !h.is_null())
-        .is_some();
-    has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
-}
-
-/// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
+/// The window of a request that does not aggregate. [`Self::BroadcastUnservable`] falls through
+/// to the fallback, never an error.
 #[derive(Debug, Clone, PartialEq)]
 pub(in super::super) enum JoinWindowPlan {
     Unbounded,
@@ -260,16 +207,13 @@ pub(in super::super) enum JoinWindowPlan {
         limit: Option<u64>,
         offset: u64,
     },
-    ExasolPostProcessed,
+    BroadcastUnservable,
 }
 
-/// Whether the projection can bind an `Ordered` key is decided at construction: rendering
-/// a projection here would let an aggregate-carrying join reach a render that can `Err` on
-/// absent column metadata.
+/// Whether the projection can bind an `Ordered` key is decided at construction, once the broadcast
+/// render has built that projection. An aggregating request never reaches here: Exasol renders
+/// its window over the fan-out.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    if carries_aggregation_clause(pushdown_req) {
-        return JoinWindowPlan::ExasolPostProcessed;
-    }
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     let Some(order_by) = pushdown_req
@@ -279,7 +223,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     else {
         // Exasol rejects OFFSET without ORDER BY and a per-shard offset does not compose.
         if offset != 0 {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         }
         return match limit {
             Some(n) => JoinWindowPlan::BareLimit(n),
@@ -292,7 +236,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
         // The wrapper binds ORDER BY against emitted columns and appends no hidden ones, so
         // only a flagged plain column, never an expression, is servable.
         let Some(key) = parse_sort_key_element(element) else {
-            return JoinWindowPlan::ExasolPostProcessed;
+            return JoinWindowPlan::BroadcastUnservable;
         };
         keys.push(ParsedSortKey::Column(key));
     }

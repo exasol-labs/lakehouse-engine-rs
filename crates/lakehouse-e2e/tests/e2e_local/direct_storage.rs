@@ -2,14 +2,14 @@
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 
 use crate::common::e2e_harness::{
-    SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
-    assert_decimal_orders_numerically, assert_filters_match_native_copy,
-    assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_query_fails,
-    assert_refused_column, assert_text_columns, assert_type_matrix, column_adapter_notes,
-    create_virtual_schema_with_password, declared_type, error_text, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, identifier_note, note_of, nullable_text, parse_int, parse_numeric,
-    partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
-    try_create_virtual_schema_with_password, value_to_string,
+    BROADCAST_JOIN, Expect, PathCheck, SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps,
+    assert_binary_columns_match_native_copy, assert_decimal_orders_numerically,
+    assert_filters_match_native_copy, assert_hex_literal_compares_bytes, assert_notes_well_formed,
+    assert_query_fails, assert_refused_column, assert_text_columns, assert_type_matrix,
+    column_adapter_notes, create_virtual_schema_with_password, declared_type, error_text, exa_conn,
+    explain_virtual_sql, has_broadcast_join_block, identifier_note, native_copy_mismatch, note_of,
+    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses, skip_reason,
+    skipped_entries, text_column, try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::{
@@ -729,16 +729,34 @@ const DATE_RANGE_DAYS: [i32; 6] = [
     -719_163,
 ];
 
+/// Rows 2 and 3 pair each placeholder DATE with the other placeholder TIMESTAMP.
+const DATE_RANGE_TS_MICROS: [Option<i64>; 6] = [
+    Some(1_704_110_400_000_000),
+    Some(253_402_300_799_999_999),
+    Some(-62_135_596_800_000_000),
+    None,
+    None,
+    None,
+];
+
 fn date_range_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
         Field::new("STORED_DATE", DataType::Date32, true),
+        Field::new(
+            "STORED_TS",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
     ]));
     RecordBatch::try_new(
         schema,
         vec![
             Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
             Arc::new(Date32Array::from(DATE_RANGE_DAYS.to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(
+                DATE_RANGE_TS_MICROS.to_vec(),
+            )),
         ],
     )
     .expect("date_range batch construction is infallible")
@@ -2278,6 +2296,71 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
     );
 }
 
+/// Scenario: A DATE meets a TIMESTAMP at the timestamp's unit
+#[test]
+fn placeholder_dates_meet_timestamps_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = vs_table(VS_DIRECT, "DATE_RANGE");
+    let oracle = "LHVS.DIRECT_DATE_RANGE_ORACLE";
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {oracle} AS SELECT * FROM {table} WHERE ID <= 3"
+    ));
+
+    let in_scan = PathCheck::Has("AS TIMESTAMP(");
+    let broadcast = PathCheck::Has(BROADCAST_JOIN);
+    // Exasol 8 brings a CASE whose first branch is a DATE to the DATE.
+    let date_first_case = if engine_honors_declared_precision(&mut conn) {
+        in_scan
+    } else {
+        PathCheck::Has("AS DATE)")
+    };
+    let cases = [
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_DATE < TIMESTAMP '2020-01-01 00:00:00'",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_TS > STORED_DATE",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_DATE BETWEEN STORED_TS AND TIMESTAMP '9999-12-31 23:59:59.999999'",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_TS IN (DATE '0001-01-01', STORED_DATE)",
+            in_scan,
+        ),
+        (
+            "SELECT ID, CASE WHEN ID > 2 THEN STORED_DATE ELSE STORED_TS END FROM {T} WHERE ID <= 3",
+            date_first_case,
+        ),
+        (
+            "SELECT ID, COALESCE(STORED_DATE, STORED_TS), GREATEST(STORED_DATE, STORED_TS), \
+             LEAST(STORED_TS, STORED_DATE), NULLIF(STORED_TS, STORED_DATE) FROM {T} WHERE ID <= 3",
+            in_scan,
+        ),
+        (
+            "SELECT a.ID, b.ID FROM {T} a JOIN {T} b ON a.STORED_DATE = b.STORED_TS \
+             WHERE a.ID <= 3 AND b.ID <= 3",
+            broadcast,
+        ),
+        (
+            "SELECT a.ID FROM {T} a JOIN {T} b ON a.ID = b.ID \
+             WHERE a.ID <= 3 AND a.STORED_DATE < b.STORED_TS",
+            broadcast,
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(query, path)| {
+            native_copy_mismatch(&mut conn, &table, oracle, query, *path, Expect::Rows)
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     setup();
@@ -2715,6 +2798,7 @@ const BASE_TWO_SPELLINGS: &str = "s3://warehouse/direct_two_spellings/";
 const BASE_SPELLING_DRIFT: &str = "s3://warehouse/direct_spelling_drift/";
 const BASE_KEY_CASE: &str = "s3://warehouse/direct_key_case/";
 const BASE_OVER_LIMIT: &str = "s3://warehouse/direct_over_limit/";
+const BASE_REFUSED_FIRST: &str = "s3://warehouse/direct_refused_first/";
 
 const VS_NOTES: &str = "DIRECT_COLUMN_NOTES_VS";
 const VS_DRIFT: &str = "DIRECT_SOURCE_DRIFT_VS";
@@ -2722,8 +2806,13 @@ const VS_TWO_SPELLINGS: &str = "DIRECT_TWO_SPELLINGS_VS";
 const VS_SPELLING_DRIFT: &str = "DIRECT_SPELLING_DRIFT_VS";
 const VS_KEY_CASE: &str = "DIRECT_KEY_CASE_VS";
 const VS_OVER_LIMIT: &str = "DIRECT_OVER_LIMIT_VS";
+const VS_REFUSED_FIRST: &str = "DIRECT_REFUSED_FIRST_VS";
+const VS_REFUSED_FIRST_LOW: &str = "DIRECT_REFUSED_FIRST_LOW_VS";
+const REFUSED_FIRST_ORACLE: &str = "DIRECT_REFUSED_FIRST_ORACLE";
 
 const CONN_NOTES: &str = "DIRECT_STORAGE_COLUMN_NOTES_CREDS";
+const CONN_REFUSED_FIRST: &str = "DIRECT_STORAGE_REFUSED_FIRST_CREDS";
+const CONN_REFUSED_FIRST_LOW: &str = "DIRECT_STORAGE_REFUSED_FIRST_LOW_CREDS";
 
 /// Scenario: Every declared column carries its source shape in its adapterNotes
 #[test]
@@ -2802,6 +2891,344 @@ fn direct_storage_refused_column_note_records_the_refusal() {
         vs_table(VS_DIRECT, "ANNOTATED_TYPES")
     ));
     assert_eq!(ids[0].len(), ALL_TYPES_IDS.len(), "SELECT ID must succeed");
+}
+
+/// A refused column first, so the fan-out of an aggregation that reads no column cannot fall
+/// back to the first declared column.
+fn refused_first_bytes() -> Bytes {
+    encode_parquet_message(
+        "message refused_first {
+            OPTIONAL GROUP c_struct_enum {
+                OPTIONAL BYTE_ARRAY k (ENUM);
+            }
+            REQUIRED INT64 id;
+            REQUIRED INT64 x;
+        }",
+        |row_group| {
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &vec![ByteArray::from("blue"); 4],
+                Some(&[2; 4]),
+            );
+            write_parquet_column::<_, Int64Type>(row_group, &[1, 2, 3, 4], None);
+            write_parquet_column::<_, Int64Type>(row_group, &[10, 20, 30, 40], None);
+        },
+    )
+}
+
+static REFUSED_FIRST_SETUP: OnceLock<()> = OnceLock::new();
+
+/// `FACT (C_STRUCT_ENUM, ID, X, PART)` in one partition, its first column refused, and `DIMS
+/// (DIM_ID, C_STRUCT_ENUM)`, all readable, under a broadcasting and a non-broadcasting schema.
+fn refused_first_setup() -> ExaConn {
+    setup();
+    let mut conn = exa_conn();
+    REFUSED_FIRST_SETUP.get_or_init(|| {
+        delete_fixture_prefix(BASE_REFUSED_FIRST);
+        put_fixture_object(
+            &format!("{BASE_REFUSED_FIRST}fact/part=1/f.parquet"),
+            refused_first_bytes(),
+        );
+        for id in 1..=3 {
+            write_parquet_fixture(
+                &format!("{BASE_REFUSED_FIRST}dims/d{id}.parquet"),
+                shared_name_dimension_batch(id),
+            );
+        }
+        create_direct_vs(
+            &mut conn,
+            VS_REFUSED_FIRST,
+            CONN_REFUSED_FIRST,
+            BASE_REFUSED_FIRST,
+        );
+        let notes = column_adapter_notes(&mut conn, VS_REFUSED_FIRST, "FACT");
+        assert!(
+            note_of(&notes, "C_STRUCT_ENUM").get("refused").is_some(),
+            "FACT's first column must be refused for these tests to discriminate: {notes:?}"
+        );
+        create_virtual_schema_with_password(
+            &mut conn,
+            &direct_vs(VS_REFUSED_FIRST_LOW, CONN_REFUSED_FIRST_LOW)
+                .with_join_broadcast_max_bytes("1"),
+            BASE_REFUSED_FIRST,
+            &direct_storage_password(),
+        );
+        for statement in [
+            format!("CREATE SCHEMA IF NOT EXISTS {REFUSED_FIRST_ORACLE}"),
+            format!(
+                "CREATE OR REPLACE TABLE {REFUSED_FIRST_ORACLE}.FACT \
+                 (ID DECIMAL(20,0), X DECIMAL(20,0), PART VARCHAR(2000000))"
+            ),
+            format!(
+                "INSERT INTO {REFUSED_FIRST_ORACLE}.FACT VALUES \
+                 (1, 10, '1'), (2, 20, '1'), (3, 30, '1'), (4, 40, '1')"
+            ),
+            format!(
+                "CREATE OR REPLACE TABLE {REFUSED_FIRST_ORACLE}.DIMS \
+                 (DIM_ID DECIMAL(20,0), C_STRUCT_ENUM VARCHAR(2000000))"
+            ),
+            format!(
+                "INSERT INTO {REFUSED_FIRST_ORACLE}.DIMS VALUES (1, 'd1'), (2, 'd2'), (3, 'd3')"
+            ),
+        ] {
+            conn.execute(&statement);
+        }
+    });
+    conn
+}
+
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+/// Scenario: A request that reads no column never emits a refused column
+#[test]
+fn no_route_emits_a_refused_column_the_request_does_not_name() {
+    let mut conn = refused_first_setup();
+    const JOIN: &str = "{T}.FACT a JOIN {T}.DIMS b ON a.ID = b.DIM_ID";
+    // The scan declines a CAST of a DECIMAL to text, so Exasol applies it in the wrapper.
+    const DECLINED: &str = "CAST(X AS VARCHAR(10)) <> '20'";
+    // Every file lies in the partition `part=1`, so the filter prunes every file.
+    const PRUNED: &str = "PART = '99'";
+    let row_scan = PathCheck::Lacks(r#"AS "LHS_T0""#);
+    let broadcast = PathCheck::Has(BROADCAST_JOIN);
+    let no_scan = PathCheck::Lacks(SCAN_SCRIPT_NAME);
+    let cases = [
+        (
+            VS_REFUSED_FIRST,
+            "SELECT ID FROM {T}.FACT WHERE X >= 20".to_string(),
+            row_scan,
+        ),
+        // Exasol keeps a COUNT(*) over a RANDOM() filter itself and sends an empty select list.
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(*) FROM {T}.FACT WHERE RANDOM() >= 0".to_string(),
+            row_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {{T}}.FACT WHERE {DECLINED} AND RANDOM() >= 0"),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(*) FROM {T}.FACT WHERE EXISTS (SELECT 1 FROM DUAL)".to_string(),
+            row_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(*) FROM {T}.FACT, DUAL".to_string(),
+            row_scan,
+        ),
+        // Exasol strips the aggregates of a subquery whose columns the outer query ignores.
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(*) FROM (SELECT SUM(X) FROM {T}.FACT)".to_string(),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(*) FROM (SELECT COUNT(DISTINCT ID), COUNT(DISTINCT X) FROM {T}.FACT)"
+                .to_string(),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT ID FROM {{T}}.FACT WHERE {DECLINED}"),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT ID FROM {T}.FACT ORDER BY X * -1 LIMIT 2".to_string(),
+            row_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT X, COUNT(*) FROM {T}.FACT GROUP BY X".to_string(),
+            PathCheck::Split,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT X, COUNT(DISTINCT ID) FROM {T}.FACT GROUP BY X".to_string(),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT SUM(X), COUNT(*) FROM {T}.FACT".to_string(),
+            PathCheck::Split,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(DISTINCT X) FROM {T}.FACT".to_string(),
+            PathCheck::Has(r#"COUNT(DISTINCT "V")"#),
+        ),
+        (
+            VS_REFUSED_FIRST,
+            "SELECT COUNT(DISTINCT ID), COUNT(DISTINCT X) FROM {T}.FACT".to_string(),
+            PathCheck::Wrapper,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT a.X, b.DIM_ID FROM {JOIN}"),
+            broadcast,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {JOIN} WHERE RANDOM() >= 0"),
+            broadcast,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {JOIN}"),
+            broadcast,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {JOIN} WHERE a.X >= 20"),
+            broadcast,
+        ),
+        // DIMS declares a readable column under the name FACT's reader refuses.
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT b.C_STRUCT_ENUM, a.X FROM {JOIN}"),
+            broadcast,
+        ),
+        (
+            VS_REFUSED_FIRST_LOW,
+            format!("SELECT b.C_STRUCT_ENUM, a.X FROM {JOIN}"),
+            PathCheck::NScan(2),
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT b.C_STRUCT_ENUM FROM {JOIN} WHERE a.{PRUNED}"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*), SUM(a.X) FROM {JOIN} WHERE a.X >= 20"),
+            broadcast,
+        ),
+        (
+            VS_REFUSED_FIRST_LOW,
+            format!("SELECT a.X, b.DIM_ID FROM {JOIN}"),
+            PathCheck::NScan(2),
+        ),
+        (
+            VS_REFUSED_FIRST_LOW,
+            format!("SELECT COUNT(*) FROM {JOIN} WHERE RANDOM() >= 0"),
+            PathCheck::NScan(2),
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT ID FROM {{T}}.FACT WHERE {PRUNED}"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {{T}}.FACT WHERE {PRUNED} AND RANDOM() >= 0"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!(
+                "SELECT COUNT(*) FROM {{T}}.FACT WHERE {PRUNED} AND {DECLINED} AND RANDOM() >= 0"
+            ),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT SUM(X), COUNT(*) FROM {{T}}.FACT WHERE {PRUNED}"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT X, COUNT(*) FROM {{T}}.FACT WHERE {PRUNED} GROUP BY X"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(DISTINCT ID), COUNT(DISTINCT X) FROM {{T}}.FACT WHERE {PRUNED}"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*) FROM {JOIN} WHERE a.{PRUNED} AND RANDOM() >= 0"),
+            no_scan,
+        ),
+        (
+            VS_REFUSED_FIRST,
+            format!("SELECT COUNT(*), SUM(a.X) FROM {JOIN} WHERE a.{PRUNED}"),
+            no_scan,
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(vs, query, path)| {
+            native_copy_mismatch(
+                &mut conn,
+                vs,
+                REFUSED_FIRST_ORACLE,
+                query,
+                *path,
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+#[test]
+fn every_route_refuses_a_request_that_names_or_emits_a_refused_column() {
+    let mut conn = refused_first_setup();
+    let fact = vs_table(VS_REFUSED_FIRST, "FACT");
+    let join = |vs: &str| {
+        format!(
+            "{} a JOIN {} b ON a.ID = b.DIM_ID",
+            vs_table(vs, "FACT"),
+            vs_table(vs, "DIMS")
+        )
+    };
+    for sql in [
+        format!("SELECT * FROM {fact}"),
+        format!("SELECT C_STRUCT_ENUM FROM {fact}"),
+        format!("SELECT ID FROM {fact} WHERE C_STRUCT_ENUM IS NOT NULL"),
+        format!("SELECT ID FROM {fact} WHERE CAST(C_STRUCT_ENUM AS VARCHAR(10)) <> 'a'"),
+        format!("SELECT ID FROM {fact} ORDER BY C_STRUCT_ENUM"),
+        format!("SELECT COUNT(C_STRUCT_ENUM) FROM {fact}"),
+        format!("SELECT C_STRUCT_ENUM, COUNT(*) FROM {fact} GROUP BY C_STRUCT_ENUM"),
+        format!("SELECT COUNT(DISTINCT C_STRUCT_ENUM) FROM {fact}"),
+        format!(
+            "SELECT COUNT(*) FROM {} WHERE a.C_STRUCT_ENUM IS NOT NULL",
+            join(VS_REFUSED_FIRST)
+        ),
+        format!(
+            "SELECT a.C_STRUCT_ENUM, b.DIM_ID FROM {}",
+            join(VS_REFUSED_FIRST_LOW)
+        ),
+        format!("SELECT * FROM {}", join(VS_REFUSED_FIRST)),
+        format!("SELECT * FROM {}", join(VS_REFUSED_FIRST_LOW)),
+        format!("SELECT * FROM {fact} WHERE PART = '99'"),
+        format!("SELECT COUNT(C_STRUCT_ENUM) FROM {fact} WHERE PART = '99'"),
+        format!(
+            "SELECT a.C_STRUCT_ENUM FROM {} WHERE a.PART = '99'",
+            join(VS_REFUSED_FIRST)
+        ),
+    ] {
+        assert_query_fails(&mut conn, &sql, &["'c_struct_enum.k'", "type 'enum'"]);
+    }
+}
+
+/// [`dimension_batch`] beside a text column named like the column `FACT`'s reader refuses.
+fn shared_name_dimension_batch(id: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("DIM_ID", DataType::Int64, false),
+            Field::new("C_STRUCT_ENUM", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(StringArray::from(vec![format!("d{id}")])),
+        ],
+    )
+    .expect("dimension batch construction is infallible")
 }
 
 fn dimension_batch(id: i64) -> RecordBatch {

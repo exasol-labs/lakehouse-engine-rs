@@ -12,7 +12,10 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{JOIN_ORACLE, copy_join_tables_natively, events, stack, vs_table};
+use crate::fixtures::{
+    JOIN_ORACLE, assert_two_scan_join_wrapper, copy_join_tables_natively, events,
+    events_labels_join, stack, vs_table,
+};
 
 use parquet::file::statistics::Statistics;
 
@@ -422,43 +425,9 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
     );
 }
 
-#[test]
-fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let offset_without_order_by = format!("{} LIMIT 3 OFFSET 2", join_query(VS_NAME));
-    let resp = conn.try_execute(&offset_without_order_by);
-    let msg = error_text(
-        &resp,
-        &format!("LIMIT ... OFFSET with no ORDER BY ({offset_without_order_by})"),
-    );
-    assert_eq!(
-        resp["exception"]["sqlCode"].as_str(),
-        Some("42000"),
-        "expected sqlCode 42000, got: {resp}"
-    );
-    assert!(
-        msg.contains("OFFSET") && msg.contains("ORDER BY"),
-        "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \
-         message, got: {msg}"
-    );
-
-    let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "an aggregate over a join must still fall back to the two-scan wrapper \
-         (LHS_T0/LHS_T1):\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate over a join must NOT carry a broadcast common-blob join \
-         block:\n{pushed}"
-    );
-}
-
 /// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 /// Scenario: A join outside the broadcast contract is declined safely
+/// Scenario: Pushdown resolves every tuning value from the properties
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -496,8 +465,26 @@ fn e2e_above_threshold_result_matches_broadcast() {
     );
 }
 
-// An aggregate over a join is served by the two-scan wrapper with Exasol aggregating
-// the materialized join, never by the broadcast in-UDF join.
+/// Scenario: A constant sort key does not become a select-list position
+#[test]
+fn e2e_join_fallback_constant_sort_key_returns_the_native_order() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for constant in [1, 5] {
+        let query = events_labels_join(
+            VS_NAME_LOW,
+            &format!("e.ID, {constant}"),
+            "ORDER BY 2 DESC, 1 LIMIT 3",
+        );
+        assert_two_scan_join_wrapper(&mut conn, &query);
+        assert_eq!(
+            int_column(&conn.query_columns(&query)[0]),
+            [1, 2, 3],
+            "{query}"
+        );
+    }
+}
 
 fn aggregate_join_query(vs_name: &str) -> String {
     format!(
@@ -508,28 +495,172 @@ fn aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 #[test]
-fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
+fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
     setup_e2e();
     let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
+    let self_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
+    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    // A literal list bounds the text column's width, so the join stays broadcast.
+    let named = "c.C_NAME IN ('customer-01', 'customer-02', 'customer-03')";
+    let having_only = format!(
+        "SELECT c.C_NAME FROM {orders} WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
+         AND {named} GROUP BY c.C_NAME HAVING SUM(o.O_TOTALPRICE) > 100"
+    );
+    let broadcast = [
+        format!(
+            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} WHERE {named} GROUP BY c.C_NAME"
+        ),
+        // Select items whose exact type the typed pass derives.
+        format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
+             MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {orders}"
+        ),
+        format!(
+            "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE \
+             ELSE TIMESTAMP '1960-01-01 10:00:00.123456' END) FROM {orders}"
+        ),
+        format!(
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} WHERE o.O_ORDERDATE >= DATE \
+             '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_CUSTKEY HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, c.C_CUSTKEY LIMIT 2"
+        ),
+        format!(
+            "SELECT c.C_NAME, o.O_ORDERDATE, MAX(c.C_CUSTKEY), MIN(o.O_TOTALPRICE) \
+             FROM {orders} WHERE c.C_NAME = 'customer-02' GROUP BY c.C_NAME, o.O_ORDERDATE"
+        ),
+        format!(
+            "SELECT c.C_CUSTKEY, SUM(o.O_TOTALPRICE * c.C_CUSTKEY) FROM {orders} \
+             GROUP BY c.C_CUSTKEY"
+        ),
+        format!(
+            "SELECT c.C_CUSTKEY, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_CUSTKEY \
+             ORDER BY SUM(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 1"
+        ),
+        format!("SELECT COUNT(*), SUM(o.O_TOTALPRICE) FROM {orders}"),
+        format!(
+            "SELECT COUNT(*), MAX(c.C_NAME) FROM {orders} \
+             WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0 AND {named}"
+        ),
+        format!("SELECT COUNT(DISTINCT c.C_CUSTKEY) FROM {orders}"),
+        format!("SELECT COUNT(*) FROM (SELECT SUM(o.O_TOTALPRICE) FROM {orders})"),
+        format!(
+            "SELECT a.O_CUSTKEY, COUNT(*), SUM(b.O_TOTALPRICE) FROM {self_join} GROUP BY a.O_CUSTKEY"
+        ),
+        format!(
+            "SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} \
+             WHERE l.SCORE IN ('score-01', 'score-07') GROUP BY l.SCORE"
+        ),
+        format!("SELECT e.ID, MIN(l.ID) FROM {events_labels} GROUP BY e.ID HAVING MIN(l.ID) > 3"),
+        format!("SELECT COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY"),
+        having_only.clone(),
+        format!(
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY \
+             ORDER BY MAX(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 2"
+        ),
+        format!("SELECT DISTINCT * FROM {orders} WHERE {named}"),
+    ];
+    let n_scan = [
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} AND o.O_ORDERKEY > c.C_CUSTKEY \
+             WHERE {named} GROUP BY c.C_NAME"
+        ),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE SECOND(o.O_ORDERDATE, 3) = 0 \
+             AND {named} GROUP BY c.C_NAME"
+        ),
+    ];
+    let mut failures = Vec::new();
+    for query in &broadcast {
+        for (vs_name, path) in [
+            (VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
+            (VS_NAME_LOW, PathCheck::NScan(2)),
+        ] {
+            failures.extend(native_copy_mismatch(
+                &mut conn,
+                vs_name,
+                JOIN_ORACLE,
+                query,
+                path,
+                Expect::Rows,
+            ));
+        }
+    }
+    for query in &n_scan {
+        failures.extend(native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            query,
+            PathCheck::NScan(2),
+            Expect::Rows,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "aggregate-over-join must emit the two-scan wrapper so Exasol aggregates \
-         over the join (LHS_T0/LHS_T1), even on the broadcast VS:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate cannot ride the broadcast in-UDF join — no common-blob join \
-         block may appear:\n{pushed}"
-    );
-    assert!(
-        pushed.contains("COUNT(*)"),
-        "the aggregate must be rendered as Exasol SQL over the join:\n{pushed}"
-    );
+    // The scan applies the condition and WHERE, so it emits only the HAVING's and select list's.
+    let pushed = explain_virtual_sql(&mut conn, &having_only.replace("{T}", VS_NAME));
+    for read in [r#""LHS_T0_O_TOTALPRICE""#, r#""LHS_T1_C_NAME""#] {
+        assert!(
+            pushed.contains(read),
+            "the fan-out must emit {read}:\n{pushed}"
+        );
+    }
+    for unread in [
+        r#""LHS_T0_O_CUSTKEY""#,
+        r#""LHS_T0_O_ORDERDATE""#,
+        r#""LHS_T1_C_CUSTKEY""#,
+    ] {
+        assert!(
+            !pushed.contains(unread),
+            "the fan-out must not emit {unread}:\n{pushed}"
+        );
+    }
 }
 
+/// Scenario: An aggregating join that reads an unbounded text column of the small side keeps the N-scan
+#[test]
+fn e2e_aggregating_join_reading_a_wide_dimension_text_column_keeps_the_n_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
+    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    let n_scan = [
+        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
+        format!("SELECT COUNT(*), MAX(c.C_NAME) FROM {orders}"),
+        format!("SELECT COUNT(DISTINCT c.C_NAME) FROM {orders}"),
+        format!(
+            "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(*) FROM {orders} \
+             GROUP BY SUBSTR(c.C_NAME, 1, 10)"
+        ),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE c.C_NAME LIKE 'customer-0%' \
+             GROUP BY c.C_NAME"
+        ),
+        format!("SELECT DISTINCT * FROM {orders}"),
+        // LABELS, the smaller side, declares SCORE as text, while EVENTS declares it DOUBLE.
+        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
+    ];
+
+    let mut failures = Vec::new();
+    for query in &n_scan {
+        failures.extend(native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            query,
+            PathCheck::NScan(2),
+            Expect::Rows,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scenario: Aggregate over a join routes through the unified qualified wrapper
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
     setup_e2e();
@@ -547,29 +678,53 @@ fn e2e_aggregate_over_join_result_correct() {
     let expected_count = value_to_string(&truth[0][0]);
     let expected_min = value_to_string(&truth[1][0]);
 
-    for vs_name in [VS_NAME, VS_NAME_LOW] {
-        let cols = conn.query_columns(&aggregate_join_query(vs_name));
-        assert_eq!(
-            cols.len(),
-            2,
-            "aggregate-over-join must return 2 columns for {vs_name}: {cols:?}"
-        );
-        assert_eq!(
-            cols[0].len(),
-            1,
-            "a single-group aggregate returns exactly one row for {vs_name}: {cols:?}"
-        );
-        assert_eq!(
-            value_to_string(&cols[0][0]),
-            expected_count,
-            "COUNT(*) over the join must equal the single-table COUNT for {vs_name}"
-        );
-        assert_eq!(
-            value_to_string(&cols[1][0]),
-            expected_min,
-            "MIN(O_ORDERDATE) over the join must equal the single-table MIN for {vs_name}"
-        );
-    }
+    // Over the 1-byte budget the join is outside the broadcast contract.
+    let query = aggregate_join_query(VS_NAME_LOW);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2) && !has_broadcast_join_block(&pushed),
+        "an aggregate over a join outside the broadcast contract must take the N-scan \
+         wrapper:\n{pushed}"
+    );
+    let cols = conn.query_columns(&query);
+    assert_eq!(
+        cols.len(),
+        2,
+        "aggregate-over-join must return 2 columns: {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "a single-group aggregate returns exactly one row: {cols:?}"
+    );
+    assert_eq!(
+        value_to_string(&cols[0][0]),
+        expected_count,
+        "COUNT(*) over the join must equal the single-table COUNT"
+    );
+    assert_eq!(
+        value_to_string(&cols[1][0]),
+        expected_min,
+        "MIN(O_ORDERDATE) over the join must equal the single-table MIN"
+    );
+
+    let nested = format!("SELECT COUNT(*) FROM ({query})");
+    let cols = conn.query_columns(&nested);
+    assert_eq!(cols[0].len(), 1, "{nested} must return one row: {cols:?}");
+    assert_eq!(value_to_string(&cols[0][0]), "1", "{nested}");
+
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let union_items = format!(
+        "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
+         MIN(COALESCE(o.O_ORDERDATE, DATE '2000-01-01')) FROM {} o JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
+        vs_fact_table("{T}"),
+        vs_dim_table("{T}")
+    );
+    let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME_LOW, &union_items);
+    assert!(
+        !pushed.contains("CAST(MAX("),
+        "a select item of an exact DATE type needs no CAST: {pushed}"
+    );
 }
 
 // Every line item references exactly one order and one supplier, so the 3- and 4-table
@@ -870,6 +1025,7 @@ fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<
     fetch_rows_as_vecs(&cols)
 }
 
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     setup_e2e();
@@ -879,14 +1035,8 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a scalar-over-aggregate grouped join must be served by the unified \
-         N-scan wrapper (N=2, LHS_T0/LHS_T1), not declined:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a grouped aggregate cannot ride the broadcast in-UDF join — no \
-         common-blob join block may appear:\n{pushed}"
+        has_broadcast_join_block(&pushed),
+        "a scalar-over-aggregate grouped join must aggregate over the broadcast fan-out:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);
@@ -906,6 +1056,7 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     );
 }
 
+/// Scenario: A scalar function wrapping aggregates in a grouped join select list is rendered, not declined
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     setup_e2e();
@@ -2038,6 +2189,7 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     }
 }
 
+/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 #[test]
 fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
     setup_e2e();
@@ -2052,14 +2204,8 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_two_scan_wrapper(&pushed),
-        "an ungrouped scalar-over-aggregate join must be served by the N-scan \
-         wrapper (N=2, LHS_T0/LHS_T1) so Exasol aggregates over the join:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "an aggregate — even one hidden inside a scalar function — cannot ride \
-         the broadcast in-UDF join, which renders projection only:\n{pushed}"
+        has_broadcast_join_block(&pushed),
+        "an ungrouped scalar-over-aggregate join must aggregate over the broadcast fan-out:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);

@@ -6,9 +6,10 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 
 * Exasol sends `selectListDataTypes`, one type per select-list item. A nested node, such as the `MAX(UPPER(s))` inside `LENGTH(MAX(UPPER(s)))`, and an unprojected `groupBy` node carry no type, except a `CAST` node, whose `dataType` is its target type.
 * A guessed type breaks the merge. A text, date, or timestamp value fails the emit or the merge, a `DOUBLE` partial over an exact expression loses digits, and a key staged as text is read back by the session's NLS format and splits values that are equal in Exasol, such as `-0.0` and `0.0`.
-* An expression's exact type comes from its `selectListDataTypes` entry when it is a select-list item, else from its own `dataType` (a `CAST`), else from `involvedTables` when it is a bare column.
+* An expression's exact type comes from its `selectListDataTypes` entry when it is a select-list item, else from the typed pass. The typed pass derives an exact type for a bare column from `involvedTables`, a `CAST` from its `dataType`, a `JSON_VALUE` from its `RETURNING` type or `VARCHAR(2000000)` without one, a predicate as BOOLEAN, a literal from its value (DOUBLE for a DOUBLE literal, `DECIMAL(n,0)` for an integer of n digits, DATE, and `TIMESTAMP(p)` by its fractional digits), an aggregate as native Exasol types it (below), and the forms its feature specs list: integer branches in `pushdown-types/pushdown-planning-scan-text-conversion`, date and timestamp forms in `sql-functions/vs-expression-translator-date-add-fns`, and `SECOND` in `sql-functions/vs-expression-translator-second`. For example, a CASE, `COALESCE`, `GREATEST`, or `LEAST` over only dates is a DATE.
+* The typed pass derives the same type for an expression whether or not the scan computes it, so a nested aggregate argument, a group key, and a qualified-wrapper join item share its rules.
 * Native Exasol types an aggregate as follows: `COUNT` is `DECIMAL(18,0)`; `AVG`, `STDDEV`, and `VARIANCE` and their variants are `DOUBLE`; `SUM` over `DECIMAL(p,s)` is `DECIMAL(min(p+11, 36), s)` and over `DOUBLE` is `DOUBLE`; `MIN` and `MAX` take the argument's type.
-* The adapter does not infer the type of an arbitrary expression. Exasol's typing rules depend on literal values, the session, and the Exasol version, so an adapter copy of them would drift.
+* The typed pass derives the exact type the Exasol version of the pushdown gives an expression (`sql-functions/vs-expression-translator-date-add-fns`), which an E2E test checks against native Exasol on Exasol 8 and 2025. A CASE or `COALESCE` over DOUBLEs has no exact type.
 * A constant group key forms one group whatever type carries it, so it is staged as `VARCHAR(2000000)`.
 
 ## Scenarios
@@ -16,8 +17,7 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 ### Scenario: A nested aggregate over an expression declines the split
 
 * *GIVEN* a single-group or grouped `pushdown` request whose select list nests `MIN`, `MAX`, or `SUM` over an expression inside a scalar, such as `LENGTH(MAX(UPPER(s)))` or `ROUND(SUM(a * b), 6)`
-* *AND* no top-level select-list item is the same aggregate
-* *AND* the argument is not a `CAST`
+* *AND* no top-level select-list item is the same aggregate, and the argument has no exact type (Background)
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL route it to the qualified wrapper
 * *AND* the result SHALL equal native Exasol over the same rows, including every decimal digit
@@ -29,7 +29,7 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * *WHEN* the adapter types that aggregate's partial and merged columns
 * *THEN* a top-level select-list item that is the same aggregate SHALL supply the type
 * *AND* otherwise `COUNT`, `AVG`, `STDDEV`, and `VARIANCE` SHALL take their fixed native types
-* *AND* otherwise `MIN`, `MAX`, and `SUM` SHALL take the native type derived from their argument's exact type, for example `TIMESTAMP(3)` for `MIN(CAST(d AS TIMESTAMP))`
+* *AND* otherwise `MIN`, `MAX`, and `SUM` SHALL take the native type derived from their argument's exact type, for example `TIMESTAMP(3)` for `MIN(CAST(d AS TIMESTAMP))` and DATE for `MAX(CASE WHEN c THEN d ELSE DATE '2024-01-01' END)`
 * *AND* the request SHALL keep the split path
 
 ### Scenario: A merged aggregate under a scalar keeps its native type
@@ -57,11 +57,27 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * *THEN* the key SHALL take the column type from `involvedTables`
 * *AND* the request SHALL keep the split path
 
+### Scenario: An unprojected group key with a derived exact type keeps the split
+
+* *GIVEN* a grouped request whose `groupBy` holds an expression absent from the select list that the typed pass gives an exact type (Background), such as `SELECT COUNT(*) FROM t GROUP BY CASE WHEN id > 2 THEN d ELSE DATE '2024-01-01' END` or `GROUP BY GREATEST(a, b)` over integer columns
+* *WHEN* the adapter types the key
+* *THEN* the key SHALL take that type
+* *AND* the request SHALL keep the split path
+* *AND* the result SHALL equal native Exasol over the same rows, also under a `HAVING` over the key
+
 ### Scenario: An unprojected group key without an exact type declines the split
 
-* *GIVEN* a grouped request whose `groupBy` holds an expression that is absent from the select list, is not a `CAST`, and is not a constant, such as `SELECT COUNT(*) FROM t GROUP BY UPPER(s)`
+* *GIVEN* a grouped request whose `groupBy` holds an expression that is absent from the select list, has no exact type (Background), and is not a constant, such as `SELECT COUNT(*) FROM t GROUP BY UPPER(s)`
 * *WHEN* the adapter types the key
 * *THEN* the adapter SHALL route the request to the qualified wrapper
+
+### Scenario: A form whose type differs by Exasol version takes the type of the version it runs on
+
+* *GIVEN* a split aggregate whose nested aggregate argument or unprojected group key is `TO_TIMESTAMP`, `ADD_HOURS` or `ADD_MINUTES` over a DATE, `SECOND` over a DATE, a TIMESTAMP literal with other than 3 fractional digits, or a CASE or `GREATEST` over a DATE and a TIMESTAMP
+* *WHEN* the adapter plans the request on Exasol 8 or Exasol 2025
+* *THEN* the argument or key SHALL take the type that version gives it (`sql-functions/vs-expression-translator-date-add-fns`, `sql-functions/vs-expression-translator-second`)
+* *AND* the request SHALL keep the split path
+* *AND* the result SHALL equal native Exasol over the same rows, including sub-millisecond and pre-1970 values
 
 ### Scenario: An all-pruned grouped request types a text scalar over an aggregate
 
@@ -69,3 +85,10 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * *WHEN* the adapter builds the empty result
 * *THEN* that item SHALL be rendered `CAST(NULL AS VARCHAR(2000000))`
 * *AND* the query SHALL return zero rows, as native Exasol does
+
+### Scenario: An unprojected SECOND group key takes the type of its argument's precision
+
+* *GIVEN* a grouped request whose `groupBy` holds `SECOND(x)` or `EXTRACT(SECOND FROM x)` absent from the select list, where `x` has the exact type `TIMESTAMP(p)` in the typed scan pass, such as `SELECT COUNT(*) FROM t GROUP BY SECOND(ts)` or `GROUP BY SECOND(COALESCE(updated_at, created_at))`
+* *WHEN* the adapter types the key
+* *THEN* the key SHALL take the type `DECIMAL(2+p, p)`
+* *AND* the request SHALL keep the split path
