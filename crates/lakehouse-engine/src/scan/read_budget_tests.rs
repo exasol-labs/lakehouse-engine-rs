@@ -83,6 +83,57 @@ async fn a_lease_extends_beyond_the_budget_when_no_other_lease_is_running() {
     assert_eq!(pool.reserved(), 80);
 }
 
+/// Scenario: Only one stream reads beyond the read budget
+#[tokio::test]
+async fn a_lease_beyond_the_budget_extends_again_and_lets_no_other_lease_pass() {
+    let (pool, budget) = budget(100);
+    let mut first = budget.admit(50).await;
+    let mut second = budget.admit(50).await;
+
+    let mut head = Box::pin(first.extend(30));
+    assert!((&mut head).now_or_never().is_none());
+    let mut behind = Box::pin(second.extend(30));
+    assert!((&mut behind).now_or_never().is_none());
+    head.await;
+
+    // A third fetch of the row group beyond the budget does not wait behind `second`.
+    first.extend(30).now_or_never().expect("extends at once");
+    assert_eq!(pool.reserved(), 160);
+    assert!((&mut behind).now_or_never().is_none());
+
+    drop(first);
+    behind.await;
+    assert_eq!(pool.reserved(), 80);
+}
+
+/// Scenario: Only one stream reads beyond the read budget
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_bytes_stay_within_the_budget_and_one_row_group_over_three_fetches() {
+    const ROW_GROUP: usize = 110;
+    let (pool, budget) = budget(100);
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (pool, budget, peak) = (Arc::clone(&pool), Arc::clone(&budget), Arc::clone(&peak));
+        readers.spawn(async move {
+            for _ in 0..20 {
+                let mut lease = budget.admit(10).await;
+                for _ in 0..2 {
+                    tokio::task::yield_now().await;
+                    lease.extend(50).await;
+                    peak.fetch_max(pool.reserved(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    while let Some(reader) = readers.join_next().await {
+        reader.unwrap();
+    }
+    let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(peak <= 100 + ROW_GROUP, "{peak} bytes held");
+    assert_eq!(pool.reserved(), 0);
+}
+
 #[tokio::test]
 async fn a_waiting_read_is_not_admitted_when_the_only_lease_extends() {
     let (pool, budget) = budget(100);

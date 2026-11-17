@@ -42,30 +42,43 @@ fn write_local_parquet_rows(
     row_group_rows: usize,
     name_padding: usize,
 ) -> String {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-    ]));
+    write_local_parquet_columns(dir, rows, row_group_rows, name_padding, &["name"])
+}
+
+/// Writes `id` and one string column per name in `strings`, all with the same values.
+fn write_local_parquet_columns(
+    dir: &std::path::Path,
+    rows: i64,
+    row_group_rows: usize,
+    padding: usize,
+    strings: &[&str],
+) -> String {
+    let mut fields = vec![Field::new("id", DataType::Int64, false)];
+    fields.extend(
+        strings
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, false)),
+    );
+    let schema = Arc::new(Schema::new(fields));
     let path = dir.join("plan_shape.parquet");
     let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group_rows))
-        // Padded names are stored plain, so the `name` chunk is as large as its values.
-        .set_dictionary_enabled(name_padding == 0)
+        // Padded values are stored plain, so a string chunk is as large as its values.
+        .set_dictionary_enabled(padding == 0)
         .build();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
-    let names: Vec<String> = (0..rows)
-        .map(|i| format!("row-{:0>name_padding$}", i % 100))
+    let values: Vec<String> = (0..rows)
+        .map(|i| format!("row-{:0>padding$}", i % 100))
         .collect();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
-    )
-    .expect("record batch");
+    let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(Int64Array::from(ids))];
+    columns.extend(
+        strings
+            .iter()
+            .map(|_| Arc::new(StringArray::from(values.clone())) as Arc<dyn Array>),
+    );
+    let batch = RecordBatch::try_new(schema, columns).expect("record batch");
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
     url::Url::from_file_path(&path)
@@ -572,6 +585,52 @@ async fn every_plan_shape_completes_when_the_streams_row_groups_exceed_the_pool(
         write_local_parquet_rows(dir, 800_000, 50_000, 120)
     });
     assert_plan_shapes_complete(&files, 16, 64 * 1024 * 1024).await;
+}
+
+/// Scenario: Only one stream reads beyond the read budget
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_of_two_conjuncts_reserves_no_more_than_the_pool() {
+    const POOL_BYTES: usize = 64 * 1024 * 1024;
+    let tmp = tempfile::tempdir().unwrap();
+    // 16 row groups of 12.8 MB. Each conjunct fetches its own column, so a stream fetches
+    // the 0.4 MB `id` chunk, then the 6.2 MB `name` chunk, then the 6.2 MB `tag` chunk.
+    let files = local_files(tmp.path(), 1, |dir| {
+        write_local_parquet_columns(dir, 800_000, 50_000, 120, &["name", "tag"])
+    });
+    let mut spec = single_partition_spec(files[0].path.clone());
+    spec.files = files;
+    spec.common.df_target_partitions = 16;
+    spec.common.projection = vec!["ID".into(), "NAME".into(), "TAG".into()];
+    spec.common.filter = Some(r#""ID" >= 10 AND "NAME" <> 'row-7'"#.into());
+
+    let pool = Arc::new(PeakPool {
+        pool: GreedyMemoryPool::new(POOL_BYTES),
+        peak: AtomicUsize::new(0),
+    });
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+        .build_arc()
+        .unwrap();
+    let ctx = SessionContext::new_with_config_rt(session_config_for_spec(&spec), runtime);
+    register_files(
+        &ctx,
+        "scan_target",
+        &spec,
+        &scan_fixture::resolved_storage(&spec),
+    )
+    .await
+    .expect("register the scan");
+    let plan = build_raw_scan_physical_plan(&ctx, &spec)
+        .await
+        .expect("build the raw plan");
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("the scan completes");
+
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 800_000 - 10);
+    let peak = pool.peak.load(Ordering::Relaxed);
+    assert!(peak <= POOL_BYTES, "{peak} bytes reserved");
 }
 
 fn row_scan_spec() -> ScanSpec {

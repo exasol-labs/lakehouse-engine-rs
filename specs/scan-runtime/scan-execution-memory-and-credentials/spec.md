@@ -132,6 +132,14 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *AND* when every stream that holds bytes waits, the UDF SHALL let the first of them fetch beyond the budget
 * *AND* the scan SHALL NOT reserve more than the memory pool when the row groups of all streams exceed it
 
+### Scenario: Only one stream reads beyond the read budget
+
+* *GIVEN* a scan whose filter has several conjuncts, so a stream fetches one row group in three or more requests
+* *WHEN* a stream has fetched beyond the read budget
+* *THEN* the later fetches of that row group SHALL NOT wait
+* *AND* no other stream SHALL fetch beyond the budget until that stream releases its row group
+* *AND* the bytes held by all streams SHALL NOT exceed the read budget by more than one row group
+
 ### Scenario: A row group larger than the read budget still reads
 
 * *GIVEN* a row group whose fetched bytes exceed the read budget

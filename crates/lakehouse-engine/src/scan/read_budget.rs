@@ -63,30 +63,34 @@ impl ReadBudget {
     }
 
     /// Waits until `bytes` fit, or until `unblocked` says that waiting longer frees nothing.
-    async fn take(&self, bytes: usize, queue: &Queue, unblocked: fn(&Held) -> bool) {
+    /// Returns whether the bytes went beyond the budget.
+    async fn take(&self, bytes: usize, queue: &Queue, unblocked: fn(&Held) -> bool) -> bool {
         let _turn = queue.turn.lock().await;
-        loop {
+        let beyond = loop {
             {
                 let mut held = self.held();
-                if unblocked(&held) || held.bytes.saturating_add(bytes) <= self.capacity {
+                let fits = held.bytes.saturating_add(bytes) <= self.capacity;
+                if fits || unblocked(&held) {
                     held.bytes += bytes;
                     held.running += 1;
-                    break;
+                    break !fits;
                 }
             }
             queue.freed.notified().await;
-        }
+        };
         self.reservation.grow(bytes);
+        beyond
     }
 
     /// A read is admitted when nothing is held, whatever its size, so a row group larger than
     /// the budget still reads.
     pub(super) async fn admit(self: &Arc<Self>, bytes: usize) -> ReadLease {
-        self.take(bytes, &self.admits, |held| held.bytes == 0).await;
+        let beyond = self.take(bytes, &self.admits, |held| held.bytes == 0).await;
         ReadLease {
             budget: Arc::clone(self),
             bytes,
             waiting: false,
+            beyond,
         }
     }
 }
@@ -98,6 +102,9 @@ pub(super) struct ReadLease {
     bytes: usize,
     /// Set while `extend` waits, and left set when that wait is cancelled.
     waiting: bool,
+    /// Set once a fetch went beyond the budget. Only this lease's drop brings the held bytes
+    /// back within it, so its later fetches never wait.
+    beyond: bool,
 }
 
 impl ReadLease {
@@ -105,12 +112,19 @@ impl ReadLease {
     /// the first one goes beyond the budget.
     pub(super) async fn extend(&mut self, bytes: usize) {
         let budget = &self.budget;
+        if self.beyond {
+            // It stays running, so no second lease goes beyond the budget before it drops.
+            budget.held().bytes += bytes;
+            budget.reservation.grow(bytes);
+            self.bytes += bytes;
+            return;
+        }
         if !self.waiting {
             self.waiting = true;
             budget.held().running -= 1;
             budget.wake();
         }
-        budget
+        self.beyond = budget
             .take(bytes, &budget.extends, |held| held.running == 0)
             .await;
         self.waiting = false;

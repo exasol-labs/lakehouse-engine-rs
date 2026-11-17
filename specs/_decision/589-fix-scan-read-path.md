@@ -69,7 +69,7 @@ DataFusion's Parquet reader holds the fetched bytes of each stream's current row
 
 ### Decision
 
-The shared reader admits every fetch of a row group against one byte budget per invocation, a quarter of the memory pool. The bytes stay reserved in the pool until the reader fetches its next row group or drops. A fetch that does not fit waits in arrival order. A first fetch is admitted when nothing else is held. A later fetch of the same row group keeps its bytes while it waits and goes before any first fetch. When every reader that holds bytes waits, the first of them goes beyond the budget.
+The shared reader admits every fetch of a row group against one byte budget per invocation, a quarter of the memory pool. The bytes stay reserved in the pool until the reader fetches its next row group or drops. A fetch that does not fit waits in arrival order. A first fetch is admitted when nothing else is held. A later fetch of the same row group keeps its bytes while it waits and goes before any first fetch. When every reader that holds bytes waits, the first of them goes beyond the budget. That reader fetches the rest of its row group without waiting, and no other reader goes beyond the budget until it releases the row group.
 
 ### Options Considered
 
@@ -78,6 +78,7 @@ The shared reader admits every fetch of a row group against one byte budget per 
 | Cap the stream count | Rejected: it bounds memory for one row-group size only, and it lowers small-file concurrency |
 | Fail a read that does not fit | Rejected: a query that ran before would fail, where waiting only slows it |
 | Let a later fetch of an admitted row group skip the budget | Rejected: a filter fetches its columns first, so every stream was admitted for a small fetch and then held a whole row group. 16 streams reserved 95 MB against a 16 MB budget, and the next operator's reservation failed |
+| Let a reader beyond the budget wait again for its next fetch | Rejected: it then counted as waiting, so the next reader went beyond the budget too. A filter of two conjuncts fetches a row group in three requests, and 16 streams reserved 109 MB against a 64 MB pool |
 | Admit the whole row group at its first fetch | Rejected: the reader does not know the scan's Parquet columns, so it would count unread columns and stall wide tables |
 | Count held file bytes against the same budget | Rejected: a file's footer bytes stay held until all its ranges finish, so they could block the reads that release them |
 
