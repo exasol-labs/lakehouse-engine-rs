@@ -495,9 +495,46 @@ fn copy_into_nano_bucketfs(bytes: &[u8], bucketfs_path: &str) {
         let dest = format!("{container}:{NANO_BUCKETFS_ROOT}/{target}");
         docker_cp(&["-", &dest], Some(bytes)).unwrap_or_else(|e| panic!("{e}"));
     }
+    let bucket = relative
+        .split('/')
+        .next()
+        .expect("a BucketFS path names a bucket");
+    wait_for_nano_bucket(&container, bucket);
+}
+
+/// Nano registers a new bucket directory only when its poller next lists it in `bucketfs.conf`.
+/// Until then a script whose language alias points into the bucket fails "Cannot access bucket".
+fn wait_for_nano_bucket(container: &str, bucket: &str) {
+    let entry = format!("{NANO_BUCKETFS_ROOT}/{bucket}");
+    let local = std::env::temp_dir().join(format!("lh-bucketfs-conf-{}", std::process::id()));
+    let local_path = local.display().to_string();
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        docker_cp(
+            &[&format!("{container}:{NANO_BUCKETFS_CONF}"), &local_path],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let conf =
+            std::fs::read_to_string(&local).unwrap_or_else(|e| panic!("read {local:?}: {e}"));
+        if conf
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(entry.as_str()))
+        {
+            let _ = std::fs::remove_file(&local);
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Nano did not register bucket `{bucket}` within {DEFAULT_TIMEOUT:?}; \
+             {NANO_BUCKETFS_CONF} holds:\n{conf}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 const NANO_BUCKETFS_ROOT: &str = "/exa/bucketfs/bfsdefault";
+const NANO_BUCKETFS_CONF: &str = "/exa/bucketfs.conf";
 
 fn docker_cp(args: &[&str], stdin: Option<&[u8]>) -> Result<(), String> {
     use std::io::Write;
