@@ -12,6 +12,11 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "Blocked by parquet/arrow-ipc/apache-avro/iceberg zstd ^0.13 pins; none of them calls Encoder/Decoder::with_context, the affected constructors" },
     { id = "RUSTSEC-2026-0398", reason = "Blocked by the zstd ^0.13 pins; zstd-safe is built without the `seekable` feature, so Seekable::decompress is not compiled" },
     { id = "RUSTSEC-2026-0403", reason = "Blocked by the zstd ^0.13 pins; dependents decode only through stream::read::Decoder, decode_all, and bulk, which the advisory lists as unaffected" },
+    # Unmaintained, not vulnerable (chronotope/chrono#1768). arrow, parquet, datafusion, iceberg,
+    # delta_kernel, and object_store all depend on chrono; re-evaluate when they move to jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fixed version; required by arrow/datafusion/iceberg/delta_kernel" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained alongside chrono, no fixed version; required by arrow-array and datafusion-functions" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained alongside chrono, no fixed version; required by object_store" },
 ]
 
 [licenses]
