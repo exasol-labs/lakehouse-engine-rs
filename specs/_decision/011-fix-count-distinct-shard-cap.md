@@ -26,28 +26,4 @@ Each shard streams one row per shard-local distinct value, and the outer query r
 ### Consequences
 
 - Distinct cardinality is bounded only by Exasol's aggregate engine, not by a per-shard cap.
-
-## ADR: The count stays byte-exact: approximate distinct is rejected
-
-**ID:** count-distinct-exact-not-approximate
-**Plan:** `fix-count-distinct-shard-cap`
-**Status:** Accepted
-
-### Context
-
-An approximate sketch such as HyperLogLog could scale `COUNT(DISTINCT)` without a cap.
-
-### Decision
-
-`COUNT(DISTINCT col)` stays exact. Sketch-based counting is out of scope.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Fixed-size mergeable sketches (HLL) | Rejected: trades exactness for scale, against the project's correctness-first mission |
-
-### Consequences
-
-- Every scaling fix for this function preserves exact results.
-
+- `COUNT(DISTINCT col)` stays exact, so any later scaling fix preserves exact results and sketch-based counting stays out of scope.

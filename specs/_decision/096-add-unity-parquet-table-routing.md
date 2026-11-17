@@ -8,11 +8,11 @@
 
 ### Context
 
-Exact-case column binding turned a case-drifted column into NULL, and the default expression adapter cast every castable pair, including narrowing casts that truncate values. The Delta protocol requires a data file column to have the table schema's type, except as Type Widening allows. Spark resolves Parquet columns case-insensitively by default.
+A data file column can drift from the table schema in letter case or type, and the default expression adapter casts every castable pair, including narrowing casts that truncate values. The Delta protocol requires a data file column to have the table schema's type except as Type Widening allows, and Spark resolves Parquet columns case-insensitively by default.
 
 ### Decision
 
-For every format, the scan checks each bound column per file before the cast. It admits a type pair that widens to the logical type, a timestamp pair that keeps every stored instant, or a text-rendered type under a string tag. Any other pair fails a query that reads the column, naming the storage location, the column, and both types. Name binding matches the exact name first, then the uppercase fold, and fails on an ambiguous fold. Field-id and declared-physical-name bindings stay exact.
+For every format, the scan checks each bound column per file before the cast and admits only a type pair that widens to the logical type, a timestamp pair that keeps every stored instant, or a text-rendered type under a string tag, failing a query that reads any other pair with the storage location, the column, and both types. Name binding matches the exact name first, then the uppercase fold, and fails on an ambiguous fold. Field-id and declared-physical-name bindings stay exact.
 
 ### Options Considered
 

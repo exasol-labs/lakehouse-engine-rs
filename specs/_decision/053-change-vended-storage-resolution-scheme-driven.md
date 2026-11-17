@@ -8,11 +8,11 @@
 
 ### Context
 
-The vended path selects its storage backend from the table location's URI scheme, which is known only after the catalog loads the table. The static path selects from the CONNECTION credential shape. One selector would need CONNECTION parsing deferred for every request, and could not serve a request that resolves no table.
+The vended path selects its storage backend from the table location's URI scheme, known only after the catalog loads the table, while the static path selects from the CONNECTION credential shape. One selector would defer CONNECTION parsing for every request and could not serve a request that resolves no table.
 
 ### Decision
 
-There are two selectors on disjoint inputs. The static selector reads the CONNECTION credential shape and runs only when vended credentials are off. The vended selector reads the table location scheme and runs only when they are on. One branch on that setting chooses between them.
+The static selector reads the CONNECTION credential shape and runs only when vended credentials are off. The vended selector reads the table location scheme and runs only when they are on. One branch on that setting chooses between them.
 
 ### Options Considered
 
@@ -20,7 +20,6 @@ There are two selectors on disjoint inputs. The static selector reads the CONNEC
 |--------|---------|
 | One selector that receives the URI scheme | Rejected: the scheme is known only after the table load, which runs later, once per table, and never at virtual schema creation |
 | The vended arm mutates the payload `storage_block` returned | Rejected: reaching into a built payload to finish construction is forbidden |
-| Call the scheme switch "not a selection" and keep the one-site clause | Rejected: a false one-site claim on a credentials path misleads |
 
 ### Consequences
 

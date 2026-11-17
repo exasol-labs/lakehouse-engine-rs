@@ -403,11 +403,8 @@ async fn debug_output_of_an_answer_and_a_failure_hides_the_bearer() {
         .send(get(&http, &base_uri), RepeatSafety::Safe, None)
         .await
         .unwrap();
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_uri = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
     let failure = http
-        .send(get(&http, &dead_uri), RepeatSafety::Unsafe, None)
+        .send(get(&http, CLOSED_PORT_URI), RepeatSafety::Unsafe, None)
         .await
         .unwrap_err();
 

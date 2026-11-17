@@ -12,7 +12,7 @@ The typed pass kept its own coarse copy of the Exasol type, so each new rule mea
 
 ### Decision
 
-The pass derives each node's type as an `ExasolType` when that type is known, as a kind with unknown parameters (text, integer, number, timestamp), as NULL, or as unknown. A rule returns an exact type only after a live Exasol check confirms it. Otherwise it returns a kind. Each scalar function has exactly one result rule.
+The pass derives each node's type as an `ExasolType` when that type is known, as a kind with unknown parameters (text, integer, number, timestamp), as NULL, or as unknown. A rule returns an exact type only after a live Exasol check confirms it, and a kind otherwise. Each scalar function has exactly one result rule.
 
 ### Consequences
 

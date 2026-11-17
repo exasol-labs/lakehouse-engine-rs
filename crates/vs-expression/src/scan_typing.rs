@@ -422,7 +422,7 @@ pub(crate) fn type_scan_tree(
         Ok(ty)
     })?;
     let ty = node_type(node, &children);
-    rewrite_for_scan(node, &mut out, &children, ty)?;
+    rewrite_for_scan(node, &mut out, &children)?;
     Ok((out, ty))
 }
 
@@ -533,13 +533,7 @@ fn node_type(node: &Json, children: &ChildTypes) -> Inferred {
 }
 
 /// Declines what the scan cannot compute as Exasol does, and rewrites `out` for DataFusion.
-/// `ty` is the node's [`node_type`].
-fn rewrite_for_scan(
-    node: &Json,
-    out: &mut Json,
-    children: &ChildTypes,
-    ty: Inferred,
-) -> Result<(), UdfError> {
+fn rewrite_for_scan(node: &Json, out: &mut Json, children: &ChildTypes) -> Result<(), UdfError> {
     match second_call(node, children) {
         SecondCall::Of(seconds) => {
             *out = seconds.node(out["arguments"][0].take());
@@ -580,11 +574,11 @@ fn rewrite_for_scan(
             } else {
                 refuse_implicit_text(node, children.of("arguments"))?;
             }
-            unify_branches(node, out, "results", children.of("results"), ty)?;
+            unify_branches(node, out, "results", children.of("results"))?;
         }
         "function_scalar_json_value" => check_json_value(node, children.of("arguments"))?,
         _ if is_cast(node) => rewrite_cast(out, children.of("arguments"))?,
-        "function_scalar" => rewrite_scalar_function(node, out, children.of("arguments"), ty)?,
+        "function_scalar" => rewrite_scalar_function(node, out, children.of("arguments"))?,
         "function_aggregate" => check_aggregate(node, children.of("arguments"))?,
         _ => refuse_implicit_text(node, &children.all())?,
     }
@@ -627,19 +621,14 @@ fn timestamp_literal_type(node: &Json) -> Inferred {
     }
 }
 
-fn rewrite_scalar_function(
-    node: &Json,
-    out: &mut Json,
-    args: &[Inferred],
-    ty: Inferred,
-) -> Result<(), UdfError> {
+fn rewrite_scalar_function(node: &Json, out: &mut Json, args: &[Inferred]) -> Result<(), UdfError> {
     let function = typed_function(&upper_name(node));
     let text_positions = function.string_positions(args.len());
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
     if function.result == ResultRule::Unified {
-        return unify_branches(node, out, "arguments", args, ty);
+        return unify_branches(node, out, "arguments", args);
     }
     if let ResultRule::DateAddition(_) = function.result {
         check_date_addition(node, out, args)?;
@@ -836,6 +825,7 @@ fn type_comparison(node: &Json, out: &mut Json, children: &ChildTypes) -> Result
         operands.extend(args.iter().zip(children.of("arguments").iter().copied()));
     }
     compare_without_session_parse(node, out, &operands)?;
+    compare_dates_as_timestamps(out, children, &operands);
     compare_booleans_as_numbers(node, out, children, &operands)
 }
 
@@ -910,22 +900,45 @@ fn compare_booleans_as_numbers(
             short(node)
         )));
     }
-    for field in COMPARED_FIELDS {
-        if children.one(field) == Some(BOOLEAN) {
-            out[field] = wrap(BOOLEAN_NUMBER_NODE, out[field].take());
-        }
-    }
-    for (i, ty) in children.of("arguments").iter().enumerate() {
-        if *ty == BOOLEAN {
-            out["arguments"][i] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][i].take());
-        }
-    }
+    rewrite_operands(out, children, BOOLEAN, |operand| {
+        wrap(BOOLEAN_NUMBER_NODE, operand)
+    });
     Ok(())
+}
+
+/// A DATE compared with a TIMESTAMP gets a CAST to the timestamp's unit ([`common_timestamp`]).
+fn compare_dates_as_timestamps(
+    out: &mut Json,
+    children: &ChildTypes,
+    operands: &[(&Json, Inferred)],
+) {
+    let types: Vec<Inferred> = operands.iter().map(|(_, ty)| *ty).collect();
+    if let Some(target) = common_timestamp(&types) {
+        rewrite_operands(out, children, DATE, |operand| cast_node(target, operand));
+    }
+}
+
+fn rewrite_operands(
+    out: &mut Json,
+    children: &ChildTypes,
+    ty: Inferred,
+    rewrite: impl Fn(Json) -> Json,
+) {
+    for field in COMPARED_FIELDS {
+        if children.one(field) == Some(ty) {
+            out[field] = rewrite(out[field].take());
+        }
+    }
+    for (i, operand) in children.of("arguments").iter().enumerate() {
+        if *operand == ty {
+            out["arguments"][i] = rewrite(out["arguments"][i].take());
+        }
+    }
 }
 
 /// DataFusion truncates a timestamp literal to its TIMESTAMP operand's unit, while Exasol compares
 /// at full precision (#461, apache/datafusion#22142, fixed by apache/datafusion#22906). A DATE
-/// needs no floor, because DataFusion compares it with a timestamp in nanoseconds.
+/// needs no floor, because it compares at the unit that holds the literal.
 fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
     let precision = |field: &str| children.one(field)?.timestamp_precision();
     let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
@@ -1064,18 +1077,15 @@ fn refuse_text_among_others(node: &Json, types: &[Inferred]) -> Result<(), UdfEr
 }
 
 /// The type Exasol brings the values in `field` to (CASE results, `GREATEST`, `LEAST`).
-/// DataFusion brings timestamps to the finest unit among them, so each branch gets a CAST to the
-/// unit that holds Exasol's precision.
+/// Branches of DATEs and TIMESTAMPs each get a CAST to their [`common_timestamp`].
 fn unify_branches(
     node: &Json,
     out: &mut Json,
     field: &str,
     branches: &[Inferred],
-    unified: Inferred,
 ) -> Result<(), UdfError> {
     refuse_text_among_others(node, branches)?;
-    if let Some(precision) = unified.timestamp_precision() {
-        let target = ExasolType::timestamp(TimestampUnit::holding(precision).digits());
+    if let Some(target) = common_timestamp(branches) {
         for (i, branch) in branches.iter().enumerate() {
             if *branch != Inferred::Null {
                 out[field][i] = cast_node(target, out[field][i].take());
@@ -1083,6 +1093,21 @@ fn unify_branches(
         }
     }
     Ok(())
+}
+
+/// The TIMESTAMP at the unit holding the finest `TIMESTAMP(p)` among `types`, when all others
+/// are DATE or NULL. DataFusion otherwise brings a DATE and a TIMESTAMP to nanoseconds, which
+/// span only 1677 to 2262 (#642), and two TIMESTAMPs to the finer unit of their two.
+fn common_timestamp(types: &[Inferred]) -> Option<ExasolType> {
+    let finest = types
+        .iter()
+        .filter(|ty| !matches!(**ty, Inferred::Null | DATE))
+        .try_fold(None, |finest: Option<u8>, ty| {
+            Some(finest.max(Some(ty.timestamp_precision()?)))
+        })??;
+    Some(ExasolType::timestamp(
+        TimestampUnit::holding(finest).digits(),
+    ))
 }
 
 fn union_of(branches: &[Inferred]) -> Inferred {

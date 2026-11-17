@@ -1151,6 +1151,14 @@ fn timestamp_branches_cast_to_the_unit_holding_their_unified_precision() {
             case_when([col("B")], [col("D"), date_lit("2024-01-01")]),
             r#"(CASE WHEN "B" THEN "D" ELSE DATE '2024-01-01' END)"#,
         ),
+        (
+            case_when([col("B"), col("B")], [col("D"), col("TS3"), null_lit()]),
+            r#"(CASE WHEN "B" THEN CAST("D" AS TIMESTAMP(3)) WHEN "B" THEN CAST("TS3" AS TIMESTAMP(3)) ELSE NULL END)"#,
+        ),
+        (
+            case_when([col("B")], [col("D"), col("LTZ")]),
+            r#"(CASE WHEN "B" THEN "D" ELSE "LTZ" END)"#,
+        ),
     ];
     for (expr, expected) in cases {
         assert_eq!(render(&expr).unwrap(), expected);
@@ -1161,6 +1169,47 @@ fn timestamp_branches_cast_to_the_unit_holding_their_unified_precision() {
             .unwrap()
             .contains(r#"greatest(CAST("TS0" AS TIMESTAMP(6)), CAST("TS" AS TIMESTAMP(6)))"#)
     );
+    let least = scalar_fn("LEAST", [col("D"), col("TS")]);
+    assert!(
+        render(&least)
+            .unwrap()
+            .contains(r#"least(CAST("D" AS TIMESTAMP(6)), CAST("TS" AS TIMESTAMP(6)))"#)
+    );
+}
+
+#[test]
+fn a_date_compared_with_a_timestamp_casts_to_the_timestamp_unit() {
+    let ts_lit = || timestamp_lit("2020-01-01 00:00:00");
+    let cases = [
+        (
+            compare("predicate_less", col("D"), ts_lit()),
+            r#"(CAST("D" AS TIMESTAMP(0)) < arrow_cast('2020-01-01 00:00:00', 'Timestamp(Microsecond, None)'))"#,
+        ),
+        (
+            compare("predicate_greater", col("TS"), col("D")),
+            r#"("TS" > CAST("D" AS TIMESTAMP(6)))"#,
+        ),
+        (
+            between(col("D"), col("TS0"), col("TS3")),
+            r#"(CAST("D" AS TIMESTAMP(3)) BETWEEN "TS0" AND "TS3")"#,
+        ),
+        (
+            in_list(col("TS"), [date_lit("9999-12-31"), col("TS0")]),
+            r#"("TS" IN (CAST(DATE '9999-12-31' AS TIMESTAMP(6)), "TS0"))"#,
+        ),
+        (
+            nullif(col("D"), col("TS")),
+            r#"(CASE CAST("D" AS TIMESTAMP(6)) WHEN "TS" THEN NULL ELSE "D" END)"#,
+        ),
+        (
+            predicate_equal(col("D"), date_lit("9999-12-31")),
+            r#"("D" = DATE '9999-12-31')"#,
+        ),
+        (predicate_equal(col("D"), col("LTZ")), r#"("D" = "LTZ")"#),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected);
+    }
 }
 
 #[test]
@@ -1421,7 +1470,7 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
     }
 
     // ADD_MINUTES over a DATE is a TIMESTAMP(0); ADD_DAYS and ADD_WEEKS are a DATE, which
-    // DataFusion compares with the literal in nanoseconds.
+    // compares at the literal's unit.
     for (name, floored) in [
         ("ADD_MINUTES", true),
         ("ADD_DAYS", false),
@@ -1431,7 +1480,7 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         let expected = if floored {
             compare("predicate_notequal", typed_call.clone(), typed_call)
         } else {
-            predicate_equal(typed_call, over())
+            predicate_equal(cast_to(ExasolType::timestamp(9), typed_call), over())
         };
         assert_eq!(
             typed(&predicate_equal(

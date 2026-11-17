@@ -729,16 +729,34 @@ const DATE_RANGE_DAYS: [i32; 6] = [
     -719_163,
 ];
 
+/// Rows 2 and 3 pair each placeholder DATE with the other placeholder TIMESTAMP.
+const DATE_RANGE_TS_MICROS: [Option<i64>; 6] = [
+    Some(1_704_110_400_000_000),
+    Some(253_402_300_799_999_999),
+    Some(-62_135_596_800_000_000),
+    None,
+    None,
+    None,
+];
+
 fn date_range_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
         Field::new("STORED_DATE", DataType::Date32, true),
+        Field::new(
+            "STORED_TS",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
     ]));
     RecordBatch::try_new(
         schema,
         vec![
             Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
             Arc::new(Date32Array::from(DATE_RANGE_DAYS.to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(
+                DATE_RANGE_TS_MICROS.to_vec(),
+            )),
         ],
     )
     .expect("date_range batch construction is infallible")
@@ -2276,6 +2294,65 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
         &format!("SELECT ID FROM {table} WHERE STORED_DATE > DATE '9999-12-31' ORDER BY ID"),
         &[&[Some("4"), Some("5")]],
     );
+}
+
+/// Scenario: A DATE meets a TIMESTAMP at the timestamp's unit
+#[test]
+fn placeholder_dates_meet_timestamps_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = vs_table(VS_DIRECT, "DATE_RANGE");
+    let oracle = "LHVS.DIRECT_DATE_RANGE_ORACLE";
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {oracle} AS SELECT * FROM {table} WHERE ID <= 3"
+    ));
+
+    let in_scan = PathCheck::Has("AS TIMESTAMP(");
+    let broadcast = PathCheck::Has(BROADCAST_JOIN);
+    let cases = [
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_DATE < TIMESTAMP '2020-01-01 00:00:00'",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_TS > STORED_DATE",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_DATE BETWEEN STORED_TS AND TIMESTAMP '9999-12-31 23:59:59.999999'",
+            in_scan,
+        ),
+        (
+            "SELECT ID FROM {T} WHERE ID <= 3 AND STORED_TS IN (DATE '0001-01-01', STORED_DATE)",
+            in_scan,
+        ),
+        (
+            "SELECT ID, CASE WHEN ID > 2 THEN STORED_DATE ELSE STORED_TS END FROM {T} WHERE ID <= 3",
+            in_scan,
+        ),
+        (
+            "SELECT ID, COALESCE(STORED_DATE, STORED_TS), GREATEST(STORED_DATE, STORED_TS), \
+             LEAST(STORED_TS, STORED_DATE), NULLIF(STORED_TS, STORED_DATE) FROM {T} WHERE ID <= 3",
+            in_scan,
+        ),
+        (
+            "SELECT a.ID, b.ID FROM {T} a JOIN {T} b ON a.STORED_DATE = b.STORED_TS \
+             WHERE a.ID <= 3 AND b.ID <= 3",
+            broadcast,
+        ),
+        (
+            "SELECT a.ID FROM {T} a JOIN {T} b ON a.ID = b.ID \
+             WHERE a.ID <= 3 AND a.STORED_DATE < b.STORED_TS",
+            broadcast,
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(query, path)| {
+            native_copy_mismatch(&mut conn, &table, oracle, query, *path, Expect::Rows)
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
