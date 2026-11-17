@@ -160,6 +160,7 @@ async fn a_namespace_level_without_an_answer_is_sent_again() {
     assert_eq!(requests_starting(&requests, "POST ").len(), 2);
 }
 
+/// Scenario: Two exports that create the same table leave one winner
 #[tokio::test]
 async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it() {
     let (uri, _) = catalog(
@@ -186,7 +187,8 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     );
     assert_eq!(
         foreign.err().unwrap().to_string(),
-        "table ns.t already exists; the export only creates new tables"
+        "table ns.t was created by another statement after the export checked that it does not \
+         exist"
     );
 }
 

@@ -1,13 +1,15 @@
-//! The export's first target: an Iceberg table created through an Iceberg REST catalog.
+//! The export's first target: an Iceberg table that the export creates through an Iceberg REST
+//! catalog, or an existing one it appends to.
 
 use super::iceberg_sink::{IcebergSink, OpenedTable};
 use super::refusal;
-use super::target::{ExportConnection, ExportSink, ExportTarget};
+use super::target::{ExportConnection, ExportSink, ExportTarget, TableMode};
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
+use iceberg::spec::{FormatVersion, PartitionSpec, Transform};
 use lakehouse_catalog::{CatalogSession, ResolvedIdentity, resolve_aws_identity};
 use lakehouse_catalog_write::{CommitTag, TableWriteSession, WriteStorage};
 
@@ -51,13 +53,16 @@ impl IcebergRestTarget {
 
 #[async_trait(?Send)]
 impl ExportTarget for IcebergRestTarget {
-    async fn prepare(&self) -> Result<(), UdfError> {
+    async fn prepare(&self) -> Result<TableMode, UdfError> {
         let session = self.session().await?;
-        session.refuse_existing_table(&self.ident).await?;
-        session.ensure_namespace(&self.ident.namespace).await
+        if session.table_exists(&self.ident).await? {
+            return Ok(TableMode::Append);
+        }
+        session.ensure_namespace(&self.ident.namespace).await?;
+        Ok(TableMode::Create)
     }
 
-    async fn open_table(
+    async fn open_new_table(
         &self,
         schema: &Schema,
         tag: &CommitTag,
@@ -72,7 +77,7 @@ impl ExportTarget for IcebergRestTarget {
                     .await?,
             )
         } else {
-            OpenedTable::Created(
+            OpenedTable::Listed(
                 session
                     .create_table(&self.ident, schema, &tag.export_id)
                     .await?,
@@ -82,6 +87,68 @@ impl ExportTarget for IcebergRestTarget {
             IcebergSink::open(session, opened, tag.clone()).await?,
         ))
     }
+
+    async fn open_existing_table(&self, tag: &CommitTag) -> Result<Box<dyn ExportSink>, UdfError> {
+        let session = self.session().await?;
+        let table = session.load_table(&self.ident).await?;
+        let metadata = table.table().metadata();
+        refuse_unappendable(
+            &self.ident,
+            metadata.format_version(),
+            metadata.default_partition_spec(),
+            metadata.current_schema(),
+        )?;
+        let opened = OpenedTable::Listed(table);
+        Ok(Box::new(
+            IcebergSink::open(session, opened, tag.clone()).await?,
+        ))
+    }
+}
+
+/// Refuses format version 3 or later, whose row lineage and encryption keys the export does not
+/// maintain, a partition field other than `void`, whose values it does not compute, and a `void`
+/// field named like a column, which iceberg-rust cannot commit to.
+fn refuse_unappendable(
+    table: &TableIdent,
+    version: FormatVersion,
+    spec: &PartitionSpec,
+    schema: &iceberg::spec::Schema,
+) -> Result<(), UdfError> {
+    if version > FormatVersion::V2 {
+        return Err(refusal(format_args!(
+            "table {table} has format version {}; the export appends only to tables of format \
+             version 1 or 2",
+            version as u8
+        )));
+    }
+    let partitioned: Vec<String> = spec
+        .fields()
+        .iter()
+        .filter(|field| field.transform != Transform::Void)
+        .map(|field| format!("{} ({})", field.name, field.transform))
+        .collect();
+    if !partitioned.is_empty() {
+        return Err(refusal(format_args!(
+            "table {table} is partitioned by {}; the export appends only to unpartitioned tables",
+            partitioned.join(", ")
+        )));
+    }
+    // iceberg-rust's commit rebinds the default spec and refuses a non-identity field named like a
+    // column, which Spark leaves when it drops a version 1 identity field.
+    let named_like_columns: Vec<String> = spec
+        .fields()
+        .iter()
+        .filter(|field| schema.field_by_name(&field.name).is_some())
+        .map(|field| format!("{} ({})", field.name, field.transform))
+        .collect();
+    if !named_like_columns.is_empty() {
+        return Err(refusal(format_args!(
+            "table {table} keeps the dropped partition field {} under the name of a column; the \
+             export appends only to tables whose partition fields are not named like a column",
+            named_like_columns.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// The Iceberg schema of an export table, derived from the export's Arrow schema with field IDs

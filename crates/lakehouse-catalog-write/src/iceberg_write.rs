@@ -231,12 +231,9 @@ impl TableWriteSession {
         self.session.catalog_uri()
     }
 
-    /// Refuses `table` when the catalog already holds it, because the export only creates tables.
-    pub async fn refuse_existing_table(&self, table: &TableIdent) -> Result<(), UdfError> {
-        if self.session.table_exists(table).await? {
-            return Err(existing_table_error(table));
-        }
-        Ok(())
+    /// Whether the catalog holds `table`.
+    pub async fn table_exists(&self, table: &TableIdent) -> Result<bool, UdfError> {
+        self.session.table_exists(table).await
     }
 
     /// Creates each level of `namespace` that the catalog does not hold, top-down. A level is
@@ -331,9 +328,8 @@ impl TableWriteSession {
         Ok(StagedTable(self.open(table, staged)?))
     }
 
-    /// The error for a catalog that ignored `stage-create` and created the table. The table is
-    /// dropped when its `lakehouse.export-id` shows this export created it, so a later export into
-    /// the name does not fail with "already exists"; else the error says it must be dropped.
+    /// The error for a catalog that ignored `stage-create`. A table this export created is dropped,
+    /// so the failed export leaves no empty table behind; else the error says to drop it.
     async fn ignored_staging(&self, table: &TableIdent, export_id: &str) -> UdfError {
         let ignored = format!(
             "the catalog {} ignored staged creation (stage-create): table {} became visible \
@@ -535,7 +531,7 @@ impl TableWriteSession {
             .map(String::as_str)
             != Some(export_id)
         {
-            return Err(existing_table_error(table));
+            return Err(created_by_another_statement(table));
         }
         self.open(table, existing).map(Some)
     }
@@ -836,9 +832,10 @@ fn staged_creation_error(table: &TableIdent, cause: impl fmt::Display) -> UdfErr
     ))
 }
 
-fn existing_table_error(table: &TableIdent) -> UdfError {
+fn created_by_another_statement(table: &TableIdent) -> UdfError {
     UdfError::User(format!(
-        "table {table} already exists; the export only creates new tables"
+        "table {table} was created by another statement after the export checked that it does \
+         not exist"
     ))
 }
 

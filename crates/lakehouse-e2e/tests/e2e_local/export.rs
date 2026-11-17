@@ -655,6 +655,7 @@ fn export_errors_carry_no_connection_password() {
         "columns": ["X"],
         "single_commit": false,
         "allow_http": true,
+        "append": false,
     });
     let forged_writer_call =
         format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");

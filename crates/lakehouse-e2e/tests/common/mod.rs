@@ -32,6 +32,8 @@ pub mod e2e_harness;
     feature = "glue-e2e"
 ))]
 pub mod exasol_ws;
+#[cfg(feature = "exasol-e2e")]
+pub mod export_append_fixtures;
 #[cfg(feature = "glue-e2e")]
 pub mod glue;
 #[cfg(feature = "exasol-e2e")]
@@ -73,7 +75,7 @@ pub mod raw_parquet;
 ))]
 pub mod seed;
 pub mod stack;
-#[cfg(feature = "exasol-e2e")]
+#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
 pub mod table_state;
 #[cfg(any(feature = "exasol-e2e", feature = "unity-e2e", feature = "glue-e2e"))]
 pub mod timestamp_precision;

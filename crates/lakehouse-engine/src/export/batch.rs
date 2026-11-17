@@ -1,13 +1,11 @@
-//! Maps the export's source columns to Arrow, the type model every target format derives its own
-//! schema from, and turns the writer's input rows into Arrow batches of the sink's table schema,
-//! binding each source column to its table field by name and taking decimal scales from the table.
-//! The type rules and refusals are the export's.
+//! The export's Exasol-to-Arrow model: source schemas, and batches of the sink's table schema.
+//! Name binding, type acceptance, and value conversion live here together, so they cannot drift.
 
 use super::refusal;
 use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int32Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -19,6 +17,22 @@ use std::sync::Arc;
 
 pub(super) const BATCH_ROWS: usize = 8_192;
 
+/// The columns of the table a writer fills, as its sink reads them from the table.
+pub(super) struct TableColumns {
+    /// The table's name, for errors.
+    pub(super) table: String,
+    /// The Arrow schema every batch must have.
+    pub(super) schema: SchemaRef,
+    /// The type of each field of `schema` as the table format names it, for errors.
+    pub(super) type_names: Vec<String>,
+}
+
+/// The export's source columns in input order: each one's name and its Exasol metadata.
+pub(super) struct SourceColumns {
+    pub(super) names: Vec<String>,
+    pub(super) columns: Vec<ColumnInfo>,
+}
+
 /// One Arrow batch in the making.
 pub(super) struct BatchBuilder {
     schema: SchemaRef,
@@ -27,7 +41,11 @@ pub(super) struct BatchBuilder {
 }
 
 struct ColumnBuilder {
+    /// The table column's name.
     name: String,
+    /// The table column, its type, and its table, for a value error.
+    described: String,
+    required: bool,
     /// The input column, after the writer spec in column 0.
     input: usize,
     values: Values,
@@ -38,6 +56,8 @@ enum Values {
         builder: Decimal128Builder,
         scale: i8,
     },
+    Int(Int32Builder),
+    Long(Int64Builder),
     Double(Float64Builder),
     Boolean(BooleanBuilder),
     Text(StringBuilder),
@@ -46,25 +66,77 @@ enum Values {
 }
 
 impl BatchBuilder {
-    /// Binds field `i` of `schema` to input column `i + 1`, after the writer spec. Every writer
-    /// of one export derives the schema from the same source columns in input order, and the
-    /// catalog refuses a table another export created, so the two always line up.
-    pub(super) fn bind(schema: SchemaRef) -> Result<Self, UdfError> {
-        let columns = schema
+    /// Binds each table column to its source column by name and checks each type pair. Every
+    /// mismatch fails in one error, before any row is read.
+    pub(super) fn bind(table: &TableColumns, source: &SourceColumns) -> Result<Self, UdfError> {
+        let table_names: Vec<&str> = table
+            .schema
             .fields()
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let name = field.name();
-                Ok(ColumnBuilder {
-                    name: name.clone(),
-                    input: index + 1,
-                    values: Values::of(name, field.data_type())?,
-                })
-            })
-            .collect::<Result<_, UdfError>>()?;
+            .map(|field| field.name().as_str())
+            .collect();
+        let source_names: Vec<&str> = source.names.iter().map(String::as_str).collect();
+        let names = NameMatch::of(&table_names, &source_names);
+        let mut mismatches = Vec::new();
+        for &field in &names.missing {
+            mismatches.push(format!(
+                "table column {} has no export column",
+                table.described(field)
+            ));
+        }
+        for &column in &names.extra {
+            mismatches.push(format!(
+                "export column {} has no table column",
+                source.described(column)
+            ));
+        }
+        let mut columns = Vec::new();
+        for (field, column) in names.bound.iter().enumerate() {
+            let Some(column) = *column else { continue };
+            match Values::filling(table.schema.field(field), &source.columns[column]) {
+                Some(values) => columns.push(ColumnBuilder {
+                    name: table_names[field].to_string(),
+                    described: format!(
+                        "column {} of table {}",
+                        table.described(field),
+                        table.table
+                    ),
+                    required: !table.schema.field(field).is_nullable(),
+                    input: column + 1,
+                    values,
+                }),
+                None => mismatches.push(format!(
+                    "export column {} cannot fill table column {}",
+                    source.described(column),
+                    table.described(field)
+                )),
+            }
+        }
+        for (column, fields) in &names.ambiguous_sources {
+            let fields: Vec<String> = fields.iter().map(|&f| table.described(f)).collect();
+            mismatches.push(format!(
+                "export column {} matches table columns {} only by letter case",
+                source.described(*column),
+                listed(&fields)
+            ));
+        }
+        for (field, sources) in &names.ambiguous_fields {
+            let sources: Vec<String> = sources.iter().map(|&c| source.described(c)).collect();
+            mismatches.push(format!(
+                "table column {} matches export columns {} only by letter case",
+                table.described(*field),
+                listed(&sources)
+            ));
+        }
+        if !mismatches.is_empty() {
+            return Err(refusal(format_args!(
+                "the export columns do not match the columns of table {}: {}",
+                table.table,
+                mismatches.join("; ")
+            )));
+        }
         Ok(Self {
-            schema,
+            schema: table.schema.clone(),
             columns,
             rows: 0,
         })
@@ -74,7 +146,7 @@ impl BatchBuilder {
     pub(super) fn append_row(&mut self, ctx: &dyn UdfContext) -> Result<(), UdfError> {
         for column in &mut self.columns {
             let value = ctx.get_value(column.input)?;
-            column.values.append(&column.name, value)?;
+            column.append(value)?;
         }
         self.rows += 1;
         Ok(())
@@ -101,39 +173,171 @@ impl BatchBuilder {
     }
 }
 
+impl TableColumns {
+    fn described(&self, field: usize) -> String {
+        format!(
+            "{} ({})",
+            self.schema.field(field).name(),
+            self.type_names[field]
+        )
+    }
+}
+
+impl SourceColumns {
+    fn described(&self, column: usize) -> String {
+        format!(
+            "{} ({})",
+            self.names[column], self.columns[column].type_name
+        )
+    }
+}
+
+/// How the table's column names match the source's: each table column's source column, and the
+/// columns that match none or match ambiguously. Each list holds column indexes.
+#[derive(Debug, Default, PartialEq)]
+struct NameMatch {
+    bound: Vec<Option<usize>>,
+    missing: Vec<usize>,
+    extra: Vec<usize>,
+    /// A source column and the unmatched table columns its name matches only by letter case.
+    ambiguous_sources: Vec<(usize, Vec<usize>)>,
+    /// A table column and the unmatched source columns its name matches only by letter case.
+    ambiguous_fields: Vec<(usize, Vec<usize>)>,
+}
+
+impl NameMatch {
+    /// Exact names bind first; a name without one binds the one leftover name equal but for case.
+    /// A name that matches several is ambiguous, and the names it matches are listed under it only.
+    fn of(table: &[&str], source: &[&str]) -> Self {
+        let exact: Vec<Option<usize>> = table
+            .iter()
+            .map(|name| source.iter().position(|column| column == name))
+            .collect();
+        let open_fields: Vec<usize> = (0..table.len()).filter(|&f| exact[f].is_none()).collect();
+        let open_sources: Vec<usize> = (0..source.len())
+            .filter(|&c| !exact.contains(&Some(c)))
+            .collect();
+        let folded = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+        let field_matches = |f: usize| -> Vec<usize> {
+            let matching = |&&c: &&usize| folded(table[f], source[c]);
+            open_sources.iter().filter(matching).copied().collect()
+        };
+        let source_matches = |c: usize| -> Vec<usize> {
+            let matching = |&&f: &&usize| folded(table[f], source[c]);
+            open_fields.iter().filter(matching).copied().collect()
+        };
+        let mut found = Self {
+            bound: exact,
+            ..Self::default()
+        };
+        for &field in &open_fields {
+            match field_matches(field).as_slice() {
+                [] => found.missing.push(field),
+                &[column] if source_matches(column) == [field] => {
+                    found.bound[field] = Some(column);
+                }
+                [_] => {}
+                several => found.ambiguous_fields.push((field, several.to_vec())),
+            }
+        }
+        for &column in &open_sources {
+            match source_matches(column).as_slice() {
+                [] => found.extra.push(column),
+                [_] => {}
+                several => found.ambiguous_sources.push((column, several.to_vec())),
+            }
+        }
+        found
+    }
+}
+
+/// `items` joined as an English list: `a`, `a and b`, `a, b, and c`.
+fn listed(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+impl ColumnBuilder {
+    fn append(&mut self, value: Option<Value>) -> Result<(), UdfError> {
+        match value {
+            None if self.required => Err(refusal(format_args!(
+                "an export row holds NULL for the required {}",
+                self.described
+            ))),
+            None => {
+                self.values.append_null();
+                Ok(())
+            }
+            Some(value) => self.values.append(&self.name, &self.described, value),
+        }
+    }
+}
+
 impl Values {
-    fn of(name: &str, data_type: &DataType) -> Result<Self, UdfError> {
-        Ok(match data_type {
-            DataType::Decimal128(precision, scale) => Self::Decimal {
-                builder: Decimal128Builder::with_capacity(BATCH_ROWS)
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(|error| refusal(format_args!("column {name}: {error}")))?,
-                scale: *scale,
-            },
-            DataType::Float64 => Self::Double(Float64Builder::with_capacity(BATCH_ROWS)),
-            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(BATCH_ROWS)),
-            DataType::Utf8 => Self::Text(StringBuilder::new()),
-            DataType::Date32 => Self::Date(Date32Builder::with_capacity(BATCH_ROWS)),
-            DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Self::Timestamp(TimestampMicrosecondBuilder::with_capacity(BATCH_ROWS))
+    /// The builder of `field` for `source` values, `None` for a refused pair. Integer and
+    /// `timestamptz` fields accept by value, so rows read through a virtual schema fill them again.
+    fn filling(field: &Field, source: &ColumnInfo) -> Option<Self> {
+        let source = arrow_type(field.name(), source).ok()?;
+        Some(match (field.data_type(), source) {
+            (DataType::Decimal128(precision, scale), DataType::Decimal128(p, s))
+                if s == *scale && p <= *precision =>
+            {
+                Self::Decimal {
+                    builder: Decimal128Builder::with_capacity(BATCH_ROWS)
+                        .with_precision_and_scale(*precision, *scale)
+                        .ok()?,
+                    scale: *scale,
+                }
             }
-            other => {
-                return Err(refusal(format_args!(
-                    "table column {name} has the Arrow type {other}, which the export cannot write"
-                )));
+            (DataType::Int32, DataType::Decimal128(_, 0)) => {
+                Self::Int(Int32Builder::with_capacity(BATCH_ROWS))
             }
+            (DataType::Int64, DataType::Decimal128(_, 0)) => {
+                Self::Long(Int64Builder::with_capacity(BATCH_ROWS))
+            }
+            (DataType::Float64, DataType::Float64) => {
+                Self::Double(Float64Builder::with_capacity(BATCH_ROWS))
+            }
+            (DataType::Boolean, DataType::Boolean) => {
+                Self::Boolean(BooleanBuilder::with_capacity(BATCH_ROWS))
+            }
+            (DataType::Utf8, DataType::Utf8) => Self::Text(StringBuilder::new()),
+            (DataType::Date32, DataType::Date32) => {
+                Self::Date(Date32Builder::with_capacity(BATCH_ROWS))
+            }
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, zone),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ) => Self::Timestamp(
+                TimestampMicrosecondBuilder::with_capacity(BATCH_ROWS)
+                    .with_timezone_opt(zone.clone()),
+            ),
+            _ => return None,
         })
     }
 
-    fn append(&mut self, name: &str, value: Option<Value>) -> Result<(), UdfError> {
-        let Some(value) = value else {
-            self.append_null();
-            return Ok(());
+    /// Appends `value` to the column `name`; `described` names its type and table for a value
+    /// outside its range.
+    fn append(&mut self, name: &str, described: &str, value: Value) -> Result<(), UdfError> {
+        let out_of_range = || {
+            refusal(format_args!(
+                "an export row holds a value outside the range of {described}"
+            ))
         };
         match (self, value) {
             (Self::Decimal { builder, scale }, value) => {
                 builder.append_value(rescaled(name, value, *scale)?)
             }
+            (Self::Int(builder), value) => builder.append_value(
+                i32::try_from(rescaled(name, value, 0)?).map_err(|_| out_of_range())?,
+            ),
+            (Self::Long(builder), value) => builder.append_value(
+                i64::try_from(rescaled(name, value, 0)?).map_err(|_| out_of_range())?,
+            ),
             (Self::Double(builder), Value::Double(double)) => builder.append_value(double),
             (Self::Boolean(builder), Value::Bool(flag)) => builder.append_value(flag),
             (Self::Text(builder), Value::String(text)) => builder.append_value(text),
@@ -151,6 +355,8 @@ impl Values {
     fn append_null(&mut self) {
         match self {
             Self::Decimal { builder, .. } => builder.append_null(),
+            Self::Int(builder) => builder.append_null(),
+            Self::Long(builder) => builder.append_null(),
             Self::Double(builder) => builder.append_null(),
             Self::Boolean(builder) => builder.append_null(),
             Self::Text(builder) => builder.append_null(),
@@ -162,6 +368,8 @@ impl Values {
     fn finish(&mut self) -> ArrayRef {
         match self {
             Self::Decimal { builder, .. } => Arc::new(builder.finish()),
+            Self::Int(builder) => Arc::new(builder.finish()),
+            Self::Long(builder) => Arc::new(builder.finish()),
             Self::Double(builder) => Arc::new(builder.finish()),
             Self::Boolean(builder) => Arc::new(builder.finish()),
             Self::Text(builder) => Arc::new(builder.finish()),
