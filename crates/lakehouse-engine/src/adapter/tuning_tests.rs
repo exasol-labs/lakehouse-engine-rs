@@ -77,7 +77,7 @@ fn df_target_partitions_uses_supplied_value() {
         8,
     );
     assert_eq!(
-        tuning.df_target_partitions, 4,
+        tuning.scan.df_target_partitions, 4,
         "explicit value must be returned"
     );
 }
@@ -86,12 +86,12 @@ fn df_target_partitions_uses_supplied_value() {
 fn df_batch_size_uses_supplied_value() {
     let tuning = resolved_tuning(serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" }), 1);
     assert_eq!(
-        tuning.df_batch_size, 4096,
+        tuning.scan.df_batch_size, 4096,
         "explicit DATAFUSION_BATCH_SIZE must be returned"
     );
 
     assert_eq!(
-        resolved_tuning(serde_json::json!({}), 1).df_batch_size,
+        resolved_tuning(serde_json::json!({}), 1).scan.df_batch_size,
         DEFAULT_DF_BATCH_SIZE,
         "absent property must return DEFAULT_DF_BATCH_SIZE (8192)"
     );
@@ -104,7 +104,7 @@ fn df_threads_per_udf_uses_supplied_value() {
         8,
     );
     assert_eq!(
-        tuning.df_threads_per_udf, 2,
+        tuning.scan.df_threads_per_udf, 2,
         "explicit value must be returned"
     );
 }
@@ -112,31 +112,38 @@ fn df_threads_per_udf_uses_supplied_value() {
 #[test]
 fn resolve_memory_pool_fraction_defaults_and_reads_the_supplied_value() {
     assert_eq!(
-        resolved_tuning(serde_json::json!({}), 1).memory_pool_fraction,
+        resolved_tuning(serde_json::json!({}), 1)
+            .scan
+            .memory_pool_fraction,
         DEFAULT_MEMORY_POOL_FRACTION,
         "absent → default 0.6"
     );
 
     let valid = resolved_tuning(serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0.5" }), 1);
-    assert_eq!(valid.memory_pool_fraction, 0.5);
+    assert_eq!(valid.scan.memory_pool_fraction, 0.5);
 
     let one = resolved_tuning(serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.0" }), 1);
-    assert_eq!(one.memory_pool_fraction, 1.0);
+    assert_eq!(one.scan.memory_pool_fraction, 1.0);
 }
 
 #[test]
 fn resolve_instance_overhead_mb_defaults_and_reads_the_supplied_value() {
     assert_eq!(
-        resolved_tuning(serde_json::json!({}), 1).instance_overhead_mb,
+        resolved_tuning(serde_json::json!({}), 1)
+            .scan
+            .instance_overhead_mb,
         DEFAULT_INSTANCE_OVERHEAD_MB,
         "absent → default 200"
     );
 
     let zero = resolved_tuning(serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "0" }), 1);
-    assert_eq!(zero.instance_overhead_mb, 0, "\"0\" is a valid overhead");
+    assert_eq!(
+        zero.scan.instance_overhead_mb, 0,
+        "\"0\" is a valid overhead"
+    );
 
     let valid = resolved_tuning(serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "256" }), 1);
-    assert_eq!(valid.instance_overhead_mb, 256);
+    assert_eq!(valid.scan.instance_overhead_mb, 256);
 }
 
 #[test]
@@ -186,7 +193,10 @@ fn threading_mode_defaults_to_auto() {
 fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
     let absent = resolved_tuning(serde_json::json!({}), 8);
     assert_eq!(
-        (absent.df_target_partitions, absent.df_threads_per_udf),
+        (
+            absent.scan.df_target_partitions,
+            absent.scan.df_threads_per_udf
+        ),
         (16, 8),
         "8 cores → 8 threads, 16 target partitions"
     );
@@ -200,7 +210,10 @@ fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
         8,
     );
     assert_eq!(
-        (supplied.df_target_partitions, supplied.df_threads_per_udf),
+        (
+            supplied.scan.df_target_partitions,
+            supplied.scan.df_threads_per_udf
+        ),
         (16, 8),
         "AUTO ignores supplied values"
     );
@@ -211,7 +224,10 @@ fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
 fn auto_mode_yields_one_thread_on_one_core() {
     let tuning = resolved_tuning(serde_json::json!({}), 1);
     assert_eq!(
-        (tuning.df_target_partitions, tuning.df_threads_per_udf),
+        (
+            tuning.scan.df_target_partitions,
+            tuning.scan.df_threads_per_udf
+        ),
         (2, 1),
         "one core → 1 thread, 2 target partitions"
     );
@@ -228,14 +244,20 @@ fn fixed_mode_uses_supplied_values() {
         16,
     );
     assert_eq!(
-        (supplied.df_target_partitions, supplied.df_threads_per_udf),
+        (
+            supplied.scan.df_target_partitions,
+            supplied.scan.df_threads_per_udf
+        ),
         (3, 2),
         "FIXED uses supplied values verbatim"
     );
 
     let absent = resolved_tuning(serde_json::json!({ PROP_DF_THREADING_MODE: "FIXED" }), 8);
     assert_eq!(
-        (absent.df_target_partitions, absent.df_threads_per_udf),
+        (
+            absent.scan.df_target_partitions,
+            absent.scan.df_threads_per_udf
+        ),
         (16, 8),
         "absent values fall back to the AUTO values"
     );
@@ -244,7 +266,9 @@ fn fixed_mode_uses_supplied_values() {
 #[test]
 fn resolve_s3_max_connections_fixed_value_wins() {
     assert_eq!(
-        resolved_tuning(serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" }), 8).s3_max_connections,
+        resolved_tuning(serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" }), 8)
+            .scan
+            .s3_max_connections,
         64,
         "explicit S3_MAX_CONNECTIONS must be used verbatim"
     );
@@ -258,12 +282,14 @@ fn resolve_s3_max_connections_auto_scales_with_threads() {
         8,
     );
     assert_eq!(
-        two_threads_on_eight_cores.s3_max_connections,
+        two_threads_on_eight_cores.scan.s3_max_connections,
         2 * S3_CONNECTIONS_PER_THREAD,
         "an absent value derives from the resolved threads, not the cores"
     );
     assert_eq!(
-        resolved_tuning(serde_json::json!({}), 1).s3_max_connections,
+        resolved_tuning(serde_json::json!({}), 1)
+            .scan
+            .s3_max_connections,
         S3_CONNECTIONS_PER_THREAD
     );
 }

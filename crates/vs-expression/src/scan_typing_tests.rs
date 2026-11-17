@@ -1,7 +1,7 @@
 use super::*;
 use crate::ExasolVersion;
 use crate::test_support::*;
-use crate::{CHECKED_INT_DIV_FN, SqlFragment, render_scan_expression};
+use crate::{CHECKED_INT_DIV_FN, SqlFragment};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -31,7 +31,9 @@ fn date_like(subject: Json) -> Json {
 }
 
 fn render(expr: &Json) -> Result<String, UdfError> {
-    render_scan_expression(expr, &columns(), ExasolVersion::Exasol2025).map(|fragment| fragment.sql)
+    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .render_expression(expr)
+        .map(|fragment| fragment.sql)
 }
 
 /// Exasol converts these by the session's NLS settings: a date or non-integer number at a text
@@ -319,7 +321,9 @@ fn second_renders_the_fraction_of_its_argument_precision() {
     for (argument, sql, ty) in cases {
         for expr in [second(argument.clone()), extract("SECOND", argument)] {
             assert_eq!(
-                render_scan_expression(&expr, &columns(), ExasolVersion::Exasol2025).unwrap(),
+                ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                    .render_expression(&expr)
+                    .unwrap(),
                 SqlFragment::new(sql, Some(ty)),
                 "{expr}"
             );
@@ -345,18 +349,17 @@ fn second_of_a_date_takes_each_versions_type() {
     ];
     for (version, sql, ty) in cases {
         assert_eq!(
-            render_scan_expression(&second(col("D")), &columns(), version).unwrap(),
+            ScanTyping::new(&columns(), version)
+                .render_expression(&second(col("D")))
+                .unwrap(),
             SqlFragment::new(sql, ty),
             "{version:?}"
         );
     }
     assert!(
-        render_scan_expression(
-            &scalar_fn("CONCAT", [second(col("D")), str_lit("x")]),
-            &columns(),
-            ExasolVersion::Exasol8,
-        )
-        .is_err(),
+        ScanTyping::new(&columns(), ExasolVersion::Exasol8)
+            .render_expression(&scalar_fn("CONCAT", [second(col("D")), str_lit("x")]))
+            .is_err(),
         "DECIMAL(5,3) converts to text by the session's NLS settings"
     );
 }
@@ -384,9 +387,9 @@ fn second_takes_a_computed_arguments_type_from_the_typed_pass() {
         ),
     ];
     for (argument, unit, ty) in cases {
-        let fragment =
-            render_scan_expression(&second(argument), &columns(), ExasolVersion::Exasol2025)
-                .unwrap();
+        let fragment = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+            .render_expression(&second(argument))
+            .unwrap();
         assert!(
             fragment.sql.contains(&format!("date_part('{unit}'")),
             "{fragment:?}"
@@ -403,7 +406,9 @@ fn second_over_any_other_argument_declines() {
         second(case_when([is_not_null(col("TS"))], [col("TS"), col("D")])),
     ] {
         assert!(
-            render_scan_expression(&version_dependent, &columns(), ExasolVersion::Unknown).is_err(),
+            ScanTyping::new(&columns(), ExasolVersion::Unknown)
+                .render_expression(&version_dependent)
+                .is_err(),
             "{version_dependent} must decline on an unknown version"
         );
     }
@@ -815,7 +820,9 @@ fn infer_type_types_what_the_scan_declines() {
     for (label, node, expected) in cases {
         assert!(render(&node).is_err(), "{label} must decline in the scan");
         assert_eq!(
-            infer_type(&node, &columns(), ExasolVersion::Exasol2025).exact(),
+            ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                .infer_type(&node)
+                .exact(),
             expected,
             "{label}"
         );
@@ -825,7 +832,8 @@ fn infer_type_types_what_the_scan_declines() {
 #[test]
 fn a_scan_fragment_carries_the_column_or_cast_type_it_emits() {
     let typed = |expr: &Json| {
-        render_scan_expression(expr, &columns(), ExasolVersion::Exasol2025)
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+            .render_expression(expr)
             .unwrap()
             .ty
     };
@@ -839,18 +847,16 @@ fn a_scan_fragment_carries_the_column_or_cast_type_it_emits() {
 
 #[test]
 fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
-    let fragment = render_scan_expression(
-        &cast_to(ExasolType::varchar(20), col("S10")),
-        &columns(),
-        ExasolVersion::Exasol2025,
-    );
+    let fragment = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .render_expression(&cast_to(ExasolType::varchar(20), col("S10")));
     assert_eq!(fragment.unwrap().ty, Some(ExasolType::WIDEST_VARCHAR));
 }
 
 #[test]
 fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
-    let typed =
-        |expr: &Json| crate::render_exasol_fragment(expr, &columns(), ExasolVersion::Exasol2025);
+    let typed = |expr: &Json| {
+        crate::ScanTyping::new(&columns(), ExasolVersion::Exasol2025).exasol_fragment(expr)
+    };
     assert_eq!(
         typed(&cast_to(ExasolType::char(3), col("S10"))),
         SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))
@@ -925,11 +931,12 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
 }
 
 fn type_of(expr: &Json) -> Inferred {
-    let ty = type_scan_tree(expr, &columns(), ExasolVersion::Exasol2025)
+    let ty = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .type_scan_tree(expr)
         .unwrap()
         .1;
     assert_eq!(
-        infer_type(expr, &columns(), ExasolVersion::Exasol2025),
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).infer_type(expr),
         ty,
         "{expr}"
     );
@@ -937,7 +944,8 @@ fn type_of(expr: &Json) -> Inferred {
 }
 
 fn typed(expr: &Json) -> Json {
-    type_scan_tree(expr, &columns(), ExasolVersion::Exasol2025)
+    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .type_scan_tree(expr)
         .unwrap()
         .0
 }
@@ -1222,7 +1230,7 @@ fn version_dependent_forms_take_each_versions_type() {
     for (label, expr, expected) in cases {
         for (version, expected) in [Exasol8, Exasol2025, Unknown].into_iter().zip(expected) {
             assert_eq!(
-                infer_type(&expr, &columns(), version),
+                ScanTyping::new(&columns(), version).infer_type(&expr),
                 expected,
                 "{label} on {version:?}"
             );
@@ -1233,7 +1241,8 @@ fn version_dependent_forms_take_each_versions_type() {
 #[test]
 fn exasol_8_brings_a_timestamp_after_a_date_to_the_date() {
     let expr = case_when([col("B")], [col("D"), col("TS3")]);
-    let typed = type_scan_tree(&expr, &columns(), ExasolVersion::Exasol8)
+    let typed = ScanTyping::new(&columns(), ExasolVersion::Exasol8)
+        .type_scan_tree(&expr)
         .unwrap()
         .0;
     assert_eq!(typed["results"][0], col("D"));
@@ -1803,7 +1812,8 @@ fn to_timestamp_computes_at_the_unit_of_its_digits() {
         ),
     ];
     for (version, expr, sql) in cases {
-        let rendered = render_scan_expression(&expr, &columns(), version)
+        let rendered = ScanTyping::new(&columns(), version)
+            .render_expression(&expr)
             .unwrap()
             .sql;
         assert_eq!(rendered, sql, "{expr} on {version:?}");

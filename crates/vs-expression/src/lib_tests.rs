@@ -5,11 +5,7 @@ use crate::test_support::*;
 use serde_json::json;
 
 fn scan_filter(filter: &Json) -> Result<String, UdfError> {
-    render_scan_filter(
-        filter,
-        &typed_columns::<&str>(&[]),
-        ExasolVersion::Exasol2025,
-    )
+    ScanTyping::new(&typed_columns::<&str>(&[]), ExasolVersion::Exasol2025).render_filter(filter)
 }
 
 /// Exasol's `CAST("X" AS data_type)` node.
@@ -28,7 +24,9 @@ fn typed_scan(expr: &Json) -> Result<String, UdfError> {
         ("ts", ExasolType::timestamp(6)),
         ("s", ExasolType::WIDEST_VARCHAR),
     ]);
-    render_scan_expression(expr, &columns, ExasolVersion::Exasol2025).map(|fragment| fragment.sql)
+    ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+        .render_expression(expr)
+        .map(|fragment| fragment.sql)
 }
 
 #[test]
@@ -1383,7 +1381,9 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
         "SECOND(ts, 3) must decline under the DataFusion dialect"
     );
     assert!(
-        render_scan_expression(&expr, &microsecond_ts(), ExasolVersion::Exasol2025).is_err(),
+        ScanTyping::new(&microsecond_ts(), ExasolVersion::Exasol2025)
+            .render_expression(&expr)
+            .is_err(),
         "SECOND(ts, 3) must decline even where the typed pass knows the argument's precision"
     );
     assert_eq!(render_expression_exasol(&expr), r#"SECOND("TS", 3)"#);
@@ -2397,7 +2397,8 @@ fn date_addition_renders_scan_function_calls() {
     for (exasol_name, scan_name) in DATE_ADDITIONS {
         let date_column = scalar_fn(exasol_name, [col("d"), num_lit(2)]);
         assert_eq!(
-            render_scan_expression(&date_column, &columns, ExasolVersion::Exasol2025)
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&date_column)
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(\"D\" AS DATE), 2)"),
@@ -2405,7 +2406,8 @@ fn date_addition_renders_scan_function_calls() {
         );
         let timestamp_column = scalar_fn(exasol_name, [col("ts"), num_lit(2)]);
         assert_eq!(
-            render_scan_expression(&timestamp_column, &columns, ExasolVersion::Exasol2025)
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&timestamp_column)
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(\"TS\" AS TIMESTAMP(6)), 2)"),
@@ -2413,7 +2415,8 @@ fn date_addition_renders_scan_function_calls() {
         );
         let date_literal = scalar_fn(exasol_name, [date_lit("2024-02-28"), num_lit(1)]);
         assert_eq!(
-            render_scan_expression(&date_literal, &columns, ExasolVersion::Exasol2025)
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&date_literal)
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(DATE '2024-02-28' AS DATE), 1)"),
@@ -2424,7 +2427,8 @@ fn date_addition_renders_scan_function_calls() {
             [timestamp_lit("2024-01-01 00:00:00.5"), num_lit(30)],
         );
         assert_eq!(
-            render_scan_expression(&timestamp_literal, &columns, ExasolVersion::Exasol2025)
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&timestamp_literal)
                 .unwrap()
                 .sql,
             format!(
@@ -2437,7 +2441,8 @@ fn date_addition_renders_scan_function_calls() {
             [cast_to(ExasolType::Date, col("ts")), num_lit(1)],
         );
         assert_eq!(
-            render_scan_expression(&cast, &columns, ExasolVersion::Exasol2025)
+            ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+                .render_expression(&cast)
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(CAST(\"TS\" AS DATE) AS DATE), 1)"),
@@ -2449,7 +2454,8 @@ fn date_addition_renders_scan_function_calls() {
         [scalar_fn("ADD_DAYS", [col("d"), num_lit(1)]), num_lit(2)],
     );
     assert_eq!(
-        render_scan_expression(&nested, &columns, ExasolVersion::Exasol2025)
+        ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+            .render_expression(&nested)
             .unwrap()
             .sql,
         "vs_add_hours(CAST(vs_add_days(CAST(\"D\" AS DATE), 1) AS DATE), 2)"
@@ -2459,13 +2465,10 @@ fn date_addition_renders_scan_function_calls() {
         [scalar_fn("ADD_HOURS", [col("d"), num_lit(1)]), num_lit(2)],
     );
     assert_eq!(
-        render_scan_expression(
-            &over_a_timestamp_result,
-            &columns,
-            ExasolVersion::Exasol2025
-        )
-        .unwrap()
-        .sql,
+        ScanTyping::new(&columns, ExasolVersion::Exasol2025)
+            .render_expression(&over_a_timestamp_result)
+            .unwrap()
+            .sql,
         "vs_add_days(CAST(vs_add_hours(CAST(\"D\" AS DATE), 1) AS TIMESTAMP(6)), 2)"
     );
 }

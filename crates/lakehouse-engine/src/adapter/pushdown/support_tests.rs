@@ -2,7 +2,7 @@ use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, ScanTuning, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::exasol_type_to_json;
 
@@ -631,14 +631,17 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
         storage: ScanStorage::Inline(sample_storage()),
-        s3_max_connections: distinctive_s3_max_connections,
+        tuning: ScanTuning {
+            s3_max_connections: distinctive_s3_max_connections,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![]);
 
     let common = spec_template.to_common();
     assert_eq!(
-        common.s3_max_connections, distinctive_s3_max_connections,
+        common.tuning.s3_max_connections, distinctive_s3_max_connections,
         "s3_max_connections must carry from ScanSpec into CommonScanSpec"
     );
 
@@ -1040,7 +1043,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         &emitting(&column_types(&all_cols)),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         None,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("Case 2/3 qualified wrapper must build");
 

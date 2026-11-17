@@ -1,14 +1,13 @@
 use crate::adapter::table_identity::read_identifier;
-use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use super::super::ResolvedScan;
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{
     ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
-use super::super::{RefusedColumn, ResolvedScan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinLeaf {
@@ -92,19 +91,10 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 pub(crate) struct ResolvedJoinSide {
     pub table_name: String,
     pub table_identifier: String,
-    /// Empty ⇒ every `files` path is absolute.
-    pub table_root: String,
-    /// Includes each file's delete mechanisms, so the scan applies them per side.
-    pub files: Vec<FileEntry>,
-    pub logical_schema: Vec<LogicalField>,
-    /// Empty when the table has no name-mapping property, and on every Delta side.
-    pub name_mapping: Vec<NameMappingEntry>,
-    pub effective_storage: StorageBackend,
-    /// Empty on every Iceberg side.
-    pub partition_columns: Vec<String>,
+    /// Per side, never merged: files carry their own delete mechanisms, and a refused column
+    /// belongs to the table that raised it.
+    pub scan: ResolvedScan,
     pub total_bytes: u64,
-    /// Per side, not merged: a refusal belongs to the table that raised it.
-    pub refused_columns: Vec<RefusedColumn>,
     /// Unqualified.
     pub column_types: ColumnTypes,
 }
@@ -114,32 +104,18 @@ impl ResolvedJoinSide {
     pub(super) fn new(
         table_name: String,
         table_identifier: String,
-        resolved: ResolvedScan,
+        scan: ResolvedScan,
         column_types: ColumnTypes,
     ) -> Self {
-        let ResolvedScan {
-            files,
-            effective_storage,
-            logical_schema,
-            table_root,
-            name_mapping,
-            partition_columns,
-            refused_columns,
-        } = resolved;
-        let total_bytes = files
+        let total_bytes = scan
+            .files
             .iter()
             .fold(0u64, |acc, entry| acc.saturating_add(entry.size));
         Self {
             table_name,
             table_identifier,
-            table_root,
-            files,
-            logical_schema,
-            name_mapping,
-            effective_storage,
-            partition_columns,
+            scan,
             total_bytes,
-            refused_columns,
             column_types,
         }
     }

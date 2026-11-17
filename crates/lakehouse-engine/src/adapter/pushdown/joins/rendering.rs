@@ -3,10 +3,11 @@ use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ExasolVersion, conjoin_scan_filters, exact_type,
-    render_expression_exasol, strip_table_alias, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, ScanTyping, conjoin_scan_filters, render_expression_exasol,
+    strip_table_alias, walk_column_nodes,
 };
 
+use super::super::context::PushdownContext;
 use super::super::support::{ColumnTypes, Emitted, OutputContract, ScanTranslator, quote_ident};
 use super::attribution::JoinLegs;
 
@@ -30,9 +31,9 @@ pub(super) fn select_item_type(
     item: &Json,
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
-    version: ExasolVersion,
+    context: &PushdownContext<'_>,
 ) -> Option<ExasolType> {
-    exact_type(item, &LegColumnTypes { legs, cols_per_leg }, version)
+    ScanTyping::new(&LegColumnTypes { legs, cols_per_leg }, context.version).exact_type(item)
 }
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
@@ -140,13 +141,13 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
 pub(super) fn screen_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
-    version: ExasolVersion,
+    context: &PushdownContext<'_>,
 ) -> Result<(Option<String>, Option<Json>), UdfError> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(side_local, &mut conjuncts);
     // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
     let bare: Vec<Json> = conjuncts.iter().map(|c| strip_table_alias(c)).collect();
-    let scan = ScanTranslator::over(col_types, version, &bare.iter().collect::<Vec<_>>())?;
+    let scan = ScanTranslator::over(col_types, context.version, &bare.iter().collect::<Vec<_>>())?;
     let mut rendered = Vec::new();
     let mut declined = Vec::new();
     for (bare, conjunct) in bare.iter().zip(conjuncts) {

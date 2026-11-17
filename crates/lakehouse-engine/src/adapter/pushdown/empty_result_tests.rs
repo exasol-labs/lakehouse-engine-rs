@@ -28,6 +28,7 @@ fn empty_sql(
         &projection,
         scan,
         &EmptyRelation::single_scan(request, emitted),
+        &test_context(),
     )
     .expect("the empty result must build")["sql"]
         .as_str()

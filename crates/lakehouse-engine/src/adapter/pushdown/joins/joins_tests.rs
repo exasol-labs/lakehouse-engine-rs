@@ -809,10 +809,8 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
         )
         .column(table_col("ORDERS", "X")),
     );
-    let customer = ResolvedJoinSide {
-        refused_columns: vec![unread_refused("Parquet", "x", None, "geometry")],
-        ..resolved_side("CUSTOMER", Vec::new())
-    };
+    let mut customer = resolved_side("CUSTOMER", Vec::new());
+    customer.scan.refused_columns = vec![unread_refused("Parquet", "x", None, "geometry")];
     let sides = request_typed(&request, &[customer, resolved_side("ORDERS", Vec::new())]);
     let emitted = vec![
         emitting_named(&sides[0].column_types, &["ID"]),
@@ -824,7 +822,7 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
         &detected_join(&request),
         &sides,
         emitted,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("ORDERS.X is readable");
 

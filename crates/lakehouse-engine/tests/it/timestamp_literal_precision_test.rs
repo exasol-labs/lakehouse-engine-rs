@@ -42,11 +42,11 @@ fn context_with_timestamp_columns() -> SessionContext {
 }
 
 fn rendered_fragment(node_type: &str) -> String {
-    vs_expression::render_scan_expression(
-        &lit(node_type, FAR_FUTURE),
+    vs_expression::ScanTyping::new(
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
+    .render_expression(&lit(node_type, FAR_FUTURE))
     .expect("render_expression must translate the timestamp literal node")
     .sql
 }

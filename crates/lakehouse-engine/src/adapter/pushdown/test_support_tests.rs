@@ -10,6 +10,7 @@ use crate::adapter::tuning::Tuning;
 use crate::adapter::{ResolvedConnectionConfig, get_properties};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
+use crate::scan::spec::ScanTuning;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, ScanStorage, StorageBackend, StorageProps,
 };
@@ -39,13 +40,15 @@ pub(crate) fn test_context() -> PushdownContext<'static> {
         udfs: ScanUdfs::in_schema(None),
         cluster_nodes: 1,
         tuning: Tuning {
+            scan: ScanTuning {
+                df_target_partitions: 1,
+                df_threads_per_udf: 1,
+                df_batch_size: 8192,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 0,
+                s3_max_connections: 1,
+            },
             parallelism_factor: 1,
-            df_target_partitions: 1,
-            df_threads_per_udf: 1,
-            df_batch_size: 8192,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 0,
-            s3_max_connections: 1,
             join_broadcast_max_bytes: 134_217_728,
         },
         binary_as_string: false,
@@ -58,10 +61,13 @@ pub(crate) fn dispatch_context() -> PushdownContext<'static> {
     let base = test_context();
     PushdownContext {
         tuning: Tuning {
-            df_target_partitions: 4,
-            df_threads_per_udf: 2,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            scan: ScanTuning {
+                df_target_partitions: 4,
+                df_threads_per_udf: 2,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+                ..base.tuning.scan
+            },
             ..base.tuning
         },
         ..base
@@ -525,8 +531,8 @@ pub(crate) fn request_typed(
             joins::ResolvedJoinSide {
                 column_types: ColumnTypes::of(
                     &involved,
-                    &side.logical_schema,
-                    &side.refused_columns,
+                    &side.scan.logical_schema,
+                    &side.scan.refused_columns,
                     false,
                 ),
                 ..side.clone()
@@ -547,14 +553,16 @@ pub(crate) fn request_sides(
         .map(|leaf| joins::ResolvedJoinSide {
             table_name: leaf.table_name.clone(),
             table_identifier: leaf.table_identifier.clone(),
-            table_root: String::new(),
-            files: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            effective_storage: sample_storage(),
-            partition_columns: Vec::new(),
+            scan: ResolvedScan {
+                table_root: String::new(),
+                files: Vec::new(),
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                effective_storage: sample_storage(),
+                partition_columns: Vec::new(),
+                refused_columns: Vec::new(),
+            },
             total_bytes: 0,
-            refused_columns: Vec::new(),
             // Typed by `request_typed` below.
             column_types: column_types(NO_COLUMNS),
         })
@@ -712,7 +720,7 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
         &emitting(&first_table_column_types(request)),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         Some(declined),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("the wrapper must render the declined predicate")
 }
@@ -1382,9 +1390,12 @@ pub(crate) async fn pushdown_over(
     let context = PushdownContext {
         connection: statement.connection(),
         tuning: Tuning {
-            df_batch_size: 1024,
-            instance_overhead_mb: 200,
-            s3_max_connections: 4,
+            scan: ScanTuning {
+                df_batch_size: 1024,
+                instance_overhead_mb: 200,
+                s3_max_connections: 4,
+                ..base.tuning.scan
+            },
             join_broadcast_max_bytes,
             ..base.tuning
         },
@@ -1958,4 +1969,24 @@ pub(crate) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
         path: path.into(),
         size,
     }
+}
+
+/// A fileless table at `table_root` over the sample storage, with no declared column.
+pub(crate) fn resolved_table(table_root: &str) -> ResolvedScan {
+    ResolvedScan {
+        files: Vec::new(),
+        effective_storage: sample_storage(),
+        logical_schema: Vec::new(),
+        table_root: table_root.to_string(),
+        name_mapping: Vec::new(),
+        partition_columns: Vec::new(),
+        refused_columns: Vec::new(),
+    }
+}
+
+/// The clause-free scan of `table` under [`dispatch_context`].
+pub(crate) fn dispatch_base(table: ResolvedScan) -> CommonScanSpec {
+    dispatch_context()
+        .common_spec(&table)
+        .expect("the test CONNECTION names its storage")
 }

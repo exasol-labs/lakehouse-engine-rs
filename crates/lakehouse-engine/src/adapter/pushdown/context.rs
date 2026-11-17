@@ -1,12 +1,11 @@
 use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::sharding::partition_files_by_bytes;
 use crate::adapter::tuning::Tuning;
-use crate::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanStorage, StorageBackend,
-};
+use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use vs_expression::ExasolVersion;
 
+use super::ResolvedScan;
 use super::shard_paths::relativize_shards_to_root;
 use super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, quote_ident, scan_storage_for, shard_count,
@@ -48,18 +47,11 @@ impl PushdownContext<'_> {
         )
     }
 
-    /// A scan of one table with no clause, carrying the request's tuning.
-    pub(super) fn common_spec(
-        &self,
-        table_root: String,
-        logical_schema: Vec<LogicalField>,
-        name_mapping: Vec<NameMappingEntry>,
-        partition_columns: Vec<String>,
-        storage: ScanStorage,
-    ) -> CommonScanSpec {
-        let tuning = &self.tuning;
-        CommonScanSpec {
-            table_root,
+    /// A scan of `table` with no clause, carrying the request's tuning. Fails as
+    /// [`Self::scan_storage`], so before any use of the table's files.
+    pub(super) fn common_spec(&self, table: &ResolvedScan) -> Result<CommonScanSpec, UdfError> {
+        Ok(CommonScanSpec {
+            table_root: table.table_root.clone(),
             projection: Vec::new(),
             filter: None,
             limit: None,
@@ -67,19 +59,14 @@ impl PushdownContext<'_> {
             aggregates: None,
             group_keys: None,
             distinct: false,
-            logical_schema,
-            name_mapping,
+            logical_schema: table.logical_schema.clone(),
+            name_mapping: table.name_mapping.clone(),
             join: None,
-            partition_columns,
-            storage,
-            df_target_partitions: tuning.df_target_partitions,
-            df_batch_size: tuning.df_batch_size,
-            df_threads_per_udf: tuning.df_threads_per_udf,
-            memory_pool_fraction: tuning.memory_pool_fraction,
-            instance_overhead_mb: tuning.instance_overhead_mb,
-            s3_max_connections: tuning.s3_max_connections,
+            partition_columns: table.partition_columns.clone(),
+            storage: self.scan_storage(&table.effective_storage)?,
+            tuning: self.tuning.scan,
             binary_as_string: self.binary_as_string,
-        }
+        })
     }
 }
 

@@ -160,8 +160,8 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
 pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     let config = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(spec.common.df_target_partitions.max(1))
-        .with_batch_size(spec.common.df_batch_size.max(1))
+        .with_target_partitions(spec.common.tuning.df_target_partitions.max(1))
+        .with_batch_size(spec.common.tuning.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
         .set_bool(
@@ -208,7 +208,7 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 
     let storage = resolve_scan_storage(&spec.common, ctx)?;
 
-    let rt = build_scan_runtime(spec.common.df_threads_per_udf).map_err(UdfError::User)?;
+    let rt = build_scan_runtime(spec.common.tuning.df_threads_per_udf).map_err(UdfError::User)?;
 
     run_on_runtime(rt, run_scan_one(ctx, spec, &storage, build_session_context))
 }

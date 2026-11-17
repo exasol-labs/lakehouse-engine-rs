@@ -3,7 +3,7 @@ use super::*;
 use crate::adapter::tuning::Tuning;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
-    StorageProps,
+    ScanTuning, StorageProps,
 };
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
@@ -664,13 +664,14 @@ fn dispatch_with(
         limit,
         order_by_present(&pushdown_req),
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
-        dispatch_context().common_spec(
-            "s3://warehouse/db/events".to_string(),
-            logical_schema,
-            Vec::new(),
-            Vec::new(),
-            scan_storage.clone(),
-        ),
+        CommonScanSpec {
+            storage: scan_storage.clone(),
+            ..dispatch_base(ResolvedScan {
+                logical_schema,
+                ..resolved_table("s3://warehouse/db/events")
+            })
+        },
+        &dispatch_context(),
     )
 }
 
@@ -1565,12 +1566,14 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             physical_name: None,
         }],
         storage: back.storage.clone(),
-        df_target_partitions: 1,
-        df_batch_size: 1024,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 4,
+        tuning: ScanTuning {
+            df_target_partitions: 1,
+            df_batch_size: 1024,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 4,
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -1663,13 +1666,12 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         None,
         false,
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
-        dispatch_context().common_spec(
-            "s3://warehouse/db/events".to_string(),
-            Vec::new(),
-            Vec::new(),
-            vec!["LETTER".to_string()],
-            sample_scan_storage(),
-        ),
+        dispatch_base(ResolvedScan {
+            logical_schema: Vec::new(),
+            partition_columns: vec!["LETTER".to_string()],
+            ..resolved_table("s3://warehouse/db/events")
+        }),
+        &dispatch_context(),
     )
     .expect("build_dispatch_sql must succeed for the EVENTS fixture");
     let sql = result["sql"]
@@ -1684,27 +1686,31 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let fact = ResolvedJoinSide {
         table_name: "ORDERS".to_string(),
         table_identifier: "cat.sch.orders".to_string(),
-        table_root: "s3://warehouse/lh/orders".to_string(),
-        files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: Vec::new(),
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/orders".to_string(),
+            files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: Vec::new(),
+            refused_columns: Vec::new(),
+        },
         total_bytes: 100,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
         table_identifier: "cat.sch.customer".to_string(),
-        table_root: "s3://warehouse/lh/customer".to_string(),
-        files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: vec!["REGION".to_string()],
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/customer".to_string(),
+            files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: vec!["REGION".to_string()],
+            refused_columns: Vec::new(),
+        },
         total_bytes: 10,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
     };
     let sides = broadcast_sides(fact, dimension, 1);
@@ -1718,8 +1724,11 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let base = test_context();
     let tuning = PushdownContext {
         tuning: Tuning {
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            scan: ScanTuning {
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+                ..base.tuning.scan
+            },
             ..base.tuning
         },
         ..base

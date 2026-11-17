@@ -1,15 +1,12 @@
 use std::num::NonZeroUsize;
 
 use super::properties::{ThreadingMode, TuningProperties, VsProperties};
+// The defaults a property and a scan spec that lacks the field share.
+use crate::scan::spec::{
+    DEFAULT_DF_BATCH_SIZE, DEFAULT_INSTANCE_OVERHEAD_MB, DEFAULT_MEMORY_POOL_FRACTION, ScanTuning,
+};
 
 pub(super) const DEFAULT_PARALLELISM_FACTOR: usize = 1;
-/// DataFusion's default rows per RecordBatch.
-pub(super) const DEFAULT_DF_BATCH_SIZE: usize = 8192;
-/// Fraction of the net per-instance RSS budget allocated to the DataFusion memory pool.
-pub(super) const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
-/// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
-/// applying the pool fraction.
-pub(super) const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
 pub(super) const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
 /// The reads wait on the network, so the default does not follow the core count.
 pub(super) const DEFAULT_METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
@@ -20,13 +17,9 @@ pub(super) const S3_CONNECTIONS_PER_THREAD: usize = 4;
 /// The tuning a request derives from its properties and the adapter VM's core count.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Tuning {
+    /// What every scan spec of the request carries.
+    pub(crate) scan: ScanTuning,
     pub(crate) parallelism_factor: usize,
-    pub(crate) df_target_partitions: usize,
-    pub(crate) df_threads_per_udf: usize,
-    pub(crate) df_batch_size: usize,
-    pub(crate) memory_pool_fraction: f64,
-    pub(crate) instance_overhead_mb: u64,
-    pub(crate) s3_max_connections: usize,
     pub(crate) join_broadcast_max_bytes: u64,
 }
 
@@ -53,10 +46,7 @@ impl Tuning {
             ),
             ThreadingMode::Auto => (auto_partitions, auto_threads),
         };
-        Self {
-            parallelism_factor: checked
-                .parallelism_factor
-                .map_or(DEFAULT_PARALLELISM_FACTOR, |n| usize::from(n.get())),
+        let scan = ScanTuning {
             df_target_partitions,
             df_threads_per_udf,
             df_batch_size: checked
@@ -73,6 +63,12 @@ impl Tuning {
                 .map_or(df_threads_per_udf * S3_CONNECTIONS_PER_THREAD, |n| {
                     usize::from(n.get())
                 }),
+        };
+        Self {
+            scan,
+            parallelism_factor: checked
+                .parallelism_factor
+                .map_or(DEFAULT_PARALLELISM_FACTOR, |n| usize::from(n.get())),
             join_broadcast_max_bytes: checked
                 .join_broadcast_max_bytes
                 .map_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES, |n| n.get()),

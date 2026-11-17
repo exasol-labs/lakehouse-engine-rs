@@ -39,7 +39,7 @@ fn join_condition_renders_via_translator() {
         &parsed_pushdown(&request),
         &detected,
         &sides,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renderable join")
     .expect("an equi-join must render, not decline");
@@ -66,7 +66,7 @@ fn join_where_filter_spanning_both_sides_renders() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renderable join")
     .expect("must render");
@@ -445,12 +445,9 @@ fn screen_leg_filter_renders_the_accepted_set_bare() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = screen_leg_filter(
-        &filter,
-        &column_types(&orders_col_types()),
-        ExasolVersion::Exasol2025,
-    )
-    .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -472,12 +469,9 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) = screen_leg_filter(
-        &filter,
-        &column_types(&orders_col_types()),
-        ExasolVersion::Exasol2025,
-    )
-    .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -502,7 +496,7 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
     let (_, declined) = screen_leg_filter(
         &pruning,
         &column_types(&orders_col_types()),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("every column of the leg filter binds the leg");
 
@@ -521,12 +515,9 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) = screen_leg_filter(
-        &filter,
-        &column_types(&orders_col_types()),
-        ExasolVersion::Exasol2025,
-    )
-    .expect("every column of the leg filter binds the leg");
+    let (leg, declined) =
+        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
+            .expect("every column of the leg filter binds the leg");
 
     assert_eq!(leg, None);
     assert_eq!(declined, Some(filter));
@@ -540,7 +531,7 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
         screen_leg_filter(
             filter,
             &column_types(&[("SHARED_KEY", exa_type)]),
-            ExasolVersion::Exasol2025,
+            &test_context(),
         )
         .expect("every column of the leg filter binds the leg")
     };
@@ -926,7 +917,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -953,7 +944,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renderable join")
     .expect("an equi-join must render, not decline");
@@ -981,7 +972,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -1077,7 +1068,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &parsed_pushdown(&request),
         &detected,
         &sides,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renderable join")
     .expect("must render");
@@ -1086,9 +1077,8 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) =
-        screen_leg_filter(&filter, &sides[0].column_types, ExasolVersion::Exasol2025)
-            .expect("every column of the leg filter binds the leg");
+    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types, &test_context())
+        .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }

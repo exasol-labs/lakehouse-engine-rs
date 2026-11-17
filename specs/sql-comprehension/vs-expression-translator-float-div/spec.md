@@ -18,7 +18,7 @@ Renders `FLOAT_DIV` (Exasol's `/`) as true `DOUBLE` division. The DataFusion dia
 * *GIVEN* a VS expression node of type `function_scalar` named `FLOAT_DIV`, the wire name for Exasol's `/`, advertised as `FN_FLOAT_DIV`
 * *AND* Exasol's `FN_FLOAT_DIV` always performs true float division and always results in `DOUBLE`, for every operand-type combination, verified live against the Docker Exasol container: `7/2 = 3.5` (NOT `3`), `CAST(711.56 AS DECIMAL(18,2))/CAST(7 AS DECIMAL(18,0)) = 101.65142857142857` at full double precision (NOT scale-capped), and a CTAS over each operand pairing types the result column `DOUBLE` in `EXA_ALL_COLUMNS`
 * *AND* the renderer picks one rendering per function, so it does not render one shape for integer operands and another for decimal or double operands
-* *WHEN* the node is rendered through the DataFusion-dialect entry points (`render_scan_expression`, `render_scan_filter`), the ones whose output DataFusion's SQL frontend parses inside the scan UDF
+* *WHEN* the node is rendered through the DataFusion-dialect entry points (`ScanTyping::render_expression`, `ScanTyping::render_filter`), the ones whose output DataFusion's SQL frontend parses inside the scan UDF
 * *THEN* the translator SHALL return `vs_checked_float_div(<left>, <right>)`, a call to the single checked-division function the crate declares, with both operands rendered recursively and neither wrapped in a CAST
 * *AND* the function name SHALL be exported from `crates/vs-expression` as one public constant that the rendering itself reads, so the name has ONE owner and the scan crate that registers the function cannot drift from the crate that emits it
 * *AND* that constant's documentation SHALL state the full contract the registered implementation MUST satisfy: two arguments, both coerced to `Float64`, a `Float64` result, NULL propagated, and an error raised when the result is not finite
@@ -33,7 +33,7 @@ Renders `FLOAT_DIV` (Exasol's `/`) as true `DOUBLE` division. The DataFusion dia
 ### Scenario: The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator
 
 * *GIVEN* the same `function_scalar` node named `FLOAT_DIV`
-* *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `render_exasol_fragment`), the ones whose output Exasol's own core engine parses
+* *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `ScanTyping::exasol_fragment`), the ones whose output Exasol's own core engine parses
 * *THEN* the translator SHALL return the bare `(<left> / <right>)`, because Exasol's `/` IS `FN_FLOAT_DIV`: it already divides as `DOUBLE` for every operand type AND it already raises `22012` on a zero divisor, so it needs neither the cast nor the checked call
 * *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node, `vs_checked_float_div(<l>, <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect
 * *AND* every Exasol-dialect consumer's SQL SHALL stay byte-identical, the qualified single-table wrapper, the N-scan join wrapper, the grouped merge, the single-group scalar-over-aggregate merge (`render_scalar_over_merge`, which calls `render_expression_exasol`), and the self-applied WHERE path

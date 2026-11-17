@@ -1,6 +1,6 @@
 use super::ScanUdfs;
-use crate::adapter::pushdown::test_support::test_context;
-use crate::scan::spec::{FileEntry, ScanStorage};
+use crate::adapter::pushdown::test_support::{resolved_table, test_context};
+use crate::scan::spec::FileEntry;
 
 #[test]
 fn the_udfs_are_qualified_by_a_nonempty_schema() {
@@ -36,20 +36,13 @@ fn the_shard_count_is_the_parallelism_factor_times_the_node_count() {
 #[test]
 fn the_common_spec_carries_the_resolved_tuning() {
     let mut context = test_context();
-    context.tuning.memory_pool_fraction = 0.4;
-    context.tuning.instance_overhead_mb = 123;
-    context.tuning.s3_max_connections = 9;
-    let spec = context.common_spec(
-        String::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        ScanStorage::Connection {
-            name: "C".to_string(),
-            allow_http: false,
-        },
-    );
-    assert_eq!(spec.memory_pool_fraction, 0.4);
-    assert_eq!(spec.instance_overhead_mb, 123);
-    assert_eq!(spec.s3_max_connections, 9);
+    context.tuning.scan.memory_pool_fraction = 0.4;
+    context.tuning.scan.instance_overhead_mb = 123;
+    context.tuning.scan.s3_max_connections = 9;
+    let spec = context
+        .common_spec(&resolved_table(""))
+        .expect("the test CONNECTION names its storage");
+    assert_eq!(spec.tuning.memory_pool_fraction, 0.4);
+    assert_eq!(spec.tuning.instance_overhead_mb, 123);
+    assert_eq!(spec.tuning.s3_max_connections, 9);
 }

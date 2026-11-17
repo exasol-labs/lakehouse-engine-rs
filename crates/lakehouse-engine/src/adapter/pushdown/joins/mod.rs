@@ -5,7 +5,6 @@ use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
-use vs_expression::ExasolVersion;
 
 use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
@@ -72,13 +71,14 @@ fn ensure_no_side_refuses_a_referenced_column(
         let mut touched = possible_side_column_names(request, &side.table_name);
         match output {
             OutputContract::WholeRow => touched.extend(
-                side.refused_columns
+                side.scan
+                    .refused_columns
                     .iter()
                     .map(|column| column.column_name.to_uppercase()),
             ),
             OutputContract::AnyOneColumn | OutputContract::Items => {}
         }
-        ensure_no_touched_column_is_refused(&touched, &side.refused_columns)?;
+        ensure_no_touched_column_is_refused(&touched, &side.scan.refused_columns)?;
     }
     Ok(())
 }
@@ -90,7 +90,7 @@ fn empty_join_sql(
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     emitted: Vec<Emitted>,
-    version: ExasolVersion,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let legs = join.legs();
     let col_types = ColumnTypes::per_relation(
@@ -100,7 +100,7 @@ fn empty_join_sql(
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
     let bound = pushdown.with_json(legs.qualify(pushdown.json()));
-    let scan = ScanTranslator::over(&col_types, version, &[bound.json()])?;
+    let scan = ScanTranslator::over(&col_types, context.version, &[bound.json()])?;
     let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
     empty_result_sql(
         pushdown,
@@ -108,6 +108,7 @@ fn empty_join_sql(
         &projection,
         scan,
         &EmptyRelation::join(join, emitted),
+        context,
     )
 }
 
@@ -155,13 +156,8 @@ pub(super) async fn plan_join(
         Some(join),
         &involved.iter().collect::<Vec<_>>(),
     )?;
-    let resolver = TableScanResolver::for_request(
-        statement,
-        permission,
-        &identifiers,
-        context.binary_as_string,
-    )
-    .await?;
+    let resolver =
+        TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
@@ -185,8 +181,8 @@ pub(super) async fn plan_join(
     ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
     let emitted = n_scan_emission(pushdown, join, &sides)?;
 
-    if sides.iter().any(|s| s.files.is_empty()) {
-        return empty_join_sql(pushdown, join, &sides, emitted, context.version);
+    if sides.iter().any(|s| s.scan.files.is_empty()) {
+        return empty_join_sql(pushdown, join, &sides, emitted, context);
     }
 
     if let Some(sql) = plan_broadcast_join(pushdown, join, &sides, context)? {

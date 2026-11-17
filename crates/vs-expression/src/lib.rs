@@ -21,7 +21,7 @@ use scan_typing::{
     BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
     seconds_type, timestamp_digits,
 };
-pub use scan_typing::{ColumnTypeLookup, exact_type};
+pub use scan_typing::{ColumnTypeLookup, ScanTyping};
 use timestamp::{TimestampLiteral, TimestampUnit};
 pub use version::ExasolVersion;
 
@@ -1189,35 +1189,32 @@ fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String 
 
 /// The only DataFusion-dialect entry point, so every scan expression is typed first. `Err` declines.
 /// A CHAR or VARCHAR CAST renders unsized, so its fragment type is the widest VARCHAR.
-pub fn render_scan_expression(
-    expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-    version: ExasolVersion,
-) -> Result<SqlFragment, UdfError> {
-    let (typed, inferred) = scan_typing::type_scan_tree(expr, columns, version)?;
-    let ty = inferred.exact().map(|ty| {
-        if ty.is_character() {
-            ExasolType::WIDEST_VARCHAR
-        } else {
-            ty
-        }
-    });
-    Ok(SqlFragment::new(render_expression(&typed)?, ty))
+impl ScanTyping<'_> {
+    pub fn render_expression(self, expr: &Json) -> Result<SqlFragment, UdfError> {
+        let (typed, inferred) = self.type_scan_tree(expr)?;
+        let ty = inferred.exact().map(|ty| {
+            if ty.is_character() {
+                ExasolType::WIDEST_VARCHAR
+            } else {
+                ty
+            }
+        });
+        Ok(SqlFragment::new(render_expression(&typed)?, ty))
+    }
+
+    /// [`Self::render_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
+    /// filter it sends renders as `TRUE`.
+    pub fn render_filter(self, filter_expr: &Json) -> Result<String, UdfError> {
+        Ok(null_keeps_no_row(self.render_expression(filter_expr)?.sql))
+    }
+
+    /// [`render_expression_exasol`] for an output select item, with its [`Self::exact_type`].
+    pub fn exasol_fragment(self, expr: &Json) -> SqlFragment {
+        SqlFragment::new(render_expression_exasol(expr), self.exact_type(expr))
+    }
 }
 
-/// [`render_scan_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
-/// filter it sends renders as `TRUE`.
-pub fn render_scan_filter(
-    filter_expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-    version: ExasolVersion,
-) -> Result<String, UdfError> {
-    Ok(null_keeps_no_row(
-        render_scan_expression(filter_expr, columns, version)?.sql,
-    ))
-}
-
-/// The filter [`render_scan_filter`] renders for the `AND` of conjuncts rendered one by one.
+/// The filter [`ScanTyping::render_filter`] renders for the `AND` of conjuncts rendered one by one.
 pub fn conjoin_scan_filters(conjuncts: Vec<String>) -> Option<String> {
     if conjuncts.is_empty() {
         return None;
@@ -1230,7 +1227,7 @@ fn null_keeps_no_row(sql: String) -> String {
     if sql == "NULL" { "FALSE".into() } else { sql }
 }
 
-/// DataFusion dialect, untyped. Use [`render_scan_expression`].
+/// DataFusion dialect, untyped. Use [`ScanTyping::render_expression`].
 pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
@@ -1251,18 +1248,6 @@ pub fn render_expression_exasol(expr: &Json) -> String {
 }
 
 const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
-
-/// [`render_expression_exasol`] for an output select item, with its [`exact_type`].
-pub fn render_exasol_fragment(
-    expr: &Json,
-    columns: &dyn ColumnTypeLookup,
-    version: ExasolVersion,
-) -> SqlFragment {
-    SqlFragment::new(
-        render_expression_exasol(expr),
-        exact_type(expr, columns, version),
-    )
-}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

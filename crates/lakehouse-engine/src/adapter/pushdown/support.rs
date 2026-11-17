@@ -13,8 +13,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ExasolVersion, SqlFragment, exact_type, render_exasol_fragment,
-    render_scan_expression, render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, SqlFragment, walk_column_nodes,
 };
 
 use super::RefusedColumn;
@@ -661,27 +660,24 @@ impl<'a> ScanTranslator<'a> {
         self.columns
     }
 
-    pub(super) fn version(self) -> ExasolVersion {
-        self.version
+    fn typing(self) -> ScanTyping<'a> {
+        ScanTyping::new(self.columns, self.version)
     }
 
     pub(super) fn exact_type(self, node: &Json) -> Option<ExasolType> {
-        exact_type(node, self.columns, self.version)
+        self.typing().exact_type(node)
     }
 
     /// The Exasol-dialect `expr` with its exact type, for an item Exasol computes.
     pub(super) fn exasol_fragment(self, expr: &Json) -> SqlFragment {
-        render_exasol_fragment(expr, self.columns, self.version)
+        self.typing().exasol_fragment(expr)
     }
 
     /// `None` declines: the caller applies the expression in Exasol or declines the shape.
     pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
-        render_scan_expression(
-            &compare_binary_bytes(expr.clone(), self.columns),
-            self.columns,
-            self.version,
-        )
-        .ok()
+        self.typing()
+            .render_expression(&compare_binary_bytes(expr.clone(), self.columns))
+            .ok()
     }
 
     /// Where the request's WHERE applies, the scan or Exasol (`_decision/045`).
@@ -689,11 +685,10 @@ impl<'a> ScanTranslator<'a> {
         let Some(raw) = filter else {
             return ScanWhere::Absent;
         };
-        match render_scan_filter(
-            &compare_binary_bytes(raw.clone(), self.columns),
-            self.columns,
-            self.version,
-        ) {
+        match self
+            .typing()
+            .render_filter(&compare_binary_bytes(raw.clone(), self.columns))
+        {
             Ok(sql) => ScanWhere::Pushed(sql),
             Err(_) => ScanWhere::Declined(raw),
         }

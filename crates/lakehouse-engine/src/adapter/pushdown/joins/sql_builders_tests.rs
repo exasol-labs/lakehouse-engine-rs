@@ -109,7 +109,7 @@ fn broadcast_join_declines_wrapped_projection() {
             &parsed_pushdown(&ok_req),
             &detected,
             &request_sides(&ok_req, &detected),
-            ExasolVersion::Exasol2025
+            &test_context()
         )
         .expect("the control must not error")
         .is_some(),
@@ -131,7 +131,7 @@ fn broadcast_join_declines_wrapped_projection() {
             &parsed_pushdown(&request),
             &detected,
             &request_sides(&request, &detected),
-            ExasolVersion::Exasol2025
+            &test_context()
         )
         .expect("a wrapped projection is a clean decline, NOT an error")
         .is_none(),
@@ -152,7 +152,7 @@ fn broadcast_declines_on_a_declined_filter() {
             &parsed_pushdown(&request),
             &detected,
             &request_sides(&request, &detected),
-            ExasolVersion::Exasol2025
+            &test_context()
         )
         .expect("a declined filter is a clean decline, not an error")
         .is_none(),
@@ -178,7 +178,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("a type-declined filter is a clean decline, not an error");
     assert!(
@@ -197,7 +197,7 @@ fn broadcast_absent_filter_stays_eligible() {
         &parsed_pushdown(&absent_request),
         &absent_detected,
         &request_sides(&absent_request, &absent_detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("an absent filter must not error")
     .expect("an absent filter must keep the broadcast plan");
@@ -885,7 +885,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("a VARCHAR LIKE subject must not error")
     .expect("a VARCHAR LIKE subject must keep the broadcast plan");
@@ -1219,7 +1219,7 @@ fn golden_broadcast_join_sql_unchanged() {
     let fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
     let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
     // Deliberately distinct from the fact side's backend.
-    dimension.effective_storage = StorageBackend::S3(StorageProps {
+    dimension.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-dim:9000".into(),
         region: "us-east-2".into(),
         access_key: "dimadmin".into(),
@@ -1256,7 +1256,7 @@ fn golden_broadcast_join_sql_unchanged() {
 #[test]
 fn broadcast_carries_each_sides_own_storage() {
     let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
-    fact.effective_storage = StorageBackend::S3(StorageProps {
+    fact.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-fact:9000".into(),
         region: "us-east-1".into(),
         access_key: "factadmin".into(),
@@ -1265,7 +1265,7 @@ fn broadcast_carries_each_sides_own_storage() {
         ..Default::default()
     });
     let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    dimension.effective_storage = StorageBackend::S3(StorageProps {
+    dimension.scan.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-dim:9000".into(),
         region: "us-east-2".into(),
         access_key: "dimadmin".into(),
@@ -1299,12 +1299,12 @@ fn broadcast_carries_each_sides_own_storage() {
         (
             "common.storage",
             &common["storage"],
-            &fact.effective_storage,
+            &fact.scan.effective_storage,
         ),
         (
             "join.storage",
             &common["join"]["storage"],
-            &dimension.effective_storage,
+            &dimension.scan.effective_storage,
         ),
     ] {
         let selected: ScanStorage =
@@ -1536,7 +1536,7 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
             &parsed_pushdown(request),
             &detected_join(request),
             &request_sides(request, &detected_join(request)),
-            ExasolVersion::Exasol2025,
+            &test_context(),
         )
         .expect("renders")
         .expect("an ordered equi-join renders");
@@ -1695,7 +1695,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         &emitting(&first_table_column_types(&request)),
         &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
         None,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("the grouped qualified fallback must build");
     assert_eq!(
@@ -1815,7 +1815,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &emitting_named(&column_types(&grouped_all), &["GK", "REGION"]),
         &unqualified_shards(shards.to_vec()),
         None,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("grouped decline wrapper must build");
     assert!(
@@ -1860,7 +1860,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &emitting_named(&column_types(&sg_all), &["A", "B"]),
         &unqualified_shards(shards.to_vec()),
         None,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("single-group Case 2/3 wrapper must build");
     assert!(
@@ -1976,7 +1976,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &ScanWhere::Absent,
         &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
         &emitting(&first_table_column_types(&request)),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
 }
 
@@ -2109,7 +2109,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         &legs,
         &[leg],
         LegColumns::Relations,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("a renderable expression sort key must render, not decline");
 
@@ -2149,7 +2149,7 @@ fn seam_trailing(request: &Json) -> Result<String, UdfError> {
         &legs,
         &vec![events; leg_count],
         LegColumns::Relations,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .map(|clauses| clauses.trailing)
 }
@@ -2372,7 +2372,7 @@ fn shared_names_broadcast_sql_over(
         &parsed_pushdown(request),
         &detected_join(request),
         &typed,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("a well-formed request renders without error")?;
     let sides = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
@@ -2459,9 +2459,9 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
 #[test]
 fn binary_detection_resolves_a_shared_column_name_per_leg() {
     let mut events = resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]);
-    events.logical_schema = vec![nullable_field("payload", "binary")];
+    events.scan.logical_schema = vec![nullable_field("payload", "binary")];
     let mut labels = resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]);
-    labels.logical_schema = vec![nullable_field("payload", "utf8")];
+    labels.scan.logical_schema = vec![nullable_field("payload", "utf8")];
     let filter_on = |column: Json| {
         let request = shared_names_request(
             &[events_column("ID"), labels_column("ID")],
@@ -2499,7 +2499,7 @@ fn output_name_over_identifier_limit_declines_broadcast() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
-            ExasolVersion::Exasol2025,
+            &test_context(),
         )
         .expect("an identifier-limit decline is not an error")
     };
@@ -2529,7 +2529,7 @@ fn self_join_renders_each_occurrence_as_its_own_relation() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
-            ExasolVersion::Exasol2025,
+            &test_context(),
         )
         .expect("renders")
         .expect("a self-join is no reason to decline");
@@ -2554,7 +2554,7 @@ fn join_block_names_the_dimension_legs_alias() {
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_sides(&request, &detected_join(&request)),
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("renders")
     .expect("an equi-join renders");

@@ -60,11 +60,11 @@ async fn collect_strings(ctx: &SessionContext, sql: &str, col: &str) -> Vec<Opti
 async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
     let ctx = context_with_acctbal();
     let expr = cast_to(ExasolType::varchar(10), acctbal_greater_than_zero());
-    let fragment = vs_expression::render_scan_expression(
-        &expr,
+    let fragment = vs_expression::ScanTyping::new(
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
+    .render_expression(&expr)
     .expect("CAST must translate")
     .sql;
 
@@ -81,11 +81,11 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
 async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(
-        &concat_expr,
+    let fragment = vs_expression::ScanTyping::new(
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
+    .render_expression(&concat_expr)
     .expect("CONCAT must translate")
     .sql;
 
@@ -102,11 +102,11 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
 async fn concat_group_by_key_uses_exasol_uppercase_labels() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(
-        &concat_expr,
+    let fragment = vs_expression::ScanTyping::new(
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
+    .render_expression(&concat_expr)
     .expect("CONCAT must translate")
     .sql;
 

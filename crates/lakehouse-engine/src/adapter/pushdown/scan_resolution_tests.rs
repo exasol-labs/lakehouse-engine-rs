@@ -1,4 +1,6 @@
-use super::super::test_support::{UNREACHABLE_CATALOG, endpoint_storage, statement_over};
+use super::super::test_support::{
+    UNREACHABLE_CATALOG, endpoint_storage, statement_over, test_context,
+};
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::permission::PermissionSettings;
@@ -41,13 +43,15 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_by_its_kinds_
     ] {
         let statement = statement_over(kind, address, endpoint_storage(UNREACHABLE_CATALOG));
 
-        let err =
-            TableScanResolver::for_request(&statement, &lakekeeper_check(), &identifiers, false)
-                .await
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("{kind:?}: a malformed identifier on any leg must be refused")
-                });
+        let err = TableScanResolver::for_request(
+            &statement,
+            &lakekeeper_check(),
+            &identifiers,
+            &test_context(),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{kind:?}: a malformed identifier on any leg must be refused"));
 
         let message = err.to_string();
         assert!(
@@ -72,7 +76,8 @@ async fn an_enforced_check_reads_no_table_that_no_check_admitted() {
         endpoint_storage(UNREACHABLE_CATALOG),
     );
     let check = lakekeeper_check();
-    let resolver = TableScanResolver::for_request(&statement, &check, &["events"], false)
+    let context = test_context();
+    let resolver = TableScanResolver::for_request(&statement, &check, &["events"], &context)
         .await
         .expect("a kind that runs no check admits nothing and fails nothing");
 

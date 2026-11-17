@@ -24,7 +24,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, DeltaDeletionVectorStorage, FileEntry, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
+    ScanTuning, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{register_files, run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -145,7 +145,10 @@ fn scan_spec(
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)
@@ -356,7 +359,7 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     }
 
     let mut spec = scan_spec(entries, &dir_url(dir), None, None);
-    spec.common.s3_max_connections = BUDGET;
+    spec.common.tuning.s3_max_connections = BUDGET;
 
     let (probe, peak) = ConcurrencyProbe::new(needles, BUDGET);
     let store = Arc::new(TrackingStore {

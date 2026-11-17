@@ -6,7 +6,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, CommonScanSpec, ScanStorage};
 use crate::scan::test_support::WithFiles;
-use vs_expression::ExasolVersion;
 use vs_expression::SqlFragment;
 
 #[test]
@@ -1529,7 +1528,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         &emitting(&column_types(&all_cols)),
         &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
         None,
-        ExasolVersion::Exasol2025,
+        &test_context(),
     )
     .expect("qualified fallback must build");
 

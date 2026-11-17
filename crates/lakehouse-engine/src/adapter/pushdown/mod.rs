@@ -89,8 +89,6 @@ use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, LogicalField, Storage
 use support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, scan_storage_for};
 #[cfg(test)]
 use test_support::scan_filter_sql;
-#[cfg(test)]
-use vs_expression::ExasolVersion;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
@@ -138,56 +136,35 @@ pub(crate) async fn handle_pushdown(
     // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
     let has_order_by = order_by_present(pushdown_req);
 
-    let resolver = TableScanResolver::for_request(
-        statement,
-        permission,
-        &[catalog.table.as_str()],
-        context.binary_as_string,
-    )
-    .await?;
-    let (
-        ResolvedScan {
-            files,
-            effective_storage,
-            logical_schema,
-            table_root,
-            name_mapping,
-            partition_columns,
-            refused_columns,
-        },
-        col_types,
-    ) = resolver
+    let resolver =
+        TableScanResolver::for_request(statement, permission, &[catalog.table.as_str()], context)
+            .await?;
+    let (resolved, col_types) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
     let scan = ScanTranslator::over(&col_types, context.version, &[pushdown_req])?;
     // Before the zero-files early return: a refused column must error, never yield an empty
     // result.
-    ensure_no_refused_column_referenced(request, pushdown.output(), &refused_columns)?;
+    ensure_no_refused_column_referenced(request, pushdown.output(), &resolved.refused_columns)?;
     let emitted = single_table_emission(request, &pushdown, &col_types)?;
     let projection = project_columns(&pushdown, scan, &emitted)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let scan_where = scan.split_where(filter_json_raw);
-    let scan_storage = context.scan_storage(&effective_storage)?;
+    let base = context.common_spec(&resolved)?;
 
-    if files.is_empty() {
+    if resolved.files.is_empty() {
         return empty_result_sql(
             &pushdown,
             &pushdown,
             &projection,
             scan,
             &EmptyRelation::single_scan(request, emitted),
+            context,
         );
     }
 
-    let shards = context.shards(files, &table_root);
-    let base = context.common_spec(
-        table_root,
-        logical_schema,
-        name_mapping,
-        partition_columns,
-        scan_storage,
-    );
+    let shards = context.shards(resolved.files, &resolved.table_root);
     build_dispatch_sql(
         request,
         &pushdown,
@@ -199,6 +176,7 @@ pub(crate) async fn handle_pushdown(
         has_order_by,
         &shards,
         base,
+        context,
     )
 }
 
@@ -216,6 +194,7 @@ fn build_dispatch_sql(
     has_order_by: bool,
     shards: &Shards,
     base: CommonScanSpec,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
     let fallback = || {
@@ -226,7 +205,7 @@ fn build_dispatch_sql(
             &scan_where,
             shards,
             emitted,
-            scan.version(),
+            context,
         )
     };
 

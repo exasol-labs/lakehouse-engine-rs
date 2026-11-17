@@ -15,12 +15,12 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *GIVEN* a `function_scalar` node named `SECOND`, or a `function_scalar_extract` node whose `toExtract` field is `SECOND`
 * *WHEN* `render_expression` processes the node
 * *THEN* it SHALL decline the node, because only the typed pass knows the argument's precision
-* *AND* `render_scan_expression` SHALL render a one-argument `SECOND(x)` or `EXTRACT(SECOND FROM x)` per `SECOND keeps the fraction of its argument's declared precision`
+* *AND* `ScanTyping::render_expression` SHALL render a one-argument `SECOND(x)` or `EXTRACT(SECOND FROM x)` per `SECOND keeps the fraction of its argument's declared precision`
 
 ### Scenario: SECOND keeps the fraction of its argument's declared precision
 
 * *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has the exact type `TIMESTAMP(p)` in the typed scan pass: a column, a `CAST` to `TIMESTAMP(p)` with p of 0, 3, 6, or 9 (the only CAST precisions the DataFusion dialect renders), `DATE_TRUNC`, `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over a TIMESTAMP, a timestamp literal, or a `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, or `LEAST` over only timestamps
-* *WHEN* `render_scan_expression` renders it
+* *WHEN* `ScanTyping::render_expression` renders it
 * *THEN* the fragment SHALL compute the seconds of `x` with their first p fractional digits, and SHALL carry the type `DECIMAL(2+p, p)`
 * *AND* it SHALL read `date_part('second', …)` when p is 0, `date_part('microsecond', …)` when p is 1 to 6, and `date_part('nanosecond', …)` when p is 7 to 9
 * *AND* it SHALL cut the digits beyond p, never round them, and SHALL scale with exact decimal arithmetic, never through `DOUBLE`
@@ -28,7 +28,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ### Scenario: SECOND over a DATE takes each version's type
 
 * *GIVEN* `SECOND(x)` whose argument `x` has the exact type `DATE` in the typed scan pass, such as a DATE column, a `CAST` to `DATE`, `DATE_TRUNC` over a DATE, or `TO_DATE`
-* *WHEN* `render_scan_expression` renders it
+* *WHEN* `ScanTyping::render_expression` renders it
 * *THEN* the fragment SHALL compute 0 for a non-NULL `x` and NULL for a NULL `x`
 * *AND* the fragment SHALL carry `DECIMAL(2,0)` on Exasol 2025, `DECIMAL(5,3)` on Exasol 8, where the scan computes the seconds of `x` as a `TIMESTAMP(3)`, and no exact type on an unknown version (`sql-functions/vs-expression-translator-date-add-fns`)
 * *AND* a conversion of it to text SHALL run in Exasol unless its type is `DECIMAL(2,0)` (`pushdown-types/pushdown-planning-scan-text-conversion`)
@@ -36,7 +36,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 ### Scenario: SECOND over any other argument, or EXTRACT(SECOND) over a DATE, runs in Exasol
 
 * *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has neither the exact type `TIMESTAMP(p)` nor `DATE`, such as `SECOND(TO_TIMESTAMP(s))` on an unknown Exasol version, `SECOND` of a `VARCHAR` column, `SECOND(CAST(ts AS TIMESTAMP(7)))` (a CAST precision the DataFusion dialect cannot render), or `SECOND(CAST(ts AS TIMESTAMP(6) WITH LOCAL TIME ZONE))`, or `EXTRACT(SECOND FROM x)` over a DATE `x`
-* *WHEN* `render_scan_expression` renders it
+* *WHEN* `ScanTyping::render_expression` renders it
 * *THEN* the DataFusion dialect SHALL decline the node, so Exasol computes the function in the wrapper
 * *AND* `EXTRACT(SECOND FROM <date>)` SHALL therefore fail with Exasol's own `Feature not supported` error, as it does over a native table
 
