@@ -1,19 +1,14 @@
 use super::*;
 use crate::scan::raised_failure::session_raised_failure;
-use crate::scan::scan_session_context;
+use crate::scan::test_support::{first_column as rows, scan_session_over};
 use arrow::array::{Decimal128Array, Float64Array, Int64Array, RecordBatch};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{Field, Schema};
-use arrow::util::display::array_value_to_string;
-use datafusion::datasource::MemTable;
-use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::prelude::SessionConfig;
 
 const BIG: i64 = 4_000_000_000_000_000_000;
 
 /// `n` holds `BIG` behind its NULL, so only a kernel that skips NULL slots passes.
 fn session() -> SessionContext {
-    let ctx = scan_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
     let schema = Arc::new(Schema::new(vec![
         Field::new("l", DataType::Int64, true),
         Field::new("n", DataType::Int64, true),
@@ -21,7 +16,7 @@ fn session() -> SessionContext {
         Field::new("dec36", DataType::Decimal128(36, 6), true),
     ]));
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
             Arc::new(Int64Array::from(vec![Some(BIG), Some(3), None])),
             Arc::new(Int64Array::new(
@@ -37,20 +32,7 @@ fn session() -> SessionContext {
         ],
     )
     .unwrap();
-    ctx.register_table(
-        "t",
-        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
-    )
-    .unwrap();
-    ctx
-}
-
-async fn rows(ctx: &SessionContext, sql: &str) -> Vec<String> {
-    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    batches
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|r| array_value_to_string(b.column(0), r).unwrap()))
-        .collect()
+    scan_session_over(batch)
 }
 
 /// Scenario: Exact arithmetic and SUM do not wrap

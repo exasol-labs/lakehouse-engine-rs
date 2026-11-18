@@ -38,6 +38,7 @@ pub use datetime_add::CountArithmetic;
 mod exasol_numeric;
 mod json_value;
 mod raised_failure;
+mod string_argument;
 
 pub(crate) mod parquet_reader;
 
@@ -129,7 +130,7 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
     let mut rules = Analyzer::new().rules;
     rules.insert(0, numeric_typing.clone());
-    let state = SessionStateBuilder::new()
+    let mut builder = SessionStateBuilder::new()
         .with_config(
             config
                 .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
@@ -137,8 +138,9 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
         )
         .with_runtime_env(runtime)
         .with_default_features()
-        .with_analyzer_rules(rules)
-        .build();
+        .with_analyzer_rules(rules);
+    string_argument::install(&mut builder, &raised);
+    let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     numeric_typing.register_functions(&ctx);
     raw_scan::register_nested_json_render_udf(&ctx);
