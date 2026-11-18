@@ -53,7 +53,7 @@ The statement fails before it reads any source row when any of these holds:
 | `SINGLE_COMMIT` | no | `true` or `false`, in any letter case. | `false` |
 | `ALLOW_HTTP` | no | `true` or `false`, in any letter case. | `false` |
 
-Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to the catalog address, the OAuth2 server, the AWS STS endpoint, the CONNECTION's storage endpoint, a storage endpoint that the catalog vends, or a vended `abfs://` table location. Without it, an `http://` address fails the statement with an error that names the CONNECTION field and `ALLOW_HTTP`, and a vended `abfs://` location fails the writer with an error that names the table and `ALLOW_HTTP`.
+Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to the catalog address, the OAuth2 server, the AWS STS endpoint, the CONNECTION's storage endpoint, or a storage endpoint that the catalog vends. Without it, an `http://` address fails the statement with an error that names the CONNECTION field and `ALLOW_HTTP`. A vended `abfs://` table location also needs `ALLOW_HTTP = 'true'`, as it does for a virtual schema, although the export writes it over HTTPS. Without it, the writer fails with an error that names the table and `ALLOW_HTTP`.
 
 ## The table
 

@@ -26,6 +26,10 @@ The export reaches the Iceberg REST catalog that the CONNECTION names and the ta
 * *WHEN* the catalog offers no credentials endpoint
 * *THEN* the export SHALL fail with an error that names the table and states that its vended credentials expired and that the catalog offers no credentials endpoint
 * *AND* the error MUST NOT contain a storage credential
+
+### Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
+
+* *GIVEN* a CONNECTION that sets `"use_vended_credentials": true`
 * *WHEN* the catalog states no expiry for the credentials it vends, no `s3.session-token-expires-at-ms` for S3 keys and no `adls.sas-token-expires-at-ms.<host>` for the table location's host for an ADLS SAS
 * *THEN* the writer SHALL use the credentials as vended and SHALL NOT renew them
 * *WHEN* the catalog states an expiry that is no epoch millisecond

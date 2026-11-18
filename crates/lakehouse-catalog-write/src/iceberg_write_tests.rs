@@ -7,7 +7,7 @@ use crate::test_support::{
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
-use lakehouse_catalog::{AdlsCred, StorageProps, system_clock};
+use lakehouse_catalog::{AdlsCred, StorageProps};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,14 +74,14 @@ fn load_table_with_retries(retries: u32) -> String {
 fn memory_write_table() -> WriteTable {
     WriteTable {
         table: memory_table(LOAD_TABLE_NO_SNAPSHOTS, &ident("ns", "t")),
-        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None, system_clock())),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     }
 }
 
 fn memory_staged_table() -> StagedTable {
     StagedTable(WriteTable {
         table: memory_table(STAGE_TABLE, &ident("ns", "staged")),
-        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None, system_clock())),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     })
 }
 
@@ -367,116 +367,111 @@ fn azure_storage() -> WriteStorage {
     })
 }
 
-/// [`STAGE_TABLE`] at a location under `prefix`, its credentials holding an ADLS SAS for the
-/// `account` host beside the recorded S3 keys.
-fn stage_answer_under(prefix: &str) -> String {
-    let mut answer: serde_json::Value =
-        serde_json::from_str(&STAGE_TABLE.replace("s3://warehouse/lakehouse_vended/", prefix))
-            .unwrap();
-    answer["storage-credentials"][0]["config"]["adls.sas-token.account.dfs.core.windows.net"] =
-        "sv=2022-11-02&sig=STAGED_SAS".into();
-    answer.to_string()
+fn vended_storage() -> WriteStorage {
+    WriteStorage::Vended(StaticStoreAddress::default())
 }
 
-/// Scenario: A table location the CONNECTION's storage cannot address is refused
-#[tokio::test]
-async fn a_location_its_storage_cannot_address_is_refused_naming_the_table_and_the_scheme() {
-    let abfss = "abfss://warehouse@account.dfs.core.windows.net/";
-    let abfs = "abfs://warehouse@account.dfs.core.windows.net/";
-    // (case, storage, ALLOW_HTTP, location prefix, refusal or `None` when the table opens)
-    type Case = (
-        &'static str,
-        fn() -> WriteStorage,
+#[test]
+fn a_location_its_storage_cannot_address_is_refused_naming_the_table_and_the_scheme() {
+    let abfss = "abfss://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs = "abfs://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs_needs_allow_http = "plaintext scheme abfs needs the export option ALLOW_HTTP = \
+                                 'true', which acknowledges that the export writes the location \
+                                 over HTTPS";
+    // (case, storage, ALLOW_HTTP, location, the vended backend it selects or the refusal's tail)
+    type Case<'a> = (
+        &'a str,
+        WriteStorage,
         bool,
-        &'static str,
-        Option<&'static str>,
+        &'a str,
+        Result<&'a str, &'a str>,
     );
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         (
             "static S3 on abfss",
-            static_storage,
+            static_storage(),
             false,
             abfss,
-            Some("whose scheme abfss the CONNECTION's S3 storage cannot address"),
+            Err("scheme abfss the CONNECTION's S3 storage cannot address"),
         ),
         (
             "static S3 on s3a",
-            static_storage,
+            static_storage(),
             false,
-            "s3a://warehouse/",
-            None,
+            "s3a://warehouse/ns/t",
+            Ok("none"),
         ),
         (
             "static Azure on s3",
-            azure_storage,
+            azure_storage(),
             true,
-            "s3://warehouse/",
-            Some("whose scheme s3 the CONNECTION's Azure storage cannot address"),
+            "s3://warehouse/ns/t",
+            Err("scheme s3 the CONNECTION's Azure storage cannot address"),
         ),
         (
             "static Azure on abfs",
-            azure_storage,
+            azure_storage(),
             true,
             abfs,
-            Some("whose scheme abfs the CONNECTION's Azure storage cannot address"),
+            Err("scheme abfs the CONNECTION's Azure storage cannot address"),
         ),
-        ("static Azure on abfss", azure_storage, false, abfss, None),
+        (
+            "static Azure on abfss",
+            azure_storage(),
+            false,
+            abfss,
+            Ok("none"),
+        ),
         (
             "vended on gs",
-            vended_storage,
+            vended_storage(),
             true,
-            "gs://warehouse/",
-            Some("whose scheme gs vended storage cannot address"),
+            "gs://warehouse/ns/t",
+            Err("scheme gs vended storage cannot address"),
         ),
         (
             "vended on abfs without ALLOW_HTTP",
-            vended_storage,
+            vended_storage(),
             false,
             abfs,
-            Some(
-                "whose scheme abfs names plain-HTTP transport, but the export option ALLOW_HTTP is not 'true'",
-            ),
+            Err(abfs_needs_allow_http),
         ),
         (
             "vended on abfs with ALLOW_HTTP",
-            vended_storage,
+            vended_storage(),
             true,
             abfs,
-            None,
+            Ok("ADLS"),
         ),
-        ("vended on abfss", vended_storage, false, abfss, None),
+        (
+            "vended on abfss",
+            vended_storage(),
+            false,
+            abfss,
+            Ok("ADLS"),
+        ),
+        (
+            "vended on s3a",
+            vended_storage(),
+            false,
+            "s3a://warehouse/ns/t",
+            Ok("S3"),
+        ),
     ];
 
-    for (case, storage, allow_http, prefix, refusal) in cases {
-        let answer = stage_answer_under(prefix);
-        let (uri, _) = catalog(PREFIX_CONFIG, routes(vec![(TABLES, (200, answer))])).await;
-        let use_vended = matches!(storage(), WriteStorage::Vended(_));
-        let writes = TableWriteSession::new(session(&uri, use_vended).await, storage(), allow_http);
+    for (case, storage, allow_http, location, expected) in cases {
+        let checked = refuse_unaddressable(&storage, allow_http, &ident("ns", "t"), location)
+            .map(|kind| match kind {
+                None => "none",
+                Some(VendedBackendKind::S3) => "S3",
+                Some(VendedBackendKind::Adls) => "ADLS",
+            })
+            .map_err(|error| error.to_string());
 
-        let staged = writes
-            .stage_table(&ident("ns", "staged"), schema(), "e1")
-            .await;
-
-        match (staged, refusal) {
-            (Ok(_), None) => {}
-            (Err(error), Some(refusal)) => {
-                let error = error.to_string();
-                let location = format!("{prefix}01a1bf3b-af23-7020-ac26-0a0912b927ee");
-                assert!(
-                    error.starts_with("table ns.staged has the "),
-                    "{case}: {error}"
-                );
-                assert!(error.contains(&location), "{case}: {error}");
-                assert!(error.contains(refusal), "{case}: {error}");
-            }
-            (Ok(_), Some(_)) => panic!("{case}: expected a refusal"),
-            (Err(error), None) => panic!("{case}: {error}"),
-        }
+        let expected = expected
+            .map_err(|tail| format!("table ns.t has the location {location}, whose {tail}"));
+        assert_eq!(checked, expected, "{case}");
     }
-}
-
-fn vended_storage() -> WriteStorage {
-    WriteStorage::Vended(StaticStoreAddress::default())
 }
 
 #[tokio::test]
@@ -1128,7 +1123,7 @@ fn load_table_with_ids(schema_id: i32, spec_id: i32) -> String {
 fn memory_write_table_with_ids(schema_id: i32, spec_id: i32) -> WriteTable {
     WriteTable {
         table: memory_table(&load_table_with_ids(schema_id, spec_id), &ident("ns", "t")),
-        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None, system_clock())),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     }
 }
 

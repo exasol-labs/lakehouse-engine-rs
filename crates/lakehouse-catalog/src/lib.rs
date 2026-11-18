@@ -56,9 +56,6 @@ pub use storage::{
 };
 pub use sts::{AssumedRole, ResolvedIdentity, resolve_aws_identity};
 
-pub use vended::{
-    VendedAdlsSas, VendedCredentialSet, VendedS3Credentials, resolve_vended_storage,
-    vended_adls_sas, vended_s3_credentials,
-};
+pub use vended::{VendedAdlsSas, VendedCredentialSet, VendedS3Credentials, resolve_vended_storage};
 
 pub use unity::{TemporaryTableCredentials, UnityCatalogSession, resolve_uc_vended_storage};

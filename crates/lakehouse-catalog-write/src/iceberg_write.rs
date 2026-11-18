@@ -19,8 +19,8 @@ use iceberg_catalog_rest::{
 use lakehouse_catalog::{
     AssumedRole, CatalogResponse, CatalogSendError, CatalogSession, ConnectionCreds, EpochClock,
     RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, VendedBackendKind,
-    classify_vended_scheme, namespace_tables_path, resolve_vended_storage, scheme_of, system_clock,
-    table_ident_path, vended_adls_sas, vended_s3_credentials,
+    VendedCredentialSet, classify_vended_scheme, namespace_tables_path, resolve_vended_storage,
+    scheme_of, system_clock, table_ident_path,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -601,65 +601,33 @@ impl TableWriteSession {
     /// the storage cannot address is refused before any storage is configured.
     fn open(&self, table: &TableIdent, answer: LoadTableResult) -> Result<WriteTable, UdfError> {
         let location = answer.metadata.location().to_string();
-        self.refuse_unaddressable(table, &location)?;
-        let (file_io, credentials) = self.storage_of(table, &answer, location)?;
+        let vended_kind = refuse_unaddressable(&self.storage, self.allow_http, table, &location)?;
+        let (file_io, credentials) = self.storage_of(table, &answer, location, vended_kind)?;
         let table = iceberg_table(table, answer, file_io)
             .map_err(|error| UdfError::User(format!("could not open table {}: {error}", table)))?;
         Ok(WriteTable { table, credentials })
     }
 
-    /// The CONNECTION's S3 storage, by keys or a role, addresses `s3` and `s3a`, its Azure storage
-    /// `abfss`, and vended storage all four schemes, `abfs` only under the export's `ALLOW_HTTP`.
-    fn refuse_unaddressable(&self, table: &TableIdent, location: &str) -> Result<(), UdfError> {
-        let scheme = scheme_of(location);
-        let storage = match &self.storage {
-            WriteStorage::Static(backend) | WriteStorage::AssumedRole { backend, .. } => {
-                if backend.addresses_scheme(&scheme) {
-                    return Ok(());
-                }
-                match backend {
-                    StorageBackend::S3(_) => "the CONNECTION's S3 storage",
-                    StorageBackend::Adls { .. } => "the CONNECTION's Azure storage",
-                }
-            }
-            WriteStorage::Vended(_) => match classify_vended_scheme(&scheme) {
-                Some(VendedBackendKind::Adls) if scheme == "abfs" && !self.allow_http => {
-                    return Err(UdfError::User(format!(
-                        "table {table} has the plaintext location {location}, whose scheme abfs \
-                         names plain-HTTP transport, but the export option ALLOW_HTTP is not \
-                         'true'"
-                    )));
-                }
-                Some(_) => return Ok(()),
-                None => "vended storage",
-            },
-        };
-        Err(UdfError::User(format!(
-            "table {table} has the location {location}, whose scheme {scheme} {storage} cannot \
-             address"
-        )))
-    }
-
     /// The FileIO of the table at `location` and the credential source it signs with: the
     /// CONNECTION's own credentials, the credentials of its role, or the credentials `answer`
-    /// vends. Each is seeded into a source that renews it its own way.
+    /// vends, of the backend `vended_kind` selects. Each is seeded into a source that renews it its
+    /// own way.
     fn storage_of(
         &self,
         table: &TableIdent,
         answer: &LoadTableResult,
         location: String,
+        vended_kind: Option<VendedBackendKind>,
     ) -> Result<(FileIO, TableCredentials), UdfError> {
         match &self.storage {
             WriteStorage::Static(StorageBackend::Adls { cred, .. }) => {
-                let credentials = AdlsCredentials::connection(cred, self.clock.clone())?;
-                Ok(adls_storage(&location, credentials))
+                Ok(adls_storage(&location, AdlsCredentials::connection(cred)?))
             }
             WriteStorage::Static(backend @ StorageBackend::S3(props)) => {
                 let keys = StorageCredentials::keys(
                     &props.access_key,
                     &props.secret_key,
                     props.session_token.as_deref(),
-                    self.clock.clone(),
                 );
                 s3_storage(backend, keys)
             }
@@ -673,19 +641,58 @@ impl TableWriteSession {
                     location: location.clone(),
                     allow_http: self.allow_http,
                 };
-                if let Some(VendedBackendKind::Adls) = classify_vended_scheme(&scheme_of(&location))
-                {
-                    let seed = vended_adls_sas(answer, &location)?;
+                let set = VendedCredentialSet::of(answer, &location);
+                if let Some(VendedBackendKind::Adls) = vended_kind {
+                    let seed = set.adls_sas(&location)?;
                     let credentials = AdlsCredentials::vended(vended, seed, self.clock.clone())?;
                     return Ok(adls_storage(&location, credentials));
                 }
-                let seed = vended_s3_credentials(answer, &location)?;
+                let seed = set.s3(&location)?;
                 let credentials = StorageCredentials::vended(vended, seed, self.clock.clone())?;
                 let backend = resolve_vended_storage(answer, &location, self.allow_http, address)?;
                 s3_storage(&backend, credentials)
             }
         }
     }
+}
+
+/// Refuses a location the storage cannot address: the CONNECTION's S3 storage, by keys or a role,
+/// addresses `s3` and `s3a`, its Azure storage `abfss`, and vended storage all four schemes,
+/// `abfs` only under the export's `ALLOW_HTTP`. Returns the backend a vended location selects.
+fn refuse_unaddressable(
+    storage: &WriteStorage,
+    allow_http: bool,
+    table: &TableIdent,
+    location: &str,
+) -> Result<Option<VendedBackendKind>, UdfError> {
+    let scheme = scheme_of(location);
+    let storage = match storage {
+        WriteStorage::Static(backend) | WriteStorage::AssumedRole { backend, .. } => {
+            if backend.addresses_scheme(&scheme) {
+                return Ok(None);
+            }
+            match backend {
+                StorageBackend::S3(_) => "the CONNECTION's S3 storage",
+                StorageBackend::Adls { .. } => "the CONNECTION's Azure storage",
+            }
+        }
+        WriteStorage::Vended(_) => match classify_vended_scheme(&scheme) {
+            // object_store writes `abfs` over HTTPS too; ALLOW_HTTP acknowledges the upgrade, as
+            // the virtual schema's property does.
+            Some(VendedBackendKind::Adls) if scheme == "abfs" && !allow_http => {
+                return Err(UdfError::User(format!(
+                    "table {table} has the location {location}, whose plaintext scheme abfs needs \
+                     the export option ALLOW_HTTP = 'true', which acknowledges that the export \
+                     writes the location over HTTPS"
+                )));
+            }
+            Some(kind) => return Ok(Some(kind)),
+            None => "vended storage",
+        },
+    };
+    Err(UdfError::User(format!(
+        "table {table} has the location {location}, whose scheme {scheme} {storage} cannot address"
+    )))
 }
 
 fn s3_storage(

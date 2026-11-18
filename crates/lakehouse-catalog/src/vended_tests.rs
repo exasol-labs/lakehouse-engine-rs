@@ -142,6 +142,22 @@ fn resolved_adls_sas(
     }
 }
 
+/// The S3 credentials a `loadTable` answer vends for `location`.
+fn vended_s3_credentials(
+    answer: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Result<VendedS3Credentials, UdfError> {
+    VendedCredentialSet::of(answer, location).s3(location)
+}
+
+/// The ADLS SAS a `loadTable` answer vends for `location`'s host.
+fn vended_adls_sas(
+    answer: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Result<VendedAdlsSas, UdfError> {
+    VendedCredentialSet::of(answer, location).adls_sas(location)
+}
+
 fn assert_names_no_credential_value(message: &str) {
     for secret in CREDENTIAL_SENTINELS {
         assert!(
@@ -1459,7 +1475,6 @@ fn adls_entry_with(key: &str, value: Option<&str>) -> iceberg_catalog_rest::Load
 
 #[test]
 fn vended_adls_sas_is_the_selected_sources_sas_of_the_location_host_with_its_expiry() {
-    let full = vended_adls_sas(&adls_entry_with("", None), ADLS_ANCHOR).unwrap();
     let upper_host = ADLS_HOST.to_ascii_uppercase();
     let case_variant = make_load_table_result(
         None,
@@ -1478,22 +1493,31 @@ fn vended_adls_sas_is_the_selected_sources_sas_of_the_location_host_with_its_exp
             ),
         ],
     );
-    let case_variant = vended_adls_sas(&case_variant, ADLS_ANCHOR).unwrap();
-    let without_expiry = vended_adls_sas(
-        &adls_entry_with(
-            &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}"),
-            None,
+    let without_expiry = adls_entry_with(
+        &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}"),
+        None,
+    );
+    let cases = [
+        (
+            "the covering entry",
+            adls_entry_with("", None),
+            Some(1_700_000_000_000),
         ),
-        ADLS_ANCHOR,
-    )
-    .unwrap();
+        (
+            "a case variant of the host",
+            case_variant,
+            Some(1_700_000_000_000),
+        ),
+        ("no stated expiry", without_expiry, None),
+    ];
 
-    assert_eq!(full.sas, VENDED_SAS);
-    assert_eq!(full.expires_at_ms, Some(1_700_000_000_000));
-    assert_eq!(case_variant.sas, VENDED_SAS);
-    assert_eq!(case_variant.expires_at_ms, Some(1_700_000_000_000));
-    assert_eq!(without_expiry.sas, VENDED_SAS);
-    assert_eq!(without_expiry.expires_at_ms, None);
+    for (case, answer, expires_at_ms) in cases {
+        let sas =
+            vended_adls_sas(&answer, ADLS_ANCHOR).unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert_eq!(sas.sas, VENDED_SAS, "{case}");
+        assert_eq!(sas.expires_at_ms, expires_at_ms, "{case}");
+    }
 }
 
 #[test]
@@ -1546,7 +1570,7 @@ fn vended_adls_sas_takes_its_expiry_from_the_key_spelling_its_sas_comes_from() {
     );
 }
 
-/// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
 #[test]
 fn vended_adls_sas_without_a_sas_or_a_readable_expiry_is_refused_naming_the_key() {
     let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");

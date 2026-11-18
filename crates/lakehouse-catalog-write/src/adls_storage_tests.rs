@@ -1,17 +1,11 @@
 use super::*;
 use lakehouse_catalog::AdlsCred;
-use lakehouse_catalog::exported_test_support::clock_reading;
-use std::sync::atomic::AtomicU64;
 
 const LOCATION: &str = "abfss://container@account.dfs.core.windows.net/warehouse/ns/t";
 const SAS: &str = "sv=2022-11-02&sr=c&sp=racwdl&sig=SAS_SIGNATURE_SECRET";
 
 fn credentials() -> AdlsCredentials {
-    AdlsCredentials::connection(
-        &AdlsCred::Sas(SAS.into()),
-        clock_reading(&Arc::new(AtomicU64::new(0))),
-    )
-    .unwrap()
+    AdlsCredentials::connection(&AdlsCred::Sas(SAS.into())).unwrap()
 }
 
 fn storage() -> AdlsStorage {

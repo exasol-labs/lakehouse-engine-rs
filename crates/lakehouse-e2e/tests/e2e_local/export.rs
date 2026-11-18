@@ -106,6 +106,16 @@ fn missing_grant_error(user: &str) -> String {
     )
 }
 
+/// Static Azure storage fields over the local catalog, whose warehouse lies on `s3://`.
+fn azure_connection_password() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        account_name: Some("exporte2e".to_string()),
+        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
+        ..Default::default()
+    }
+}
+
 /// A table no earlier export wrote.
 fn new_table() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -444,11 +454,8 @@ fn export_refuses_unwritable_connections_and_column_names() {
     setup();
     let mut sys = exa_conn();
     let azure_role = CatalogConnectionPassword {
-        warehouse: "s3://warehouse/".to_string(),
-        account_name: Some("exporte2e".to_string()),
-        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
         aws_assume_role_arn: Some("arn:aws:iam::000000000000:role/export-e2e".to_string()),
-        ..Default::default()
+        ..azure_connection_password()
     };
     let sigv4 = CatalogConnectionPassword {
         use_sigv4: true,
@@ -529,6 +536,45 @@ fn export_refuses_unwritable_connections_and_column_names() {
             "{case}: the account key leaked: {error}"
         );
         assert!(!table_exists(&table), "{case}: {table} must not exist");
+    }
+}
+
+/// Scenario: A table location the CONNECTION's storage cannot address is refused
+#[test]
+fn export_through_azure_storage_into_an_s3_location_is_refused_naming_the_scheme() {
+    stack();
+    setup();
+    let mut sys = exa_conn();
+    let azure = azure_connection_password();
+    let connection = "EXPORT_E2E_AZURE_LOCATION_CREDS";
+    sys.execute(&build_create_connection_sql(
+        connection,
+        &iceberg_catalog_url_internal(),
+        &azure,
+    ));
+
+    for options in ["", "SINGLE_COMMIT = 'true'"] {
+        let table = new_table();
+        let route = ExportRoute {
+            connection,
+            ..DIRECT
+        };
+        let error = export_error(
+            &mut sys,
+            &route.export(SOURCE_TABLE, &table, options),
+            &[AZURE_ACCOUNT_KEY],
+        );
+
+        assert!(
+            error.contains(&format!("table {table} has the location s3://"))
+                && error.contains("whose scheme s3 the CONNECTION's Azure storage cannot address"),
+            "{options}: {error}"
+        );
+        let data_files = objects_under(&format!("{}/data/", table.replace('.', "/")));
+        assert!(
+            data_files.is_empty(),
+            "{options}: no data file may be written: {data_files:?}"
+        );
     }
 }
 

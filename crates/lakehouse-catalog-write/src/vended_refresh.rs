@@ -35,6 +35,15 @@ pub(crate) fn keep_at_renewal_point(point: RenewalPoint) -> bool {
     renewed_recently && point.now_ms < point.expires_at_ms
 }
 
+/// [`keep_at_renewal_point`] as the decision of a vended holder's `get_or_keep`.
+fn vended_decision(point: RenewalPoint) -> Result<AtRenewalPoint, String> {
+    Ok(if keep_at_renewal_point(point) {
+        AtRenewalPoint::Keep
+    } else {
+        AtRenewalPoint::Renew
+    })
+}
+
 /// The credential source of a table's FileIO, of the backend its location selects.
 pub(crate) enum TableCredentials {
     S3(StorageCredentials),
@@ -70,24 +79,19 @@ pub(crate) struct StorageCredentials {
 }
 
 enum Source {
-    /// The CONNECTION's own keys: a lease with no expiry, never renewed.
-    Keys(ExpiringCredential<AwsCredential>),
+    /// The CONNECTION's own keys, which never expire.
+    Keys(AwsCredential),
     /// An assumed role, shared with the catalog signing that reads the same holder.
     Role(AssumedRole),
     Vended {
-        holder: ExpiringCredential<AwsCredential>,
+        holder: Box<ExpiringCredential<AwsCredential>>,
         vended: VendedTable,
     },
 }
 
 impl StorageCredentials {
     /// The CONNECTION's keys, which do not expire.
-    pub(crate) fn keys(
-        access_key: &str,
-        secret_key: &str,
-        session_token: Option<&str>,
-        clock: EpochClock,
-    ) -> Self {
+    pub(crate) fn keys(access_key: &str, secret_key: &str, session_token: Option<&str>) -> Self {
         let lease = aws_lease(
             access_key.to_string(),
             secret_key.to_string(),
@@ -95,11 +99,7 @@ impl StorageCredentials {
             None,
         );
         Self {
-            inner: Arc::new(Source::Keys(ExpiringCredential::seeded(
-                lease,
-                RENEWAL_SKEW,
-                clock,
-            ))),
+            inner: Arc::new(Source::Keys(lease.value)),
         }
     }
 
@@ -120,7 +120,7 @@ impl StorageCredentials {
         let lease = vended_lease(seed, &vended).map_err(UdfError::User)?;
         Ok(Self {
             inner: Arc::new(Source::Vended {
-                holder: ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock),
+                holder: Box::new(ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock)),
                 vended,
             }),
         })
@@ -135,44 +135,18 @@ impl StorageCredentials {
     pub(crate) fn secret_values(&self) -> Vec<String> {
         match &*self.inner {
             Source::Role(role) => role.secret_values(),
-            Source::Keys(holder) | Source::Vended { holder, .. } => holder
-                .current()
-                .into_iter()
-                .flat_map(|credential| {
-                    [
-                        Some(credential.access_key_id),
-                        Some(credential.secret_access_key),
-                        credential.session_token,
-                    ]
-                })
-                .flatten()
-                .filter(|value| !value.is_empty())
-                .collect(),
+            Source::Keys(keys) => aws_secret_values(Some(keys.clone())),
+            Source::Vended { holder, .. } => aws_secret_values(holder.current()),
         }
     }
 
     async fn credential(&self) -> Result<AwsCredential, String> {
         match &*self.inner {
             Source::Role(role) => role.credential().await.map_err(|error| error.to_string()),
-            Source::Keys(holder) => {
-                holder
-                    .get(|_| async {
-                        Err("the CONNECTION's storage keys cannot be renewed".into())
-                    })
-                    .await
-            }
+            Source::Keys(keys) => Ok(keys.clone()),
             Source::Vended { holder, vended } => {
                 holder
-                    .get_or_keep(
-                        |point| {
-                            Ok(if keep_at_renewal_point(point) {
-                                AtRenewalPoint::Keep
-                            } else {
-                                AtRenewalPoint::Renew
-                            })
-                        },
-                        |_| self.renew_vended(vended),
-                    )
+                    .get_or_keep(vended_decision, |_| self.renew_vended(vended))
                     .await
             }
         }
@@ -184,6 +158,22 @@ impl StorageCredentials {
             .and_then(|credentials| vended_lease(credentials, vended));
         renewal.map_err(|cause| refresh_failure(vended, &self.secret_values(), &cause))
     }
+}
+
+/// The non-empty values of an AWS credential, none before the first one.
+fn aws_secret_values(credential: Option<AwsCredential>) -> Vec<String> {
+    credential
+        .into_iter()
+        .flat_map(|credential| {
+            [
+                Some(credential.access_key_id),
+                Some(credential.secret_access_key),
+                credential.session_token,
+            ]
+        })
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 impl ProvideCredential for StorageCredentials {
@@ -259,32 +249,24 @@ pub(crate) struct AdlsCredentials {
 }
 
 enum AdlsSource {
-    /// The CONNECTION's account key or SAS: a lease with no expiry, never renewed.
-    Connection(ExpiringCredential<AdlsSecret>),
+    /// The CONNECTION's account key or SAS, which never expires.
+    Connection(AdlsSecret),
     Vended {
-        holder: ExpiringCredential<AdlsSecret>,
+        holder: Box<ExpiringCredential<AdlsSecret>>,
         vended: VendedTable,
     },
 }
 
 impl AdlsCredentials {
     /// The CONNECTION's account key or SAS, which do not expire.
-    pub(crate) fn connection(cred: &AdlsCred, clock: EpochClock) -> Result<Self, UdfError> {
+    pub(crate) fn connection(cred: &AdlsCred) -> Result<Self, UdfError> {
         let secret = match cred {
             AdlsCred::AccountKey(key) => account_key_secret(key),
             AdlsCred::Sas(sas) => sas_secret(sas),
         }
         .map_err(|cause| UdfError::User(format!("the CONNECTION's {cause}")))?;
-        let lease = Lease {
-            value: secret,
-            expires_at_ms: None,
-        };
         Ok(Self {
-            inner: Arc::new(AdlsSource::Connection(ExpiringCredential::seeded(
-                lease,
-                RENEWAL_SKEW,
-                clock,
-            ))),
+            inner: Arc::new(AdlsSource::Connection(secret)),
         })
     }
 
@@ -300,7 +282,7 @@ impl AdlsCredentials {
         })?;
         Ok(Self {
             inner: Arc::new(AdlsSource::Vended {
-                holder: ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock),
+                holder: Box::new(ExpiringCredential::seeded(lease, RENEWAL_SKEW, clock)),
                 vended,
             }),
         })
@@ -308,37 +290,22 @@ impl AdlsCredentials {
 
     /// The credential value held now, for value-based error redaction.
     pub(crate) fn secret_values(&self) -> Vec<String> {
-        match &*self.inner {
-            AdlsSource::Connection(holder) | AdlsSource::Vended { holder, .. } => holder
-                .current()
-                .map(|secret| secret.value)
-                .filter(|value| !value.is_empty())
-                .into_iter()
-                .collect(),
-        }
+        let held = match &*self.inner {
+            AdlsSource::Connection(secret) => Some(secret.clone()),
+            AdlsSource::Vended { holder, .. } => holder.current(),
+        };
+        held.map(|secret| secret.value)
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect()
     }
 
     async fn credential(&self) -> Result<AdlsSecret, String> {
         match &*self.inner {
-            AdlsSource::Connection(holder) => {
-                holder
-                    .get(|_| async {
-                        Err("the CONNECTION's storage credential cannot be renewed".into())
-                    })
-                    .await
-            }
+            AdlsSource::Connection(secret) => Ok(secret.clone()),
             AdlsSource::Vended { holder, vended } => {
                 holder
-                    .get_or_keep(
-                        |point| {
-                            Ok(if keep_at_renewal_point(point) {
-                                AtRenewalPoint::Keep
-                            } else {
-                                AtRenewalPoint::Renew
-                            })
-                        },
-                        |_| self.renew_vended(vended),
-                    )
+                    .get_or_keep(vended_decision, |_| self.renew_vended(vended))
                     .await
             }
         }

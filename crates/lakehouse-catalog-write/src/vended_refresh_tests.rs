@@ -176,10 +176,8 @@ async fn expired_credentials_renew_whether_or_not_the_catalog_lists_the_credenti
 
 #[tokio::test]
 async fn connection_keys_never_expire_and_are_never_renewed() {
-    let time = Arc::new(AtomicU64::new(0));
-    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"), clock_reading(&time));
+    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"));
 
-    time.store(u64::MAX / 2, Ordering::SeqCst);
     let kept = provide(&source).await.unwrap();
 
     assert_eq!(kept.access_key_id, "KEY");
@@ -379,7 +377,7 @@ async fn a_vended_sas_within_five_minutes_of_expiry_is_renewed_and_signs_the_nex
     );
 }
 
-/// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
 #[tokio::test]
 async fn credentials_without_an_expiry_are_used_as_vended_and_never_renewed() {
     let (uri, requests) = catalog(OFFERING_CONFIG, |_| (200, LOAD_ADLS_CREDENTIALS.into())).await;
@@ -397,7 +395,7 @@ async fn credentials_without_an_expiry_are_used_as_vended_and_never_renewed() {
     assert_eq!(credential_requests(&requests), Vec::<String>::new());
 }
 
-/// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
 #[tokio::test]
 async fn a_renewal_sas_answer_without_the_hosts_sas_is_refused_naming_the_key() {
     let keyless =
@@ -424,16 +422,10 @@ async fn a_renewal_sas_answer_without_the_hosts_sas_is_refused_naming_the_key() 
 
 #[tokio::test]
 async fn the_connections_account_key_and_sas_are_never_renewed() {
-    let time = Arc::new(AtomicU64::new(0));
     let key = "c2VjcmV0LWtleQ==";
-    let account_key =
-        AdlsCredentials::connection(&AdlsCred::AccountKey(key.into()), clock_reading(&time))
-            .unwrap();
-    let sas =
-        AdlsCredentials::connection(&AdlsCred::Sas(format!("?{SEED_SAS}")), clock_reading(&time))
-            .unwrap();
+    let account_key = AdlsCredentials::connection(&AdlsCred::AccountKey(key.into())).unwrap();
+    let sas = AdlsCredentials::connection(&AdlsCred::Sas(format!("?{SEED_SAS}"))).unwrap();
 
-    time.store(u64::MAX / 2, Ordering::SeqCst);
     let signing_key = account_key.get_credential().await.unwrap();
 
     assert!(matches!(&*signing_key, AzureCredential::AccessKey(_)));
@@ -447,7 +439,6 @@ async fn the_connections_account_key_and_sas_are_never_renewed() {
 
 #[test]
 fn a_malformed_connection_account_key_or_sas_is_refused_naming_the_field_but_no_value() {
-    let clock = clock_reading(&Arc::new(AtomicU64::new(0)));
     let cases = [
         (
             AdlsCred::AccountKey("NOT BASE64 SECRET".into()),
@@ -457,9 +448,7 @@ fn a_malformed_connection_account_key_or_sas_is_refused_naming_the_field_but_no_
     ];
 
     for (cred, field) in cases {
-        let refused = AdlsCredentials::connection(&cred, clock.clone())
-            .unwrap_err()
-            .to_string();
+        let refused = AdlsCredentials::connection(&cred).unwrap_err().to_string();
 
         assert!(
             refused.starts_with(&format!("the CONNECTION's {field}")),

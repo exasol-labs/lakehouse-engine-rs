@@ -57,17 +57,24 @@ impl fmt::Debug for VendedAdlsSas {
     }
 }
 
-/// The vended credentials that apply to one table location, as a `loadCredentials` answer selects
-/// them. It carries credentials, so `Debug` shows none.
+/// The vended credentials that apply to one table location, as a `loadTable` or `loadCredentials`
+/// answer selects them. It carries credentials, so `Debug` shows none.
 pub struct VendedCredentialSet(pub(crate) HashMap<String, String>);
 
 impl VendedCredentialSet {
-    /// The set read as S3 keys, as [`vended_s3_credentials`] reads a `loadTable` answer.
+    /// The set `answer` vends for `location`, from the same credential source that
+    /// [`resolve_vended_storage`] selects.
+    pub fn of(answer: &LoadTableResult, location: &str) -> Self {
+        Self(vended_credential_config(answer, location).clone())
+    }
+
+    /// The set read as S3 keys. A refusal names the missing or unreadable key, never a value.
     pub fn s3(&self, location: &str) -> Result<VendedS3Credentials, UdfError> {
         s3_credentials(&self.0, location)
     }
 
-    /// The set read as an ADLS SAS, as [`vended_adls_sas`] reads a `loadTable` answer.
+    /// The set read as the SAS for `location`'s host and its expiry, with the host match of
+    /// [`resolve_vended_storage`]. A refusal names the missing or unreadable key, never a value.
     pub fn adls_sas(&self, location: &str) -> Result<VendedAdlsSas, UdfError> {
         adls_sas_credentials(&self.0, location)
     }
@@ -78,25 +85,6 @@ impl fmt::Debug for VendedCredentialSet {
         f.debug_struct("VendedCredentialSet")
             .finish_non_exhaustive()
     }
-}
-
-/// The S3 credentials `answer` vends for `location`, read from the same credential source that
-/// [`resolve_vended_storage`] selects. A refusal names the missing or unreadable key, never a value.
-pub fn vended_s3_credentials(
-    answer: &LoadTableResult,
-    location: &str,
-) -> Result<VendedS3Credentials, UdfError> {
-    s3_credentials(vended_credential_config(answer, location), location)
-}
-
-/// The ADLS SAS `answer` vends for `location`'s host and its expiry, read from the same
-/// credential source and with the same host match as [`resolve_vended_storage`]. A refusal names
-/// the missing or unreadable key, never a value.
-pub fn vended_adls_sas(
-    answer: &LoadTableResult,
-    location: &str,
-) -> Result<VendedAdlsSas, UdfError> {
-    adls_sas_credentials(vended_credential_config(answer, location), location)
 }
 
 /// `anchor` must be the table's OWN location (what `storage_credentials[*].prefix` is
@@ -183,7 +171,6 @@ fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<V
 }
 
 /// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
-/// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
 pub(crate) fn s3_credentials(
     vended: &HashMap<String, String>,
     anchor: &str,
@@ -255,7 +242,7 @@ fn selected_sas<'a>(
     anchor: &'a str,
 ) -> Result<(&'a str, &'a String), UdfError> {
     let host = location_host(anchor);
-    host_key_suffixes(vended, VENDED_SAS_TOKEN_KEY_PREFIX, host)
+    sas_key_hosts(vended, host)
         .into_iter()
         .find_map(|suffix| {
             vended
@@ -272,21 +259,17 @@ fn selected_sas<'a>(
         })
 }
 
-/// The host spellings of the `<prefix><host>` keys: `host` itself first when present, then every
-/// case variant (RFC 3986 §3.2.2), smallest key first.
-fn host_key_suffixes<'a>(
-    vended: &'a HashMap<String, String>,
-    prefix: &str,
-    host: &'a str,
-) -> Vec<&'a str> {
+/// The host spellings of the SAS keys: `host` itself first when present, then every case variant
+/// (RFC 3986 §3.2.2), smallest key first.
+fn sas_key_hosts<'a>(vended: &'a HashMap<String, String>, host: &'a str) -> Vec<&'a str> {
     let mut variants: Vec<&str> = vended
         .keys()
-        .filter_map(|key| key.strip_prefix(prefix))
+        .filter_map(|key| key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX))
         .filter(|key_host| *key_host != host && key_host.eq_ignore_ascii_case(host))
         .collect();
     variants.sort_unstable();
     let exact = vended
-        .contains_key(&format!("{prefix}{host}"))
+        .contains_key(&format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
         .then_some(host);
     exact.into_iter().chain(variants).collect()
 }
