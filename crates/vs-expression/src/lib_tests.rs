@@ -777,6 +777,33 @@ fn literal_timestamputc_wire_name_renders_exasol_only() {
 }
 
 #[test]
+fn tstz_literal_keeps_its_fractional_digits_in_exasol_dialect() {
+    let cases = [
+        (
+            "2024-03-01 09:00:00.245223",
+            "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+        ),
+        (
+            "2024-03-01 09:00:00.245223789",
+            "TIMESTAMP(9) WITH LOCAL TIME ZONE",
+        ),
+        (
+            "2024-03-01 09:00:00.2452",
+            "TIMESTAMP(4) WITH LOCAL TIME ZONE",
+        ),
+        ("2024-03-01 09:00:00.245", "TIMESTAMP WITH LOCAL TIME ZONE"),
+        ("2024-03-01 09:00:00", "TIMESTAMP WITH LOCAL TIME ZONE"),
+    ];
+    for (value, cast_type) in cases {
+        assert_eq!(
+            render_expression_exasol(&lit("literal_timestamputc", value)),
+            format!("CAST(CONVERT_TZ(TIMESTAMP '{value}', 'UTC', SESSIONTIMEZONE) AS {cast_type})"),
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn renders_null_valued_tstz_literal_bare_in_exasol_dialect() {
     for node_type in ["literal_timestamp_utc", "literal_timestamputc"] {
         for node in [

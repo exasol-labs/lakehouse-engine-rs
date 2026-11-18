@@ -116,14 +116,23 @@ fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
 
 /// Converting the UTC-normalized wire value into `SESSIONTIMEZONE` reproduces
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
-/// session-local (verified live).
+/// session-local (verified live). A bare TSTZ cast keeps 3 fractional digits, so a longer value
+/// names its precision; Exasol 8 never sends more than 3 and has no precision syntax.
 fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
-        Some(_) => format!(
-            "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)",
-            render_exasol_timestamp_literal(value)
-        ),
+        Some(v) => {
+            let digits = v
+                .as_str()
+                .map_or(0, |s| TimestampLiteral(s).type_precision());
+            let cast_type = ExasolType::TimestampWithLocalTimeZone {
+                precision: u8::try_from(digits.max(3)).unwrap_or(u8::MAX),
+            };
+            format!(
+                "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS {cast_type})",
+                render_exasol_timestamp_literal(value)
+            )
+        }
     }
 }
 

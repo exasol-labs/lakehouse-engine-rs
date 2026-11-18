@@ -13,6 +13,7 @@ use crate::common::seed::{
     CLOCK_ROWS, E2E_CLOCK_NAMESPACE, E2E_CLOCK_TABLE, E2E_CLOCK_TABLE_2, seed_clock_probe,
 };
 use crate::common::stack::iceberg_catalog_url;
+use crate::common::timestamp_precision::engine_honors_declared_precision;
 use crate::fixtures::{explain_virtual_messages, explain_virtual_pushdown_sql, stack, vs_table};
 
 const VS: &str = "CLOCK_VS";
@@ -332,6 +333,27 @@ fn clock_functions_match_native_when_the_session_zone_matches() {
         through_vs,
         column_type(&mut conn, "SELECT CURRENT_TIMESTAMP")
     );
+}
+
+/// Scenario: The clock functions fold in the zone that Exasol uses when the session zone matches
+#[test]
+fn a_projected_tstz_value_keeps_its_fractional_digits() {
+    let mut conn = setup();
+    session_in_db_timezone(&mut conn);
+    let mut precisions = vec![3];
+    if engine_honors_declared_precision(&mut conn) {
+        precisions.extend([0, 6, 9]);
+    }
+    for precision in precisions {
+        let value = format!(
+            "CAST(TIMESTAMP '2024-03-01 10:00:00.245223789' AS TIMESTAMP({precision}) \
+             WITH LOCAL TIME ZONE)"
+        );
+        let through_vs =
+            conn.query_columns(&format!("SELECT {value} FROM {} WHERE ID = 1", table(VS)));
+        let native = conn.query_columns(&format!("SELECT {value}"));
+        assert_eq!(through_vs, native, "{value} through {VS}");
+    }
 }
 
 /// Scenario: SESSION_TIME_ZONE sets the zone of the session-zone functions

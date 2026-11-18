@@ -42,6 +42,7 @@ The adapter pushes down `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `
 * *THEN* each function SHALL fold to the date or wall-clock time in the `TZ` zone
 * *AND* each projected value SHALL be within 60 seconds of the same session's native value, and each comparison SHALL return the rows that native Exasol returns
 * *AND* `SELECT CURRENT_TIMESTAMP FROM t` SHALL return a `TIMESTAMP WITH LOCAL TIME ZONE` column, the type native Exasol returns
+* *AND* a projected `CURRENT_TIMESTAMP(6)` or `TIMESTAMP WITH LOCAL TIME ZONE` literal SHALL keep every fractional digit that native Exasol shows
 
 ### Scenario: A projected clock function keeps the aggregate split
 
