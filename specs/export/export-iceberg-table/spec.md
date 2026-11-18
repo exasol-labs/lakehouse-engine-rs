@@ -8,8 +8,8 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * Read through a virtual schema: export/export-into-script § Background.
 * Catalog, storage, and credentials: export/export-catalog-storage § Background.
 * Before it reads any source row the export makes catalog calls only: it authenticates, checks whether the table exists, and, when it does not, creates every missing level of the namespace, even when it then writes no rows or fails. It never writes to storage at that point, so a storage error shows when the writers write, and in parallel mode a failed export can leave an empty table behind. A table that another statement creates after that check fails the writers with an error that names the table.
-* `SINGLE_COMMIT` means the table appears only with its data. Iceberg REST does it by staged table creation (`stage-create`), so only a `SINGLE_COMMIT` export that creates its table needs a catalog that accepts it.
-* Type mapping. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
+* `SINGLE_COMMIT` into a new table: export/export-single-commit § Background.
+* Type mapping. The export creates format-version 2 tables, unpartitioned unless `PARTITION_BY` is given (export/export-partitioned-iceberg-table). Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
 
   | Exasol type | Iceberg type |
   |-------------|--------------|
@@ -83,26 +83,3 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *WHEN* the writer commits its data files
 * *THEN* the commit SHALL assert the schema ID and the partition spec ID that the writer checked
 * *AND* a commit that reloads the changed table, before its first attempt or before a retry, SHALL fail with an error that names the table and what changed, and SHALL add no snapshot
-
-### Scenario: SINGLE_COMMIT on a catalog without staged creation fails and creates no table
-
-* *GIVEN* a catalog that refuses staged table creation
-* *WHEN* a user exports a source of 1,000 rows with `SINGLE_COMMIT = 'true'`
-* *THEN* the export SHALL fail with an error that names the catalog and states that `SINGLE_COMMIT` needs staged table creation
-* *AND* the export SHALL NOT create the table
-* *AND* the same export without `SINGLE_COMMIT` SHALL succeed
-
-### Scenario: SINGLE_COMMIT creates the table only together with its rows
-
-* *GIVEN* a table that does not exist and a source of 1,000 rows
-* *WHEN* a user exports it with `SINGLE_COMMIT = 'true'`
-* *THEN* the table SHALL have exactly one snapshot, which holds the 1,000 rows
-* *AND* no earlier version of the table's metadata SHALL exist
-
-### Scenario: A failed SINGLE_COMMIT export leaves no table
-
-* *GIVEN* a source of 1,000 rows and a namespace that does not exist
-* *WHEN* a user exports it with `SINGLE_COMMIT = 'true'`, and either the source raises an error at its 500th row or the writer fails after it has written its data files and before it commits
-* *THEN* the statement SHALL fail, with the source's error when the source failed
-* *AND* the catalog SHALL NOT hold the table, and the namespace that the export created SHALL remain
-* *AND* the data files that the writer wrote SHALL NOT remain in storage
