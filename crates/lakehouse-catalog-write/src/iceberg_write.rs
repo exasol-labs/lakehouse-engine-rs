@@ -7,7 +7,7 @@ use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_upda
 use crate::vended_refresh::{StorageCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
+use iceberg::spec::{DataFile, Schema, TableMetadata};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -361,26 +361,34 @@ impl TableWriteSession {
         UdfError::User(format!("{ignored}; {outcome}"))
     }
 
-    /// Adds `files` to `table` in one snapshot tagged with `tag`. A conflict (HTTP 409), a busy
-    /// catalog (429, 503), a request that never reached the catalog, or a lost answer (502, 504, a
-    /// broken transport) waits, then reloads the table: a snapshot with the tag means the commit
-    /// landed, else the snapshot is rebuilt on the reloaded metadata and sent again, up to the
-    /// table's `commit.retry.num-retries` times. Every other answer fails at once.
+    /// Adds `files`, written under `written`, to the table in one snapshot tagged with `tag`. The
+    /// table is reloaded first, so the snapshot holds every commit of other writers so far. A
+    /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
+    /// or a lost answer (502, 504, a broken transport) waits, then reloads the table: a snapshot
+    /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
+    /// and sent again, up to the table's `commit.retry.num-retries` times. Every other answer
+    /// fails at once.
     pub async fn append_files(
         &self,
-        table: &WriteTable,
+        written: &WriteTable,
         files: Vec<DataFile>,
         tag: &CommitTag,
-        checked: &TableMetadata,
     ) -> Result<(), CommitError> {
-        let ident = table.table.identifier();
-        // `checked` is the table the files were written under. A fast append asserts neither its
-        // schema nor its partition spec, so every commit pins both.
-        let checked = TableShape::of(checked);
-        refuse_changed(checked, TableShape::of(table.table.metadata()))
+        let ident = written.table.identifier();
+        // A fast append asserts neither the schema nor the partition spec the files were written
+        // under, so every commit pins both.
+        let checked = TableShape::of(written.table.metadata());
+        let reloaded = self
+            .session
+            .load_table_with_all_snapshots(ident)
+            .await
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        refuse_changed(checked, TableShape::of(&reloaded.metadata))
             .map_err(|change| CommitError::new(ident, change, false))?;
-        let mut retries = Retries::new(commit_retries(table.table.metadata().properties()));
-        let mut base = table.table.clone();
+        // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
+        let mut base = rebuilt(&written.table, reloaded)
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        let mut retries = Retries::new(commit_retries(base.metadata().properties()));
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
@@ -664,13 +672,12 @@ fn adls_refused() -> UdfError {
     )
 }
 
-/// What a writer's data files depend on: the field IDs of the current schema, the partition spec
-/// their partition values follow, and a format version the export writes, 1 or 2.
+/// What a writer's data files depend on: the field IDs of the current schema, and the partition
+/// spec their partition values follow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TableShape {
     schema_id: i32,
     spec_id: i32,
-    format_version: FormatVersion,
 }
 
 impl TableShape {
@@ -678,7 +685,6 @@ impl TableShape {
         Self {
             schema_id: metadata.current_schema_id(),
             spec_id: metadata.default_partition_spec_id(),
-            format_version: metadata.format_version(),
         }
     }
 
@@ -710,19 +716,13 @@ fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), Strin
             checked.spec_id, reloaded.spec_id
         ));
     }
-    if reloaded.format_version > FormatVersion::V2 {
-        changes.push(format!(
-            "it was upgraded to format version {}",
-            reloaded.format_version as u8
-        ));
+    if changes.is_empty() {
+        return Ok(());
     }
-    let changed = match changes.as_slice() {
-        [] => return Ok(()),
-        [only] => only.clone(),
-        [first, second] => format!("{first} and {second}"),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-    };
-    Err(format!("{changed} after the writer checked the table"))
+    Err(format!(
+        "{} after the writer checked the table",
+        changes.join(" and ")
+    ))
 }
 
 /// What an HTTP status says about a state-changing request.
