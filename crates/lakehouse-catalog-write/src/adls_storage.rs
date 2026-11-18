@@ -12,7 +12,7 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use serde::{Deserialize, Serialize};
@@ -66,8 +66,9 @@ pub(crate) struct AdlsStorage {
     scheme: String,
     /// `<container>@<host>`.
     authority: String,
+    /// object_store's Azure client in production.
     #[serde(skip)]
-    store: Option<Arc<MicrosoftAzure>>,
+    store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl fmt::Debug for AdlsStorage {
@@ -100,7 +101,7 @@ impl AdlsStorage {
                     .with_url(format!("{scheme}://{authority}/"))
                     .with_credentials(Arc::new(credentials))
                     .build()
-                    .map(Arc::new)
+                    .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
                     .map_err(|error| {
                         Error::new(
                             ErrorKind::DataInvalid,
@@ -145,7 +146,7 @@ impl AdlsStorage {
         })
     }
 
-    fn store(&self) -> Result<&Arc<MicrosoftAzure>> {
+    fn store(&self) -> Result<&Arc<dyn ObjectStore>> {
         self.store.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -261,7 +262,7 @@ impl Storage for AdlsStorage {
 }
 
 struct AdlsFileRead {
-    store: Arc<MicrosoftAzure>,
+    store: Arc<dyn ObjectStore>,
     key: Path,
     path: String,
 }

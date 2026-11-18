@@ -1,5 +1,6 @@
 use super::*;
 use lakehouse_catalog::AdlsCred;
+use object_store::memory::InMemory;
 
 const LOCATION: &str = "abfss://container@account.dfs.core.windows.net/warehouse/ns/t";
 const SAS: &str = "sv=2022-11-02&sr=c&sp=racwdl&sig=SAS_SIGNATURE_SECRET";
@@ -94,4 +95,115 @@ fn debug_shows_the_container_and_no_credential() {
 
     assert!(shown.contains(LOCATION), "{shown}");
     assert!(!shown.contains("SAS_SIGNATURE_SECRET"), "{shown}");
+}
+
+/// The storage of [`LOCATION`]'s container over an in-memory store.
+fn memory_storage() -> AdlsStorage {
+    AdlsStorage {
+        scheme: "abfss".into(),
+        authority: "container@account.dfs.core.windows.net".into(),
+        store: Some(Arc::new(InMemory::new())),
+    }
+}
+
+fn at(name: &str) -> String {
+    format!("{LOCATION}/{name}")
+}
+
+#[tokio::test]
+async fn a_written_file_reads_back_whole_and_by_range() {
+    let storage = memory_storage();
+    let path = at("metadata/v1.json");
+
+    storage
+        .write(&path, Bytes::from_static(b"hello world"))
+        .await
+        .unwrap();
+
+    assert!(storage.exists(&path).await.unwrap());
+    assert_eq!(storage.metadata(&path).await.unwrap().size, 11);
+    assert_eq!(storage.read(&path).await.unwrap(), "hello world");
+    let reader = storage.reader(&path).await.unwrap();
+    assert_eq!(reader.read(6..11).await.unwrap(), "world");
+    assert_eq!(
+        storage.new_input(&path).unwrap().read().await.unwrap(),
+        "hello world"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_file_does_not_exist_reads_fail_naming_it_and_its_delete_succeeds() {
+    let storage = memory_storage();
+    let path = at("data/missing.parquet");
+
+    assert!(!storage.exists(&path).await.unwrap());
+    let refused = [
+        storage.metadata(&path).await.err().unwrap().to_string(),
+        storage.read(&path).await.unwrap_err().to_string(),
+        storage
+            .reader(&path)
+            .await
+            .unwrap()
+            .read(0..1)
+            .await
+            .unwrap_err()
+            .to_string(),
+    ];
+    for (refused, action) in refused.iter().zip(["look up", "read", "read"]) {
+        assert!(
+            refused.contains(&format!("could not {action} {path} on ADLS")),
+            "{refused}"
+        );
+    }
+    storage.delete(&path).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_writer_uploads_its_parts_as_one_file_of_their_total_size_and_then_refuses_writes() {
+    let storage = memory_storage();
+    let path = at("data/f.parquet");
+    let mut writer = storage.new_output(&path).unwrap().writer().await.unwrap();
+
+    writer.write(Bytes::from_static(b"ab")).await.unwrap();
+    writer.write(Bytes::from_static(b"cd")).await.unwrap();
+    let written = writer.close().await.unwrap();
+    let after_close = [
+        writer.write(Bytes::from_static(b"e")).await.unwrap_err(),
+        writer.close().await.err().unwrap(),
+    ];
+
+    assert_eq!(written.size, 4);
+    assert_eq!(storage.read(&path).await.unwrap(), "abcd");
+    for refused in after_close {
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("the ADLS file {path} is already closed")),
+            "{refused}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_prefix_removes_the_files_under_the_prefix_and_delete_stream_each_listed_file() {
+    let storage = memory_storage();
+    let paths = ["data/a/1", "data/a/2", "data/ab/1", "data/b/1"].map(at);
+    for path in &paths {
+        storage.write(path, Bytes::from_static(b"x")).await.unwrap();
+    }
+
+    storage.delete_prefix(&at("data/a")).await.unwrap();
+    let after_prefix = [
+        storage.exists(&paths[0]).await.unwrap(),
+        storage.exists(&paths[1]).await.unwrap(),
+        storage.exists(&paths[2]).await.unwrap(),
+    ];
+    storage
+        .delete_stream(futures::stream::iter([paths[2].clone(), paths[3].clone()]).boxed())
+        .await
+        .unwrap();
+
+    assert_eq!(after_prefix, [false, false, true]);
+    assert!(!storage.exists(&paths[2]).await.unwrap());
+    assert!(!storage.exists(&paths[3]).await.unwrap());
 }
