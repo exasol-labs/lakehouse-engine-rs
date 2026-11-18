@@ -12,7 +12,8 @@ much work runs inside the scan and how much data travels into Exasol. A query is
 - **The shards do the work.** Filters, partial aggregates, broadcast joins, and top-N run in
   DataFusion on every node, next to the data.
 - **Few rows reach Exasol.** Whatever the adapter does not receive, Exasol computes over the rows
-  the scan returns.
+  the scan returns, and it holds all of them in memory first (see
+  [Exasol holds every pushdown result in memory](#exasol-holds-every-pushdown-result-in-memory)).
 
 This page lists the rules that follow from this, with the form to prefer and the form to avoid.
 [Capabilities](capabilities.md) has the full detail behind each rule. The rules describe the
@@ -31,6 +32,7 @@ release that does so updates this page. Last verified against lakehouse-engine 0
 | `FROM a JOIN b ON ... JOIN c ON ...` | `FROM a, c, b` where `c` does not join `a` | Exasol then pushes every table separately. |
 | Outer-side filters of a `LEFT JOIN` in a `WITH` clause | Outer-side filters in `ON` | Exasol pushes no filter from `ON` to the outer side. |
 | `JOIN` on a unique key | `IN (SELECT ...)`, `EXISTS` | A semi-join is never pushed down. |
+| Filters on the lakehouse table's own columns | Filters only on the native table it joins | Exasol holds the whole lakehouse side before it joins. |
 | `SUM`, `COUNT`, `MIN`, `MAX`, `AVG` | `MEDIAN`, `LISTAGG`, `APPROXIMATE_COUNT_DISTINCT` | Only decomposable aggregates run in the shards. |
 | The columns you need | `SELECT *` | The scan reads only the projected columns. |
 
@@ -45,6 +47,35 @@ page, look at:
 - **The `PUSHDOWN_SQL` column.** A `"join":{` object in the scan payload is a broadcast join.
   Several `LAKEHOUSE_SCAN` calls in one row are a join that scans each table separately. A
   `FROM DUAL WHERE 1=0` means the filter pruned every file.
+
+## Exasol holds every pushdown result in memory
+
+Exasol writes the complete result of each lakehouse pushdown into a temporary table before it
+joins, filters, sorts, or limits it. A query's memory cost is the size of what the pushdowns
+return, not of the final result. Each concurrent query holds its own copy. When the copies exceed
+DB RAM, Exasol spills them to disk, which makes queries several times slower, and under enough
+concurrent load sessions fail with out-of-memory errors.
+
+- **Filters that don't push down don't shrink it.** Exasol holds the whole table, then filters it.
+- **`LIMIT` shrinks it only when it pushes down** (see [`ORDER BY ... LIMIT`](#order-by--limit)).
+  Over a join with a native table, a join that scans each table on its own, or an unpushed
+  filter, Exasol holds every row before it applies the limit.
+- **A join with a native Exasol table holds the whole lakehouse side**, reduced only by filters
+  on the lakehouse table's own columns. Exasol does not derive them from filters on the native
+  table, from the join key, or from an `IN` subquery over a native table, so write them out.
+- **A broadcast join holds only the joined rows.** A join that scans each table on its own, and
+  tables pushed down separately, hold each table in full, reduced only by its own `WHERE`
+  filters.
+- **An aggregation that pushes down holds only the groups.**
+- **Every selected column is held**, so `SELECT *` costs memory as well as I/O.
+
+| Prefer | Avoid |
+|---|---|
+| `SELECT ... FROM orders o JOIN native_customers c ON o.customer_id = c.customer_id WHERE o.customer_id IN (1, 2, 3)` | `SELECT ... FROM orders o JOIN native_customers c ON o.customer_id = c.customer_id WHERE c.customer_id IN (1, 2, 3)` |
+
+To see what Exasol held, run the query with `ALTER SESSION SET PROFILE = 'ON'`, then
+`FLUSH STATISTICS`, and read `OUT_ROWS` of the `INSERT` parts on `TEMPORARY table` in
+`EXA_STATISTICS.EXA_USER_PROFILE_LAST_DAY`.
 
 ## Filters
 
@@ -191,13 +222,14 @@ broadcast. Group by a numeric key instead, or limit the text column with a liter
 
 `ORDER BY ... LIMIT n` runs as a per-shard top-N, so each shard sends only `n` rows, when the
 query reads one table or a broadcast join, has no aggregation and no `OFFSET`, and every sort key
-is a column in the select list. Any other shape scans fully and sorts in Exasol. A bare `LIMIT`
-without `ORDER BY` stops each shard early.
+is a column in the select list. Any other shape returns every row to Exasol, which holds them all
+before it sorts. A bare `LIMIT` without `ORDER BY` stops each shard early.
 
 ## Select list
 
 Select only the columns you need. The scan reads only the projected columns from Parquet, so
-`SELECT *` on a wide table reads, decodes, and transfers every column.
+`SELECT *` on a wide table reads, decodes, and transfers every column, and Exasol holds every
+column of every returned row in memory.
 
 ## What always runs in Exasol
 
