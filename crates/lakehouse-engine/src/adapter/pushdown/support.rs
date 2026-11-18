@@ -905,7 +905,7 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
 
 /// Exasol rejects `OFFSET` without `ORDER BY` but accepts `ORDER BY FALSE`, which no select-list
 /// position can name, so a windowed all-constant `orderBy` keeps one `FALSE` key.
-pub(super) fn drop_constant_sort_keys(json: &mut Json) {
+fn drop_constant_sort_keys(json: &mut Json) {
     let offset = extract_offset(json);
     let Some(keys) = json.get_mut("orderBy").and_then(Json::as_array_mut) else {
         return;
@@ -1082,8 +1082,10 @@ impl PushdownRequest {
     }
 
     /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
-    /// copy a broadcast join projects from, beside the types already checked for it.
-    pub fn with_json(&self, json: Json) -> Self {
+    /// copy a broadcast join projects from, beside the types already checked for it. A rewrite can
+    /// turn a sort key constant, such as a folded clock function, so the drop runs again.
+    pub fn with_json(&self, mut json: Json) -> Self {
+        drop_constant_sort_keys(&mut json);
         Self {
             json,
             select_types: self.select_types.clone(),

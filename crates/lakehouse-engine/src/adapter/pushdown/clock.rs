@@ -7,12 +7,12 @@ use std::sync::OnceLock;
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::{Value as Json, json};
+use vs_expression::timestamp::TimestampLiteral;
 
 use crate::adapter::time_zone::TimeZone;
 use crate::types::exasol_type::ExasolType;
 
 use super::PushdownRequest;
-use super::support::drop_constant_sort_keys;
 
 /// Exasol's default fractional-seconds precision, and the only one Exasol 8 has.
 const DEFAULT_DIGITS: usize = 3;
@@ -77,8 +77,6 @@ impl StatementClock {
         if let (Some(list), Json::Object(fields)) = (select_list, &mut json) {
             fields.insert("selectList".to_string(), list);
         }
-        // A clock sort key is a constant now, which parsing would have dropped.
-        drop_constant_sort_keys(&mut json);
         Ok(pushdown.with_json(json))
     }
 
@@ -172,9 +170,7 @@ fn parse_tstz(value: &str) -> Result<Tstz, UdfError> {
             "TIMESTAMP WITH LOCAL TIME ZONE literal '{value}' is no timestamp: {e}"
         ))
     })?;
-    let digits = value
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.len());
+    let digits = TimestampLiteral(value).type_precision();
     Ok(Tstz { utc, digits })
 }
 
