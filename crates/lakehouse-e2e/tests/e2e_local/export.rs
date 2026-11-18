@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, NamespaceIdent};
 
 use crate::common::e2e_harness::{
     DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
@@ -18,7 +18,7 @@ use crate::common::stack::{
     build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url_internal,
     local_stack_connection_password, proxy_log_during,
 };
-use crate::common::table_state::{WAREHOUSE_BUCKET, objects_under};
+use crate::common::table_state::{WAREHOUSE_BUCKET, objects_under, table_exists};
 use crate::fixtures::{
     EXPORT_DIRECT as DIRECT, EXPORT_PROXIED as PROXIED, LAKEHOUSE_VS, lakehouse_vs,
     proxy_virtual_schemas, seed_catalog, stack, vs_table,
@@ -135,14 +135,6 @@ fn profiled_export(source: &str, options: &str) -> (i64, i64) {
 fn connection_secrets() -> [String; 2] {
     let password = local_stack_connection_password();
     [password.access_key, password.secret_key]
-}
-
-fn table_exists(table: &str) -> bool {
-    let ident = TableIdent::from_strs(table.split('.'))
-        .unwrap_or_else(|e| panic!("{table} is not a table name: {e}"));
-    runtime()
-        .block_on(seed_catalog(runtime(), "export").table_exists(&ident))
-        .unwrap_or_else(|e| panic!("check table {table}: {e}"))
 }
 
 fn namespace_exists(namespace: &str) -> bool {
@@ -312,7 +304,7 @@ fn export_refuses_invalid_statements_before_reading() {
             "unknown option",
             export_sql(&FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
             vec![
-                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, and ALLOW_HTTP"
+                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, ALLOW_HTTP, and PARTITION_BY"
                     .to_string(),
             ],
         ),
@@ -656,6 +648,7 @@ fn export_errors_carry_no_connection_password() {
         "single_commit": false,
         "allow_http": true,
         "append": false,
+        "partition_by": [],
     });
     let forged_writer_call =
         format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");

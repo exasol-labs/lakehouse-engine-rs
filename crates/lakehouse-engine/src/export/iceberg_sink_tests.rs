@@ -1,10 +1,8 @@
 use super::super::iceberg_rest::target;
-use super::partition_key;
-use crate::export::test_support::{date_columns, partition_spec, static_key_connection};
+use crate::export::test_support::static_key_connection;
 use arrow::array::{ArrayRef, Decimal128Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use iceberg::spec::{Struct, Transform};
 use lakehouse_catalog_write::CommitTag;
 use lakehouse_catalog_write::exported_test_support::{
     LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog,
@@ -55,7 +53,10 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
         writer_id: "w1".into(),
     };
     let target = target(static_key_connection(&uri, true), "ns.t").unwrap();
-    let mut sink = target.open_new_table(&schema, &tag, false).await.unwrap();
+    let mut sink = target
+        .open_new_table(&schema, &[], &tag, false, 1 << 20)
+        .await
+        .unwrap();
     let ids: ArrayRef = Arc::new(
         Decimal128Array::from(vec![1, 2])
             .with_precision_and_scale(18, 0)
@@ -74,29 +75,4 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
     );
     assert_eq!(data_file_paths(&requests, "PUT").len(), 1);
     assert!(data_file_paths(&requests, "DELETE").is_empty());
-}
-
-/// iceberg-rust's fast append refuses a data file of another spec ID or partition arity than the
-/// table's default spec.
-#[test]
-fn every_data_file_carries_the_default_spec_and_a_null_per_void_field() {
-    let cases = [
-        ("no fields, spec ID 0", 0, &[][..]),
-        ("no fields, spec ID 1", 1, &[]),
-        ("only void fields", 1, &[Transform::Void, Transform::Void]),
-    ];
-
-    for (case, spec_id, transforms) in cases {
-        let key = partition_key(
-            &partition_spec(spec_id, transforms),
-            date_columns(transforms.len()),
-        );
-
-        assert_eq!(key.spec().spec_id(), spec_id, "{case}");
-        assert_eq!(
-            key.data(),
-            &transforms.iter().map(|_| None).collect::<Struct>(),
-            "{case}"
-        );
-    }
 }

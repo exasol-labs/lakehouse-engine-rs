@@ -128,6 +128,21 @@ pub fn load_table(namespace: &str, table: &str) -> iceberg::table::Table {
     })
 }
 
+/// Whether the local REST catalog holds `table`, a `<namespace>.<table>` name.
+pub fn table_exists(table: &str) -> bool {
+    let ident = TableIdent::from_strs(table.split('.'))
+        .unwrap_or_else(|e| panic!("{table} is not a table name: {e}"));
+    runtime()
+        .block_on(async {
+            build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "exists")
+                .await
+                .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog: {e:#}"))
+                .table_exists(&ident)
+                .await
+        })
+        .unwrap_or_else(|e| panic!("check table {table}: {e}"))
+}
+
 /// The metadata JSON of `namespace.table` of the local REST catalog, with every snapshot.
 pub fn local_table_metadata(namespace: &str, table: &str) -> Value {
     serde_json::to_value(load_table(namespace, table).metadata())

@@ -4,6 +4,7 @@
 
 use super::batch::TableColumns;
 use super::options::ALLOW_HTTP;
+use super::partition_by::PartitionField;
 use super::{EXPORT_SCRIPT_NAME, refusal};
 use crate::connection::{
     parse_creds, password_object, supplied_azure_fields, validate_shared_creds,
@@ -30,19 +31,26 @@ pub(super) trait ExportTarget {
     /// For a missing table it also creates the missing namespace levels.
     async fn prepare(&self) -> Result<TableMode, UdfError>;
 
-    /// Creates the table, or takes the one another writer of the same export created, so every
-    /// writer's sink commits into the one table. With `single_commit` it prepares the table
-    /// without creating it: the table appears only when the sink commits its data.
+    /// Creates the table, partitioned by `partition_by`, or takes the one another writer of the
+    /// same export created, so every writer's sink commits into the one table. With
+    /// `single_commit` it prepares the table without creating it: the table appears only when the
+    /// sink commits its data. The sink buffers at most `budget` bytes of rows.
     async fn open_new_table(
         &self,
         schema: &Schema,
+        partition_by: &[PartitionField],
         tag: &CommitTag,
         single_commit: bool,
+        budget: usize,
     ) -> Result<Box<dyn ExportSink>, UdfError>;
 
     /// Loads the existing table and refuses one the export cannot append to, before any data is
     /// written. With `SINGLE_COMMIT` the one writer appends the same way, in its one commit.
-    async fn open_existing_table(&self, tag: &CommitTag) -> Result<Box<dyn ExportSink>, UdfError>;
+    async fn open_existing_table(
+        &self,
+        tag: &CommitTag,
+        budget: usize,
+    ) -> Result<Box<dyn ExportSink>, UdfError>;
 }
 
 /// One writer's files in the table its target opened.
