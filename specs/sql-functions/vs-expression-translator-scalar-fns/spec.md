@@ -51,13 +51,12 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 
 ### Scenario: String scalar functions translate to DataFusion string calls
 
-* *GIVEN* a VS expression node of type `function_scalar` whose `name` is one of the supported Exasol string functions: `CONCAT`, `LENGTH`, `LOWER`, `UPPER`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `REPEAT`, `REVERSE`, `LPAD`, `RPAD`, `ASCII`, `CHR`, `INITCAP`, `LEFT`, `RIGHT`, `TRANSLATE`, `INSTR`, `LOCATE`, `OCTET_LENGTH`, `UNICODE`, or `UNICODECHR`
-* *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `LENGTH`→`character_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
-* *AND* each argument SHALL be rendered recursively by the translator
-* *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string"
+* *GIVEN* a `function_scalar` node named `CONCAT`, `LENGTH`, `LOWER`, `UPPER`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `REPEAT`, `REVERSE`, `LPAD`, `RPAD`, `ASCII`, `CHR`, `INITCAP`, `LEFT`, `RIGHT`, `TRANSLATE`, `INSTR`, `LOCATE`, `OCTET_LENGTH`, `UNICODE`, or `UNICODECHR`
+* *WHEN* the adapter renders the node for the scan
+* *THEN* the scan SQL SHALL call the DataFusion function of the same lower-cased name over the rendered arguments in order, except `LENGTH`→`character_length`, `INSTR`/`LOCATE`→`strpos` (string first, then substring), `UNICODE`→`ascii`, and `UNICODECHR`→`chr`
+* *AND* a call that returns text SHALL be wrapped as `nullif(<call>, '')`, per `pushdown-types/pushdown-planning-scan-empty-string`
 * *AND* an `INSTR` or `LOCATE` node with more than two arguments SHALL decline, because `strpos` takes no start position or occurrence
-* *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-functions/vs-expression-translator-concat`, not by this name-mapping table
+* *AND* `CONCAT` SHALL follow `sql-functions/vs-expression-translator-concat`, and `REPLACE` and a call with a NULL argument SHALL follow `pushdown-types/pushdown-planning-scan-empty-string`
 
 ### Scenario: String scalar functions render verbatim in the Exasol dialect
 
