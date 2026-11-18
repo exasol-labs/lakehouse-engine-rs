@@ -8,7 +8,7 @@ use crate::common::e2e_harness::{
 };
 use crate::common::identity_partition_fixtures::TYPES_TABLE;
 use crate::common::pruning_cases::{
-    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_clock_cases_hold,
+    CLOCK_FOLDING_ZONE, Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_clock_cases_hold,
     assert_grouped_aggregates_match_oracle, assert_instant_clock_cases_hold,
     assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle,
 };
@@ -25,7 +25,6 @@ use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 use std::sync::OnceLock;
 
 const CONN_HIVE: &str = "PRUNING_HIVE_CREDS";
-const CLOCK_FOLDING_ZONE: &str = "EUROPE/BERLIN";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -43,7 +42,6 @@ fn setup() {
         for statement in oracle_statements() {
             conn.execute(&statement);
         }
-        // A folding zone other than UTC, so a time zone literal folds differently in each zone.
         create_virtual_schema(
             &mut conn,
             &VsProps::new(VS_ICEBERG, PRUNING_NAMESPACE)
@@ -53,7 +51,8 @@ fn setup() {
             &mut conn,
             &VsProps::new(VS_HIVE, "")
                 .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_HIVE),
+                .with_catalog_conn_name(CONN_HIVE)
+                .with_property("SESSION_TIME_ZONE", CLOCK_FOLDING_ZONE),
             PRUNING_HIVE_BASE,
             &hive_storage_password(),
         );
@@ -163,6 +162,7 @@ fn clock_and_tstz_filters_prune_files() {
     ));
     assert_clock_cases_hold(&mut conn, Format::Iceberg);
     assert_instant_clock_cases_hold(&mut conn, Format::Iceberg);
+    assert_instant_clock_cases_hold(&mut conn, Format::Hive);
 
     // `dt` is an identity partition holding 2024-02-29 and NULL.
     lakehouse_vs();

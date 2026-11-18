@@ -8,10 +8,14 @@ use crate::common::e2e_harness::{
     assert_query_fails, assert_refused_column, assert_text_columns, assert_type_matrix,
     column_adapter_notes, create_virtual_schema_with_password, declared_type, error_text, exa_conn,
     explain_virtual_sql, has_broadcast_join_block, identifier_note, native_copy_mismatch, note_of,
-    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses, skip_reason,
-    skipped_entries, text_column, try_create_virtual_schema_with_password, value_to_string,
+    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses,
+    resolve_fixture_files, runtime, skip_reason, skipped_entries, text_column,
+    try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
+use crate::common::int96_fixtures::{
+    INT96_TS_FAR_FUTURE_COLUMN, INT96_TS_FAR_FUTURE_TABLE, NAMESPACE as INT96_NAMESPACE,
+};
 use crate::common::raw_parquet::{
     delete_fixture_object, delete_fixture_prefix, encode_parquet_message, encode_parquet_with,
     get_fixture_object, put_fixture_object, write_parquet_column, write_parquet_fixture,
@@ -63,6 +67,7 @@ const BASE_TABLE_FILTER: &str = "s3://warehouse/direct_table_filter/";
 const BASE_AWKWARD: &str = "s3://warehouse/direct_awkward_names/";
 /// Only SeaweedFS's `anonymous` identity (`seaweedfs-iam.json`) makes this bucket readable unsigned.
 const BASE_PUBLIC: &str = "s3://public/direct_public/";
+const BASE_INT96: &str = "s3://warehouse/direct_int96/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -78,6 +83,7 @@ const VS_REFRESH_NAMES: &str = "DIRECT_REFRESH_NAMES_VS";
 const VS_TABLE_FILTER: &str = "DIRECT_TABLE_FILTER_VS";
 const VS_AWKWARD: &str = "DIRECT_AWKWARD_NAMES_VS";
 const VS_PUBLIC: &str = "DIRECT_PUBLIC_VS";
+const VS_INT96: &str = "DIRECT_INT96_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
@@ -88,6 +94,7 @@ const CONN_REFRESH_NAMES: &str = "DIRECT_STORAGE_REFRESH_NAMES_CREDS";
 const CONN_TABLE_FILTER: &str = "DIRECT_STORAGE_TABLE_FILTER_CREDS";
 const CONN_AWKWARD: &str = "DIRECT_STORAGE_AWKWARD_NAMES_CREDS";
 const CONN_PUBLIC: &str = "DIRECT_STORAGE_PUBLIC_CREDS";
+const CONN_INT96: &str = "DIRECT_STORAGE_INT96_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -4244,4 +4251,72 @@ fn a_connection_without_credentials_reads_a_public_bucket_unsigned() {
         pushed.contains(SCAN_SCRIPT_NAME),
         "the rows must come from the scan UDF: {pushed}"
     );
+}
+
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
+#[test]
+fn an_int96_column_compares_with_a_tstz_value_as_an_instant() {
+    const ORACLE: &str = "DIRECT_INT96_ORACLE.INT96_TS";
+    stack();
+    // Only a Spark write lands a genuine INT96 column, so the directory holds that file's copy.
+    let files = runtime().block_on(resolve_fixture_files(
+        INT96_NAMESPACE,
+        INT96_TS_FAR_FUTURE_TABLE,
+    ));
+    let [file] = files.as_slice() else {
+        panic!("{INT96_TS_FAR_FUTURE_TABLE} must resolve one data file, got {files:?}");
+    };
+    put_fixture_object(
+        &format!("{BASE_INT96}int96_ts/part-0.parquet"),
+        get_fixture_object(&file.path),
+    );
+    let mut conn = exa_conn();
+    create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(VS_INT96, CONN_INT96).with_property("SESSION_TIME_ZONE", "AMERICA/NEW_YORK"),
+        BASE_INT96,
+        &direct_storage_password(),
+    );
+    conn.execute("CREATE SCHEMA IF NOT EXISTS DIRECT_INT96_ORACLE");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {ORACLE} ({INT96_TS_FAR_FUTURE_COLUMN} TIMESTAMP WITH LOCAL TIME ZONE)"
+    ));
+    conn.execute("ALTER SESSION SET TIME_ZONE = 'UTC'");
+    conn.execute(&format!(
+        "INSERT INTO {ORACLE} VALUES (TIMESTAMP '9999-12-31 23:59:59')"
+    ));
+
+    // 15:59:59 in Los Angeles is the row's instant, 23:59:59 UTC; the New York wall clock of
+    // that instant is 18:59:59.
+    conn.execute("ALTER SESSION SET TIME_ZONE = 'AMERICA/LOS_ANGELES'");
+    let column = INT96_TS_FAR_FUTURE_COLUMN.to_uppercase();
+    let cases = [
+        (
+            format!(
+                "{column} = CAST(TIMESTAMP '9999-12-31 15:59:59' AS TIMESTAMP WITH LOCAL TIME ZONE)"
+            ),
+            1,
+        ),
+        (
+            format!(
+                "{column} < CAST(TIMESTAMP '9999-12-31 15:59:58' AS TIMESTAMP WITH LOCAL TIME ZONE)"
+            ),
+            0,
+        ),
+    ];
+    let table = vs_table(VS_INT96, "int96_ts");
+    for (predicate, expected) in cases {
+        let query = format!("SELECT COUNT(*) FROM {{T}} WHERE {predicate}");
+        let mismatch = native_copy_mismatch(
+            &mut conn,
+            &table,
+            ORACLE,
+            &query,
+            PathCheck::Unchecked,
+            Expect::Rows,
+        );
+        assert!(mismatch.is_none(), "{mismatch:?}");
+        let count = conn.query_scalar_i64(&query.replace("{T}", &table));
+        assert_eq!(count, expected, "{predicate} over the INT96 column");
+    }
 }

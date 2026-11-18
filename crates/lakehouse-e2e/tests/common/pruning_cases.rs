@@ -26,6 +26,9 @@ use Placement::{OuterWhere, Scan, Split};
 pub const VS_ICEBERG: &str = "PRUNING_ICEBERG";
 pub const VS_HIVE: &str = "PRUNING_HIVE";
 pub const VS_UNITY: &str = "PRUNING_UNITY";
+/// Every pruning virtual schema's `SESSION_TIME_ZONE`: no UTC zone, so a time zone literal folds
+/// differently against an instant column than against any other column.
+pub const CLOCK_FOLDING_ZONE: &str = "EUROPE/BERLIN";
 /// The Hive copy as a Unity Catalog Parquet table, whose partition columns carry declared types.
 pub const PRUNING_PARQUET_TABLE: &str = "pruning_cases_parquet";
 
@@ -511,7 +514,8 @@ const INSTANT_CLOCK_CASES: &[Case] = &[Case::new(
     Scan,
 )
 .oracle("TZ < TIMESTAMP '2024-01-01 00:10:00'")
-.iceberg_and_delta(&["b1", "n1"])];
+.iceberg_and_delta(&["b1", "n1"])
+.hive(ALL_FILES)];
 
 /// Runs every case against `format`'s virtual schema, which the caller's setup has created,
 /// and fails once with every failed case.
