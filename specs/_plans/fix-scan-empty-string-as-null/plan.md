@@ -10,7 +10,7 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 - An empty string has two sources: a string column of a data file, and a text function such as `RTRIM(c, c)`.
 - A value the scan emits already arrives in Exasol as NULL, so only expressions computed inside the scan are wrong: filters, function arguments, aggregates, join keys, and per-shard sort keys.
 - DataFusion's statistics pruning reads only a bare column, a cast, or a negation on the column side of a comparison. A column wrapped in `nullif` is never pruned.
-- Plan-time file pruning reads the request's filter JSON, not the scan SQL. It prunes a file with a null count of 0 for `col IS NULL`, although the file can hold `''`.
+- Plan-time file pruning reads the request's filter JSON, not the scan SQL. It prunes a file with a null count of 0 for `col IS NULL`, although the file can hold `''` or an empty binary value, which both read as NULL.
 - Exasol sends `REPLACE(s, 'U')` and `REPLACE(s, 'U', '')` with a NULL third argument. DataFusion's `replace` returns NULL for it.
 - The broadcast join top-N already ranks an emitted `''` as NULL (#309). The single-table top-N does not.
 - Table format specs, which keep `''` and null distinct. Reading `''` as NULL is the named trade-off of Exasol's VARCHAR domain, not a gap:
@@ -47,7 +47,7 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 | Null test form | A null test over a bare character column renders `IS NULL OR = ''`, or `IS NOT NULL AND <> ''`, at any position. |
 | Bare-column filter form | The typed pass keeps the bare column for the comparison forms the spec lists, only where the node is reached from a filter root or a join condition root through `AND` and `OR`. `binary_filter.rs` does the same for binary columns and is the model. |
 | Character columns | The rule reads the per-column type map and covers every column it declares as a character type. |
-| Plan-time null test | In the one parsed pruning filter, a null test on a string column becomes `IS NULL OR = ''`, and the negated one `IS NOT NULL AND <> ''`. |
+| Plan-time null test | In the one parsed pruning filter, a null test on a string column becomes `IS NULL OR = ''`, and the negated one `IS NOT NULL AND <> ''`. A null test on a variable-length binary column, hex or `BINARY_AS_STRING`, takes the same form over the empty value or constrains nothing. |
 | Per-shard sort | The single-table per-shard sort ranks a string key as the join top-N does. Share that rendering between both paths. |
 | Docs | `docs/capabilities.md` names each text function form that runs in Exasol after the capture. |
 
@@ -72,12 +72,12 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 | An equality of two string columns never matches empty strings | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `string_key_equality_never_matches_empty_strings` |
 | REPLACE reads a NULL argument as the empty string | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `replace_reads_null_argument_as_empty` |
 | A text function with a NULL argument returns what native Exasol returns | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `text_function_null_argument_matches_native` |
-| A null test on a string column keeps the files that hold empty strings | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `null_test_keeps_file_of_empty_strings` |
+| A null test keeps the files that hold empty values | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `null_test_keeps_file_of_empty_strings` |
 | A per-shard top-N ranks a stored empty string as NULL | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `per_shard_top_n_ranks_empty_string_as_null` |
 | IS NULL and IS NOT NULL predicates translate correctly | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `null_test_over_string_column_keeps_the_bare_column` |
 | String scalar functions translate to DataFusion string calls | Unit | `crates/vs-expression/src/lib_tests.rs` | the existing string-function case table, with the wrapped expectations |
 
-- The E2E tests share one new Iceberg fixture, seeded through `tests/common/seed.rs`: a string column that stores `''`, NULL, and text across two data files, one of which holds `''` and no NULL, plus a native copy of the same rows. The top-N test reuses the blank-label fixture of #309 with a shard count above 1.
+- The E2E tests share one new Iceberg fixture, seeded through `tests/common/seed.rs`: a string column that stores `''`, NULL, and text across two data files, one of which holds `''` and no NULL, a variable-length binary column with an empty value and no NULL in that same file, plus a native copy of the same rows. A second virtual schema reads the table under `BINARY_AS_STRING`. The top-N test reuses the blank-label fixture of #309 with a shard count above 1.
 - Each E2E test asserts the pushed scan SQL from `EXPLAIN VIRTUAL` beside the rows, so a silent fallback fails.
 - The row-group scenario has no Exasol oracle, so a host scan test proves it over a multi-row-group file.
 

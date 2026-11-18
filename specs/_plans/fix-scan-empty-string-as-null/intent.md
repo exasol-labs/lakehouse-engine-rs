@@ -15,3 +15,5 @@
 - [D5] A text function whose NULL-argument result differs from DataFusion's renders a NULL guard for that argument, as `REPLACE` does. Where no guard reproduces it, the call declines unless that argument is a non-NULL literal.
 - [D6] The plan-time null test is proved on the Iceberg copy only, because every pruning path reads the one parsed filter.
 - [D7] The empty-string node takes the exact type of its argument, so declared types, split aggregates, and branch unification are unchanged.
+- [D8] The per-shard sort ranks `''` as NULL inside the scan, from the emitted value, not in the translator; ADR `join-shard-ranks-by-emitted-value` places ranking at the emit boundary, and the plan extends that one site to the single-table path.
+- [D9] The plan-time null test also covers a variable-length binary column, whose empty value reads as NULL too; the scan side takes its columns from the Exasol type, the pruning side from the source type, so both name the same columns.
