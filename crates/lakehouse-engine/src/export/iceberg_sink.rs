@@ -107,47 +107,36 @@ impl IcebergSink {
     }
 
     fn storage_error(&self, error: iceberg::Error) -> UdfError {
-        self.redacted(
-            format!(
-                "writing the data files of table {} to storage failed: {}",
-                self.opened.table().identifier(),
-                error_chain(&error)
-            ),
-            Vec::new(),
-        )
+        self.redacted(format!(
+            "writing the data files of table {} to storage failed: {}",
+            self.opened.table().identifier(),
+            error_chain(&error)
+        ))
     }
 
-    /// `message` without any storage credential the sink's tables have signed with.
-    fn redacted(&self, message: String, mut secrets: Vec<String>) -> UdfError {
-        secrets.extend(self.opened.secret_values());
+    /// `message` without any storage credential the sink's table signs with.
+    fn redacted(&self, message: String) -> UdfError {
+        let secrets = self.opened.secret_values();
         let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
         UdfError::User(redact_error_text(&message, &secrets))
     }
 
-    /// Appends to the table reloaded with every writer's commits so far, or creates the staged
-    /// table with the files.
+    /// Appends to the table reloaded with every writer's commits so far, under the schema and
+    /// partition spec the files were written with, or creates the staged table with the files.
     async fn commit(&mut self, files: Vec<DataFile>) -> Result<(), UdfError> {
-        let (committed, reloaded_secrets) = match &self.opened {
+        let committed = match &self.opened {
             OpenedTable::Created(created) => {
-                let table = self
-                    .session
-                    .load_table(created.table().identifier())
-                    .await?;
-                let committed = self.session.append_files(&table, files, &self.tag).await;
-                (committed, table.secret_values())
+                self.session.append_files(created, files, &self.tag).await
             }
             OpenedTable::Staged(staged) => {
-                let committed = self.session.commit_staged(staged, files, &self.tag).await;
-                (committed, Vec::new())
+                self.session.commit_staged(staged, files, &self.tag).await
             }
         };
-        match committed {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.files_may_be_committed = error.outcome_unknown();
-                Err(self.redacted(error.to_string(), reloaded_secrets))
-            }
-        }
+        let Err(error) = committed else {
+            return Ok(());
+        };
+        self.files_may_be_committed = error.outcome_unknown();
+        Err(self.redacted(error.to_string()))
     }
 }
 

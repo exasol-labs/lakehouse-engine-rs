@@ -82,7 +82,7 @@ Exasol truncates `TIMESTAMP(7)` to `TIMESTAMP(9)` values to microseconds before 
 
 1. Before it reads any source row, the export makes catalog calls only. It authenticates, refuses an existing table, and creates every missing level of the namespace. It writes nothing to storage yet, so a storage error, such as a wrong key or a missing write permission, shows only when the writers write. The namespace stays even when the export then fails or writes no rows.
 2. The writers read the source rows. Each opens the table at its first row: the first creates it, and the others take the table that a writer of the same statement created. A source with no rows creates no table.
-3. Each writer writes its data files and commits them once. A commit that conflicts with another writer's, or whose answer is lost, is sent again only after the writer checks that the table holds no snapshot of its own, so its rows land once.
+3. Each writer writes its data files and commits them once. A commit that conflicts with another writer's, or whose answer is lost, is sent again only after the writer checks that the table holds no snapshot of its own, so its rows land once. A commit fails, with an error that names the table and what changed, when another engine changed the table's current schema or default partition spec after the writer checked it.
 
 Two statements that export into the same new table at the same time leave one winner. One succeeds, the other fails with an error that names the table, and the table holds only the winner's rows.
 

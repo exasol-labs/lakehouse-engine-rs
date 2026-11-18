@@ -361,26 +361,41 @@ impl TableWriteSession {
         UdfError::User(format!("{ignored}; {outcome}"))
     }
 
-    /// Adds `files` to `table` in one snapshot tagged with `tag`. A conflict (HTTP 409), a busy
-    /// catalog (429, 503), a request that never reached the catalog, or a lost answer (502, 504, a
-    /// broken transport) waits, then reloads the table: a snapshot with the tag means the commit
-    /// landed, else the snapshot is rebuilt on the reloaded metadata and sent again, up to the
-    /// table's `commit.retry.num-retries` times. Every other answer fails at once.
+    /// Adds `files`, written under `written`, to the table in one snapshot tagged with `tag`. The
+    /// table is reloaded first, so the snapshot holds every commit of other writers so far. A
+    /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
+    /// or a lost answer (502, 504, a broken transport) waits, then reloads the table: a snapshot
+    /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
+    /// and sent again, up to the table's `commit.retry.num-retries` times. Every other answer
+    /// fails at once.
     pub async fn append_files(
         &self,
-        table: &WriteTable,
+        written: &WriteTable,
         files: Vec<DataFile>,
         tag: &CommitTag,
     ) -> Result<(), CommitError> {
-        let ident = table.table.identifier();
-        let mut retries = Retries::new(commit_retries(table.table.metadata().properties()));
-        let mut base = table.table.clone();
+        let ident = written.table.identifier();
+        // A fast append asserts neither the schema nor the partition spec the files were written
+        // under, so every commit pins both.
+        let checked = TableShape::of(written.table.metadata());
+        let reloaded = self
+            .session
+            .load_table_with_all_snapshots(ident)
+            .await
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        refuse_changed(checked, TableShape::of(&reloaded.metadata))
+            .map_err(|change| CommitError::new(ident, change, false))?;
+        // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
+        let mut base = rebuilt(&written.table, reloaded)
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        let mut retries = Retries::new(commit_retries(base.metadata().properties()));
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
                 .await
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
-            let body = commit_request(ident, captured.requirements, captured.updates)
+            let requirements = checked.pinned(captured.requirements);
+            let body = commit_request(ident, requirements, captured.updates)
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
@@ -398,6 +413,8 @@ impl TableWriteSession {
             if tag.is_on(&reloaded.metadata) {
                 return Ok(());
             }
+            refuse_changed(checked, TableShape::of(&reloaded.metadata))
+                .map_err(|change| CommitError::new(ident, change, false))?;
             if !may_retry {
                 return Err(exhausted_commit_error(ident, &retries, &failure));
             }
@@ -653,6 +670,59 @@ fn adls_refused() -> UdfError {
     UdfError::User(
         "an AWS credential loader signs only S3 storage requests, but the storage is ADLS".into(),
     )
+}
+
+/// What a writer's data files depend on: the field IDs of the current schema, and the partition
+/// spec their partition values follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableShape {
+    schema_id: i32,
+    spec_id: i32,
+}
+
+impl TableShape {
+    fn of(metadata: &TableMetadata) -> Self {
+        Self {
+            schema_id: metadata.current_schema_id(),
+            spec_id: metadata.default_partition_spec_id(),
+        }
+    }
+
+    /// `requirements` plus the assertions that the table still has this schema and partition spec.
+    fn pinned(self, mut requirements: Vec<TableRequirement>) -> Vec<TableRequirement> {
+        requirements.push(TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: self.schema_id,
+        });
+        requirements.push(TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: self.spec_id,
+        });
+        requirements
+    }
+}
+
+/// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
+/// depend on did.
+fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), String> {
+    let mut changes = Vec::new();
+    if reloaded.schema_id != checked.schema_id {
+        changes.push(format!(
+            "its current schema ID changed from {} to {}",
+            checked.schema_id, reloaded.schema_id
+        ));
+    }
+    if reloaded.spec_id != checked.spec_id {
+        changes.push(format!(
+            "its default partition spec ID changed from {} to {}",
+            checked.spec_id, reloaded.spec_id
+        ));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} after the writer checked the table",
+        changes.join(" and ")
+    ))
 }
 
 /// What an HTTP status says about a state-changing request.
