@@ -175,6 +175,8 @@ pub fn assert_one_shaped_file_per_label(format: &str, uris: &[String]) {
 /// because a partly translated predicate is held to soundness alone (`pushdown-file-pruning`).
 struct Case {
     predicate: &'static str,
+    /// The oracle's form of `predicate`, where the two differ.
+    oracle: Option<&'static str>,
     placement: Placement,
     counts: bool,
     /// Direct storage declares every partition column a string, so it skips typed ones.
@@ -188,6 +190,7 @@ impl Case {
     const fn new(predicate: &'static str, placement: Placement) -> Self {
         Case {
             predicate,
+            oracle: None,
             placement,
             counts: false,
             typed_partition: false,
@@ -195,6 +198,17 @@ impl Case {
             hive: None,
             delta: None,
         }
+    }
+
+    const fn oracle(self, predicate: &'static str) -> Self {
+        Case {
+            oracle: Some(predicate),
+            ..self
+        }
+    }
+
+    fn oracle_predicate(&self) -> &'static str {
+        self.oracle.unwrap_or(self.predicate)
     }
 
     const fn counted(self) -> Self {
@@ -423,10 +437,11 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
     let select = format!("SELECT ID FROM {table} WHERE {predicate} ORDER BY ID");
     let mut failures = Vec::new();
 
+    let oracle_predicate = case.oracle_predicate();
     let rows = sorted_ids(conn, &select);
     let oracle_rows = sorted_ids(
         conn,
-        &format!("SELECT ID FROM {PRUNING_ORACLE_TABLE} WHERE {predicate} ORDER BY ID"),
+        &format!("SELECT ID FROM {PRUNING_ORACLE_TABLE} WHERE {oracle_predicate} ORDER BY ID"),
     );
     if rows != oracle_rows {
         failures.push(format!("returned ids {rows:?}, the oracle {oracle_rows:?}"));
@@ -435,7 +450,7 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
         let count =
             conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"));
         let oracle_count = conn.query_scalar_i64(&format!(
-            "SELECT COUNT(*) FROM {PRUNING_ORACLE_TABLE} WHERE {predicate}"
+            "SELECT COUNT(*) FROM {PRUNING_ORACLE_TABLE} WHERE {oracle_predicate}"
         ));
         if count != oracle_count {
             failures.push(format!("COUNT(*) {count}, the oracle {oracle_count}"));
@@ -444,7 +459,7 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
 
     let plan = isolated_pushdown_statement(conn, &select);
     let scanned = labels_named(&plan);
-    let matching = oracle_labels(conn, predicate);
+    let matching = oracle_labels(conn, oracle_predicate);
     if !matching.is_subset(&scanned) {
         failures.push(format!(
             "Sound: scanned {scanned:?}, but {matching:?} hold a matching row"
@@ -478,15 +493,25 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
 }
 
 /// Filters on a clock function or a time zone literal. Every `DT` lies before today, and in a
-/// session zone that is `DBTIMEZONE` the literal's bound is `TZ < TIMESTAMP '2024-01-01 00:10:00'`.
+/// session zone that is the folding zone the literal's bound is `TS < TIMESTAMP '2024-01-01
+/// 00:00:00.400'`.
 const CLOCK_CASES: &[Case] = &[
     Case::new("DT >= CURRENT_DATE", Scan).iceberg_and_delta(&[]),
     Case::new(
-        "TZ < CAST(TIMESTAMP '2024-01-01 00:10:00' AS TIMESTAMP WITH LOCAL TIME ZONE)",
+        "TS < CAST(TIMESTAMP '2024-01-01 00:00:00.400' AS TIMESTAMP WITH LOCAL TIME ZONE)",
         Scan,
     )
-    .iceberg_and_delta(&["b1", "n1"]),
+    .iceberg_and_delta(&["a1", "b1"]),
 ];
+
+/// A time zone literal compared with the instant column `TZ` in a `PACIFIC/KIRITIMATI` session,
+/// UTC+14: 14:10 there is 00:10 UTC, the oracle's plain bound, whatever the folding zone.
+const INSTANT_CLOCK_CASES: &[Case] = &[Case::new(
+    "TZ < CAST(TIMESTAMP '2024-01-01 14:10:00' AS TIMESTAMP WITH LOCAL TIME ZONE)",
+    Scan,
+)
+.oracle("TZ < TIMESTAMP '2024-01-01 00:10:00'")
+.iceberg_and_delta(&["b1", "n1"])];
 
 /// Runs every case against `format`'s virtual schema, which the caller's setup has created,
 /// and fails once with every failed case.
@@ -497,6 +522,12 @@ pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
 /// [`assert_cases_hold`] over the clock and time zone literal cases.
 pub fn assert_clock_cases_hold(conn: &mut ExaConn, format: Format) {
     assert_listed_cases_hold(conn, format, CLOCK_CASES);
+}
+
+/// [`assert_cases_hold`] over the instant-column cases, in a `PACIFIC/KIRITIMATI` session.
+pub fn assert_instant_clock_cases_hold(conn: &mut ExaConn, format: Format) {
+    conn.execute("ALTER SESSION SET TIME_ZONE = 'PACIFIC/KIRITIMATI'");
+    assert_listed_cases_hold(conn, format, INSTANT_CLOCK_CASES);
 }
 
 fn assert_listed_cases_hold(conn: &mut ExaConn, format: Format, cases: &[Case]) {

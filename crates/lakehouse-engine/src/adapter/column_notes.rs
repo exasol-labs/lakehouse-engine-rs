@@ -6,6 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde::{Deserialize, Serialize};
 
 use crate::scan::spec::LogicalField;
+use crate::types::mapping::tag_holds_utc_instants;
 
 /// Exasol persists at most this many characters of one column's `adapterNotes` and rejects the
 /// statement above it (sqlCode 04000). The limit counts characters, not bytes.
@@ -35,6 +36,12 @@ impl ColumnDeclaration {
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("a column declaration always serializes")
     }
+}
+
+/// Whether the column a note declares holds UTC instants; `false` for an unreadable note.
+pub fn declares_utc_instants(note: &str) -> bool {
+    serde_json::from_str::<ColumnDeclaration>(note)
+        .is_ok_and(|declaration| tag_holds_utc_instants(&declaration.source_type.arrow_type))
 }
 
 /// Passes `note` through unchanged when Exasol will persist it, so a pushdown never plans from a

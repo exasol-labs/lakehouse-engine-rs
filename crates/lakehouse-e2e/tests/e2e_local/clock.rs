@@ -18,6 +18,8 @@ use crate::fixtures::{explain_virtual_messages, explain_virtual_pushdown_sql, st
 
 const VS: &str = "CLOCK_VS";
 const ORACLE: &str = "CLOCK_ORACLE.CLOCK_PROBE";
+/// The fixture's rows with `TZ` a `TIMESTAMP WITH LOCAL TIME ZONE` holding the same instants.
+const INSTANT_ORACLE: &str = "CLOCK_ORACLE.CLOCK_PROBE_INSTANTS";
 const CLOCK_FUNCTIONS: [&str; 5] = [
     "CURRENT_DATE",
     "CURRENT_TIMESTAMP",
@@ -28,6 +30,9 @@ const CLOCK_FUNCTIONS: [&str; 5] = [
 const DATE_FUNCTIONS: [&str; 2] = ["CURRENT_DATE", "SYSDATE"];
 const TOLERANCE_SECONDS: f64 = 60.0;
 const TOKYO: &str = "ASIA/TOKYO";
+const BERLIN: &str = "EUROPE/BERLIN";
+/// UTC+14 all year, so a value compared in it is a day off a UTC or European wall clock.
+const KIRITIMATI: &str = "PACIFIC/KIRITIMATI";
 /// The adapter's error for a clock value it cannot fold in the `TZ` zone.
 const TZ_REFUSAL: &str = "cannot fold a clock function or TIMESTAMP WITH LOCAL TIME ZONE literal in the adapter's TZ zone";
 /// The TSTZ literal of the fixture's boundary, 10:00 in the session zone.
@@ -54,6 +59,16 @@ fn setup() -> ExaConn {
             })
             .collect();
         conn.execute(&format!("INSERT INTO {ORACLE} VALUES {}", rows.join(", ")));
+        conn.execute(&format!(
+            "CREATE OR REPLACE TABLE {INSTANT_ORACLE} \
+             (ID DECIMAL(18,0), D DATE, TS TIMESTAMP, TZ TIMESTAMP WITH LOCAL TIME ZONE, \
+             REGION VARCHAR(10))"
+        ));
+        // A plain timestamp converts to TSTZ as session-local, so UTC keeps each instant.
+        set_session_zone(&mut conn, "UTC");
+        conn.execute(&format!(
+            "INSERT INTO {INSTANT_ORACLE} SELECT * FROM {ORACLE}"
+        ));
         create_virtual_schema(&mut conn, &VsProps::new(VS, E2E_CLOCK_NAMESPACE));
     });
     exa_conn()
@@ -101,17 +116,29 @@ fn ids(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
     ids
 }
 
-/// The ids `predicate` keeps through `vs`, asserted equal to the native oracle's.
+/// The ids `predicate` keeps through `vs`, asserted equal to the native oracle's, whose `TZ`
+/// holds the UTC dates and times of the instants.
 #[track_caller]
 fn assert_native_rows(conn: &mut ExaConn, vs: &str, predicate: &str) -> Vec<i64> {
+    assert_oracle_rows(conn, vs, ORACLE, predicate)
+}
+
+/// [`assert_native_rows`] against the oracle whose `TZ` holds the instants.
+#[track_caller]
+fn assert_instant_rows(conn: &mut ExaConn, vs: &str, predicate: &str) -> Vec<i64> {
+    assert_oracle_rows(conn, vs, INSTANT_ORACLE, predicate)
+}
+
+#[track_caller]
+fn assert_oracle_rows(conn: &mut ExaConn, vs: &str, oracle: &str, predicate: &str) -> Vec<i64> {
     let through_vs = ids(
         conn,
         &format!("SELECT ID FROM {} WHERE {predicate}", table(vs)),
     );
-    let native = ids(conn, &format!("SELECT ID FROM {ORACLE} WHERE {predicate}"));
+    let native = ids(conn, &format!("SELECT ID FROM {oracle} WHERE {predicate}"));
     assert_eq!(
         through_vs, native,
-        "{vs} `{predicate}` must return the native rows"
+        "{vs} `{predicate}` must return the rows of {oracle}"
     );
     through_vs
 }
@@ -284,18 +311,16 @@ fn a_tstz_literal_comparison_runs_in_the_scan() {
     let mut conn = setup();
     // In a session whose zone is the folding zone, the literal folds to its own wall clock.
     session_in_db_timezone(&mut conn);
-    for column in ["TS", "TZ"] {
-        let predicate = format!("{column} > {TSTZ_BOUNDARY}");
-        let pushed = explain_virtual_pushdown_sql(
-            &mut conn,
-            &format!("SELECT ID FROM {} WHERE {predicate}", table(VS)),
-        );
-        assert!(
-            pushed.contains("2024-03-01 10:00:00.000") && !pushed.contains("SESSIONTIMEZONE"),
-            "{predicate}: the scan filter must compare with the folding zone's wall clock: {pushed}"
-        );
-        assert_eq!(assert_native_rows(&mut conn, VS, &predicate), [3, 4]);
-    }
+    let predicate = format!("TS > {TSTZ_BOUNDARY}");
+    let pushed = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT ID FROM {} WHERE {predicate}", table(VS)),
+    );
+    assert!(
+        pushed.contains("2024-03-01 10:00:00.000") && !pushed.contains("SESSIONTIMEZONE"),
+        "{predicate}: the scan filter must compare with the folding zone's wall clock: {pushed}"
+    );
+    assert_eq!(assert_native_rows(&mut conn, VS, &predicate), [3, 4]);
     let recent = "TS > ADD_HOURS(CURRENT_TIMESTAMP, -1)";
     let pushed = explain_virtual_pushdown_sql(
         &mut conn,
@@ -313,7 +338,7 @@ fn clock_functions_match_native_when_the_session_zone_matches() {
     session_in_db_timezone(&mut conn);
     for function in CLOCK_FUNCTIONS {
         assert_matches_native(&mut conn, VS, function, function);
-        for column in ["D", "TS", "TZ"] {
+        for column in ["D", "TS"] {
             assert_native_rows(&mut conn, VS, &format!("{column} <= {function}"));
         }
     }
@@ -331,6 +356,129 @@ fn clock_functions_match_native_when_the_session_zone_matches() {
         through_vs,
         column_type(&mut conn, "SELECT CURRENT_TIMESTAMP")
     );
+}
+
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
+#[test]
+fn a_tstz_value_compared_with_an_instant_column_compares_the_instants() {
+    const INSTANT_VS: &str = "CLOCK_VS_INSTANTS";
+    // 23:30 on March 1st in Kiritimati is 09:30 UTC, row 2's instant.
+    const ROW_2_IN_KIRITIMATI: &str =
+        "CAST(TIMESTAMP '2024-03-01 23:30:00' AS TIMESTAMP WITH LOCAL TIME ZONE)";
+    let mut conn = setup();
+    let local_is_tstz = localtimestamp_is_tstz(&mut conn);
+    create_clock_vs(
+        &mut conn,
+        VsProps::new(INSTANT_VS, E2E_CLOCK_NAMESPACE).with_property("SESSION_TIME_ZONE", BERLIN),
+    );
+    let mut predicates = vec![
+        format!("TZ > {TSTZ_BOUNDARY}"),
+        "TZ > ADD_HOURS(CURRENT_TIMESTAMP, -1)".to_string(),
+        format!("TZ BETWEEN {TSTZ_BOUNDARY} AND CURRENT_TIMESTAMP"),
+        format!("TZ IN ({TSTZ_BOUNDARY})"),
+        format!("TZ IN ({ROW_2_IN_KIRITIMATI})"),
+        format!("TZ <= {ROW_2_IN_KIRITIMATI}"),
+    ];
+    if local_is_tstz {
+        predicates.push("TZ < LOCALTIMESTAMP".to_string());
+    }
+    let projected = |relation: &str| {
+        format!(
+            "SELECT CASE WHEN TZ < CURRENT_TIMESTAMP THEN 1 ELSE 0 END FROM {relation} \
+             ORDER BY ID"
+        )
+    };
+
+    set_session_zone(&mut conn, KIRITIMATI);
+    let first = format!(
+        "SELECT ID FROM {} WHERE {}",
+        table(INSTANT_VS),
+        predicates[0]
+    );
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &first);
+    assert!(
+        pushed.contains("2024-02-29 20:00:00.000") && !pushed.contains("SESSIONTIMEZONE"),
+        "{first}: the scan filter must compare with the instant's UTC date and time: {pushed}"
+    );
+    assert_eq!(
+        assert_instant_rows(
+            &mut conn,
+            INSTANT_VS,
+            &format!("TZ <= {ROW_2_IN_KIRITIMATI}")
+        ),
+        [1, 2],
+        "fixture precondition: a Berlin wall clock would keep row 3 too"
+    );
+    // The fixture's rows lie far from now, so only the pushed literal shows the clock's fold.
+    let mut clocks = vec!["CURRENT_TIMESTAMP"];
+    if local_is_tstz {
+        clocks.push("LOCALTIMESTAMP");
+    }
+    for function in clocks {
+        let query = format!("SELECT ID FROM {} WHERE TZ < {function}", table(INSTANT_VS));
+        let pushed = explain_virtual_pushdown_sql(&mut conn, &query);
+        let folded: Vec<String> = folded_timestamps(&pushed).into_iter().collect();
+        let [folded] = folded.as_slice() else {
+            panic!("{query} must fold to one timestamp literal: {pushed}");
+        };
+        let off = parse_numeric(
+            &conn.query_columns(&format!(
+                "SELECT ABS(SECONDS_BETWEEN(TIMESTAMP '{folded}', \
+                 CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, 'UTC')))"
+            ))[0][0],
+        );
+        assert!(
+            off <= TOLERANCE_SECONDS,
+            "{query} must fold to the UTC date and time of now, {folded} is {off}s off"
+        );
+    }
+
+    for (folding_zone, session_zone) in [(BERLIN, KIRITIMATI), (TOKYO, KIRITIMATI), (TOKYO, "UTC")]
+    {
+        conn.execute(&format!(
+            "ALTER VIRTUAL SCHEMA {INSTANT_VS} SET SESSION_TIME_ZONE = '{folding_zone}'"
+        ));
+        set_session_zone(&mut conn, session_zone);
+        for predicate in &predicates {
+            assert_instant_rows(&mut conn, INSTANT_VS, predicate);
+        }
+        let through_vs = conn.query_columns(&projected(&table(INSTANT_VS)));
+        let native = conn.query_columns(&projected(INSTANT_ORACLE));
+        assert_eq!(
+            through_vs, native,
+            "{folding_zone} folding zone, {session_zone} session: the projected comparison"
+        );
+    }
+}
+
+/// Scenario: A plain value compared with an instant column compares with its UTC date and time
+#[test]
+fn a_plain_value_compared_with_an_instant_column_compares_its_utc_date_and_time() {
+    const PLAIN_VS: &str = "CLOCK_VS_PLAIN_VALUES";
+    let mut conn = setup();
+    let local_is_tstz = localtimestamp_is_tstz(&mut conn);
+    create_clock_vs(
+        &mut conn,
+        VsProps::new(PLAIN_VS, E2E_CLOCK_NAMESPACE).with_property("SESSION_TIME_ZONE", BERLIN),
+    );
+    set_session_zone(&mut conn, BERLIN);
+    let boundary = "TZ > TIMESTAMP '2024-03-01 10:00:00'";
+    assert_eq!(
+        assert_native_rows(&mut conn, PLAIN_VS, boundary),
+        [3, 4],
+        "{boundary}: a session-local reading of TZ would keep row 2 too"
+    );
+    let mut predicates = vec![
+        "TZ >= DATE '2024-03-01'",
+        "TZ <= SYSTIMESTAMP",
+        "TZ >= CURRENT_DATE",
+    ];
+    if !local_is_tstz {
+        predicates.push("TZ <= LOCALTIMESTAMP");
+    }
+    for predicate in predicates {
+        assert_native_rows(&mut conn, PLAIN_VS, predicate);
+    }
 }
 
 /// Scenario: The clock functions fold in the zone that Exasol uses when the session zone matches
@@ -564,6 +712,12 @@ fn an_unreadable_tz_fails_only_a_query_that_needs_it() {
         assert_eq!(
             ids(&mut conn, &format!("SELECT ID FROM {t} WHERE ID = 1")),
             [1]
+        );
+        set_session_zone(&mut conn, "UTC");
+        assert_eq!(
+            assert_instant_rows(&mut conn, vs, &format!("TZ > {TSTZ_BOUNDARY}")),
+            [3, 4],
+            "the instant comparison reads no TZ"
         );
 
         conn.execute(&format!(
