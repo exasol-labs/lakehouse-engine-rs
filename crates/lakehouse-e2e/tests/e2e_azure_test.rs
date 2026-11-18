@@ -15,7 +15,7 @@ use common::e2e_harness::{
     exa_conn_redacting, explain_virtual_sql, exported_rows, install_slc, parse_int,
     projection_rows, runtime, upload_so, value_to_string,
 };
-use common::exasol_ws::ExaConn;
+use common::exasol_ws::{ExaConn, error_text};
 use common::lakekeeper::{
     self, AdlsWarehouseProfile, lakekeeper_adls_connection_password,
     lakekeeper_connection_password, lakekeeper_create_adls_warehouse,
@@ -577,10 +577,12 @@ fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &A
 
 const VS_SAS: &str = "AZ_SAS_LAKEHOUSE";
 const CONN_SAS: &str = "AZ_SAS_CATALOG_CREDS";
+const CONN_S3_ON_ADLS: &str = "AZ_S3_KEYS_CATALOG_CREDS";
 const EXPORT_SOURCE: &str = "AZ_EXPORT_E2E.SRC_ROWS";
 const EXPORT_SOURCE_ROWS: i64 = 500;
 
 /// Scenario: Static and vended credentials write a table on ADLS Gen2
+/// Scenario: A table location the CONNECTION's storage cannot address is refused
 #[test]
 fn azure_export_writes_and_appends_with_account_key_sas_and_vended_credentials() {
     let fixture = AzureFixture::provision();
@@ -635,6 +637,30 @@ fn azure_export_writes_and_appends_with_account_key_sas_and_vended_credentials()
                 "{connection} {pass}"
             );
         }
+    }
+
+    // Static S3 keys address only `s3://` and `s3a://`, so the ADLS warehouse's `abfss://`
+    // location is refused before the writer configures any storage.
+    conn.execute(&build_create_connection_sql(
+        CONN_S3_ON_ADLS,
+        LAKEKEEPER_CATALOG_URI_INTERNAL,
+        &lakekeeper_connection_password(&fixture.static_arm.warehouse, false),
+    ));
+    for options in ["", "SINGLE_COMMIT = 'true'"] {
+        let table = format!("{E2E_NAMESPACE}.exported_by_s3_keys");
+        let route = ExportRoute {
+            script_schema: SCHEMA_NAME,
+            connection: CONN_S3_ON_ADLS,
+        };
+        let error = error_text(
+            &conn.try_execute(&route.export(EXPORT_SOURCE, &table, options)),
+            "EXPORT through S3 keys into ADLS",
+        );
+        assert!(
+            error.contains(&format!("table {table} has the location abfss://"))
+                && error.contains("whose scheme abfss the CONNECTION's S3 storage cannot address"),
+            "{options}: {error}"
+        );
     }
 
     for (connection, vs, table, _) in arms {
