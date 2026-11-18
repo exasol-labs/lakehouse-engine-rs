@@ -477,9 +477,8 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
     })
 }
 
-/// Filters on a clock function or a time zone literal. Every `DT` lies before today, and the
-/// literal's Berlin wall clock is the bound of `TZ < TIMESTAMP '2024-01-01 00:10:00'`, so the
-/// session zone must be the Berlin `DBTIMEZONE`.
+/// Filters on a clock function or a time zone literal. Every `DT` lies before today, and in a
+/// session zone that is `DBTIMEZONE` the literal's bound is `TZ < TIMESTAMP '2024-01-01 00:10:00'`.
 const CLOCK_CASES: &[Case] = &[
     Case::new("DT >= CURRENT_DATE", Scan).iceberg_and_delta(&[]),
     Case::new(

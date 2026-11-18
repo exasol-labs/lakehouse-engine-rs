@@ -56,7 +56,7 @@ The adapter pushes down `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `
 * *GIVEN* two virtual tables `t1` and `t2` of one virtual schema
 * *WHEN* the user runs `EXPLAIN VIRTUAL` of a statement that joins `t1` and `t2` and filters each on `SYSTIMESTAMP`, and of a statement `SELECT SYSTIMESTAMP FROM t1 UNION ALL SELECT SYSTIMESTAMP FROM t2`
 * *THEN* every folded literal of one statement SHALL hold the same instant, across its tables, its pushdown requests, and its shards
-* *AND* `SELECT COUNT(DISTINCT x) FROM (SELECT SYSTIMESTAMP AS x FROM t1 UNION ALL SELECT SYSTIMESTAMP FROM t2)` SHALL return 1
+* *AND* every row of `SELECT SYSTIMESTAMP FROM t1 UNION ALL SELECT SYSTIMESTAMP FROM t2` SHALL hold the same value
 
 ### Scenario: A filter on a clock function or a time zone literal prunes files at plan time
 

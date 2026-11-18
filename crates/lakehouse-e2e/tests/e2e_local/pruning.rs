@@ -150,12 +150,10 @@ fn hive_grouped_aggregates_match_the_oracle() {
 fn clock_and_tstz_filters_prune_files() {
     setup();
     let mut conn = exa_conn();
-    let zone = conn.query_columns("SELECT DBTIMEZONE, SESSIONTIMEZONE");
-    assert_eq!(
-        (zone[0][0].as_str(), zone[1][0].as_str()),
-        (Some("EUROPE/BERLIN"), Some("EUROPE/BERLIN")),
-        "fixture precondition: the TSTZ case's bound is a Berlin wall clock"
-    );
+    // In a session whose zone is the folding zone, the TSTZ literal folds to its own wall clock.
+    let db_timezone = conn.query_columns("SELECT DBTIMEZONE")[0][0].clone();
+    let db_timezone = db_timezone.as_str().expect("DBTIMEZONE is text");
+    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
     assert_clock_cases_hold(&mut conn, Format::Iceberg);
 
     // `dt` is an identity partition holding 2024-02-29 and NULL.

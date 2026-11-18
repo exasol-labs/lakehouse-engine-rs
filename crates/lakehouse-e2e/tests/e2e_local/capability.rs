@@ -9,6 +9,7 @@ use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT_TRAILING_SPACE, ExpectedValue,
     TYPED_TABLE_TOTAL_ROWS,
 };
+use crate::common::stack::{ExasolFlavor, exasol_flavor};
 use crate::common::timestamp_precision::{
     engine_honors_declared_precision, expected_timestamp_precision,
 };
@@ -925,10 +926,12 @@ fn e2e_clock_projection_matches_native_session_local_value() {
         .to_string();
     conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
     let offset_seconds = session_utc_offset_seconds(&mut conn);
-    assert!(
-        offset_seconds != 0.0,
-        "fixture precondition: the session's UTC offset must be non-zero, or the \
-         assertion below passes whichever zone the adapter applies (#238)"
+    // A zero offset lets the assertion below pass whichever zone the adapter applies (#238), so
+    // docker-db's DBTIMEZONE is no UTC zone. Nano runs with `sysTZ=UTC` (docker-compose.nano.yml).
+    assert_eq!(
+        offset_seconds == 0.0,
+        exasol_flavor() == ExasolFlavor::Nano,
+        "fixture precondition: the session's UTC offset is zero exactly on Nano, is {offset_seconds}s"
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
@@ -942,7 +945,8 @@ fn e2e_clock_projection_matches_native_session_local_value() {
         let within = if expr == "CURRENT_TIMESTAMP" {
             deviation < 1.0
         } else {
-            deviation <= 60.0 && (deviation - offset_seconds.abs()).abs() > 60.0
+            deviation <= 60.0
+                && (offset_seconds == 0.0 || (deviation - offset_seconds.abs()).abs() > 60.0)
         };
         assert!(
             within,

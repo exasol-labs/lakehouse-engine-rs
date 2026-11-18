@@ -12,7 +12,7 @@ use crate::common::exasol_ws::{ExaConn, error_text, parse_int};
 use crate::common::seed::{
     CLOCK_ROWS, E2E_CLOCK_NAMESPACE, E2E_CLOCK_TABLE, E2E_CLOCK_TABLE_2, seed_clock_probe,
 };
-use crate::common::stack::iceberg_catalog_url;
+use crate::common::stack::{ExasolFlavor, exasol_flavor, iceberg_catalog_url};
 use crate::common::timestamp_precision::engine_honors_declared_precision;
 use crate::fixtures::{explain_virtual_messages, explain_virtual_pushdown_sql, stack, vs_table};
 
@@ -30,7 +30,7 @@ const TOLERANCE_SECONDS: f64 = 60.0;
 const TOKYO: &str = "ASIA/TOKYO";
 /// The adapter's error for a clock value it cannot fold in the `TZ` zone.
 const TZ_REFUSAL: &str = "cannot fold a clock function or TIMESTAMP WITH LOCAL TIME ZONE literal in the adapter's TZ zone";
-/// The TSTZ literal of the fixture's boundary, 09:00 UTC, which is 10:00 in Berlin.
+/// The TSTZ literal of the fixture's boundary, 10:00 in the session zone.
 const TSTZ_BOUNDARY: &str =
     "CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)";
 
@@ -78,16 +78,17 @@ fn db_timezone(conn: &mut ExaConn) -> String {
         .to_string()
 }
 
-/// Pins the session zone to `DBTIMEZONE`, which the fixture requires to be no UTC zone, so a
-/// value folded in UTC differs from the native one.
-fn session_in_db_timezone(conn: &mut ExaConn) -> String {
+/// Pins the session zone to `DBTIMEZONE`. On docker-db it is no UTC zone, so a value folded in
+/// UTC differs from the native one. Nano runs with `sysTZ=UTC` (`docker-compose.nano.yml`).
+fn session_in_db_timezone(conn: &mut ExaConn) {
     let zone = db_timezone(conn);
-    assert_ne!(
-        zone, "UTC",
-        "fixture precondition: DBTIMEZONE must not be UTC"
+    let utc_by_workaround = exasol_flavor() == ExasolFlavor::Nano;
+    assert_eq!(
+        zone == "UTC",
+        utc_by_workaround,
+        "fixture precondition: DBTIMEZONE is UTC exactly on Nano, is {zone}"
     );
     set_session_zone(conn, &zone);
-    zone
 }
 
 fn ids(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
@@ -281,11 +282,8 @@ fn each_clock_function_reaches_the_pushed_sql_as_a_literal() {
 #[test]
 fn a_tstz_literal_comparison_runs_in_the_scan() {
     let mut conn = setup();
-    assert_eq!(
-        session_in_db_timezone(&mut conn),
-        "EUROPE/BERLIN",
-        "fixture precondition: the folding zone is the Berlin DBTIMEZONE"
-    );
+    // In a session whose zone is the folding zone, the literal folds to its own wall clock.
+    session_in_db_timezone(&mut conn);
     for column in ["TS", "TZ"] {
         let predicate = format!("{column} > {TSTZ_BOUNDARY}");
         let pushed = explain_virtual_pushdown_sql(
@@ -294,7 +292,7 @@ fn a_tstz_literal_comparison_runs_in_the_scan() {
         );
         assert!(
             pushed.contains("2024-03-01 10:00:00.000") && !pushed.contains("SESSIONTIMEZONE"),
-            "{predicate}: the scan filter must compare with the Berlin wall clock: {pushed}"
+            "{predicate}: the scan filter must compare with the folding zone's wall clock: {pushed}"
         );
         assert_eq!(assert_native_rows(&mut conn, VS, &predicate), [3, 4]);
     }
@@ -401,12 +399,12 @@ fn a_differing_session_zone_gets_the_folding_zone_values() {
         );
     }
     assert_matches_native(&mut conn, SET_VS, "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP");
-    // In this Tokyo session the literal is 01:00 UTC, 02:00 in Berlin, so every row's TS lies
-    // after it; Tokyo's 10:00 keeps two.
+    // In this Tokyo session the literal is 01:00 UTC, 01:00 or 02:00 in DBTIMEZONE, so every
+    // row's TS lies after it; Tokyo's 10:00 keeps two.
     assert_eq!(
         count(&mut conn),
         4,
-        "the literal must compare as the Berlin wall clock"
+        "the literal must compare as the DBTIMEZONE wall clock"
     );
 
     conn.execute(&format!(
@@ -505,10 +503,13 @@ fn every_clock_function_of_a_statement_folds_from_one_reading() {
             "{statement} must fold one instant: {literals:?}"
         );
     }
-    assert_eq!(
-        conn.query_scalar_i64(&format!("SELECT COUNT(DISTINCT X) FROM ({union})")),
-        1
-    );
+    // Nano's SQL process aborts on an aggregate over a UNION ALL of virtual tables, so the rows
+    // are compared here.
+    let values: BTreeSet<String> = conn.query_columns(&union)[0]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(values.len(), 1, "{union} must return one value: {values:?}");
 }
 
 /// Scenario: A numeric database time zone folds at its offset
@@ -568,6 +569,7 @@ fn an_unreadable_tz_fails_only_a_query_that_needs_it() {
         conn.execute(&format!(
             "ALTER VIRTUAL SCHEMA {vs} SET SESSION_TIME_ZONE = 'EUROPE/BERLIN'"
         ));
+        set_session_zone(&mut conn, "EUROPE/BERLIN");
         assert_eq!(
             ids(&mut conn, &tstz).len(),
             2,
