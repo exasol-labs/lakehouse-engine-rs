@@ -1082,8 +1082,10 @@ impl PushdownRequest {
     }
 
     /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
-    /// copy a broadcast join projects from, beside the types already checked for it.
-    pub fn with_json(&self, json: Json) -> Self {
+    /// copy a broadcast join projects from, beside the types already checked for it. A rewrite can
+    /// turn a sort key constant, such as a folded clock function, so the drop runs again.
+    pub fn with_json(&self, mut json: Json) -> Self {
+        drop_constant_sort_keys(&mut json);
         Self {
             json,
             select_types: self.select_types.clone(),

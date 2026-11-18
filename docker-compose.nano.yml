@@ -8,6 +8,8 @@ services:
     image: "${EXASOL_IMAGE:-exasol/nano:2026.2.0-nano.8}"
     entrypoint: ["/controller"]
     # Nano sizes DB RAM to most of the Docker VM's memory by default, starving the sibling services.
-    command: ["init", "params=dbram=${LH_NANO_DBRAM:-4096}"]
+    # Nano's SYSTIMESTAMP reads UTC under its default CET zone, which the UDF VM's TZ follows, so
+    # sysTZ=UTC makes them agree. Params are space-separated: a second `params=` replaces the first.
+    command: ["init", "params=dbram=${LH_NANO_DBRAM:-4096} sysTZ=UTC"]
     healthcheck:
       disable: true

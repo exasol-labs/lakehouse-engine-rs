@@ -203,6 +203,7 @@ fn create_accepts_every_known_property_name() {
             ("TABLE_INCLUDE", "*"),
             ("TABLE_EXCLUDE", "NO_SUCH_TABLE"),
             ("EXCLUDED_CAPABILITIES", "FN_PRED_LIKE, LIMIT_WITH_OFFSET"),
+            ("SESSION_TIME_ZONE", "Asia/Tokyo"),
         ],
     );
 
@@ -602,6 +603,53 @@ fn create_and_set_reject_an_unadvertised_capability() {
         properties,
         "a failed SET must keep the schema's properties"
     );
+    drop_vs(&mut conn, VS);
+}
+
+/// Scenario: SESSION_TIME_ZONE accepts the zone names Exasol lists and rejects other values
+#[test]
+fn session_time_zone_accepts_exasol_zone_names_and_rejects_others() {
+    const VS: &str = "PV_SESSION_TIME_ZONE";
+    const NAME: &str = "SESSION_TIME_ZONE";
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let rejected = invalid_value(NAME, "MARS/OLYMPUS", "a time zone name from EXA_TIME_ZONES");
+    let props: Vec<_> = base_props()
+        .into_iter()
+        .chain([(NAME, "MARS/OLYMPUS")])
+        .collect();
+    let msg = create_error(&mut conn, VS, &props);
+    assert!(msg.contains(&rejected), "CREATE: {msg}");
+
+    let listed =
+        conn.query_columns("SELECT MIN(TIME_ZONE_NAME), MAX(TIME_ZONE_NAME) FROM EXA_TIME_ZONES");
+    let (first, last) = (
+        value_to_string(&listed[0][0]),
+        value_to_string(&listed[1][0]),
+    );
+    create_ok(&mut conn, VS, &[(NAME, "EUROPE/BERLIN")]);
+    for zone in ["Europe/Berlin", first.as_str(), last.as_str()] {
+        conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS} SET {NAME} = '{zone}'"));
+        assert_eq!(
+            persisted_properties(&mut conn, VS)
+                .get(NAME)
+                .map(String::as_str),
+            Some(zone)
+        );
+    }
+    let properties = persisted_properties(&mut conn, VS);
+    let msg = query_error(
+        &mut conn,
+        &format!("ALTER VIRTUAL SCHEMA {VS} SET {NAME} = 'MARS/OLYMPUS'"),
+    );
+    assert!(msg.contains(&rejected), "SET: {msg}");
+    assert_eq!(
+        persisted_properties(&mut conn, VS),
+        properties,
+        "a failed SET must keep the schema's properties"
+    );
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS} SET {NAME} = null"));
+    assert!(!persisted_properties(&mut conn, VS).contains_key(NAME));
     drop_vs(&mut conn, VS);
 }
 

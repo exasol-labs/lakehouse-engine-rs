@@ -263,8 +263,8 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("ADD_WEEKS").typed(T::Never, R::DateAddition(DateResult::Date)),
         F::verbatim("ADD_HOURS").typed(T::Never, R::DateAddition(DateResult::Timestamp)),
         F::verbatim("ADD_MINUTES").typed(T::Never, R::DateAddition(DateResult::Timestamp)),
-        // Not declared: CURRENT_DATE, SYSDATE, CURRENT_TIMESTAMP, SYSTIMESTAMP. The scan
-        // UDF has no session time zone, statement anchor, or connect-back.
+        // Not declared: the clock functions reach the translator only as the literals the
+        // adapter folds them into, so a missed call is refused, never computed per shard.
     ]
 };
 
