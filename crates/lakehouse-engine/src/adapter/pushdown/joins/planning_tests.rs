@@ -31,8 +31,8 @@ fn plain_single_table_request_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// `ON c = o AND c < o` arrives as one `predicate_and` condition. Kept whole, its type is not
-/// `predicate_equal`, so `plan_join` takes the fallback instead of broadcast.
+/// `ON c = o AND c < o` arrives as one `predicate_and` condition, and detection keeps it whole:
+/// moving `c < o` to WHERE is `plan_join`'s step, not detection's.
 #[test]
 fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
     let condition = and([

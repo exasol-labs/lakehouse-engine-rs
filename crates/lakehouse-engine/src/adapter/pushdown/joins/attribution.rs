@@ -93,7 +93,8 @@ impl JoinLegs {
             .map(|key| key.leg)
     }
 
-    fn legs_referenced(&self, expr: &Json) -> BTreeSet<usize> {
+    /// The legs whose columns `expr` reads, empty for an expression that reads no column.
+    pub(super) fn legs_referenced(&self, expr: &Json) -> BTreeSet<usize> {
         let mut legs = BTreeSet::new();
         walk_column_nodes(expr, &mut |column| {
             legs.insert(self.leg(column));

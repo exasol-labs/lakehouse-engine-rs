@@ -18,6 +18,7 @@ use super::support::{
 
 mod attribution;
 mod broadcast_policy;
+mod condition_filters;
 mod planning;
 mod rendering;
 mod sql_builders;
@@ -112,6 +113,8 @@ fn empty_join_sql(
     )
 }
 
+/// Plans the request with each inner join's `ON` filters moved to WHERE
+/// ([`condition_filters::move_condition_filters`]), so every step below reads them there.
 /// Resolves each table once (never per shard), pruned by its leg-local WHERE conjuncts. Any
 /// empty side short-circuits to the shape-correct empty result, since an inner join is then
 /// empty.
@@ -134,6 +137,33 @@ pub(super) async fn plan_join(
     permission: &PermissionCheck,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
+    // Legs are indexed positionally, not by tableName, which a self-join's occurrences share.
+    let legs = join.legs();
+    let involved = join
+        .tables
+        .iter()
+        .map(|leaf| involved_table(request, &leaf.table_name))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Before the move, whose leg lookups rely on every column binding a leg.
+    ensure_columns_declared(
+        request,
+        pushdown.json(),
+        Some(join),
+        &involved.iter().collect::<Vec<_>>(),
+    )?;
+    let moved = match condition_filters::move_condition_filters(pushdown, &legs) {
+        Some(moved) => {
+            let JoinShape::Join(moved_join) = detect_join(request, moved.json())? else {
+                unreachable!("moving condition filters keeps every join node");
+            };
+            Some((moved, moved_join))
+        }
+        None => None,
+    };
+    let (pushdown, join) = match &moved {
+        Some((moved, moved_join)) => (moved, moved_join),
+        None => (pushdown, join),
+    };
     let pushdown_req = pushdown.json();
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     // Built once for every leg, so every leg's identifier passes its rule before any catalog
@@ -143,19 +173,6 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| leaf.table_identifier.as_str())
         .collect();
-    // Legs are indexed positionally, not by tableName, which a self-join's occurrences share.
-    let legs = join.legs();
-    let involved = join
-        .tables
-        .iter()
-        .map(|leaf| involved_table(request, &leaf.table_name))
-        .collect::<Result<Vec<_>, _>>()?;
-    ensure_columns_declared(
-        request,
-        pushdown_req,
-        Some(join),
-        &involved.iter().collect::<Vec<_>>(),
-    )?;
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
@@ -194,7 +211,7 @@ pub(super) async fn plan_join(
 }
 
 /// The broadcast plan of `join`, or `None` to keep the N-scan. Three things can say no, in this
-/// order: the shape (two legs, an equi-join, a window the path can serve), the policy
+/// order: the shape (two legs, a condition of join keys, a window the path can serve), the policy
 /// ([`n_scan_reason`]), and a render decline of the builder.
 fn plan_broadcast_join(
     pushdown: &PushdownRequest,
@@ -203,8 +220,8 @@ fn plan_broadcast_join(
     context: &PushdownContext<'_>,
 ) -> Result<Option<String>, UdfError> {
     let pushdown_req = pushdown.json();
-    let is_equi =
-        join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
+    let legs = join.legs();
+    let keys_only = condition_filters::holds_only_join_keys(&join.conditions[0], &legs);
     // Exasol renders an aggregating request's window over the broadcast fan-out, so only a
     // request that does not aggregate has a window the path may be unable to serve.
     let window_servable = aggregation_type(pushdown_req).is_some()
@@ -212,7 +229,7 @@ fn plan_broadcast_join(
             classify_join_window(pushdown_req),
             JoinWindowPlan::BroadcastUnservable
         );
-    if join.tables.len() != 2 || !is_equi || !window_servable {
+    if join.tables.len() != 2 || !keys_only || !window_servable {
         return Ok(None);
     }
     let candidate = select_broadcast_sides(sides[0].clone(), sides[1].clone());
@@ -220,7 +237,7 @@ fn plan_broadcast_join(
     let facts = BroadcastFacts {
         dimension_bytes: candidate.dimension.total_bytes,
         max_bytes: context.tuning.join_broadcast_max_bytes,
-        legs: &join.legs(),
+        legs: &legs,
         dimension_leg: candidate.dimension_leg,
         filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
         aggregation_reads: reads

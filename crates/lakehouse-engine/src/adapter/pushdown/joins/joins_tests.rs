@@ -655,6 +655,40 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_filters_prune_each_delta_join_leg_and_keep_the_broadcast_plan() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
+    let mut request = partitioned_legs_request();
+    request["pushdownRequest"]["from"]["condition"] = and([
+        customer_orders_join()["condition"].clone(),
+        string_equal("CUSTOMER", "C_REGION", "us"),
+        string_equal("ORDERS", "O_STATUS", "open"),
+    ]);
+
+    let result = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("a join with per-leg ON filters must plan");
+
+    let sql = result["sql"]
+        .as_str()
+        .expect("a planned pushdown carries sql");
+    assert!(
+        sql.contains("\"join\":{"),
+        "ON filters must keep the broadcast plan: {sql}"
+    );
+    assert!(sql.contains("c_region=us/part-0.parquet"), "{sql}");
+    assert!(
+        !sql.contains("c_region=eu/part-0.parquet"),
+        "CUSTOMER's ON filter must prune its non-matching file: {sql}"
+    );
+    assert!(sql.contains("o_status=open/part-0.parquet"), "{sql}");
+    assert!(
+        !sql.contains("o_status=closed/part-0.parquet"),
+        "ORDERS' ON filter must prune its non-matching file: {sql}"
+    );
+}
+
 /// A fake server that holds the first request for each key `held` derives from its target until
 /// two keys' first requests are in flight, so legs that run one after the other never get an
 /// answer. Returns the server's address.

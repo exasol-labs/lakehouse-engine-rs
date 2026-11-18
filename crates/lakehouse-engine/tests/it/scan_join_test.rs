@@ -868,6 +868,168 @@ fn selective_join_prunes_fact_row_groups_clustered_by_the_join_key() {
     }
 }
 
+/// Row group `g` holds only `(o_custkey, o_region) = (g, 10 * g)`, except the last, whose keys are
+/// all NULL.
+fn write_clustered_orders_with_two_keys(dir: &std::path::Path) -> (String, u64) {
+    let rows = CLUSTERED_ROW_GROUPS * CLUSTERED_ROWS_PER_GROUP;
+    let null_group = CLUSTERED_ROW_GROUPS - 1;
+    let group_key = |scale: i64| -> Int64Array {
+        (0..rows)
+            .map(|i| Some(i / CLUSTERED_ROWS_PER_GROUP).filter(|g| *g != null_group))
+            .map(|g| g.map(|g| g * scale))
+            .collect()
+    };
+    let batch = RecordBatch::try_from_iter([
+        (
+            "o_orderkey",
+            Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+        ),
+        ("o_custkey", Arc::new(group_key(1)) as ArrayRef),
+        ("o_region", Arc::new(group_key(10)) as ArrayRef),
+    ])
+    .expect("orders batch");
+    write_parquet(
+        &dir.join("orders_clustered_two_keys.parquet"),
+        &batch,
+        Some(CLUSTERED_ROWS_PER_GROUP as usize),
+    )
+}
+
+/// Customer `(k, r)` is named `c{k}`.
+fn write_two_key_customer(dir: &std::path::Path, keys: &[(i64, i64)]) -> (String, u64) {
+    let batch = RecordBatch::try_from_iter([
+        (
+            "c_custkey",
+            Arc::new(Int64Array::from_iter_values(keys.iter().map(|(k, _)| *k))) as ArrayRef,
+        ),
+        (
+            "c_region",
+            Arc::new(Int64Array::from_iter_values(keys.iter().map(|(_, r)| *r))) as ArrayRef,
+        ),
+        (
+            "c_name",
+            Arc::new(StringArray::from_iter_values(
+                keys.iter().map(|(k, _)| format!("c{k}")),
+            )) as ArrayRef,
+        ),
+    ])
+    .expect("customer batch");
+    write_parquet(&dir.join("customer_two_keys.parquet"), &batch, None)
+}
+
+/// The rows, the pruned fact row groups, the hash join's partition mode, and the rendered physical
+/// plan of `spec`'s plan.
+fn execute_join_plan(spec: &ScanSpec) -> (Vec<(i64, String)>, usize, PartitionMode, String) {
+    block_on(async {
+        let session = SessionContext::new_with_config(session_config_for_spec(spec));
+        let plan = build_join_physical_plan(&session, spec, &scan_fixture::resolved_storage(spec))
+            .await
+            .expect("physical plan must build");
+        let batches = collect(Arc::clone(&plan), session.task_ctx())
+            .await
+            .expect("join must execute");
+        let hash_join = find_hash_join(&plan).expect("plan must contain a HashJoinExec");
+        let hash_join: &dyn Any = hash_join.as_ref();
+        let mode = *hash_join
+            .downcast_ref::<HashJoinExec>()
+            .expect("downcast HashJoinExec")
+            .partition_mode();
+        // The plan reads text as `Utf8View`; only the emit path casts it to the declared `Utf8`.
+        let batches: Vec<RecordBatch> = batches
+            .iter()
+            .map(|batch| {
+                let mut columns = batch.columns().to_vec();
+                columns[1] = arrow::compute::cast(&columns[1], &DataType::Utf8).expect("cast");
+                RecordBatch::try_from_iter(["o_orderkey", "c_name"].into_iter().zip(columns))
+                    .expect("batch")
+            })
+            .collect();
+        let mut rows = orderkey_name_rows(&batches);
+        rows.sort();
+        (
+            rows,
+            sum_row_groups_pruned(plan.as_ref()),
+            mode,
+            displayable(plan.as_ref()).indent(true).to_string(),
+        )
+    })
+}
+
+fn two_key_join_spec(dir: &std::path::Path, dim_keys: &[(i64, i64)], condition: &str) -> ScanSpec {
+    let orders = write_clustered_orders_with_two_keys(dir);
+    let customer = write_two_key_customer(dir, dim_keys);
+    let mut spec = join_spec(
+        vec![orders],
+        vec![customer],
+        vec!["O_ORDERKEY", "C_NAME"],
+        None,
+        None,
+    );
+    spec.common
+        .join
+        .as_mut()
+        .expect("a join spec carries a join block")
+        .condition = condition.into();
+    spec
+}
+
+/// Scenario: The fact scan skips row groups that no dimension join key matches
+#[test]
+fn composite_key_join_prunes_fact_row_groups_outside_each_key_columns_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Groups 6 and 7 lie inside the C_CUSTKEY bounds but outside the C_REGION bounds, so only the
+    // second key's bounds skip them. Group 4 lies inside both bounds, and no dimension tuple
+    // matches it.
+    let dim_keys = [(3, 30), (5, 50), (7, 50)];
+    let condition = "\"LHS_T0\".\"C_CUSTKEY\" = \"LHS_T1\".\"O_CUSTKEY\" \
+                     AND \"LHS_T1\".\"O_REGION\" = \"LHS_T0\".\"C_REGION\"";
+    let spec = two_key_join_spec(tmp.path(), &dim_keys, condition);
+
+    let (rows, pruned, mode, rendered) = execute_join_plan(&spec);
+
+    assert_eq!(rows, clustered_rows([3, 5]));
+    assert_eq!(
+        mode,
+        PartitionMode::CollectLeft,
+        "a composite key must still build one hash table"
+    );
+    let outside_some_key_bounds = CLUSTERED_ROW_GROUPS as usize - 3;
+    assert!(
+        pruned >= outside_some_key_bounds,
+        "every fact row group outside the C_CUSTKEY bounds [3, 7] or the C_REGION bounds \
+         [30, 50] must be pruned, got {pruned}:\n{rendered}"
+    );
+}
+
+#[test]
+fn expression_key_join_returns_the_inner_join_rows_from_one_hash_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "expression on the dimension side",
+            "\"LHS_T0\".\"C_CUSTKEY\" + 1 = \"LHS_T1\".\"O_CUSTKEY\"",
+            clustered_rows([4, 6])
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "expression on the fact side",
+            "\"LHS_T0\".\"C_CUSTKEY\" = \"LHS_T1\".\"O_CUSTKEY\" - 1",
+            clustered_rows([4, 6]).into_iter().map(|(k, _)| k).collect(),
+        ),
+    ];
+    for (case, condition, expected_orderkeys) in cases {
+        let spec = two_key_join_spec(tmp.path(), &[(3, 30), (5, 50)], condition);
+
+        let (rows, _, mode, rendered) = execute_join_plan(&spec);
+
+        let orderkeys: Vec<i64> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(orderkeys, expected_orderkeys, "{case}:\n{rendered}");
+        assert_eq!(mode, PartitionMode::CollectLeft, "{case}:\n{rendered}");
+    }
+}
+
 #[test]
 fn join_returns_exact_rows_whatever_the_dimension_side_keeps() {
     let tmp = tempfile::tempdir().unwrap();
