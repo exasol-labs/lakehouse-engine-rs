@@ -9,11 +9,11 @@ mod common;
 
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, VsProps,
+    ADAPTER_SCRIPT_NAME, ExportRoute, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, VsProps,
     assert_decimal_orders_numerically, create_proxied_schema_and_scripts,
     create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
-    exa_conn_redacting, explain_virtual_sql, install_slc, parse_int, projection_rows, runtime,
-    upload_so, value_to_string,
+    exa_conn_redacting, explain_virtual_sql, exported_rows, install_slc, parse_int,
+    projection_rows, runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -573,6 +573,91 @@ fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &A
         !explained.contains(&account_key),
         "EXPLAIN VIRTUAL output must never leak the Azure account key"
     );
+}
+
+const VS_SAS: &str = "AZ_SAS_LAKEHOUSE";
+const CONN_SAS: &str = "AZ_SAS_CATALOG_CREDS";
+const EXPORT_SOURCE: &str = "AZ_EXPORT_E2E.SRC_ROWS";
+const EXPORT_SOURCE_ROWS: i64 = 500;
+
+/// Scenario: Static and vended credentials write a table on ADLS Gen2
+#[test]
+fn azure_export_writes_and_appends_with_account_key_sas_and_vended_credentials() {
+    let fixture = AzureFixture::provision();
+    let mut conn = exa_conn_redacting();
+    conn.execute("CREATE SCHEMA IF NOT EXISTS AZ_EXPORT_E2E");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {EXPORT_SOURCE} AS SELECT \
+           CAST(LEVEL AS DECIMAL(9,0)) AS ID, CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL \
+         FROM DUAL CONNECT BY LEVEL <= {EXPORT_SOURCE_ROWS}"
+    ));
+    // A service SAS of the run's container, so the CONNECTION holds no account key.
+    let sas_password = CatalogConnectionPassword {
+        account_key: None,
+        sas_token: Some(azure::container_sas(
+            &fixture.account_name,
+            &azure::account_key(),
+            &fixture.container_name,
+        )),
+        ..lakekeeper_adls_connection_password(
+            &fixture.static_arm.warehouse,
+            &fixture.account_name,
+            &azure::account_key(),
+        )
+    };
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_SAS, E2E_NAMESPACE).with_catalog_conn_name(CONN_SAS),
+        LAKEKEEPER_CATALOG_URI_INTERNAL,
+        &sas_password,
+    );
+    let arms = [
+        (CONN_STATIC, VS_STATIC, "exported_by_key", ""),
+        (CONN_SAS, VS_SAS, "exported_by_sas", ""),
+        (
+            CONN_VENDED,
+            VS_VENDED,
+            "exported_vended",
+            "SINGLE_COMMIT = 'true'",
+        ),
+    ];
+
+    for (connection, _, table, options) in arms {
+        let route = ExportRoute {
+            script_schema: SCHEMA_NAME,
+            connection,
+        };
+        let sql = route.export(EXPORT_SOURCE, &format!("{E2E_NAMESPACE}.{table}"), options);
+        for pass in ["create", "append"] {
+            assert_eq!(
+                exported_rows(&mut conn, &sql),
+                EXPORT_SOURCE_ROWS,
+                "{connection} {pass}"
+            );
+        }
+    }
+
+    for (connection, vs, table, _) in arms {
+        conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} REFRESH"));
+        let rows = conn.query_columns(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT ID), SUM(ID) FROM {vs}.{}",
+            table.to_uppercase()
+        ));
+        let counts: Vec<String> = rows
+            .iter()
+            .map(|column| value_to_string(&column[0]))
+            .collect();
+        let n = EXPORT_SOURCE_ROWS;
+        assert_eq!(
+            counts,
+            [
+                (2 * n).to_string(),
+                n.to_string(),
+                (n * (n + 1)).to_string()
+            ],
+            "{connection}: every source row must read back twice"
+        );
+    }
 }
 
 #[test]

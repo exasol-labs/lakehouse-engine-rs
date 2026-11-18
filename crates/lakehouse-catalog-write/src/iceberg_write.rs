@@ -2,11 +2,12 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
+use crate::adls_storage::adls_file_io;
 use crate::retry::{
     DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, append_retries, commit_retries,
 };
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
-use crate::vended_refresh::{StorageCredentials, VendedTable};
+use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
@@ -17,8 +18,9 @@ use iceberg_catalog_rest::{
 };
 use lakehouse_catalog::{
     AssumedRole, CatalogResponse, CatalogSendError, CatalogSession, ConnectionCreds, EpochClock,
-    RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, namespace_tables_path,
-    resolve_vended_storage, scheme_of, system_clock, table_ident_path, vended_s3_credentials,
+    RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, VendedBackendKind,
+    classify_vended_scheme, namespace_tables_path, resolve_vended_storage, scheme_of, system_clock,
+    table_ident_path, vended_adls_sas, vended_s3_credentials,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -31,7 +33,8 @@ const EXPORT_WRITER_PROPERTY: &str = "lakehouse.export-writer";
 /// Where an export table's storage credentials come from. Every kind reaches the table's FileIO
 /// through one credential source, which renews the credentials its own way.
 pub enum WriteStorage {
-    /// The CONNECTION's own storage keys, which do not expire.
+    /// The CONNECTION's own storage credentials, S3 keys or an Azure account key or SAS, which
+    /// do not expire.
     Static(StorageBackend),
     /// The credentials of an IAM role the CONNECTION names, assumed again before they expire.
     /// `backend` carries the store's address.
@@ -91,7 +94,7 @@ impl CommitTag {
 /// credentials, which renew themselves when the catalog vends them.
 pub struct WriteTable {
     table: Table,
-    credentials: StorageCredentials,
+    credentials: TableCredentials,
 }
 
 /// A table staged for `SINGLE_COMMIT`: invisible in the catalog until [`TableWriteSession::
@@ -594,75 +597,109 @@ impl TableWriteSession {
         })
     }
 
-    /// The table of a load, create, or stage answer, with a FileIO over its location. Only an
-    /// `s3` or `s3a` location is accepted, before any storage is configured.
+    /// The table of a load, create, or stage answer, with a FileIO over its location. A location
+    /// the storage cannot address is refused before any storage is configured.
     fn open(&self, table: &TableIdent, answer: LoadTableResult) -> Result<WriteTable, UdfError> {
         let location = answer.metadata.location().to_string();
-        let scheme = scheme_of(&location);
-        if !matches!(scheme.as_str(), "s3" | "s3a") {
-            return Err(UdfError::User(format!(
-                "table {} has the location {location}, whose scheme {scheme} is no S3-compatible \
-                 storage; the export writes only to s3:// or s3a:// locations",
-                table
-            )));
-        }
+        self.refuse_unaddressable(table, &location)?;
         let (file_io, credentials) = self.storage_of(table, &answer, location)?;
         let table = iceberg_table(table, answer, file_io)
             .map_err(|error| UdfError::User(format!("could not open table {}: {error}", table)))?;
         Ok(WriteTable { table, credentials })
     }
 
+    /// The CONNECTION's S3 storage, by keys or a role, addresses `s3` and `s3a`, its Azure storage
+    /// `abfss`, and vended storage all four schemes, `abfs` only under the export's `ALLOW_HTTP`.
+    fn refuse_unaddressable(&self, table: &TableIdent, location: &str) -> Result<(), UdfError> {
+        let scheme = scheme_of(location);
+        let storage = match &self.storage {
+            WriteStorage::Static(backend) | WriteStorage::AssumedRole { backend, .. } => {
+                if backend.addresses_scheme(&scheme) {
+                    return Ok(());
+                }
+                match backend {
+                    StorageBackend::S3(_) => "the CONNECTION's S3 storage",
+                    StorageBackend::Adls { .. } => "the CONNECTION's Azure storage",
+                }
+            }
+            WriteStorage::Vended(_) => match classify_vended_scheme(&scheme) {
+                Some(VendedBackendKind::Adls) if scheme == "abfs" && !self.allow_http => {
+                    return Err(UdfError::User(format!(
+                        "table {table} has the plaintext location {location}, whose scheme abfs \
+                         names plain-HTTP transport, but the export option ALLOW_HTTP is not \
+                         'true'"
+                    )));
+                }
+                Some(_) => return Ok(()),
+                None => "vended storage",
+            },
+        };
+        Err(UdfError::User(format!(
+            "table {table} has the location {location}, whose scheme {scheme} {storage} cannot \
+             address"
+        )))
+    }
+
     /// The FileIO of the table at `location` and the credential source it signs with: the
-    /// CONNECTION's own keys, the credentials of its role, or the credentials `answer` vends. Each
-    /// is seeded into a source that renews it its own way.
+    /// CONNECTION's own credentials, the credentials of its role, or the credentials `answer`
+    /// vends. Each is seeded into a source that renews it its own way.
     fn storage_of(
         &self,
         table: &TableIdent,
         answer: &LoadTableResult,
         location: String,
-    ) -> Result<(FileIO, StorageCredentials), UdfError> {
-        let (backend, credentials) = match &self.storage {
-            WriteStorage::Static(backend) => {
-                let StorageBackend::S3(props) = backend else {
-                    return Err(adls_refused());
-                };
+    ) -> Result<(FileIO, TableCredentials), UdfError> {
+        match &self.storage {
+            WriteStorage::Static(StorageBackend::Adls { cred, .. }) => {
+                let credentials = AdlsCredentials::connection(cred, self.clock.clone())?;
+                Ok(adls_storage(&location, credentials))
+            }
+            WriteStorage::Static(backend @ StorageBackend::S3(props)) => {
                 let keys = StorageCredentials::keys(
                     &props.access_key,
                     &props.secret_key,
                     props.session_token.as_deref(),
                     self.clock.clone(),
                 );
-                (backend.clone(), keys)
+                s3_storage(backend, keys)
             }
             WriteStorage::AssumedRole { backend, role } => {
-                (backend.clone(), StorageCredentials::role(role.clone()))
+                s3_storage(backend, StorageCredentials::role(role.clone()))
             }
             WriteStorage::Vended(address) => {
-                let seed = vended_s3_credentials(answer, &location)?;
                 let vended = VendedTable {
                     session: self.session.clone(),
                     table: table.clone(),
-                    location,
+                    location: location.clone(),
                     allow_http: self.allow_http,
                 };
+                if let Some(VendedBackendKind::Adls) = classify_vended_scheme(&scheme_of(&location))
+                {
+                    let seed = vended_adls_sas(answer, &location)?;
+                    let credentials = AdlsCredentials::vended(vended, seed, self.clock.clone())?;
+                    return Ok(adls_storage(&location, credentials));
+                }
+                let seed = vended_s3_credentials(answer, &location)?;
                 let credentials = StorageCredentials::vended(vended, seed, self.clock.clone())?;
-                let backend = resolve_vended_storage(
-                    answer,
-                    answer.metadata.location(),
-                    self.allow_http,
-                    address,
-                )?;
-                (backend, credentials)
+                let backend = resolve_vended_storage(answer, &location, self.allow_http, address)?;
+                s3_storage(&backend, credentials)
             }
-        };
-        let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
-        Ok((file_io, credentials))
+        }
     }
 }
 
-fn adls_refused() -> UdfError {
-    UdfError::User(
-        "an AWS credential loader signs only S3 storage requests, but the storage is ADLS".into(),
+fn s3_storage(
+    backend: &StorageBackend,
+    credentials: StorageCredentials,
+) -> Result<(FileIO, TableCredentials), UdfError> {
+    let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
+    Ok((file_io, TableCredentials::S3(credentials)))
+}
+
+fn adls_storage(location: &str, credentials: AdlsCredentials) -> (FileIO, TableCredentials) {
+    (
+        adls_file_io(location, credentials.clone()),
+        TableCredentials::Adls(credentials),
     )
 }
 
