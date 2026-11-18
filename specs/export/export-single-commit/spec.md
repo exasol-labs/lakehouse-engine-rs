@@ -1,10 +1,12 @@
 # Feature: EXPORT INTO SCRIPT With SINGLE_COMMIT
 
-With `SINGLE_COMMIT = 'true'`, a new table appears only together with all its rows, and a failed export leaves no table behind.
+With `SINGLE_COMMIT = 'true'` an export into a new Iceberg table creates the table only together with all its rows, through the catalog's staged table creation, and a failed export leaves no table.
 
 ## Background
 
-* Statement and options: export/export-options § Background. Creating a new table: export/export-iceberg-table § Background.
+* Statement and options: export/export-options § Background.
+* Catalog, storage, and credentials: export/export-catalog-storage § Background.
+* Table creation, type mapping, and commits: export/export-iceberg-table § Background.
 * `SINGLE_COMMIT` means the table appears only with its data. Iceberg REST does it by staged table creation (`stage-create`), so only a `SINGLE_COMMIT` export that creates its table needs a catalog that accepts it.
 
 ## Scenarios

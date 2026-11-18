@@ -3,12 +3,14 @@
 
 use crate::common::e2e_harness::runtime;
 use crate::common::e2e_harness::{
-    VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn,
-    resolve_fixture_files,
+    SCAN_SCRIPT_NAME, VsProps, create_virtual_schema, create_virtual_schema_with_password,
+    exa_conn, isolated_pushdown_statement, resolve_fixture_files,
 };
+use crate::common::identity_partition_fixtures::TYPES_TABLE;
 use crate::common::pruning_cases::{
-    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_grouped_aggregates_match_oracle,
-    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle,
+    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_clock_cases_hold,
+    assert_grouped_aggregates_match_oracle, assert_one_shaped_file_per_label,
+    assert_single_group_aggregates_match_oracle,
 };
 use crate::common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
@@ -18,7 +20,7 @@ use crate::common::seed::seed_pruning_cases;
 use crate::common::stack::{
     CatalogConnectionPassword, iceberg_catalog_url, local_stack_connection_password,
 };
-use crate::fixtures::stack;
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 use std::sync::OnceLock;
 
@@ -141,4 +143,29 @@ fn hive_single_group_aggregates_match_the_oracle() {
 fn hive_grouped_aggregates_match_the_oracle() {
     setup();
     assert_grouped_aggregates_match_oracle(&mut exa_conn(), Format::Hive);
+}
+
+/// Scenario: A filter on a clock function or a time zone literal prunes files at plan time
+#[test]
+fn clock_and_tstz_filters_prune_files() {
+    setup();
+    let mut conn = exa_conn();
+    // In a session whose zone is the folding zone, the TSTZ literal folds to its own wall clock.
+    let db_timezone = conn.query_columns("SELECT DBTIMEZONE")[0][0].clone();
+    let db_timezone = db_timezone.as_str().expect("DBTIMEZONE is text");
+    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
+    assert_clock_cases_hold(&mut conn, Format::Iceberg);
+
+    // `dt` is an identity partition holding 2024-02-29 and NULL.
+    lakehouse_vs();
+    let partitioned = format!(
+        "SELECT ID FROM {} WHERE DT = CURRENT_DATE",
+        vs_table(LAKEHOUSE_VS, TYPES_TABLE)
+    );
+    let plan = isolated_pushdown_statement(&mut conn, &partitioned);
+    assert!(
+        !plan.contains(SCAN_SCRIPT_NAME),
+        "{partitioned} must prune every file: {plan}"
+    );
+    assert_eq!(conn.query_row_count(&partitioned), 0, "{partitioned}");
 }

@@ -118,6 +118,19 @@ fn reports_audited_capability_set() {
     }
 
     for name in &[
+        "FN_CURRENT_DATE",
+        "FN_CURRENT_TIMESTAMP",
+        "FN_LOCALTIMESTAMP",
+        "FN_SYSDATE",
+        "FN_SYSTIMESTAMP",
+    ] {
+        assert!(
+            cap_strs.contains(name),
+            "{name} must be advertised: {cap_strs:?}"
+        );
+    }
+
+    for name in &[
         "FN_TO_CHAR",
         "FN_TO_NUMBER",
         "FN_PRED_REGEXP_LIKE",
@@ -133,10 +146,8 @@ fn reports_audited_capability_set() {
         "FN_DAYOFWEEK",
         "FN_LAST_DAY",
         "FN_CONVERT_TZ",
-        "FN_CURRENT_DATE",
-        "FN_CURRENT_TIMESTAMP",
-        "FN_SYSDATE",
-        "FN_SYSTIMESTAMP",
+        "FN_DBTIMEZONE",
+        "FN_SESSIONTIMEZONE",
         "FN_CURRENT_USER",
         "FN_SYS_GUID",
         "FN_CURRENT_SCHEMA",

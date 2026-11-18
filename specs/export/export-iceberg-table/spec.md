@@ -1,6 +1,6 @@
 # Feature: EXPORT INTO SCRIPT Into a New Iceberg Table
 
-The export writes the source rows as Parquet data files into a new Iceberg table, through the Iceberg REST catalog that the CONNECTION names, on S3-compatible storage. It creates the namespace and the table, and each writer commits its own files exactly once. With `SINGLE_COMMIT = 'true'` the table appears only together with all its rows. An export into an existing table appends to it: export/export-append-iceberg-table.
+The export writes the source rows as Parquet data files into a new Iceberg table, through the Iceberg REST catalog that the CONNECTION names, on S3-compatible storage or Azure Data Lake Storage Gen2. It creates the namespace and the table, and each writer commits its own files exactly once. With `SINGLE_COMMIT = 'true'` the table appears only together with all its rows: export/export-single-commit. An export into an existing table appends to it: export/export-append-iceberg-table.
 
 ## Background
 
@@ -8,7 +8,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * Read through a virtual schema: export/export-into-script § Background.
 * Catalog, storage, and credentials: export/export-catalog-storage § Background.
 * Before it reads any source row the export makes catalog calls only: it authenticates, checks whether the table exists, and, when it does not, creates every missing level of the namespace, even when it then writes no rows or fails. It never writes to storage at that point, so a storage error shows when the writers write, and in parallel mode a failed export can leave an empty table behind. A table that another statement creates after that check fails the writers with an error that names the table.
-* `SINGLE_COMMIT` into a new table: export/export-single-commit § Background.
+* `SINGLE_COMMIT`: export/export-single-commit § Background.
 * Type mapping. The export creates format-version 2 tables, unpartitioned unless `PARTITION_BY` is given (export/export-partitioned-iceberg-table). Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
 
   | Exasol type | Iceberg type |
@@ -23,6 +23,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
   Every other type is refused. Exasol itself refuses a `GEOMETRY`, `HASHTYPE`, `INTERVAL`, or `TIMESTAMP WITH LOCAL TIME ZONE` column before the export reads it: with `Column type not supported: <type>`, or with `VM error: Unknown data type found`, which names no column. Which of the two a column gets varies between statements. The export refuses `TIMESTAMP(p)` with p > 6, and any other type that reaches it, with an error that names the column and its type and suggests a cast to `TIMESTAMP(6)`.
 * Iceberg table spec § Primitive Types: `decimal(P,S)` "Scale is fixed, precision must be 38 or less", which holds Exasol's precision of at most 36. `timestamp` is "Timestamp, microsecond precision, without timezone", and note 1 states "Timestamp values _without time zone_ represent a date and time of day regardless of zone", as Exasol's `TIMESTAMP` does. `timestamp_ns` is added by v3, so a version 2 table has no lossless target for `TIMESTAMP(7)` to `TIMESTAMP(9)`: refusing them is this feature's scoped exception. `string` is "Encoded with UTF-8". § Reserved Field IDs reserves metadata columns "that can be used in user data schemas, like the `_file` column".
 * Every snapshot that an export commits carries the summary property `lakehouse.export-id`, which identifies the export statement.
+* Between two attempts of one commit the writer waits the table's `commit.retry.min-wait-ms`, doubled after each retry up to its `commit.retry.max-wait-ms`, plus up to a tenth more at random. A property that is absent or not a whole number of milliseconds takes Iceberg's default of 100 ms or 60 s.
 * Every commit pins the schema and partition spec the writer checked. The writer binds source columns to the table's fields by name and writes their field IDs into its data files, so a commit after another engine changed the schema could land values that read as NULL under the names they were bound to, for example after a column is dropped and added again. Its partition values follow the checked spec, which a manifest under a newer default spec would misdescribe.
 
 ## Scenarios

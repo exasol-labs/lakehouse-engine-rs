@@ -320,3 +320,53 @@ mod azure_error_classification_tests {
         }
     }
 }
+
+/// Azure's service SAS version whose string-to-sign has the 16 fields below.
+const SAS_VERSION: &str = "2022-11-02";
+
+/// A service SAS for `container` (`sr=c`) signed with the account key, with read, add, create,
+/// write, delete, and list permissions, valid over HTTPS for one hour.
+pub fn container_sas(account_name: &str, account_key: &str, container: &str) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use hmac::{Hmac, Mac};
+
+    let permissions = "racwdl";
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    // https://learn.microsoft.com/en-us/rest/api/storageservices/create-service-sas
+    let string_to_sign = [
+        permissions,
+        "",
+        &expiry,
+        &format!("/blob/{account_name}/{container}"),
+        "",
+        "",
+        "https",
+        SAS_VERSION,
+        "c",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]
+    .join("\n");
+    let key = STANDARD
+        .decode(account_key)
+        .expect("AZURE_STORAGE_ACCOUNT_KEY must be base64");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).expect("HMAC takes any key length");
+    mac.update(string_to_sign.as_bytes());
+    let signature = STANDARD.encode(mac.finalize().into_bytes());
+    let encode = |value: &str| {
+        percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    format!(
+        "sv={SAS_VERSION}&sr=c&sp={permissions}&se={}&spr=https&sig={}",
+        encode(&expiry),
+        encode(&signature)
+    )
+}

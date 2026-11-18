@@ -50,9 +50,12 @@ pub use session::{
     CatalogResponse, CatalogSendError, CatalogSession, load_table_any_auth, namespace_tables_path,
     table_ident_path,
 };
-pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
+pub use storage::{
+    AdlsCred, StaticStoreAddress, StorageBackend, VendedBackendKind, classify_vended_scheme,
+    scheme_of,
+};
 pub use sts::{AssumedRole, ResolvedIdentity, resolve_aws_identity};
 
-pub use vended::{VendedS3Credentials, resolve_vended_storage, vended_s3_credentials};
+pub use vended::{VendedAdlsSas, VendedCredentialSet, VendedS3Credentials, resolve_vended_storage};
 
 pub use unity::{TemporaryTableCredentials, UnityCatalogSession, resolve_uc_vended_storage};

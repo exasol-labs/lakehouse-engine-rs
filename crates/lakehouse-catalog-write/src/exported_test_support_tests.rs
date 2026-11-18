@@ -25,3 +25,13 @@ pub async fn catalog(
     })
     .await
 }
+
+/// `table`, a load-table answer, with commit retry waits of 1 ms, so a test that exhausts a
+/// commit's retries runs on the real clock.
+pub fn with_short_commit_waits(table: &str) -> String {
+    let mut table: serde_json::Value = serde_json::from_str(table).expect("a load-table answer");
+    let properties = &mut table["metadata"]["properties"];
+    properties["commit.retry.min-wait-ms"] = "1".into();
+    properties["commit.retry.max-wait-ms"] = "1".into();
+    table.to_string()
+}

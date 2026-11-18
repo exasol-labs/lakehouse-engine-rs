@@ -159,13 +159,14 @@ impl StorageBackend {
     }
 }
 
-pub(crate) enum VendedBackendKind {
+/// The backend a vended table location selects by its scheme.
+pub enum VendedBackendKind {
     S3,
     Adls,
 }
 
 /// Expects an already-lowercased scheme.
-pub(crate) fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> {
+pub fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> {
     match scheme {
         "s3" | "s3a" => Some(VendedBackendKind::S3),
         "abfs" | "abfss" => Some(VendedBackendKind::Adls),

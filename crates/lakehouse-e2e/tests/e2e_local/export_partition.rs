@@ -9,9 +9,8 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 use crate::common::e2e_harness::{
-    AddedBy, NO_SECRETS, PartitionedFile, VsProps, assert_holds_rows,
-    assert_refused_before_reading, create_virtual_schema, data_file_partitions, exa_conn,
-    export_error, exported_rows, failing_source, run_namespace, value_to_string,
+    NO_SECRETS, VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
+    exa_conn, export_error, exported_rows, failing_source, run_namespace, value_to_string,
 };
 use crate::common::export_partition_fixtures::{
     BY_TIME, BY_TIME_ALL_NULL_RIDS, BY_TIME_NULL_RIDS, BY_TIME_ROWS, BY_TIME_SPEC, BY_VALUE,
@@ -19,7 +18,8 @@ use crate::common::export_partition_fixtures::{
     EVOLVED, EVOLVED_CURRENT_RIDS, EVOLVED_SPEC, NAMESPACE, STRADDLING_PAIRS,
 };
 use crate::common::table_state::{
-    local_table_metadata, reset_to_unexported_snapshot, snapshot_ids, table_exists,
+    AddedBy, PartitionedFile, data_file_partitions, local_table_metadata,
+    reset_to_unexported_snapshot, snapshot_ids, table_exists,
 };
 use crate::fixtures::{EXPORT_DIRECT, explain_virtual_pushdown_sql, lakehouse_vs, stack, vs_table};
 

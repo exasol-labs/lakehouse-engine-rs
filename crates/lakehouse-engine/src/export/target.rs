@@ -6,9 +6,7 @@ use super::batch::TableColumns;
 use super::options::ALLOW_HTTP;
 use super::partition_by::PartitionField;
 use super::{EXPORT_SCRIPT_NAME, refusal};
-use crate::connection::{
-    parse_creds, password_object, supplied_azure_fields, validate_shared_creds,
-};
+use crate::connection::{parse_creds, password_object, validate_shared_creds};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -69,7 +67,8 @@ pub(super) trait ExportSink {
 }
 
 /// A CONNECTION the export can write through: an Iceberg REST catalog that needs no SigV4
-/// signing, on S3-compatible storage, with plain HTTP only under the export's `ALLOW_HTTP`.
+/// signing, on S3-compatible storage or ADLS Gen2, with plain HTTP only under the export's
+/// `ALLOW_HTTP`.
 pub(super) struct ExportConnection {
     /// The catalog address.
     pub(super) address: String,
@@ -115,14 +114,6 @@ fn refuse_unwritable(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError
         return Err(refusal(format_args!(
             "CONNECTION '{name}' password is missing required field: warehouse, the Iceberg REST \
              warehouse the export writes into"
-        )));
-    }
-    let azure_fields = supplied_azure_fields(creds);
-    if !azure_fields.is_empty() {
-        return Err(refusal(format_args!(
-            "CONNECTION '{name}' supplies Azure storage field(s) {}, but the export writes only \
-             to S3-compatible storage; remove them",
-            azure_fields.join(", ")
         )));
     }
     if creds.use_sigv4 {

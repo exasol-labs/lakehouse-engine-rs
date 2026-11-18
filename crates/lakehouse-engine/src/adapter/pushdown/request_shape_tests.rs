@@ -341,14 +341,15 @@ fn single_group_having_over_a_split_aggregate_renders_over_the_merge() {
 
 #[test]
 fn single_group_that_does_not_split_never_classifies_as_row_scan() {
-    let literal = str_lit("X");
     for (req, scan) in [
         single_group(
             serde_json::json!([agg_item("SUM", Some("NAME"), false)]),
             None,
         ),
-        single_group(serde_json::json!([literal.clone(), count_star()]), None),
-        single_group(serde_json::json!([literal]), Some(count_greater_than(0))),
+        single_group(
+            serde_json::json!([str_lit("X")]),
+            Some(count_greater_than(0)),
+        ),
         single_group(
             serde_json::json!([count_star()]),
             Some(compare(

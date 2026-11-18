@@ -44,6 +44,9 @@ chrono     = { workspace = true }
 percent-encoding = { workspace = true }
 base64     = "0.22"
 rand       = "0.8"
+# Sign the container SAS the Azure suite mints.
+hmac       = "0.12"
+sha2       = "0.10"
 
 reqwest = { workspace = true, features = ["blocking"] }
 # Seed harness forces static SeaweedFS admin credentials over Lakekeeper's vended STS token.

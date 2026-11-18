@@ -586,7 +586,7 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
 }
 
 /// `path_style` defaults to `false`; SeaweedFS callers must set it explicitly.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CatalogConnectionPassword {
     pub warehouse: String,
     pub endpoint: String,
@@ -604,6 +604,7 @@ pub struct CatalogConnectionPassword {
     pub scope: Option<String>,
     pub account_name: Option<String>,
     pub account_key: Option<String>,
+    pub sas_token: Option<String>,
     /// AWS IAM role to assume before signing catalog/storage requests. Absent when not supplied.
     pub aws_assume_role_arn: Option<String>,
     /// STS `ExternalId` for the assumed role. Requires `aws_assume_role_arn`. Absent when not supplied.
@@ -662,6 +663,9 @@ impl CatalogConnectionPassword {
         }
         if let Some(account_key) = &self.account_key {
             obj["account_key"] = serde_json::Value::String(account_key.clone());
+        }
+        if let Some(sas_token) = &self.sas_token {
+            obj["sas_token"] = serde_json::Value::String(sas_token.clone());
         }
         if let Some(role_arn) = &self.aws_assume_role_arn {
             obj["aws_assume_role_arn"] = serde_json::Value::String(role_arn.clone());

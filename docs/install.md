@@ -273,6 +273,11 @@ EMITS (...) AS
 - Re-running the install command recreates the scripts without the `%env` lines. Add them again
   afterwards.
 
+A `%env TZ=<zone>;` line in the `LAKEHOUSE_ADAPTER` source replaces the `DBTIMEZONE` that Exasol
+sets there. It changes the zone in which `SYSDATE` and `SYSTIMESTAMP` fold, and without `SESSION_TIME_ZONE`
+also `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` ([Capabilities](capabilities.md)).
+A query that needs that zone fails when `TZ` names no zone.
+
 ## Local dev stack
 
 For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, SeaweedFS,

@@ -125,7 +125,7 @@ fn vended_user_error(
     error.to_string()
 }
 
-fn vended_adls_sas(
+fn resolved_adls_sas(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
     allow_http: bool,
@@ -140,6 +140,22 @@ fn vended_adls_sas(
         } => (account_name, sas),
         other => panic!("expected an ADLS backend carrying a vended SAS, got {other:?}"),
     }
+}
+
+/// The S3 credentials a `loadTable` answer vends for `location`.
+fn vended_s3_credentials(
+    answer: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Result<VendedS3Credentials, UdfError> {
+    VendedCredentialSet::of(answer, location).s3(location)
+}
+
+/// The ADLS SAS a `loadTable` answer vends for `location`'s host.
+fn vended_adls_sas(
+    answer: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Result<VendedAdlsSas, UdfError> {
+    VendedCredentialSet::of(answer, location).adls_sas(location)
 }
 
 fn assert_names_no_credential_value(message: &str) {
@@ -1191,7 +1207,7 @@ fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
     let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
 
     let (account_name, sas) =
-        vended_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
+        resolved_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert_eq!(
         sas, VENDED_SAS,
@@ -1207,13 +1223,13 @@ fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
 fn vended_adls_reads_the_host_after_the_container_userinfo() {
     let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
 
-    let with_container = vended_adls_sas(
+    let with_container = resolved_adls_sas(
         &result,
         &format!("abfss://mycontainer@{ADLS_HOST}/db/t"),
         false,
         &StaticStoreAddress::default(),
     );
-    let without_container = vended_adls_sas(
+    let without_container = resolved_adls_sas(
         &result,
         &format!("abfss://{ADLS_HOST}/db/t"),
         false,
@@ -1244,7 +1260,7 @@ fn vended_adls_sas_host_match_is_case_insensitive() {
         "the anchor host must differ from the vended key's host by CASE ONLY"
     );
 
-    let (account_name, sas) = vended_adls_sas(
+    let (account_name, sas) = resolved_adls_sas(
         &result,
         &format!("abfss://mycontainer@{mixed_case_host}/db/t"),
         false,
@@ -1272,7 +1288,7 @@ fn vended_adls_sas_prefers_the_exact_host_spelling() {
     let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
 
     for _ in 0..16 {
-        let (_, sas) = vended_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
+        let (_, sas) = resolved_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
         assert_eq!(
             sas, VENDED_SAS,
             "the key whose host suffix matches the anchor exactly must win every time, not \
@@ -1304,7 +1320,7 @@ fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
             (larger_key_host, LARGER_KEY_SAS),
         ]);
 
-        let (_, sas) = vended_adls_sas(
+        let (_, sas) = resolved_adls_sas(
             &result,
             &format!("abfss://mycontainer@{anchor_host}/db/t"),
             false,
@@ -1434,4 +1450,152 @@ fn vended_s3_credentials_debug_shows_no_value() {
         !shown.contains("storage.example") && !shown.contains(EXPIRES_AT_MS),
         "{shown}"
     );
+}
+
+const ADLS_ANCHOR: &str = "abfss://container@myaccount.dfs.core.windows.net/db/t";
+
+/// An ADLS SAS for [`ADLS_HOST`] in a covering `storage_credentials` entry, with `key` replaced by
+/// `value`, or removed when `value` is `None`.
+fn adls_entry_with(key: &str, value: Option<&str>) -> iceberg_catalog_rest::LoadTableResult {
+    let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");
+    let expiry_key = format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}");
+    let mut entry = vec![
+        (sas_key.as_str(), VENDED_SAS),
+        (expiry_key.as_str(), EXPIRES_AT_MS),
+    ];
+    entry.retain(|(entry_key, _)| *entry_key != key);
+    if let Some(value) = value {
+        entry.push((key, value));
+    }
+    make_load_table_result(
+        Some(vec![(ADLS_ANCHOR, entry)]),
+        vec![(sas_key.as_str(), OTHER_HOST_SAS)],
+    )
+}
+
+#[test]
+fn vended_adls_sas_is_the_selected_sources_sas_of_the_location_host_with_its_expiry() {
+    let upper_host = ADLS_HOST.to_ascii_uppercase();
+    let case_variant = make_load_table_result(
+        None,
+        vec![
+            (
+                &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{upper_host}"),
+                VENDED_SAS,
+            ),
+            (
+                &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{upper_host}"),
+                EXPIRES_AT_MS,
+            ),
+            (
+                &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{OTHER_ADLS_HOST}"),
+                "1",
+            ),
+        ],
+    );
+    let without_expiry = adls_entry_with(
+        &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}"),
+        None,
+    );
+    let cases = [
+        (
+            "the covering entry",
+            adls_entry_with("", None),
+            Some(1_700_000_000_000),
+        ),
+        (
+            "a case variant of the host",
+            case_variant,
+            Some(1_700_000_000_000),
+        ),
+        ("no stated expiry", without_expiry, None),
+    ];
+
+    for (case, answer, expires_at_ms) in cases {
+        let sas =
+            vended_adls_sas(&answer, ADLS_ANCHOR).unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert_eq!(sas.sas, VENDED_SAS, "{case}");
+        assert_eq!(sas.expires_at_ms, expires_at_ms, "{case}");
+    }
+}
+
+#[test]
+fn vended_adls_sas_takes_its_expiry_from_the_key_spelling_its_sas_comes_from() {
+    let upper_host = ADLS_HOST.to_ascii_uppercase();
+    let answer = make_load_table_result(
+        None,
+        vec![
+            (&format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}"), ""),
+            (
+                &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}"),
+                "1",
+            ),
+            (
+                &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{upper_host}"),
+                VENDED_SAS,
+            ),
+            (
+                &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{upper_host}"),
+                EXPIRES_AT_MS,
+            ),
+        ],
+    );
+    let unreadable = make_load_table_result(
+        None,
+        vec![
+            (
+                &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{upper_host}"),
+                VENDED_SAS,
+            ),
+            (
+                &format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{upper_host}"),
+                "soon",
+            ),
+        ],
+    );
+
+    let sas = vended_adls_sas(&answer, ADLS_ANCHOR).unwrap();
+    let refused = vended_adls_sas(&unreadable, ADLS_ANCHOR)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(sas.sas, VENDED_SAS);
+    assert_eq!(sas.expires_at_ms, Some(1_700_000_000_000));
+    assert!(
+        refused.contains(&format!(
+            "{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{upper_host}"
+        )),
+        "{refused}"
+    );
+}
+
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
+#[test]
+fn vended_adls_sas_without_a_sas_or_a_readable_expiry_is_refused_naming_the_key() {
+    let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");
+    let expiry_key = format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{ADLS_HOST}");
+    for (key, value) in [
+        (sas_key.as_str(), None),
+        (sas_key.as_str(), Some("")),
+        (expiry_key.as_str(), Some("tomorrow")),
+        (expiry_key.as_str(), Some("")),
+    ] {
+        let error = vended_adls_sas(&adls_entry_with(key, value), ADLS_ANCHOR).unwrap_err();
+
+        assert!(matches!(error, UdfError::User(_)), "{error:?}");
+        let message = error.to_string();
+        assert_refused(&message, ADLS_ANCHOR, &[key]);
+        assert!(!message.contains("tomorrow"), "{message}");
+    }
+}
+
+#[test]
+fn vended_adls_sas_debug_shows_no_value() {
+    let sas = vended_adls_sas(&adls_entry_with("", None), ADLS_ANCHOR).unwrap();
+
+    let shown = format!("{sas:?}");
+
+    assert_names_no_credential_value(&shown);
+    assert!(!shown.contains(EXPIRES_AT_MS), "{shown}");
 }

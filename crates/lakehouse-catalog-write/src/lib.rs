@@ -4,6 +4,7 @@
 //! goes through `CatalogSession::post`, and each one the session sends only once is retried here by
 //! the operation that can check its outcome.
 
+mod adls_storage;
 mod iceberg_write;
 mod retry;
 mod snapshot_capture;

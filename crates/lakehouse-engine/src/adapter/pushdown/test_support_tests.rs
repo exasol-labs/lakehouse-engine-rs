@@ -53,6 +53,7 @@ pub(crate) fn test_context() -> PushdownContext<'static> {
         },
         binary_as_string: false,
         version: ExasolVersion::Exasol2025,
+        clock: StatementClock::new(chrono::DateTime::UNIX_EPOCH, None, None),
     }
 }
 

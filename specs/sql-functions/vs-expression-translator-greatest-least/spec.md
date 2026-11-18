@@ -6,7 +6,7 @@ Renders `GREATEST` and `LEAST` in the DataFusion dialect with a NULL guard, so t
 
 * Exasol returns NULL if any argument of `GREATEST` or `LEAST` is NULL. DataFusion's `greatest` and `least` return NULL only if all arguments are NULL.
 * The adapter advertises `FN_GREATEST` and `FN_LEAST`, and Exasol does not re-apply an advertised capability. The adapter must therefore generate SQL with Exasol's semantics, and the DataFusion dialect carries the guard.
-* The guard names each argument twice, once in its `IS NULL` clause and once in the call, so DataFusion may evaluate a nested argument twice. That is safe because no translated `function_scalar` name is non-deterministic. `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP` and `SYSTIMESTAMP` are absent from the declaration table, and their capabilities are withdrawn.
+* The guard names each argument twice, once in its `IS NULL` clause and once in the call, so DataFusion may evaluate a nested argument twice. That is safe because no translated `function_scalar` name is non-deterministic. A clock function reaches the translator only as the literal the adapter folds it into (`pushdown/pushdown-planning-clock-functions`).
 
 ## Scenarios
 

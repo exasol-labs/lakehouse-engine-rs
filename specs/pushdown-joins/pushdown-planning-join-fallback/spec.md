@@ -9,8 +9,6 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * Legs are numbered in the FROM tree's left-to-right traversal order, and subquery aliases follow that order.
 * The adapter advertises `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` with no per-query opt-out, and Exasol never re-plans on an adapter error. Every advertised join shape must therefore render by broadcast or by this fallback. Exasol pushes only those inner equi-joins, and the Exasol dialect renders every condition and clause Exasol sends, so the fallback has no join shape to refuse.
 * The wrapper has four entry points: an inner equi-join of N >= 2 legs, a grouped request that did not decompose into the partial/merge shape (`GroupByWrapper`), a single-group request with more than one `COUNT(DISTINCT)` or a distinct mixed with an ordinary aggregate (`pushdown-aggregates/pushdown-planning-count-distinct`), and a row scan whose derived projection was widened. All four share one `ORDER BY` and window rendering site.
-* The wrapper resolves its own `LIMIT` and `OFFSET` and renders them on its outer SELECT over limit-free, sort-free fan-out legs. A row limit that leaked into a leg would cap that leg's pre-join input and return wrong rows. A non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`).
-* The broadcast path declines, and this wrapper serves, for a request without Exasol postprocessing: a non-zero offset without `orderBy`, a non-column sort key other than a constant, an `orderBy` of constants only together with a non-zero offset, and a sort key absent from the broadcast projection (`pushdown-joins/pushdown-planning-join`).
 * A top-level WHERE conjunct reaches a leg only if it is local to that leg and the scan translator renders it against that leg's own column metadata (`pushdown-types/pushdown-planning-scan-text-conversion`). Every other conjunct is residual and lands in the outer wrapper's `WHERE`. The leg and residual sets are exact complements (`pushdown/pushdown-declined-filter-self-apply`).
 * The outer `WHERE` render has two outcomes. An absent residual set emits no clause. Any other residual set renders through the qualified Exasol-dialect render as it is.
 
@@ -28,9 +26,10 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 ### Scenario: A join outside the broadcast contract is declined safely
 
 * *GIVEN* a `pushdown` request whose `from` clause is a join
-* *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, carries a non-equi conjunct beside its equality, spans more than two legs, or carries a condition/filter/projection detail that keeps it off the broadcast path
+* *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, spans more than two legs, or carries a condition/filter/projection detail that keeps it off the broadcast path
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
 * *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 legs, the two-leg case being N = 2), so Exasol's core engine produces the correct result
+* *AND* a conjunct of the join condition beside its join equalities SHALL keep the request off the broadcast path only where the same conjunct written in WHERE would, because the adapter plans it as a WHERE conjunct (`pushdown-joins/pushdown-planning-join-condition-filters`)
 * *AND* spanning more than two legs SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
 * *AND* the adapter SHALL return a HARD error, a client-facing `F-UDF-CL-RUST-9001`, NOT a request that Exasol retries natively (Exasol does not re-plan on an adapter error), ONLY when an involved table carries no readable identifier note
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
@@ -64,61 +63,6 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *AND* a residual set that is a lone `TRUE` conjunct SHALL render as the outer `WHERE (TRUE)` and SHALL NOT error, because Exasol keeps the `TRUE` that a folded `'' IS NULL` leaves in a conjunction
 * *AND* an N-scan request in which no table occurs twice and whose filter has no declined conjunct SHALL emit the SQL that the golden-SQL fixtures pin for that shape
 * *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node, for any assignment of conditions to join points
-
-### Scenario: Aggregate over a join routes through the unified qualified wrapper
-
-* *GIVEN* an inner equi-join `pushdown` request outside the broadcast contract that requires Exasol postprocessing, or whose `ORDER BY`/`LIMIT` shape the broadcast path declines, per `pushdown-joins/pushdown-planning-join`
-* *WHEN* the adapter plans the request
-* *THEN* the adapter SHALL route the request to the unified qualified fallback path
-* *AND* a bare `LIMIT` alone, and a bare-projected-column `ORDER BY` alone, SHALL NOT force this route
-* *AND* the fallback wrapper SHALL render the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (side-0 fan-out) "LHS_T0", (side-1 fan-out) "LHS_T1", … WHERE <conditions> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), splicing Exasol's own aggregate function name verbatim while table-qualifying only its column argument(s)
-* *AND* a select-list item that is a SCALAR FUNCTION WRAPPING one or more aggregates (e.g. `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`) SHALL be rendered by recursing through the `crates/vs-expression` translator, which renders nested `function_aggregate` nodes by splicing the aggregate name verbatim and rendering the argument(s), NOT declined
-* *AND* each select-list item SHALL be cast to its `selectListDataTypes` type, except an item whose exact type (`pushdown-aggregates/pushdown-planning-split-aggregate-types`) already equals it, such as `COUNT(*)` or a `MAX` over a CASE of dates
-* *AND* the returned result SHALL equal the result of evaluating the same select list over the same inner join on a single node
-
-### Scenario: A fallback leg's fan-out scan spec never carries a row limit
-
-* *GIVEN* any request served by the unified unaccelerated fallback, for any N ≥ 2, carrying a `limit` with `numElements` = `n` and any combination of `orderBy`, `groupBy`, `having`, and `limit.offset`
-* *WHEN* the adapter builds each side's fan-out leg
-* *THEN* every leg's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and NO join block, so the leg emits every row the outer wrapper's join, ordering, and window still depend on
-* *AND* that guarantee SHALL be structural rather than conventional, and SHALL be delivered by the TYPE rather than by a call signature, a field visibility, or a comment: the broadcast path's per-shard post-join cap SHALL be a field of the JOIN BLOCK, so a scan spec carrying no join block has NO field on which a post-join cap could be set. A leg builder constructs no join block, so it cannot express a post-join cap at all, in-crate and out-of-crate, in debug builds and in release
-* *AND* the shard-invariant row-limit field the single-table scan paths use MUST NOT be set on any join-carrying spec, so the two meanings never share one field and no reader has to know which path a spec came from to know what a limit on it would mean
-* *AND* that structural property SHALL be pinned by a test asserting every fallback leg spec carries `limit` = absent, an EMPTY `order_by`, and NO join block, for a request that DOES carry a limit, an offset, and an `orderBy`, so the runtime consequence is checked as well as the type
-* *AND* the request's `LIMIT` and `OFFSET` SHALL be rendered ONLY on the outer wrapper SELECT, through the shared limit-and-offset seam
-
-### Scenario: A scalar function wrapping aggregates in a grouped join select list is rendered, not declined
-
-* *GIVEN* an inner equi-join `pushdown` request outside the broadcast contract whose grouped select list contains a select item that is a scalar function wrapping one or more aggregates, e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`, alongside plain aggregates such as `SUM(l_quantity)`, `SUM(CASE WHEN … END)`, and `AVG(l_extendedprice)`, with a GROUP BY, a HAVING, an ORDER BY, and a LIMIT
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL NOT decline the request and SHALL NOT return an error for the scalar-over-aggregate select item
-* *AND* the adapter SHALL render each such select item by recursing through the `crates/vs-expression` translator, which renders the outer scalar function (`ROUND`, arithmetic, `CASE`, …) around nested `function_aggregate` nodes whose aggregate names (`SUM`, `COUNT`, `AVG`, …) are spliced verbatim and whose column arguments are table-qualified from their `tableName`
-* *AND* a top-level bare aggregate and a nested aggregate SHALL be rendered by the same aggregate-rendering path, so the two produce consistent SQL
-* *AND* the emitted SQL SHALL be the unified qualified fallback wrapper (`LHS_T0`, `LHS_T1`, … subqueries) with the grouped select list, HAVING, ORDER BY, and LIMIT rendered over the materialized join
-* *AND* the returned result SHALL equal the result of evaluating the same grouped, scalar-over-aggregate select list over the same inner join on a single node
-
-### Scenario: The qualified wrapper renders a renderable expression sort key on every entry point that reaches it
-
-* *GIVEN* a `pushdown` request routed to the unified qualified wrapper, whose `orderBy` carries a sort key that is an EXPRESSION node rather than a bare `column`, a scalar-function, arithmetic, aggregate, or CAST node, and which the qualified expression renderer CAN render
-* *WHEN* the adapter builds the wrapper SQL, for each of the four entry points that reach this wrapper: an N-scan inner equi-join, a non-decomposing grouped request (`GroupByWrapper`), a multi-`COUNT(DISTINCT)` decline, and a widened-projection row scan
-* *THEN* the wrapper's outer `ORDER BY` SHALL carry that expression rendered with table-qualified column references resolved from each `column` node's `tableName`, exactly as the wrapper renders its select list, WHERE, GROUP BY, and HAVING, so an expression sort key is rendered, NOT declined
-* *AND* the element SHALL render its direction and NULL placement through the one shared direction/NULL seam, so the wrapper's ordering cannot drift from the other ordered paths
-* *AND* an `orderBy` mixing a bare-column key with an expression key SHALL render EVERY element, in the pushed order, each with its own direction and NULL placement
-* *AND* the wrapper's visible SELECT list SHALL be UNCHANGED by the ordering, the sort expression is rendered inline in the `ORDER BY`, so NO hidden output column is added and the returned column count still equals the `selectList` item count Exasol validates positionally
-* *AND* the per-leg fan-out subqueries SHALL each project every column the sort expression names, via the SAME referenced-column narrowing helper that walks the `orderBy` node's full expression tree, so the wrapper never references a column a leg does not emit
-* *AND* the returned result SHALL equal the same query with the same `ORDER BY` evaluated over all rows on a single node
-
-### Scenario: The qualified wrapper renders the request's OFFSET on every entry point that reaches it
-
-* *GIVEN* a `pushdown` request routed to the unified qualified wrapper, carrying a renderable non-empty `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m`
-* *WHEN* the adapter builds the wrapper SQL, for each of the four entry points that reach this wrapper: an N-scan inner equi-join, a non-decomposing grouped request, a multi-`COUNT(DISTINCT)` decline, and a widened-projection row scan
-* *THEN* the wrapper's outer SELECT SHALL render `ORDER BY <clause> LIMIT n OFFSET m`, in that clause order, through the SAME shared limit-and-offset seam every other wrapper uses
-* *AND* the per-leg fan-out subqueries SHALL remain limit-free and sort-free, so the outer SELECT is the ONLY place either bound is applied and no leg drops a row that the join or the window still needs
-* *AND* a request whose `limit.offset` is zero or absent SHALL render no `OFFSET` on all four entry points
-* *AND* the wrapper's visible SELECT list SHALL be UNCHANGED by the offset, so the returned column count still equals the `selectList` item count Exasol validates positionally
-* *AND* the adapter SHALL NOT render an `OFFSET` on a wrapper SELECT that renders no `ORDER BY`, because Exasol rejects that SQL with `sqlCode 42000` ("OFFSET not allowed in LIMIT without ORDER BY")
-* *AND* that state SHALL NOT be given a failure branch of its own, because it is unreachable: this wrapper resolves no `ORDER BY` clause ONLY when the request's `orderBy` is absent or empty, and a request carrying a non-zero `limit.offset` always carries a non-empty `orderBy` (see the offset-implies-ordering invariant in `pushdown-capabilities/pushdown-planning-order-by-capability`)
-* *AND* the adapter MUST NOT introduce a hard client-facing `User` decline for that unreachable state, because this seam serves all four entry points above: a decline here would turn a successful query into a hard failure on a branch no test exercises. The invariant SHALL instead be pinned by an assertion plus a unit test asserting that no emitted wrapper SQL contains an `OFFSET` token unpreceded by an `ORDER BY`, driven by the request shapes that actually reach this seam with an offset
-* *AND* the returned result SHALL equal the same query with the same `ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node
 
 ### Scenario: Generated SQL carries a credential reference, not a credential
 
