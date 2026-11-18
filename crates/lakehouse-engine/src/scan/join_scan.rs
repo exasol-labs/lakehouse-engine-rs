@@ -7,7 +7,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
 use crate::scan::diagnostics;
-use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
+use crate::scan::spec::{ColumnRef, JoinSpec, JoinType, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::types::mapping::arrow_to_exasol_type;
 
@@ -85,6 +85,17 @@ async fn register_join_tables(
         Arc::clone(&delete_path_read_limiter),
     )
     .await?;
+    // Only a fact-preserving join reaches the scan with no dimension files: its fact rows
+    // still emit, NULL-padded, so the dimension registers as an empty relation of its schema.
+    if join.files.is_empty() && !join.logical_schema.is_empty() {
+        let schema = super::field_id_projection::build_logical_arrow_schema(&join.logical_schema);
+        ctx.register_table(
+            JOIN_DIM_TABLE,
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(schema)),
+        )
+        .map_err(|e| UdfError::User(format!("failed to register table: {e}")))?;
+        return Ok(());
+    }
     register_file_list(
         ctx,
         JOIN_DIM_TABLE,
@@ -142,8 +153,13 @@ async fn build_join_sql(
     let select_clause = render_projection(&spec.common.projection, |column| {
         combined_type(column, &combined)
     });
+    // The dimension stays LEFT (the build side), so a fact-preserving join is a RIGHT join.
+    let join_keyword = match join.join_type {
+        JoinType::Inner => "INNER JOIN",
+        JoinType::LeftOuter => "RIGHT OUTER JOIN",
+    };
     let mut sql = format!(
-        "SELECT {select_clause} FROM ({dim_aliased}) AS {} INNER JOIN ({fact_aliased}) AS {} ON {}",
+        "SELECT {select_clause} FROM ({dim_aliased}) AS {} {join_keyword} ({fact_aliased}) AS {} ON {}",
         quote_ident(&join.dimension_alias),
         quote_ident(&join.fact_alias),
         join.condition

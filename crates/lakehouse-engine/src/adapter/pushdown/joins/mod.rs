@@ -38,7 +38,10 @@ pub(super) use sql_builders::{
 
 use broadcast_policy::{BroadcastFacts, n_scan_reason};
 pub(super) use planning::{JoinWindowPlan, involved_table};
-use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
+use planning::{
+    classify_join_window, resolve_one_join_side, select_broadcast_sides,
+    select_left_outer_broadcast_sides,
+};
 use rendering::{leg_local_filter, possible_side_column_names};
 pub(super) use sql_builders::build_n_scan_join_sql;
 use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emission};
@@ -158,8 +161,16 @@ pub(super) async fn plan_join(
     )?;
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
-    let side_filters: Vec<Option<Json>> = (0..join.tables.len())
-        .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
+    // A null-supplying leg is never pruned by WHERE: `WHERE d.k IS NULL` keeps rows it rejects.
+    let side_filters: Vec<Option<Json>> = join
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(leg, leaf)| {
+            filter
+                .filter(|_| !leaf.null_supplying)
+                .and_then(|f| leg_local_filter(f, &legs, leg))
+        })
         .collect();
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> =
@@ -181,7 +192,12 @@ pub(super) async fn plan_join(
     ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
     let emitted = n_scan_emission(pushdown, join, &sides)?;
 
-    if sides.iter().any(|s| s.scan.files.is_empty()) {
+    // Only an empty leg that every output row needs empties the join.
+    if sides
+        .iter()
+        .zip(&join.tables)
+        .any(|(s, leaf)| s.scan.files.is_empty() && !leaf.null_supplying)
+    {
         return empty_join_sql(pushdown, join, &sides, emitted, context);
     }
 
@@ -215,7 +231,11 @@ fn plan_broadcast_join(
     if join.tables.len() != 2 || !is_equi || !window_servable {
         return Ok(None);
     }
-    let candidate = select_broadcast_sides(sides[0].clone(), sides[1].clone());
+    let candidate = match join.tree["join_type"].as_str().unwrap_or("inner") {
+        "inner" => select_broadcast_sides(sides[0].clone(), sides[1].clone()),
+        "left_outer" => select_left_outer_broadcast_sides(sides[0].clone(), sides[1].clone()),
+        _ => return Ok(None),
+    };
     let reads = aggregation_reads(pushdown, join, sides)?;
     let facts = BroadcastFacts {
         dimension_bytes: candidate.dimension.total_bytes,

@@ -1,5 +1,5 @@
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, SortKey,
+    CommonScanSpec, FileEntry, JoinSpec, ProjectionItem, ScanSpec, SortKey,
     relation_alias, render_ordered,
 };
 use crate::types::exasol_type::exasol_type_to_json;
@@ -213,6 +213,37 @@ fn build_n_scan_join_from(
     from
 }
 
+
+/// Renders the request's join tree node by node, so each condition stays on its own node: an
+/// outer join's ON is not interchangeable with a WHERE or with another node's ON.
+fn render_join_tree(
+    node: &Json,
+    fan_outs: &[String],
+    legs: &JoinLegs,
+    next_leg: &mut usize,
+) -> String {
+    if node["type"] != "join" {
+        let leg = *next_leg;
+        *next_leg += 1;
+        return format!("({}) AS {}", fan_outs[leg], quote_ident(&legs.leg_alias(leg)));
+    }
+    let left = render_join_tree(&node["left"], fan_outs, legs, next_leg);
+    let right = render_join_tree(&node["right"], fan_outs, legs, next_leg);
+    let right = if node["right"]["type"] == "join" {
+        format!("({right})")
+    } else {
+        right
+    };
+    let keyword = match node["join_type"].as_str().unwrap_or("inner") {
+        "left_outer" => "LEFT OUTER JOIN",
+        "right_outer" => "RIGHT OUTER JOIN",
+        "full_outer" => "FULL OUTER JOIN",
+        _ => "INNER JOIN",
+    };
+    let on = render_expression_qualified(&node["condition"], legs);
+    format!("{left} {keyword} {right} ON ({on})")
+}
+
 fn n_full_row_items(
     legs: &JoinLegs,
     emitted: &[Emitted],
@@ -391,6 +422,9 @@ pub(in super::super) fn build_n_scan_join_sql(
     for (i, side) in sides.iter().enumerate() {
         let (side_filter, side_declined) =
             match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
+                // Filtering a null-supplying leg before the join would NULL-pad rows the WHERE
+                // must see unmatched-or-rejected, so it stays in the outer WHERE.
+                Some(side_local) if join.tables[i].null_supplying => (None, Some(side_local)),
                 Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i], context)?,
                 None => (None, None),
             };
@@ -414,7 +448,12 @@ pub(in super::super) fn build_n_scan_join_sql(
     let OuterWrapperClauses { select, trailing } =
         outer_wrapper_clauses(pushdown, &legs, emitted, LegColumns::Relations, context)?;
 
-    let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
+    let from = if join.has_outer() {
+        let mut next_leg = 0;
+        render_join_tree(&join.tree, &fan_outs, &legs, &mut next_leg)
+    } else {
+        build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions)
+    };
 
     let mut sql = format!("SELECT {select} FROM {from}");
     if let Some(f) = &filter {
@@ -561,7 +600,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         files: relativize_files_to_root(dimension.scan.files.clone(), &dimension.scan.table_root),
         logical_schema: dimension.scan.logical_schema.clone(),
         name_mapping: dimension.scan.name_mapping.clone(),
-        join_type: JoinType::Inner,
+        join_type: sides.join_type.clone(),
         fact_alias: relation_alias(sides.fact_leg()),
         dimension_alias: relation_alias(sides.dimension_leg),
         condition: rendered.condition.clone(),

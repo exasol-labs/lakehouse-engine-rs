@@ -1,4 +1,5 @@
 use crate::adapter::table_identity::read_identifier;
+use crate::scan::spec::JoinType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -17,15 +18,26 @@ pub(crate) struct JoinLeaf {
     pub table_alias: Option<String>,
     /// Original-cased catalog identifier from the identifier note of the leg's involved table.
     pub table_identifier: String,
+    /// On the nullable side of an outer join node: a WHERE conjunct over it is not necessary
+    /// for its rows to survive, so it never prunes or filters this leg.
+    pub null_supplying: bool,
 }
 
 /// `conditions` are AND-conjoined by the N-scan fallback, which is order-agnostic for an
-/// all-inner join.
+/// all-inner join. A tree with an outer node is rendered from `tree` instead.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DetectedJoin {
     /// Stable left-to-right tree order.
     pub tables: Vec<JoinLeaf>,
     pub conditions: Vec<Json>,
+    /// The request's `from` join node as Exasol sent it.
+    pub tree: Json,
+}
+
+impl DetectedJoin {
+    pub(crate) fn has_outer(&self) -> bool {
+        self.tables.iter().any(|leaf| leaf.null_supplying)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,16 +47,20 @@ pub(crate) enum JoinShape {
 }
 
 /// Leaves in left-to-right order, conditions in post-order. A leaf without `alias` is an
-/// alias-less occurrence, a leg identity of its own. Exasol pushes only the inner equi-joins
-/// the adapter advertises, so every join node is inner with both sides and a condition.
+/// alias-less occurrence, a leg identity of its own. A leaf under the nullable side of any
+/// outer join node is null-supplying: its rows may be replaced by NULLs in the output.
 fn collect_join_tree(
     node: &Json,
-    leaves: &mut Vec<(String, Option<String>)>,
+    nullable: bool,
+    leaves: &mut Vec<(String, Option<String>, bool)>,
     conditions: &mut Vec<Json>,
 ) {
     if node["type"] == "join" {
-        collect_join_tree(&node["left"], leaves, conditions);
-        collect_join_tree(&node["right"], leaves, conditions);
+        let join_type = node["join_type"].as_str().unwrap_or("inner");
+        let left_nullable = nullable || matches!(join_type, "right_outer" | "full_outer");
+        let right_nullable = nullable || matches!(join_type, "left_outer" | "full_outer");
+        collect_join_tree(&node["left"], left_nullable, leaves, conditions);
+        collect_join_tree(&node["right"], right_nullable, leaves, conditions);
         conditions.push(node["condition"].clone());
         return;
     }
@@ -52,7 +68,7 @@ fn collect_join_tree(
         .as_str()
         .expect("Exasol names the table of every join leaf");
     let alias = node["alias"].as_str().map(str::to_string);
-    leaves.push((name.to_string(), alias));
+    leaves.push((name.to_string(), alias, nullable));
 }
 
 /// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
@@ -69,19 +85,24 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 
     let mut leaves = Vec::new();
     let mut conditions = Vec::new();
-    collect_join_tree(from, &mut leaves, &mut conditions);
+    collect_join_tree(from, false, &mut leaves, &mut conditions);
 
     let mut tables = Vec::with_capacity(leaves.len());
-    for (table_name, table_alias) in leaves {
+    for (table_name, table_alias, null_supplying) in leaves {
         let table_identifier = read_identifier(request, &table_name)?;
         tables.push(JoinLeaf {
             table_name,
             table_alias,
             table_identifier,
+            null_supplying,
         });
     }
 
-    Ok(JoinShape::Join(DetectedJoin { tables, conditions }))
+    Ok(JoinShape::Join(DetectedJoin {
+        tables,
+        conditions,
+        tree: from.clone(),
+    }))
 }
 
 /// Resolved once per query in the VS layer, never per shard. `total_bytes` sums the
@@ -121,13 +142,6 @@ impl ResolvedJoinSide {
     }
 }
 
-/// Both sides stay fully resolved because the N-scan fallback scans both. The roles say nothing
-/// about whether the join is broadcast: `broadcast_policy` decides that.
-///
-/// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
-/// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
-/// a self-join's occurrences can differ in size. An empty side has 0 bytes and is always the
-/// dimension; selection does not special-case it so role assignment stays total.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinSides {
     /// Larger side by bytes, sharded like the single-table scan.
@@ -136,6 +150,7 @@ pub(crate) struct JoinSides {
     pub dimension: ResolvedJoinSide,
     /// The dimension's leg in FROM-tree order, which names its relation alias.
     pub dimension_leg: usize,
+    pub join_type: JoinType,
 }
 
 impl JoinSides {
@@ -157,6 +172,21 @@ pub(super) fn select_broadcast_sides(a: ResolvedJoinSide, b: ResolvedJoinSide) -
         fact,
         dimension,
         dimension_leg,
+        join_type: JoinType::Inner,
+    }
+}
+
+/// A `left_outer` join broadcasts only its null-supplying right leg: each shard then sees every
+/// dimension row a fact row could match, so it alone decides that a fact row has no match.
+pub(super) fn select_left_outer_broadcast_sides(
+    preserved: ResolvedJoinSide,
+    nullable: ResolvedJoinSide,
+) -> JoinSides {
+    JoinSides {
+        fact: preserved,
+        dimension: nullable,
+        dimension_leg: 1,
+        join_type: JoinType::LeftOuter,
     }
 }
 

@@ -981,6 +981,7 @@ fn seam_legs() -> JoinLegs {
             table_name: (*name).to_string(),
             table_alias: None,
             table_identifier: format!("lh.{}", name.to_lowercase()),
+            null_supplying: false,
         })
         .collect();
     legs_from_leaves(leaves)

@@ -443,11 +443,12 @@ pub enum ScanStorage {
     Inline(StorageBackend),
 }
 
-/// Only `Inner` is ever produced; the adapter declines every other join shape.
+/// `LeftOuter` preserves the fact side: the request's `fact LEFT OUTER JOIN dimension`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum JoinType {
     Inner,
+    LeftOuter,
 }
 
 /// SHARD-INVARIANT: the dimension side's full file list is resolved once and carried in the

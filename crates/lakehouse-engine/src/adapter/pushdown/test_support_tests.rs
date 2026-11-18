@@ -609,6 +609,7 @@ pub(crate) fn broadcast_sides(
         fact,
         dimension,
         dimension_leg,
+        join_type: crate::scan::spec::JoinType::Inner,
     }
 }
 

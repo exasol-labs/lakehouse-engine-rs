@@ -19,6 +19,7 @@ mod harness_row_cap;
 mod identity_partition;
 mod int96_timestamp;
 mod join;
+mod left_outer_join_spike;
 mod name_mapping;
 mod non_ascii_identifier;
 mod order_by_constant;

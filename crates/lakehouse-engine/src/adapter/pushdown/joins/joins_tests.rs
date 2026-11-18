@@ -283,6 +283,7 @@ pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     DetectedJoin {
         tables: leaves,
         conditions: Vec::new(),
+        tree: Json::Null,
     }
     .legs()
 }
@@ -295,6 +296,7 @@ pub(super) fn legs_of(names: &[&str]) -> JoinLegs {
             table_name: (*name).to_string(),
             table_alias: None,
             table_identifier: format!("lh.{}", name.to_lowercase()),
+            null_supplying: false,
         })
         .collect();
     legs_from_leaves(leaves)
@@ -310,11 +312,13 @@ pub(super) fn self_join_legs() -> JoinLegs {
             table_name: "FACT_ORDERS".to_string(),
             table_alias: Some("A".to_string()),
             table_identifier: "lh.fact_orders".to_string(),
+            null_supplying: false,
         },
         JoinLeaf {
             table_name: "FACT_ORDERS".to_string(),
             table_alias: Some("B".to_string()),
             table_identifier: "lh.fact_orders".to_string(),
+            null_supplying: false,
         },
     ])
 }

@@ -18,6 +18,7 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
         table_name: table_name.to_string(),
         table_alias: table_alias.map(str::to_string),
         table_identifier: format!("lh.{}", table_name.to_ascii_lowercase()),
+        null_supplying: false,
     }
 }
 

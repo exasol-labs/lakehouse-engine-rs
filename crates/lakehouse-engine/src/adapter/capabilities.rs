@@ -139,6 +139,7 @@ pub const CAPABILITIES: &[&str] = &[
     "AGGREGATE_HAVING",
     "JOIN",
     "JOIN_TYPE_INNER",
+    "JOIN_TYPE_LEFT_OUTER",
     "JOIN_CONDITION_EQUI",
 ];
 

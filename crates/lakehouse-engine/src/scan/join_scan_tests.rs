@@ -363,3 +363,28 @@ async fn build_join_sql_rejects_a_column_without_a_relation_alias() {
         "{error:?}"
     );
 }
+
+// SPIKE: the fact-preserving join keeps the dimension as the collected build side.
+#[tokio::test]
+async fn spike_left_outer_join_plan_collects_the_dimension() {
+    let mut spec = post_join_spec("V", Vec::new(), None);
+    spec.common.tuning.df_target_partitions = 4;
+    if let Some(join) = spec.common.join.as_mut() {
+        join.join_type = crate::scan::spec::JoinType::LeftOuter;
+    }
+    let fact = fact_batch_with("v", Arc::new(Int64Array::from(vec![7i64, 8, 9])));
+    let probe = join_session(fact.clone());
+    let ctx = SessionContext::new_with_config(crate::scan::session_config_for_spec(&spec));
+    for name in [JOIN_DIM_TABLE, JOIN_FACT_TABLE] {
+        ctx.register_table(name, probe.table_provider(name).await.unwrap()).unwrap();
+    }
+    register_nested_json_render_udf(&ctx);
+    let sql = build_join_sql(&ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, &spec).await.unwrap();
+    let df = ctx.sql(&sql).await.unwrap();
+    let plan = df.clone().create_physical_plan().await.unwrap();
+    let text = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    println!("{sql}\n{text}");
+    let rows: usize = df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3);
+    assert!(text.contains("mode=CollectLeft") && text.contains("join_type=Right"), "{text}");
+}
