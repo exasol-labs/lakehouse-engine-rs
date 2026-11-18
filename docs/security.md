@@ -92,7 +92,7 @@ GRANT LAKEHOUSE_EXPORT_ROLE_<schema> TO <user>;
 
 The export names the CONNECTION in a `WITH CATALOG_CONNECTION` option, never in an `AT` clause, so the role needs no `CONNECTION` privilege. The script-scoped `ACCESS` grant alone decides who exports through which CONNECTION. Grant the role only to users who may use the CONNECTION's credentials.
 
-The export acts as the CONNECTION's catalog identity and writes with its storage credentials, not as the exporting user. The [Lakekeeper permission check](#lakekeeper-permission-check) does not apply to exports, so an exporting user can create a table anywhere that identity may create one.
+The export acts as the CONNECTION's catalog identity and writes with its storage credentials, not as the exporting user. The [Lakekeeper permission check](#lakekeeper-permission-check) does not apply to exports, so an exporting user can create a table anywhere that identity may create one, and append rows to any table that identity may write, including tables that other engines created.
 
 ### Re-installing
 
@@ -128,12 +128,9 @@ The virtual schema's owner holds both, and so does every member of a role that o
 
 ### Who can bypass the export script
 
-A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, `SINGLE_COMMIT`, and the check for an existing table. The writer therefore treats its writer spec as untrusted input. Such a call can:
+A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, and `SINGLE_COMMIT`. The writer therefore treats its writer spec as untrusted input. Such a call can carry its own `allow_http`, so it can send requests over plain HTTP without the statement's `ALLOW_HTTP`.
 
-- carry its own `allow_http`, so it can send requests over plain HTTP without the statement's `ALLOW_HTTP`,
-- append rows to any table that an earlier export created.
-
-Grant the export role only to users who may export any rows through the CONNECTION.
+Grant the export role only to users who may write any rows into any table through the CONNECTION.
 
 ## Lakekeeper permission check
 

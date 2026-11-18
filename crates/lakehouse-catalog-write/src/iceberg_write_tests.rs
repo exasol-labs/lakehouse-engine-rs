@@ -160,6 +160,7 @@ async fn a_namespace_level_without_an_answer_is_sent_again() {
     assert_eq!(requests_starting(&requests, "POST ").len(), 2);
 }
 
+/// Scenario: Two exports that create the same table leave one winner
 #[tokio::test]
 async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it() {
     let (uri, _) = catalog(
@@ -186,7 +187,8 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     );
     assert_eq!(
         foreign.err().unwrap().to_string(),
-        "table ns.t already exists; the export only creates new tables"
+        "table ns.t was created by another statement after the export checked that it does not \
+         exist"
     );
 }
 
@@ -873,8 +875,9 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     assert_eq!(requests_starting(&requests, LOAD_T).len(), 2);
 }
 
-#[tokio::test]
-async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the_last_outcome() {
+/// The paused clock skips the backoff waits of the 20 retries an append makes at least.
+#[tokio::test(start_paused = true)]
+async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the_last_outcome() {
     for (status, unknown) in [
         (409, false),
         (429, false),
@@ -901,11 +904,11 @@ async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the
         assert_eq!(failed.outcome_unknown(), unknown, "HTTP {status}");
         assert!(
             failed.to_string().contains(&format!(
-                "2 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
+                "21 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
             )),
             "{failed}"
         );
-        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 2);
+        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 21);
     }
 }
 
@@ -1172,5 +1175,40 @@ fn a_reloaded_table_takes_the_files_only_with_the_checked_schema_and_spec() {
         let expected =
             expected.map_err(|change| format!("{change} after the writer checked the table"));
         assert_eq!(refuse_changed(checked, reloaded), expected, "{case}");
+    }
+}
+
+#[test]
+fn a_reloaded_table_upgraded_to_format_version_3_takes_no_files() {
+    let reloaded = |version: u8| {
+        let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+        answer["metadata"]["format-version"] = version.into();
+        answer["metadata"]["next-row-id"] = 0.into();
+        serde_json::from_value::<LoadTableResult>(answer)
+            .unwrap()
+            .metadata
+    };
+    let checked = TableShape::of(&reloaded(2));
+
+    assert_eq!(refuse_reloaded(checked, &reloaded(2)), Ok(()));
+    assert_eq!(
+        refuse_reloaded(checked, &reloaded(3)),
+        Err("it was upgraded to format version 3 after the writer checked the table".into())
+    );
+}
+
+#[tokio::test]
+async fn a_table_exists_only_when_the_catalog_answers_its_head_request_with_success() {
+    for (status, exists) in [(204, true), (404, false)] {
+        let (uri, _) = catalog(
+            PREFIX_CONFIG,
+            routes(vec![(EXISTS_T, (status, String::new()))]),
+        )
+        .await;
+        let writes = static_writes(&uri).await;
+
+        let found = writes.table_exists(&ident("ns", "t")).await.unwrap();
+
+        assert_eq!(found, exists, "HTTP {status}");
     }
 }

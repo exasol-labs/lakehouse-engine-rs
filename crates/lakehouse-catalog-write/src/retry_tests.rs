@@ -40,6 +40,16 @@ fn a_table_sets_its_commit_retries_or_gets_iceberg_s_default() {
     assert_eq!(commit_retries(&HashMap::new()), DEFAULT_RETRIES);
 }
 
+#[test]
+fn an_append_retries_at_least_as_often_as_an_export_s_own_table() {
+    let few = HashMap::from([(NUM_RETRIES_PROPERTY.to_string(), "2".to_string())]);
+    let many = HashMap::from([(NUM_RETRIES_PROPERTY.to_string(), "50".to_string())]);
+
+    assert_eq!(append_retries(&HashMap::new()), EXPORT_RETRIES);
+    assert_eq!(append_retries(&few), EXPORT_RETRIES);
+    assert_eq!(append_retries(&many), 50);
+}
+
 #[tokio::test(start_paused = true)]
 async fn retries_stop_at_their_bound() {
     let mut retries = Retries::new(2);

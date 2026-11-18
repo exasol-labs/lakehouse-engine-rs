@@ -2,12 +2,13 @@
 //! table, and the sink it returns takes Arrow batches and writes and commits them its own way.
 //! Also the export's CONNECTION, read and checked before any request.
 
+use super::batch::TableColumns;
 use super::options::ALLOW_HTTP;
 use super::{EXPORT_SCRIPT_NAME, refusal};
 use crate::connection::{
     parse_creds, password_object, supplied_azure_fields, validate_shared_creds,
 };
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use exasol_udf_sdk::context::UdfContext;
@@ -15,29 +16,40 @@ use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{ConnectionCreds, scheme_of};
 use lakehouse_catalog_write::CommitTag;
 
+/// Whether the writers create the table or append to the one the catalog holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TableMode {
+    Create,
+    Append,
+}
+
 /// Where an export writes: one catalog and table format.
 #[async_trait(?Send)]
 pub(super) trait ExportTarget {
-    /// Connects and authenticates, refuses an existing table, and creates the missing namespace
-    /// levels, with catalog calls only.
-    async fn prepare(&self) -> Result<(), UdfError>;
+    /// Connects and authenticates and checks whether the table exists, with catalog calls only.
+    /// For a missing table it also creates the missing namespace levels.
+    async fn prepare(&self) -> Result<TableMode, UdfError>;
 
     /// Creates the table, or takes the one another writer of the same export created, so every
     /// writer's sink commits into the one table. With `single_commit` it prepares the table
     /// without creating it: the table appears only when the sink commits its data.
-    async fn open_table(
+    async fn open_new_table(
         &self,
         schema: &Schema,
         tag: &CommitTag,
         single_commit: bool,
     ) -> Result<Box<dyn ExportSink>, UdfError>;
+
+    /// Loads the existing table and refuses one the export cannot append to, before any data is
+    /// written. With `SINGLE_COMMIT` the one writer appends the same way, in its one commit.
+    async fn open_existing_table(&self, tag: &CommitTag) -> Result<Box<dyn ExportSink>, UdfError>;
 }
 
 /// One writer's files in the table its target opened.
 #[async_trait(?Send)]
 pub(super) trait ExportSink {
-    /// The table's Arrow schema, which every batch must have.
-    fn schema(&self) -> SchemaRef;
+    /// The table's columns, which every batch must have.
+    fn columns(&self) -> &TableColumns;
 
     async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError>;
 

@@ -2,12 +2,14 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
-use crate::retry::{DEFAULT_RETRIES, Retries, commit_retries};
+use crate::retry::{
+    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, append_retries, commit_retries,
+};
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
 use crate::vended_refresh::{StorageCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Schema, TableMetadata};
+use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -25,10 +27,6 @@ use std::sync::Arc;
 
 const EXPORT_ID_PROPERTY: &str = "lakehouse.export-id";
 const EXPORT_WRITER_PROPERTY: &str = "lakehouse.export-writer";
-/// Concurrent writers of one export all commit to the table it creates, so it allows many more
-/// commit retries than Iceberg's default of 4.
-const CREATED_TABLE_PROPERTIES: [(&str, &str); 2] =
-    [("format-version", "2"), ("commit.retry.num-retries", "20")];
 
 /// Where an export table's storage credentials come from. Every kind reaches the table's FileIO
 /// through one credential source, which renews the credentials its own way.
@@ -231,12 +229,9 @@ impl TableWriteSession {
         self.session.catalog_uri()
     }
 
-    /// Refuses `table` when the catalog already holds it, because the export only creates tables.
-    pub async fn refuse_existing_table(&self, table: &TableIdent) -> Result<(), UdfError> {
-        if self.session.table_exists(table).await? {
-            return Err(existing_table_error(table));
-        }
-        Ok(())
+    /// Whether the catalog holds `table`.
+    pub async fn table_exists(&self, table: &TableIdent) -> Result<bool, UdfError> {
+        self.session.table_exists(table).await
     }
 
     /// Creates each level of `namespace` that the catalog does not hold, top-down. A level is
@@ -331,9 +326,8 @@ impl TableWriteSession {
         Ok(StagedTable(self.open(table, staged)?))
     }
 
-    /// The error for a catalog that ignored `stage-create` and created the table. The table is
-    /// dropped when its `lakehouse.export-id` shows this export created it, so a later export into
-    /// the name does not fail with "already exists"; else the error says it must be dropped.
+    /// The error for a catalog that ignored `stage-create`. A table this export created is dropped,
+    /// so the failed export leaves no empty table behind; else the error says to drop it.
     async fn ignored_staging(&self, table: &TableIdent, export_id: &str) -> UdfError {
         let ignored = format!(
             "the catalog {} ignored staged creation (stage-create): table {} became visible \
@@ -366,8 +360,8 @@ impl TableWriteSession {
     /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
     /// or a lost answer (502, 504, a broken transport) waits, then reloads the table: a snapshot
     /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
-    /// and sent again, up to the table's `commit.retry.num-retries` times. Every other answer
-    /// fails at once.
+    /// and sent again, up to the table's `commit.retry.num-retries` times, and at least 20. Every
+    /// other answer fails at once.
     pub async fn append_files(
         &self,
         written: &WriteTable,
@@ -383,12 +377,12 @@ impl TableWriteSession {
             .load_table_with_all_snapshots(ident)
             .await
             .map_err(|error| CommitError::new(ident, error, false))?;
-        refuse_changed(checked, TableShape::of(&reloaded.metadata))
+        refuse_reloaded(checked, &reloaded.metadata)
             .map_err(|change| CommitError::new(ident, change, false))?;
         // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
         let mut base = rebuilt(&written.table, reloaded)
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(commit_retries(base.metadata().properties()));
+        let mut retries = Retries::new(append_retries(base.metadata().properties()));
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
@@ -413,7 +407,7 @@ impl TableWriteSession {
             if tag.is_on(&reloaded.metadata) {
                 return Ok(());
             }
-            refuse_changed(checked, TableShape::of(&reloaded.metadata))
+            refuse_reloaded(checked, &reloaded.metadata)
                 .map_err(|change| CommitError::new(ident, change, false))?;
             if !may_retry {
                 return Err(exhausted_commit_error(ident, &retries, &failure));
@@ -535,7 +529,7 @@ impl TableWriteSession {
             .map(String::as_str)
             != Some(export_id)
         {
-            return Err(existing_table_error(table));
+            return Err(created_by_another_statement(table));
         }
         self.open(table, existing).map(Some)
     }
@@ -700,6 +694,21 @@ impl TableShape {
     }
 }
 
+/// Why the writer's files cannot go onto `reloaded`: a schema or partition spec other than the one
+/// it checked, or format version 3 or later, whose row lineage the export does not maintain. No
+/// Iceberg REST requirement asserts the format version, so only a reload can see an upgrade.
+fn refuse_reloaded(checked: TableShape, reloaded: &TableMetadata) -> Result<(), String> {
+    refuse_changed(checked, TableShape::of(reloaded))?;
+    let version = reloaded.format_version();
+    if version > FormatVersion::V2 {
+        return Err(format!(
+            "it was upgraded to format version {} after the writer checked the table",
+            version as u8
+        ));
+    }
+    Ok(())
+}
+
 /// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
 /// depend on did.
 fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), String> {
@@ -748,11 +757,11 @@ fn classify(status: u16) -> Outcome {
 }
 
 fn creation_request(table: &TableIdent, schema: Schema, export_id: &str) -> CreateTableRequest {
-    let mut properties: HashMap<String, String> = CREATED_TABLE_PROPERTIES
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    properties.insert(EXPORT_ID_PROPERTY.to_string(), export_id.to_string());
+    let properties = HashMap::from([
+        ("format-version".to_string(), "2".to_string()),
+        (NUM_RETRIES_PROPERTY.to_string(), EXPORT_RETRIES.to_string()),
+        (EXPORT_ID_PROPERTY.to_string(), export_id.to_string()),
+    ]);
     CreateTableRequest {
         name: table.name.clone(),
         location: None,
@@ -836,9 +845,10 @@ fn staged_creation_error(table: &TableIdent, cause: impl fmt::Display) -> UdfErr
     ))
 }
 
-fn existing_table_error(table: &TableIdent) -> UdfError {
+fn created_by_another_statement(table: &TableIdent) -> UdfError {
     UdfError::User(format!(
-        "table {table} already exists; the export only creates new tables"
+        "table {table} was created by another statement after the export checked that it does \
+         not exist"
     ))
 }
 
