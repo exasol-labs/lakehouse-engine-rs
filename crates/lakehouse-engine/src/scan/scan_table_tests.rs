@@ -1,8 +1,11 @@
 use super::*;
+use crate::scan::read_budget::ReadBudget;
 use crate::scan::spec::DeleteMechanism;
 use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
+use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::execution::session_state::SessionState;
 use std::collections::HashMap;
+use tokio::sync::Semaphore;
 
 /// Built field-by-field since these tests need no storage backend; the Parquet format still
 /// comes from the production decision.
@@ -27,7 +30,12 @@ fn scan_table_over(files: Vec<FileEntry>) -> ParquetScanTable {
         files,
         table_root: "memory:///db/t".to_string(),
         secrets: Arc::from([]),
-        delete_path_read_limiter: Arc::new(Semaphore::new(1)),
+        limits: ScanLimits {
+            delete_reads: Arc::new(Semaphore::new(1)),
+            read_budget: Arc::new(ReadBudget::new(
+                &(Arc::new(UnboundedMemoryPool::default()) as _),
+            )),
+        },
     }
 }
 

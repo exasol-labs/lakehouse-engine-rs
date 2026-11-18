@@ -4,7 +4,7 @@
 use crate::scan::delete_source::DeleteApplyingSource;
 use crate::scan::parquet_reader::object_meta_for;
 use crate::scan::partition_values::PartitionedScanGroups;
-use crate::scan::raw_scan::scan_table_parquet_format;
+use crate::scan::raw_scan::{ScanLimits, scan_table_parquet_format};
 use crate::scan::row_deletes::{ShardDeletes, redact};
 use crate::scan::shared_files::{SMALL_FILE_BYTES, ScanFiles, SharedReaderFactory};
 use crate::scan::spec::{FileEntry, StorageBackend};
@@ -27,7 +27,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
 use exasol_udf_sdk::error::UdfError;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// DataFusion cuts no file below this many bytes per range (`repartition_file_min_size`).
 const MIN_RANGE_BYTES: u64 = 1024 * 1024;
@@ -44,9 +43,7 @@ pub(crate) struct ParquetScanTable {
     table_root: String,
     secrets: Arc<[String]>,
     format: Arc<ParquetFormat>,
-    /// Shared by every provider of one invocation (both join sides included), so the whole
-    /// instance stays within one N-permit budget.
-    delete_path_read_limiter: Arc<Semaphore>,
+    limits: ScanLimits,
 }
 
 /// At most `target` groups, one per stream. A file up to [`SMALL_FILE_BYTES`] stays whole, and a
@@ -90,7 +87,7 @@ impl ParquetScanTable {
         files: Vec<FileEntry>,
         table_root: String,
         storage: &StorageBackend,
-        delete_path_read_limiter: Arc<Semaphore>,
+        limits: ScanLimits,
     ) -> Self {
         let secrets = storage
             .secret_values()
@@ -107,7 +104,7 @@ impl ParquetScanTable {
             table_root,
             secrets,
             format,
-            delete_path_read_limiter,
+            limits,
         }
     }
 
@@ -147,7 +144,7 @@ impl ParquetScanTable {
             files: &self.files,
             table_root: &self.table_root,
             secrets: Arc::clone(&self.secrets),
-            limiter: Arc::clone(&self.delete_path_read_limiter),
+            limiter: Arc::clone(&self.limits.delete_reads),
             reservation: Arc::new(
                 MemoryConsumer::new("row-position deletes").register(&runtime.memory_pool),
             ),
@@ -172,6 +169,7 @@ impl ParquetScanTable {
             metadata_size_hint,
             whole_small_files,
             &runtime.memory_pool,
+            Arc::clone(&self.limits.read_budget),
             shared,
             deletes,
         ))

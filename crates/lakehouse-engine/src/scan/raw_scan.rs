@@ -25,6 +25,7 @@ use crate::scan::{diagnostics, emit_phase_telemetry};
 use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanGroups;
+use super::read_budget::ReadBudget;
 use super::sql_support::{aliased_select, append_where, render_projection};
 
 const SCAN_TARGET: &str = "scan_target";
@@ -78,11 +79,23 @@ pub(super) async fn physical_plan(df: DataFrame) -> Result<Arc<dyn ExecutionPlan
         .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
-/// Bounds every object-store read the delete path issues for one invocation, shared across all
-/// its providers. Sized per call, never at process scope. Clamped to 1 because
-/// `Semaphore::new(0)` would deadlock every read.
-pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1)))
+/// One per invocation, shared by all its providers, both join sides included. Never at process
+/// scope.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanLimits {
+    /// Bounds the delete path's object-store reads.
+    pub(crate) delete_reads: Arc<Semaphore>,
+    pub(crate) read_budget: Arc<ReadBudget>,
+}
+
+impl ScanLimits {
+    /// At least one delete-read permit, because zero would deadlock every read.
+    pub(super) fn new(ctx: &SessionContext, spec: &ScanSpec) -> Self {
+        Self {
+            delete_reads: Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1))),
+            read_budget: Arc::new(ReadBudget::new(&ctx.runtime_env().memory_pool)),
+        }
+    }
 }
 
 async fn build_dataframe(
@@ -112,7 +125,6 @@ pub async fn register_files(
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
-    let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
         table_name,
@@ -122,7 +134,7 @@ pub async fn register_files(
         &spec.common.name_mapping,
         &spec.common.partition_columns,
         storage.primary(),
-        delete_path_read_limiter,
+        ScanLimits::new(ctx, spec),
     )
     .await
 }
@@ -134,8 +146,7 @@ pub async fn register_files(
 /// [`PartitionedScanGroups`]). Each side of a join registers through this same
 /// provider, so both apply their own deletes.
 ///
-/// `delete_path_read_limiter` must be the SAME `Arc` for every call in one invocation, including
-/// both join sides, so the instance stays within one N-permit budget.
+/// `limits` must be the same for every call in one invocation, both join sides included.
 ///
 /// [`ParquetScanTable`]: crate::scan::scan_table::ParquetScanTable
 #[allow(clippy::too_many_arguments)]
@@ -148,7 +159,7 @@ pub(super) async fn register_file_list(
     name_mapping: &[NameMappingEntry],
     partition_columns: &[String],
     storage: &crate::scan::spec::StorageBackend,
-    delete_path_read_limiter: Arc<Semaphore>,
+    limits: ScanLimits,
 ) -> Result<(), UdfError> {
     let first = files.first().ok_or_else(|| {
         UdfError::User(format!(
@@ -199,7 +210,7 @@ pub(super) async fn register_file_list(
         files.to_vec(),
         table_root.to_string(),
         storage,
-        delete_path_read_limiter,
+        limits,
     );
 
     ctx.register_table(table_name, Arc::new(table))
