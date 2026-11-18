@@ -9,7 +9,9 @@ use iceberg_catalog_rest::LoadTableResult;
 use lakehouse_catalog::{CatalogSession, ConnectionCreds};
 use std::sync::Mutex;
 
-pub(crate) use crate::exported_test_support::{LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog};
+pub(crate) use crate::exported_test_support::{
+    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
+};
 
 /// [`LOAD_TABLE_NO_SNAPSHOTS`] after `append_files` committed one snapshot tagged with
 /// [`TAGGED_EXPORT_ID`] and [`TAGGED_WRITER_ID`].

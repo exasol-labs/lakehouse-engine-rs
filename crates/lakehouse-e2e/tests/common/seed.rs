@@ -1097,8 +1097,14 @@ pub const CLUSTERED_ROWS_PER_KEY: i64 = 64;
 /// The dimension rows whose `C_REGION` is `hot`.
 pub const CLUSTERED_HOT_KEYS: [i64; 3] = [3, 4, 5];
 
+/// The second join-key column of key `k`, `O_SEGMENT` on the fact and `C_SEGMENT` on the
+/// dimension, so a composite key joins the clustered fixture.
+pub fn clustered_segment(key: i64) -> i64 {
+    key % 4
+}
+
 /// One fact data file whose row group `k` holds only `O_CUSTKEY = k`, and one dimension row
-/// per key, named `c{k}`.
+/// per key, named `c{k}`. Both carry the key's [`clustered_segment`].
 pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog =
         build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-clustered-join").await?;
@@ -1110,6 +1116,7 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
         .with_fields(vec![
             NestedField::required(1, "O_ORDERKEY", long()).into(),
             NestedField::required(2, "O_CUSTKEY", long()).into(),
+            NestedField::required(3, "O_SEGMENT", long()).into(),
         ])
         .build()
         .context("build fact_clustered Iceberg schema")?;
@@ -1128,11 +1135,15 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             Arc::new(ArrowSchema::new(vec![
                 Field::new("O_ORDERKEY", DataType::Int64, false),
                 Field::new("O_CUSTKEY", DataType::Int64, false),
+                Field::new("O_SEGMENT", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..rows)),
                 Arc::new(Int64Array::from_iter_values(
                     (0..rows).map(|i| i / CLUSTERED_ROWS_PER_KEY),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| clustered_segment(i / CLUSTERED_ROWS_PER_KEY)),
                 )),
             ],
         )
@@ -1159,6 +1170,7 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             NestedField::required(1, "C_CUSTKEY", long()).into(),
             NestedField::required(2, "C_NAME", string()).into(),
             NestedField::required(3, "C_REGION", string()).into(),
+            NestedField::required(4, "C_SEGMENT", long()).into(),
         ])
         .build()
         .context("build dim_clustered Iceberg schema")?;
@@ -1168,19 +1180,21 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             Field::new("C_CUSTKEY", DataType::Int64, false),
             Field::new("C_NAME", DataType::Utf8, false),
             Field::new("C_REGION", DataType::Utf8, false),
+            Field::new("C_SEGMENT", DataType::Int64, false),
         ])),
         vec![
             Arc::new(Int64Array::from_iter_values(keys.clone())),
             Arc::new(StringArray::from_iter_values(
                 keys.clone().map(|k| format!("c{k}")),
             )),
-            Arc::new(StringArray::from_iter_values(keys.map(|k| {
+            Arc::new(StringArray::from_iter_values(keys.clone().map(|k| {
                 if CLUSTERED_HOT_KEYS.contains(&k) {
                     "hot"
                 } else {
                     "cold"
                 }
             }))),
+            Arc::new(Int64Array::from_iter_values(keys.map(clustered_segment))),
         ],
     )
     .expect("dim_clustered RecordBatch construction is infallible");

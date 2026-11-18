@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::{Struct, Transform};
 use lakehouse_catalog_write::CommitTag;
 use lakehouse_catalog_write::exported_test_support::{
-    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog,
+    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
 };
 use std::sync::{Arc, Mutex};
 
@@ -29,10 +29,9 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
 }
 
 /// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
-/// The paused clock skips the backoff waits of the 20 retries that all meet a 504.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
-    let table = LOAD_TABLE_NO_SNAPSHOTS.to_string();
+    let table = with_short_commit_waits(LOAD_TABLE_NO_SNAPSHOTS);
     let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
         if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
             (504, "{}".into())

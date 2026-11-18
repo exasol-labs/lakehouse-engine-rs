@@ -4,7 +4,8 @@
 
 use crate::adls_storage::adls_file_io;
 use crate::retry::{
-    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, append_retries, commit_retries,
+    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, Waits, append_retries,
+    commit_retries,
 };
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
 use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
@@ -385,7 +386,10 @@ impl TableWriteSession {
         // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
         let mut base = rebuilt(&written.table, reloaded)
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(append_retries(base.metadata().properties()));
+        let mut retries = Retries::with_waits(
+            append_retries(base.metadata().properties()),
+            Waits::of_table(base.metadata().properties()),
+        );
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
@@ -436,7 +440,10 @@ impl TableWriteSession {
         let body = staged_commit(table, files, tag)
             .await
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(commit_retries(table.metadata().properties()));
+        let mut retries = Retries::with_waits(
+            commit_retries(table.metadata().properties()),
+            Waits::of_table(table.metadata().properties()),
+        );
         loop {
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
