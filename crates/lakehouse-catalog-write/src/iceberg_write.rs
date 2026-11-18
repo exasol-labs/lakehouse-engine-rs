@@ -2,7 +2,9 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
-use crate::retry::{DEFAULT_RETRIES, Retries, commit_retries};
+use crate::retry::{
+    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, append_retries, commit_retries,
+};
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
 use crate::vended_refresh::{StorageCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
@@ -25,10 +27,6 @@ use std::sync::Arc;
 
 const EXPORT_ID_PROPERTY: &str = "lakehouse.export-id";
 const EXPORT_WRITER_PROPERTY: &str = "lakehouse.export-writer";
-/// Concurrent writers of one export all commit to the table it creates, so it allows many more
-/// commit retries than Iceberg's default of 4.
-const CREATED_TABLE_PROPERTIES: [(&str, &str); 2] =
-    [("format-version", "2"), ("commit.retry.num-retries", "20")];
 
 /// Where an export table's storage credentials come from. Every kind reaches the table's FileIO
 /// through one credential source, which renews the credentials its own way.
@@ -362,8 +360,8 @@ impl TableWriteSession {
     /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
     /// or a lost answer (502, 504, a broken transport) waits, then reloads the table: a snapshot
     /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
-    /// and sent again, up to the table's `commit.retry.num-retries` times. Every other answer
-    /// fails at once.
+    /// and sent again, up to the table's `commit.retry.num-retries` times, and at least 20. Every
+    /// other answer fails at once.
     pub async fn append_files(
         &self,
         written: &WriteTable,
@@ -384,7 +382,7 @@ impl TableWriteSession {
         // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
         let mut base = rebuilt(&written.table, reloaded)
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(commit_retries(base.metadata().properties()));
+        let mut retries = Retries::new(append_retries(base.metadata().properties()));
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
@@ -759,11 +757,11 @@ fn classify(status: u16) -> Outcome {
 }
 
 fn creation_request(table: &TableIdent, schema: Schema, export_id: &str) -> CreateTableRequest {
-    let mut properties: HashMap<String, String> = CREATED_TABLE_PROPERTIES
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    properties.insert(EXPORT_ID_PROPERTY.to_string(), export_id.to_string());
+    let properties = HashMap::from([
+        ("format-version".to_string(), "2".to_string()),
+        (NUM_RETRIES_PROPERTY.to_string(), EXPORT_RETRIES.to_string()),
+        (EXPORT_ID_PROPERTY.to_string(), export_id.to_string()),
+    ]);
     CreateTableRequest {
         name: table.name.clone(),
         location: None,

@@ -29,13 +29,10 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
 }
 
 /// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
-#[tokio::test]
+/// The paused clock skips the backoff waits of the 20 retries that all meet a 504.
+#[tokio::test(start_paused = true)]
 async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
-    // The recorded table allows 20 commit retries; none keeps the one 504 answer decisive.
-    let table = LOAD_TABLE_NO_SNAPSHOTS.replace(
-        r#""commit.retry.num-retries": "20""#,
-        r#""commit.retry.num-retries": "0""#,
-    );
+    let table = LOAD_TABLE_NO_SNAPSHOTS.to_string();
     let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
         if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
             (504, "{}".into())

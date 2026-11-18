@@ -875,8 +875,9 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     assert_eq!(requests_starting(&requests, LOAD_T).len(), 2);
 }
 
-#[tokio::test]
-async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the_last_outcome() {
+/// The paused clock skips the backoff waits of the 20 retries an append makes at least.
+#[tokio::test(start_paused = true)]
+async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the_last_outcome() {
     for (status, unknown) in [
         (409, false),
         (429, false),
@@ -903,11 +904,11 @@ async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the
         assert_eq!(failed.outcome_unknown(), unknown, "HTTP {status}");
         assert!(
             failed.to_string().contains(&format!(
-                "2 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
+                "21 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
             )),
             "{failed}"
         );
-        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 2);
+        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 21);
     }
 }
 
