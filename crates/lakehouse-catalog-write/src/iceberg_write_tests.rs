@@ -1,9 +1,9 @@
 use super::*;
-use crate::retry::backoff_wait;
+use crate::retry::Waits;
 use crate::test_support::{
     COMMIT_CONFLICT, CREATE_CONFLICT, LOAD_TABLE_NO_SNAPSHOTS, LOAD_TABLE_TAGGED, PREFIX_CONFIG,
     RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
-    catalog, data_file, ident, memory_table, requests_starting, session,
+    catalog, data_file, ident, memory_table, requests_starting, session, with_short_commit_waits,
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
@@ -905,7 +905,7 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
             .collect::<Vec<_>>()
     };
     assert!(
-        arrived(LOAD_T)[1] - arrived(COMMIT_T)[0] >= backoff_wait(1, 0.0),
+        arrived(LOAD_T)[1] - arrived(COMMIT_T)[0] >= Waits::DEFAULT.backoff(1, 0.0),
         "a reload before the wait goes stale when another writer commits during the wait"
     );
 }
@@ -964,8 +964,7 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     assert_eq!(requests_starting(&requests, LOAD_T).len(), 2);
 }
 
-/// The paused clock skips the backoff waits of the 20 retries an append makes at least.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the_last_outcome() {
     for (status, unknown) in [
         (409, false),
@@ -978,7 +977,10 @@ async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the
             PREFIX_CONFIG,
             routes(vec![
                 (COMMIT_T, (status, "{}".into())),
-                (LOAD_T, (200, load_table_with_retries(1))),
+                (
+                    LOAD_T,
+                    (200, with_short_commit_waits(&load_table_with_retries(1))),
+                ),
             ]),
         )
         .await;
