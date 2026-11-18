@@ -1,11 +1,12 @@
 //! The virtual schema property catalog: every property name the adapter reads, and the value
-//! rule of each tuning property and of EXCLUDED_CAPABILITIES. No other module reads a property
-//! by name.
+//! rule of each tuning property, of EXCLUDED_CAPABILITIES, and of SESSION_TIME_ZONE. No other
+//! module reads a property by name.
 
 use super::capabilities::{CAPABILITIES, excluded_capability_entries};
 use super::catalog_kind::CatalogKind;
 use super::permission::PermissionSettings;
 use super::table_filter::{TableFilter, parse_patterns};
+use super::time_zone::TimeZone;
 pub(super) use crate::exasol::parse_boolean;
 use crate::exasol::{WholeNumber, parse_whole_number};
 use exasol_udf_sdk::error::UdfError;
@@ -41,10 +42,12 @@ pub(super) const USER_MAPPING: &str = "USER_MAPPING";
 const PROP_TABLE_INCLUDE: &str = "TABLE_INCLUDE";
 const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
 const PROP_EXCLUDED_CAPABILITIES: &str = "EXCLUDED_CAPABILITIES";
+// Stands in for the session time zone, which no adapter request carries.
+const PROP_SESSION_TIME_ZONE: &str = "SESSION_TIME_ZONE";
 
 /// Every name a virtual schema may set; the value rules of the properties whose owning module
 /// checks the value stay in that module.
-const PROPERTY_NAMES: [&str; 22] = [
+const PROPERTY_NAMES: [&str; 23] = [
     PROP_CATALOG_KIND,
     PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
@@ -67,6 +70,7 @@ const PROPERTY_NAMES: [&str; 22] = [
     PROP_TABLE_INCLUDE,
     PROP_TABLE_EXCLUDE,
     PROP_EXCLUDED_CAPABILITIES,
+    PROP_SESSION_TIME_ZONE,
 ];
 
 const ERROR_PREFIX: &str = "invalid virtual schema properties: ";
@@ -102,6 +106,7 @@ pub(super) struct CheckedProperties {
     pub(super) binary_as_string: bool,
     pub(super) tuning: TuningProperties,
     pub(super) table_filter: TableFilter,
+    pub(super) session_time_zone: Option<TimeZone>,
 }
 
 /// How a request treats an unknown property name or a rejected value.
@@ -160,6 +165,7 @@ pub(super) fn checked_values(props: &Json, check: Check) -> Result<CheckedProper
         binary_as_string: checker.boolean(PROP_BINARY_AS_STRING),
         tuning: checker.tuning(),
         table_filter: checker.table_filter(),
+        session_time_zone: checker.value(PROP_SESSION_TIME_ZONE, TimeZone::exasol_name),
     };
     checker.excluded_capabilities();
     if check == Check::Lenient {
