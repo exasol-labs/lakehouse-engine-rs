@@ -47,6 +47,8 @@ The adapter qualifies its calls to these scripts from its own running-script sch
 
 **Tables with deletes:** A scan of a table with positional deletes or deletion vectors holds a data file's deleted row positions in this pool until its row selection is built, and the row selection while the file is read. That memory cannot spill. When a shard's delete state does not fit, the query fails with `the row-position delete state does not fit the memory pool`. Raise `PARALLELISM_FACTOR` so each shard holds fewer data files, or raise `MEMORY_POOL_FRACTION`. Reading and decoding the deletes runs on the scan's worker threads, so the thread budget set by `DATAFUSION_THREADING_MODE` also speeds up the delete preparation.
 
+**Scan read memory:** Each scan stream holds the fetched bytes of the row group it decodes. These bytes are reserved in the pool, and the streams of one scan instance together hold at most a quarter of it. A stream that does not fit waits, so a small pool slows a scan of large row groups and does not fail it. A row group larger than that quarter is read alone. Raise `MEMORY_POOL_FRACTION` to let more streams read at once.
+
 **Quick recommendation:** Keep the defaults. On scan-only queries, `DATAFUSION_TARGET_PARTITIONS` at 4 × cores (`FIXED` mode) can be faster, but it slows joins. Raise `PARALLELISM_FACTOR` to 2 only when file sizes are very uneven, so one node does not become the long pole.
 
 ### `S3_MAX_CONNECTIONS`

@@ -2,6 +2,7 @@ use super::*;
 use crate::scan::test_support::{CountingObjectStore, parquet_bytes};
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+use futures::FutureExt;
 use object_store::memory::InMemory;
 use object_store::{GetRange, PutPayload};
 
@@ -29,13 +30,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pool: Arc<dyn MemoryPool>, metadata_size_hint: usize) -> Self {
-        Self::with(pool, metadata_size_hint, None, true).await
+        Self::with(pool, metadata_size_hint, None, usize::MAX, true).await
     }
 
     async fn with(
         pool: Arc<dyn MemoryPool>,
         metadata_size_hint: usize,
         delete_key: Option<String>,
+        read_budget: usize,
         whole_small_files: bool,
     ) -> Self {
         let bytes = data_file();
@@ -49,6 +51,7 @@ impl Fixture {
             Some(metadata_size_hint),
             whole_small_files,
             &pool,
+            Arc::new(ReadBudget::with_capacity(&pool, read_budget)),
             [(Path::from(NAME), bytes.len() as u64, delete_key)],
             None,
         ));
@@ -97,6 +100,11 @@ fn unbounded() -> Arc<dyn MemoryPool> {
 /// Room for a footer suffix and the page index, but not for the whole file.
 fn pool_below_the_file() -> Arc<dyn MemoryPool> {
     Arc::new(GreedyMemoryPool::new(64 * 1024))
+}
+
+/// Holds no file bytes, so the pool's reserved bytes are the read budget's.
+fn pool_holding_no_file_bytes() -> Arc<dyn MemoryPool> {
+    Arc::new(GreedyMemoryPool::new(0))
 }
 
 fn column_chunks(metadata: &ParquetMetaData) -> Vec<Range<u64>> {
@@ -245,7 +253,7 @@ async fn held_bytes_are_released_once_the_readers_cover_the_file() {
 /// Scenario: Held file bytes are reserved in the memory pool
 #[tokio::test]
 async fn bytes_beyond_the_pool_are_not_held_and_are_read_from_the_store() {
-    let fixture = Fixture::new(Arc::new(GreedyMemoryPool::new(0)), 16 * 1024).await;
+    let fixture = Fixture::new(pool_holding_no_file_bytes(), 16 * 1024).await;
     let mut reader = fixture.reader(None);
 
     let metadata = reader.get_metadata(None).await.unwrap();
@@ -257,7 +265,11 @@ async fn bytes_beyond_the_pool_are_not_held_and_are_read_from_the_store() {
         read,
         fixture.bytes.slice(last.start as usize..last.end as usize)
     );
-    assert_eq!(fixture.pool.reserved(), 0);
+    assert_eq!(
+        fixture.pool.reserved() as u64,
+        last.end - last.start,
+        "only the row group being read"
+    );
     assert_eq!(
         fixture.requests().len(),
         2,
@@ -298,6 +310,7 @@ async fn a_delete_carrying_file_without_its_access_plan_is_refused() {
         unbounded(),
         0,
         Some("memory:///data/a.parquet".into()),
+        usize::MAX,
         true,
     )
     .await;
@@ -317,10 +330,60 @@ async fn a_delete_carrying_file_without_its_access_plan_is_refused() {
     assert!(factory.create_reader(0, planned, None, &metrics).is_ok());
 }
 
+/// Scenario: Row-group reads wait on the read budget
+#[tokio::test]
+async fn a_reader_holds_the_bytes_of_its_row_group_until_it_fetches_the_next() {
+    let fixture = Fixture::new(pool_holding_no_file_bytes(), 0).await;
+    let mut reader = fixture.reader(None);
+    let chunks = column_chunks(&reader.get_metadata(None).await.unwrap());
+    let len = |chunk: usize| (chunks[chunk].end - chunks[chunk].start) as usize;
+
+    reader.get_bytes(chunks[0].clone()).await.unwrap();
+    assert_eq!(fixture.pool.reserved(), len(0));
+    reader.get_bytes(chunks[1].clone()).await.unwrap();
+    assert_eq!(
+        fixture.pool.reserved(),
+        len(0) + len(1),
+        "one row group, fetched in two reads"
+    );
+    reader.get_bytes(chunks[2].clone()).await.unwrap();
+    assert_eq!(fixture.pool.reserved(), len(2), "the next row group");
+    drop(reader);
+    assert_eq!(fixture.pool.reserved(), 0);
+}
+
+/// Scenario: Row-group reads wait on the read budget
+#[tokio::test]
+async fn a_reader_waits_for_the_row_group_another_reader_holds() {
+    let fixture = Fixture::with(pool_holding_no_file_bytes(), 0, None, 1, true).await;
+    let (mut first, mut second) = (fixture.reader(None), fixture.reader(None));
+    let chunks = column_chunks(&first.get_metadata(None).await.unwrap());
+    second.get_metadata(None).await.unwrap();
+
+    first.get_bytes(chunks[0].clone()).await.unwrap();
+    let mut waiting = second.get_bytes(chunks[2].clone());
+    assert!((&mut waiting).now_or_never().is_none());
+
+    drop(first);
+    let range = chunks[2].start as usize..chunks[2].end as usize;
+    assert_eq!(waiting.await.unwrap(), fixture.bytes.slice(range));
+}
+
+/// Scenario: Row-group reads wait on the read budget
+#[tokio::test]
+async fn bytes_served_from_held_file_bytes_take_no_read_budget() {
+    let fixture = Fixture::new(unbounded(), 0).await;
+    let mut reader = fixture.reader(None);
+    let chunks = column_chunks(&reader.get_metadata(None).await.unwrap());
+
+    reader.get_bytes(chunks[0].clone()).await.unwrap();
+    assert_eq!(fixture.pool.reserved() as u64, fixture.size());
+}
+
 /// Scenario: A small data file read for few columns is read by ranges
 #[tokio::test]
 async fn a_small_file_read_for_few_columns_fetches_its_footer_and_the_columns_it_reads() {
-    let fixture = Fixture::with(unbounded(), 16 * 1024, None, false).await;
+    let fixture = Fixture::with(unbounded(), 16 * 1024, None, usize::MAX, false).await;
     let mut reader = fixture.reader(None);
     let chunks = column_chunks(&reader.get_metadata(None).await.unwrap());
 

@@ -118,10 +118,11 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
 }
 
 #[test]
-fn delete_path_read_limiter_clamps_zero_connections_to_one() {
+fn zero_connections_still_give_the_delete_path_one_read_permit() {
     let mut spec = minimal_spec();
     spec.common.tuning.s3_max_connections = 0;
-    assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
+    let limits = ScanLimits::new(&SessionContext::new(), &spec);
+    assert_eq!(limits.delete_reads.available_permits(), 1);
 }
 
 /// Scenario: Scan without a logical schema falls back to first-file inference
