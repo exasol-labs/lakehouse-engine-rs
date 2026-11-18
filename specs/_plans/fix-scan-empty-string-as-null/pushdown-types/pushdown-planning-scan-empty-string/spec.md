@@ -26,7 +26,7 @@ The scan reads an empty string as NULL wherever it computes with it, so a pushed
 
 * *GIVEN* a virtual table whose string column `s` stores `''` in some rows, NULL in others, and non-empty text in the rest
 * *WHEN* a query computes with `s` in the scan
-* *THEN* the pushed scan SQL SHALL read `s` as `nullif("S", '')` inside a function argument, an aggregate argument, a `CASE`, and a null test
+* *THEN* the pushed scan SQL SHALL read `s` as `nullif("S", '')` inside a function argument, an aggregate argument, and a `CASE`
 * *AND* `LENGTH(s)`, `NVL(s, 'E')`, and `s IS NULL` SHALL return for a row that stores `''` what they return for a row that stores NULL
 * *AND* `COUNT(s)` SHALL NOT count a row that stores `''`, and `MIN(s)` SHALL return the smallest non-empty value
 * *AND* `GROUP BY s` SHALL return one NULL group that holds the rows storing `''` and the rows storing NULL
@@ -40,11 +40,12 @@ The scan reads an empty string as NULL wherever it computes with it, so a pushed
 * *AND* `s <> 'x'`, `s < 'x'`, `s <= 'x'`, and `s LIKE 'x%'` SHALL render over the bare column joined by `AND` with `"S" <> ''`
 * *AND* each filter SHALL return the rows the native oracle returns, so `s <> 'x'` and `s < 'x'` SHALL NOT return a row that stores `''`
 * *AND* the same comparison under a `NOT`, in a `CASE` condition, or in the select list SHALL read the column as `nullif("S", '')`, so `NOT (s = 'x')` SHALL NOT return a row that stores `''`
+* *AND* `s IS NULL` SHALL render as `("S" IS NULL OR "S" = '')` and `s IS NOT NULL` as `("S" IS NOT NULL AND "S" <> '')` at any position, also under a `NOT`, and SHALL return the native oracle's rows
 
 ### Scenario: A guarded string filter still skips row groups
 
 * *GIVEN* a Parquet file with several row groups whose statistics for a string column exclude the literal in all but one row group
-* *WHEN* the scan runs a filter the preceding scenario renders over the bare column, with or without the `<> ''` condition
+* *WHEN* the scan runs a filter the preceding scenario renders over the bare column, with or without the `<> ''` condition, or a null test over a bare string column
 * *THEN* the scan SHALL read only the row groups whose statistics admit a matching row
 
 ### Scenario: An equality of two string columns never matches empty strings

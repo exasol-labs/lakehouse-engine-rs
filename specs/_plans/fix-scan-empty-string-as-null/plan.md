@@ -27,14 +27,15 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 | pruning-predicate-translation | CHANGED | `file-planning/pruning-predicate-translation/spec.md` |
 | pushdown-planning-topn | CHANGED | `pushdown-capabilities/pushdown-planning-topn/spec.md` |
 | vs-expression-translator-scalar-fns | CHANGED | `sql-functions/vs-expression-translator-scalar-fns/spec.md` |
+| vs-expression-translator-predicates | CHANGED | `sql-comprehension/vs-expression-translator-predicates/spec.md` |
 
 ## Impact
 
 - Queries over data that stores `''`, or over text functions that return `''`, now return native Exasol's rows and values. Results change for such queries: `IS NULL`, `LENGTH`, `NVL`, `COUNT(col)`, `MIN`, `<>`, `<`, `<=`, `NOT (...)`, join keys, and top-N ranking.
 - `REPLACE(s, 'U')` and `REPLACE(s, 'U', '')` now remove the search text. They returned NULL.
 - A text function whose NULL-argument result the scan cannot reproduce with a NULL guard runs in Exasol whenever that argument is not a non-NULL literal, so a filter over such a call prunes no files.
-- `col IS NULL` and `col IS NOT NULL` over a string column no longer skip row groups in the scan. Plan-time file pruning for them stays. Comparisons, `IN`, `BETWEEN`, and `LIKE` over a bare string column prune as before.
-- A string filter under a `NOT`, and a comparison of two string columns other than `=`, no longer skip row groups in the scan.
+- Comparisons, `IN`, `BETWEEN`, `LIKE`, `IS NULL`, and `IS NOT NULL` over a bare string column prune as before, in the scan and at plan time.
+- A comparison, `IN`, `BETWEEN`, or `LIKE` over a string column under a `NOT`, and a comparison of two string columns other than `=`, no longer skip row groups in the scan.
 - No property, CONNECTION field, capability, or install step changes. No breaking change.
 
 ## Requirements
@@ -43,6 +44,7 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 |-------------|---------|
 | Live capture first | Before any rendering change, capture on the Docker Exasol what native Exasol returns for each text function with a NULL in each argument position, and what Exasol sends for `''` and omitted arguments. The capture decides fix or decline per function. |
 | One rule, one place | The typed pass owns the rule. It marks a string column and a text function result with one synthetic node that the DataFusion dialect renders as `nullif(x, '')`. The Exasol dialect is unchanged. |
+| Null test form | A null test over a bare character column renders `IS NULL OR = ''`, or `IS NOT NULL AND <> ''`, at any position. |
 | Bare-column filter form | The typed pass keeps the bare column for the comparison forms the spec lists, only where the node is reached from a filter root or a join condition root through `AND` and `OR`. `binary_filter.rs` does the same for binary columns and is the model. |
 | Character columns | The rule reads the per-column type map and covers every column it declares as a character type. |
 | Plan-time null test | In the one parsed pruning filter, a null test on a string column becomes `IS NULL OR = ''`, and the negated one `IS NOT NULL AND <> ''`. |
@@ -72,6 +74,7 @@ The scan reads an empty string as NULL wherever it computes with it, from a stor
 | A text function with a NULL argument returns what native Exasol returns | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `text_function_null_argument_matches_native` |
 | A null test on a string column keeps the files that hold empty strings | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `null_test_keeps_file_of_empty_strings` |
 | A per-shard top-N ranks a stored empty string as NULL | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `per_shard_top_n_ranks_empty_string_as_null` |
+| IS NULL and IS NOT NULL predicates translate correctly | E2E | `crates/lakehouse-e2e/tests/e2e_local/empty_string.rs` | `null_test_over_string_column_keeps_the_bare_column` |
 | String scalar functions translate to DataFusion string calls | Unit | `crates/vs-expression/src/lib_tests.rs` | the existing string-function case table, with the wrapped expectations |
 
 - The E2E tests share one new Iceberg fixture, seeded through `tests/common/seed.rs`: a string column that stores `''`, NULL, and text across two data files, one of which holds `''` and no NULL, plus a native copy of the same rows. The top-N test reuses the blank-label fixture of #309 with a shard count above 1.
@@ -102,5 +105,5 @@ With this clone's stack variables exported and `EXAPUMP_DSN='exasol://sys:exasol
 
 ## Out of scope
 
-- Row-group pruning for `IS NULL` over a string column and for string filters under a `NOT`.
+- Row-group pruning for a comparison, `IN`, `BETWEEN`, or `LIKE` over a string column under a `NOT`.
 - #227 (string functions on non-string arguments) and #432 (`SUBSTR` with a start at or below 0).
