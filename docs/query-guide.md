@@ -38,7 +38,7 @@ verified against lakehouse-engine 0.59.1 on Exasol 2026.2.
 | Filters on the optional side of a `LEFT JOIN` in a `WITH` clause | The same filters in `ON` | A filter in `ON` on that side doesn't reach the engine. |
 | `JOIN` on a unique key | `IN (SELECT ...)`, `EXISTS` | The engine can't run these. |
 | Filters on the lakehouse table's columns | Filters only on the Exasol table it joins | Exasol keeps the whole lakehouse table in memory before the join. |
-| `SUM`, `COUNT`, `MIN`, `MAX`, `AVG` | `MEDIAN`, `LISTAGG`, `APPROXIMATE_COUNT_DISTINCT` | Only the first group runs in the engine. |
+| `SUM`, `COUNT`, `MIN`, `MAX`, `AVG` | `MEDIAN`, `LISTAGG`, `APPROXIMATE_COUNT_DISTINCT` | The engine runs the first ones; the others send every row to Exasol. |
 | Only the columns you need | `SELECT *` | The engine reads every selected column, and Exasol keeps it in memory. |
 
 ## Check a query yourself
