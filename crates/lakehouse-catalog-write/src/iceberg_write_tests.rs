@@ -1195,3 +1195,19 @@ fn a_reloaded_table_upgraded_to_format_version_3_takes_no_files() {
         Err("it was upgraded to format version 3 after the writer checked the table".into())
     );
 }
+
+#[tokio::test]
+async fn a_table_exists_only_when_the_catalog_answers_its_head_request_with_success() {
+    for (status, exists) in [(204, true), (404, false)] {
+        let (uri, _) = catalog(
+            PREFIX_CONFIG,
+            routes(vec![(EXISTS_T, (status, String::new()))]),
+        )
+        .await;
+        let writes = static_writes(&uri).await;
+
+        let found = writes.table_exists(&ident("ns", "t")).await.unwrap();
+
+        assert_eq!(found, exists, "HTTP {status}");
+    }
+}
