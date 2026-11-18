@@ -1176,3 +1176,22 @@ fn a_reloaded_table_takes_the_files_only_with_the_checked_schema_and_spec() {
         assert_eq!(refuse_changed(checked, reloaded), expected, "{case}");
     }
 }
+
+#[test]
+fn a_reloaded_table_upgraded_to_format_version_3_takes_no_files() {
+    let reloaded = |version: u8| {
+        let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+        answer["metadata"]["format-version"] = version.into();
+        answer["metadata"]["next-row-id"] = 0.into();
+        serde_json::from_value::<LoadTableResult>(answer)
+            .unwrap()
+            .metadata
+    };
+    let checked = TableShape::of(&reloaded(2));
+
+    assert_eq!(refuse_reloaded(checked, &reloaded(2)), Ok(()));
+    assert_eq!(
+        refuse_reloaded(checked, &reloaded(3)),
+        Err("it was upgraded to format version 3 after the writer checked the table".into())
+    );
+}

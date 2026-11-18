@@ -7,7 +7,7 @@ use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_upda
 use crate::vended_refresh::{StorageCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Schema, TableMetadata};
+use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -379,7 +379,7 @@ impl TableWriteSession {
             .load_table_with_all_snapshots(ident)
             .await
             .map_err(|error| CommitError::new(ident, error, false))?;
-        refuse_changed(checked, TableShape::of(&reloaded.metadata))
+        refuse_reloaded(checked, &reloaded.metadata)
             .map_err(|change| CommitError::new(ident, change, false))?;
         // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
         let mut base = rebuilt(&written.table, reloaded)
@@ -409,7 +409,7 @@ impl TableWriteSession {
             if tag.is_on(&reloaded.metadata) {
                 return Ok(());
             }
-            refuse_changed(checked, TableShape::of(&reloaded.metadata))
+            refuse_reloaded(checked, &reloaded.metadata)
                 .map_err(|change| CommitError::new(ident, change, false))?;
             if !may_retry {
                 return Err(exhausted_commit_error(ident, &retries, &failure));
@@ -694,6 +694,21 @@ impl TableShape {
         });
         requirements
     }
+}
+
+/// Why the writer's files cannot go onto `reloaded`: a schema or partition spec other than the one
+/// it checked, or format version 3 or later, whose row lineage the export does not maintain. No
+/// Iceberg REST requirement asserts the format version, so only a reload can see an upgrade.
+fn refuse_reloaded(checked: TableShape, reloaded: &TableMetadata) -> Result<(), String> {
+    refuse_changed(checked, TableShape::of(reloaded))?;
+    let version = reloaded.format_version();
+    if version > FormatVersion::V2 {
+        return Err(format!(
+            "it was upgraded to format version {} after the writer checked the table",
+            version as u8
+        ));
+    }
+    Ok(())
 }
 
 /// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
