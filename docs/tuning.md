@@ -4,7 +4,7 @@
 
 # Parameters & Telemetry
 
-This page lists every property and shows how to see what a scan does. Set these properties on the `CREATE VIRTUAL SCHEMA` statement from [Install](install.md), and change them with `ALTER VIRTUAL SCHEMA ... SET`. Run the [Benchmark](benchmark.md) suite to find the best values for your workload. For the architectural meaning of the values, see [Architecture](architecture.md).
+This page lists every property and shows how to see what a scan does. Set these properties on the `CREATE VIRTUAL SCHEMA` statement from [Install](install.md), and change them with `ALTER VIRTUAL SCHEMA ... SET`. Run the [Benchmark](benchmark.md) suite to find the best values for your workload. For the architectural meaning of the values, see [Architecture](architecture.md). How a query is written often matters more than these values, see [Writing efficient queries](query-guide.md).
 
 ## Parameters
 
