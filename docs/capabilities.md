@@ -94,10 +94,13 @@ The scan computes these functions when DataFusion can render the filter conditio
 | String | `FN_ASCII`, `FN_CHR`, `FN_CONCAT`, `FN_INITCAP`, `FN_INSTR`, `FN_LEFT`, `FN_LENGTH`, `FN_LOCATE`, `FN_LOWER`, `FN_LPAD`, `FN_LTRIM`, `FN_OCTET_LENGTH`, `FN_REPEAT`, `FN_REPLACE`, `FN_REVERSE`, `FN_RIGHT`, `FN_RPAD`, `FN_RTRIM`, `FN_SUBSTR`, `FN_TRANSLATE`, `FN_TRIM`, `FN_UNICODE`, `FN_UNICODECHR`, `FN_UPPER` | `WHERE UPPER(code) = 'AB'` |
 | Conversion | `FN_CAST` | `SELECT CAST(id AS VARCHAR(20))` |
 | Date / time | `FN_ADD_DAYS`, `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_WEEKS`, `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
+| Clock | `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_LOCALTIMESTAMP`, `FN_SYSDATE`, `FN_SYSTIMESTAMP` | `WHERE created_at < CURRENT_TIMESTAMP` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 | JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
 `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan when the adapter knows the argument's `DATE` or `TIMESTAMP` type and the count is a number. Otherwise they run in Exasol SQL. A value with more than 6 fractional digits computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)).
+
+The adapter replaces each clock function with a `DATE` or `TIMESTAMP` literal, read once per statement from the clock of the node that plans it, so a filter over a clock function runs in the scan and prunes files like a filter over a literal. `SYSDATE` and `SYSTIMESTAMP` fold in `DBTIMEZONE`, which the adapter reads from the `TZ` variable Exasol sets in its VM. The adapter cannot read `SESSIONTIMEZONE`, so `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` fold in the zone of the `SESSION_TIME_ZONE` property ([tuning](tuning.md)), or in `DBTIMEZONE` when it is unset. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal (`LITERAL_TIMESTAMP_UTC`), such as `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, compares with the literal's wall-clock time in that zone and also runs in the scan. A projected `CURRENT_TIMESTAMP` or `TIMESTAMP WITH LOCAL TIME ZONE` literal runs in Exasol SQL and shows the session's own value. [Semantic differences](semantic-differences.md#clock-functions-and-timestamp-with-local-time-zone-literals) lists where the folded values differ from native Exasol.
 
 `DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
 
@@ -176,7 +179,7 @@ A two-table inner equi-join, or a table joined to itself, whose smaller side is 
 
 ## Handled by Exasol
 
-The adapter does not advertise these capabilities, so Exasol evaluates them itself over the rows the scan returns. Results are correct, but a predicate that Exasol keeps prunes no files. A capability is unadvertised for one of three reasons: (a) it does not decompose into a partial/merge plan, (b) the scan lacks the clock, time zone, or session context it needs, or (c) DataFusion's result differs from Exasol's. Advertised capabilities that the adapter renders in Exasol SQL are described in the sections above.
+The adapter does not advertise these capabilities, so Exasol evaluates them itself over the rows the scan returns. Results are correct, but a predicate that Exasol keeps prunes no files. A capability is unadvertised for one of three reasons: (a) it does not decompose into a partial/merge plan, (b) the scan lacks the session context it needs, or (c) DataFusion's result differs from Exasol's. Advertised capabilities that the adapter renders in Exasol SQL are described in the sections above.
 
 | Capability | Example | Where it runs |
 |---|---|---|
@@ -184,7 +187,7 @@ The adapter does not advertise these capabilities, so Exasol evaluates them itse
 | `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT` | `WHERE name REGEXP_LIKE 'event-0[1-3]'` | Exasol evaluates them over the returned rows, because DataFusion's regex matching differs from Exasol's PCRE matching. The other `AND` conjuncts and the projection still push down, and an `OR` that contains one pushes no filter |
 | `MEDIAN`, `APPROXIMATE_COUNT_DISTINCT` | `SELECT k, MEDIAN(v) FROM t GROUP BY k` | Not decomposable into partial/merge. Exasol computes on the returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
-| `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` | `WHERE created_at < CURRENT_TIMESTAMP` | The scan receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE` and holds no statement anchor, so Exasol evaluates the clock itself, once per statement, in its own zones. Results are correct; a predicate over one of these names prunes no files |
+| `DBTIMEZONE`, `SESSIONTIMEZONE` | `SELECT SESSIONTIMEZONE FROM t` | Exasol evaluates them. The adapter cannot read the session zone, and `DBTIMEZONE` has no realistic filter use |
 | Geospatial and session functions | — | Exasol evaluates them. No lakehouse type maps to GEOMETRY |
 
 ## Excluding a capability

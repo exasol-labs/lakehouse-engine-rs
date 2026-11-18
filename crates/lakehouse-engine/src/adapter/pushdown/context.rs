@@ -6,6 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 use vs_expression::ExasolVersion;
 
 use super::ResolvedScan;
+use super::clock::StatementClock;
 use super::shard_paths::relativize_shards_to_root;
 use super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, quote_ident, scan_storage_for, shard_count,
@@ -20,6 +21,7 @@ pub(crate) struct PushdownContext<'a> {
     pub(crate) tuning: Tuning,
     pub(crate) binary_as_string: bool,
     pub(crate) version: ExasolVersion,
+    pub(crate) clock: StatementClock,
 }
 
 impl PushdownContext<'_> {

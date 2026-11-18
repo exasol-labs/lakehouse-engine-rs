@@ -53,6 +53,7 @@ serde_json = { workspace = true }
 jiter      = { workspace = true }
 
 chrono  = { workspace = true }
+chrono-tz = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
 percent-encoding = { workspace = true }

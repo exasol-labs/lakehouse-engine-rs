@@ -49,7 +49,7 @@ The names come from the Exasol
 | `NULL` | ✓ |  |
 | `STRING` | ✓ |  |
 | `TIMESTAMP` | ✓ |  |
-| `TIMESTAMP_UTC` | ✓ |  |
+| `TIMESTAMP_UTC` | ✓ | Compared in the folding zone. |
 
 ## Predicates
 
@@ -113,17 +113,17 @@ The names come from the Exasol
 | `COSH` | ✓ |  |
 | `COT` | ✓ |  |
 | `CURRENT_CLUSTER` |  |  |
-| `CURRENT_DATE` |  | Needs the statement clock. |
+| `CURRENT_DATE` | ✓ | Folded into a literal. |
 | `CURRENT_SCHEMA` |  | Session function. |
 | `CURRENT_SESSION` |  |  |
 | `CURRENT_STATEMENT` |  |  |
-| `CURRENT_TIMESTAMP` |  | Needs the statement clock. |
+| `CURRENT_TIMESTAMP` | ✓ | Folded into a literal. |
 | `CURRENT_USER` |  | Session function. |
 | `DATE_TRUNC` | ✓ |  |
 | `DAY` | ✓ |  |
 | `DAYOFWEEK` |  | Needs the session's `NLS_FIRST_DAY_OF_WEEK`. |
 | `DAYS_BETWEEN` | ✓ |  |
-| `DBTIMEZONE` |  | Needs the session time zone. |
+| `DBTIMEZONE` |  | No filter use. |
 | `DEGREES` | ✓ |  |
 | `DIV` | ✓ | Some forms run in Exasol SQL. |
 | `DUMP` |  |  |
@@ -161,7 +161,7 @@ The names come from the Exasol
 | `LEFT` | ✓ |  |
 | `LENGTH` | ✓ |  |
 | `LN` | ✓ |  |
-| `LOCALTIMESTAMP` |  | Needs the statement clock. |
+| `LOCALTIMESTAMP` | ✓ | Folded into a literal. |
 | `LOCATE` | ✓ | Some forms run in Exasol SQL. |
 | `LOG` | ✓ |  |
 | `LOWER` | ✓ | Non-ASCII text can differ. |
@@ -196,7 +196,7 @@ The names come from the Exasol
 | `RTRIM` | ✓ |  |
 | `SECOND` | ✓ |  |
 | `SECONDS_BETWEEN` | ✓ |  |
-| `SESSIONTIMEZONE` |  | Needs the session time zone. |
+| `SESSIONTIMEZONE` |  | Adapter cannot read it. |
 | `SESSION_PARAMETER` |  |  |
 | `SIGN` | ✓ |  |
 | `SIN` | ✓ |  |
@@ -246,8 +246,8 @@ The names come from the Exasol
 | `ST_Y` |  | No GEOMETRY type. |
 | `SUB` | ✓ |  |
 | `SUBSTR` | ✓ |  |
-| `SYSDATE` |  | Needs the statement clock. |
-| `SYSTIMESTAMP` |  | Needs the statement clock. |
+| `SYSDATE` | ✓ | Folded into a literal. |
+| `SYSTIMESTAMP` | ✓ | Folded into a literal. |
 | `SYS_GUID` |  | Exasol-only. |
 | `TAN` | ✓ |  |
 | `TANH` | ✓ |  |

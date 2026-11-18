@@ -9,13 +9,14 @@ use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT_TRAILING_SPACE, ExpectedValue,
     TYPED_TABLE_TOTAL_ROWS,
 };
+use crate::common::stack::{ExasolFlavor, exasol_flavor};
 use crate::common::timestamp_precision::{
     engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
     TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
-    echoed_pushdown_requests, events_table, lakehouse_vs, typed_table, vs_char_pad_table,
-    vs_dim_table, vs_fact_table,
+    echoed_pushdown_requests, events_table, explain_virtual_pushdown_sql, lakehouse_vs,
+    typed_table, vs_char_pad_table, vs_dim_table, vs_fact_table,
 };
 
 /// The measured worst-case divergence of the scan's float division from native Exasol is
@@ -913,35 +914,67 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     )
 }
 
+/// Scenario: Routed session-dependent projection returns the value Exasol computes natively
 #[test]
-fn e2e_now_family_projection_matches_native_session_local_value() {
+fn e2e_clock_projection_matches_native_session_local_value() {
     lakehouse_vs();
     let mut conn = exa_conn();
     let table = events_table();
-    pin_session_time_zone(&mut conn);
+    let db_timezone = conn.query_columns("SELECT DBTIMEZONE")[0][0]
+        .as_str()
+        .expect("DBTIMEZONE is text")
+        .to_string();
+    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
     let offset_seconds = session_utc_offset_seconds(&mut conn);
-    assert!(
-        offset_seconds != 0.0,
-        "fixture precondition: the session's UTC offset must be non-zero, or the \
-         assertion below passes whichever zone the adapter applies (#238)"
+    // A zero offset lets the assertion below pass whichever zone the adapter applies (#238), so
+    // docker-db's DBTIMEZONE is no UTC zone. Nano runs with `sysTZ=UTC` (docker-compose.nano.yml).
+    assert_eq!(
+        offset_seconds == 0.0,
+        exasol_flavor() == ExasolFlavor::Nano,
+        "fixture precondition: the session's UTC offset is zero exactly on Nano, is {offset_seconds}s"
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
-        // Measured within one statement, so no wall-clock time elapses between the two values
-        // that could mask a UTC-shift regression.
+        // CURRENT_TIMESTAMP is evaluated by Exasol in this statement; SYSTIMESTAMP comes from the
+        // adapter's clock, read when it plans the statement.
         let deviation = scalar_seconds(
             &mut conn,
             &format!("SELECT SECONDS_BETWEEN({expr}, (SELECT {expr} FROM {table} WHERE id = 1))"),
         )
         .abs();
+        let within = if expr == "CURRENT_TIMESTAMP" {
+            deviation < 1.0
+        } else {
+            deviation <= 60.0
+                && (offset_seconds == 0.0 || (deviation - offset_seconds.abs()).abs() > 60.0)
+        };
         assert!(
-            deviation < 1.0,
+            within,
             "{expr}'s deviation between the native value and the VS-projected value \
-             ({deviation}s) must be near zero — this is the sharp assertion that \
+             ({deviation}s) must be within its tolerance — this is the assertion that \
              fails if the adapter ever ships the UTC instant instead of Exasol's own \
              session-local value ({offset_seconds}s off under this session's zone, #238)"
         );
+        let pruned = format!("SELECT {expr} FROM {table} WHERE id = 999999");
+        assert_eq!(conn.query_row_count(&pruned), 0, "{pruned}");
     }
+
+    let routed = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT CURRENT_TIMESTAMP FROM {table} WHERE id = 1"),
+    );
+    assert!(
+        routed.contains(r#"AS "LHS_T0""#) && !routed.contains("_LH_PROJ_0"),
+        "CURRENT_TIMESTAMP must route to the qualified wrapper: {routed}"
+    );
+    let emitted = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT SYSTIMESTAMP FROM {table} WHERE id = 1"),
+    );
+    assert!(
+        emitted.contains("_LH_PROJ_0") && !emitted.to_uppercase().contains("SYSTIMESTAMP"),
+        "the folded SYSTIMESTAMP must be a column the scan emits: {emitted}"
+    );
 }
 
 #[test]
@@ -2233,42 +2266,6 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
 // retargeted onto `events`/`typed_distinct_probe`, each compared with an in-session
 // native oracle.
 
-/// `%.f` accepts any fractional digit count, including none.
-fn parse_exasol_timestamp(s: &str) -> chrono::NaiveDateTime {
-    let normalized = s.replacen(' ', "T", 1);
-    let fmt = "%Y-%m-%dT%H:%M:%S%.f";
-    chrono::NaiveDateTime::parse_from_str(&normalized, fmt).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse Exasol timestamp {s:?} (normalized {normalized:?}) with {fmt:?}: {e}"
-        )
-    })
-}
-
-#[test]
-fn parse_exasol_timestamp_accepts_space_and_t_separators_with_or_without_fraction() {
-    assert_eq!(
-        parse_exasol_timestamp("2026-07-28 18:56:00.581000"),
-        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
-            .unwrap()
-            .and_hms_micro_opt(18, 56, 0, 581000)
-            .unwrap()
-    );
-    assert_eq!(
-        parse_exasol_timestamp("2026-07-28T18:56:00.581"),
-        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
-            .unwrap()
-            .and_hms_milli_opt(18, 56, 0, 581)
-            .unwrap()
-    );
-    assert_eq!(
-        parse_exasol_timestamp("2024-01-01T00:00:00"),
-        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-    );
-}
-
 fn parse_int_opt(v: &serde_json::Value) -> Option<i64> {
     if v.is_null() {
         None
@@ -2586,74 +2583,6 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
         vs_value, 2,
         "COUNT(DISTINCT CASE WHEN c_ts > TIMESTAMP '2020-01-01 00:00:00' ...) \
          over the VS must be 2 (matching the native oracle), got {vs_value}"
-    );
-}
-
-#[test]
-fn e2e_now_family_matches_native_oracle() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    // A UTC DBTIMEZONE would make the offset comparison vacuous.
-    let tz_cols = conn.query_columns("SELECT DBTIMEZONE");
-    let db_timezone = tz_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("DBTIMEZONE not a string: {:?}", tz_cols[0][0]))
-        .to_string();
-    assert_ne!(
-        db_timezone.to_uppercase(),
-        "UTC",
-        "DBTIMEZONE must not be UTC, or the offset comparison below is \
-         vacuous (a whole-zone-offset regression would be invisible), got \
-         {db_timezone:?}"
-    );
-
-    let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", typed_table());
-    let vs_cols = conn.query_columns(&vs_sql);
-    let vs_values: Vec<&str> = vs_cols[0]
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .unwrap_or_else(|| panic!("SYSTIMESTAMP not a string: {v:?}"))
-        })
-        .collect();
-    assert!(
-        !vs_values.is_empty(),
-        "SELECT SYSTIMESTAMP FROM {} returned no rows",
-        typed_table()
-    );
-    let distinct_vs: std::collections::HashSet<&str> = vs_values.iter().copied().collect();
-    assert_eq!(
-        distinct_vs.len(),
-        1,
-        "SELECT SYSTIMESTAMP FROM {} must return exactly one distinct value \
-         across all rows (statement-constancy Exasol guarantees); a \
-         pushdown of now() into the scan instead returns one \
-         value PER SHARD (two over this two-file table), got {distinct_vs:?}",
-        typed_table()
-    );
-    let vs_ts = parse_exasol_timestamp(vs_values[0]);
-
-    // Loose tolerance: the statements run at different instants, and the defect is a
-    // whole-zone offset of an hour or more. CURRENT_TIMESTAMP is not the probe because its
-    // TIMESTAMP WITH LOCAL TIME ZONE type never emits a pushed projection.
-    let oracle_cols = conn.query_columns("SELECT SYSTIMESTAMP");
-    let oracle_str = oracle_cols[0][0].as_str().unwrap_or_else(|| {
-        panic!(
-            "native oracle SYSTIMESTAMP not a string: {:?}",
-            oracle_cols[0][0]
-        )
-    });
-    let oracle_ts = parse_exasol_timestamp(oracle_str);
-
-    let delta = (vs_ts - oracle_ts).num_seconds().abs();
-    assert!(
-        delta <= 60,
-        "VS SYSTIMESTAMP ({vs_ts}) must be within 60s of the native oracle \
-         SYSTIMESTAMP ({oracle_ts}); a scan computing now() \
-         UTC-naively into the scan would diverge by a whole zone offset \
-         (>= 1h) from Exasol's own {db_timezone}-zoned clock, got \
-         delta={delta}s"
     );
 }
 
