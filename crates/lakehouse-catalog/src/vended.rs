@@ -15,6 +15,8 @@ use std::fmt;
 /// Host-suffixed per the iceberg Java `AzureProperties` convention, not the Iceberg REST
 /// spec; downstream readers only understand the flat `adls.sas-token`.
 const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
+/// Host-suffixed like the SAS key it states the expiry of.
+const VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX: &str = "adls.sas-token-expires-at-ms.";
 const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
 const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
 const S3_SESSION_TOKEN: &str = "s3.session-token";
@@ -41,13 +43,48 @@ impl fmt::Debug for VendedS3Credentials {
     }
 }
 
-/// The S3 credentials `answer` vends for `location`, read from the same credential source that
-/// [`resolve_vended_storage`] selects. A refusal names the missing or unreadable key, never a value.
-pub fn vended_s3_credentials(
-    answer: &LoadTableResult,
-    location: &str,
-) -> Result<VendedS3Credentials, UdfError> {
-    s3_credentials(vended_credential_config(answer, location), location)
+/// The ADLS SAS a catalog vends for one table location's host, for a writer that renews it before
+/// it expires. `Debug` shows no value.
+pub struct VendedAdlsSas {
+    pub sas: String,
+    /// When the SAS expires, in epoch milliseconds; `None` when the catalog states none.
+    pub expires_at_ms: Option<u64>,
+}
+
+impl fmt::Debug for VendedAdlsSas {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VendedAdlsSas").finish_non_exhaustive()
+    }
+}
+
+/// The vended credentials that apply to one table location, as a `loadTable` or `loadCredentials`
+/// answer selects them. It carries credentials, so `Debug` shows none.
+pub struct VendedCredentialSet(pub(crate) HashMap<String, String>);
+
+impl VendedCredentialSet {
+    /// The set `answer` vends for `location`, from the same credential source that
+    /// [`resolve_vended_storage`] selects.
+    pub fn of(answer: &LoadTableResult, location: &str) -> Self {
+        Self(vended_credential_config(answer, location).clone())
+    }
+
+    /// The set read as S3 keys. A refusal names the missing or unreadable key, never a value.
+    pub fn s3(&self, location: &str) -> Result<VendedS3Credentials, UdfError> {
+        s3_credentials(&self.0, location)
+    }
+
+    /// The set read as the SAS for `location`'s host and its expiry, with the host match of
+    /// [`resolve_vended_storage`]. A refusal names the missing or unreadable key, never a value.
+    pub fn adls_sas(&self, location: &str) -> Result<VendedAdlsSas, UdfError> {
+        adls_sas_credentials(&self.0, location)
+    }
+}
+
+impl fmt::Debug for VendedCredentialSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VendedCredentialSet")
+            .finish_non_exhaustive()
+    }
 }
 
 /// `anchor` must be the table's OWN location (what `storage_credentials[*].prefix` is
@@ -134,21 +171,13 @@ fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<V
 }
 
 /// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
-/// An expiry that is present but empty is unreadable, not absent.
 pub(crate) fn s3_credentials(
     vended: &HashMap<String, String>,
     anchor: &str,
 ) -> Result<VendedS3Credentials, UdfError> {
     let expires_at_ms = vended
         .get(S3_EXPIRES_AT_MS)
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                UdfError::User(format!(
-                    "the catalog vended credentials for table location {anchor} whose \
-                     {S3_EXPIRES_AT_MS} is no epoch millisecond"
-                ))
-            })
-        })
+        .map(|value| expiry(value, S3_EXPIRES_AT_MS, anchor))
         .transpose()?;
     let s3 = iceberg_vended_s3(vended, anchor)?;
     Ok(VendedS3Credentials {
@@ -157,6 +186,34 @@ pub(crate) fn s3_credentials(
         session_token: s3.session_token,
         endpoint: s3.endpoint,
         expires_at_ms,
+    })
+}
+
+/// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
+/// The expiry key carries the host spelling the SAS key was selected by.
+fn adls_sas_credentials(
+    vended: &HashMap<String, String>,
+    anchor: &str,
+) -> Result<VendedAdlsSas, UdfError> {
+    let (host, sas) = selected_sas(vended, anchor)?;
+    let expiry_key = format!("{VENDED_SAS_EXPIRES_AT_MS_KEY_PREFIX}{host}");
+    let expires_at_ms = vended
+        .get(&expiry_key)
+        .map(|value| expiry(value, &expiry_key, anchor))
+        .transpose()?;
+    Ok(VendedAdlsSas {
+        sas: sas.clone(),
+        expires_at_ms,
+    })
+}
+
+/// An expiry that is present but empty is unreadable, not absent.
+fn expiry(value: &str, key: &str, anchor: &str) -> Result<u64, UdfError> {
+    value.parse::<u64>().map_err(|_| {
+        UdfError::User(format!(
+            "the catalog vended credentials for table location {anchor} whose {key} is no epoch \
+             millisecond"
+        ))
     })
 }
 
@@ -176,19 +233,22 @@ fn required_vended_value(
 /// Host matched case-insensitively (RFC 3986 §3.2.2), ties broken toward the smallest
 /// key. A SAS is account-scoped, so one for another host is as unusable as none.
 fn iceberg_vended_sas(vended: &HashMap<String, String>, anchor: &str) -> Result<String, UdfError> {
+    selected_sas(vended, anchor).map(|(_, sas)| sas.clone())
+}
+
+/// The first non-empty SAS among the location host's key spellings, with the spelling.
+fn selected_sas<'a>(
+    vended: &'a HashMap<String, String>,
+    anchor: &'a str,
+) -> Result<(&'a str, &'a String), UdfError> {
     let host = location_host(anchor);
-    vended_config_value(vended, &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
-        .or_else(|| {
+    sas_key_hosts(vended, host)
+        .into_iter()
+        .find_map(|suffix| {
             vended
-                .iter()
-                .filter(|(key, value)| {
-                    !value.is_empty()
-                        && key
-                            .strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX)
-                            .is_some_and(|key_host| key_host.eq_ignore_ascii_case(host))
-                })
-                .min_by(|(left, _), (right, _)| left.cmp(right))
-                .map(|(_, value)| value.clone())
+                .get(&format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{suffix}"))
+                .filter(|sas| !sas.is_empty())
+                .map(|sas| (suffix, sas))
         })
         .ok_or_else(|| {
             UdfError::User(format!(
@@ -197,6 +257,21 @@ fn iceberg_vended_sas(vended: &HashMap<String, String>, anchor: &str) -> Result<
                  no non-empty {VENDED_SAS_TOKEN_KEY_PREFIX}{host} key in any casing of that host"
             ))
         })
+}
+
+/// The host spellings of the SAS keys: `host` itself first when present, then every case variant
+/// (RFC 3986 §3.2.2), smallest key first.
+fn sas_key_hosts<'a>(vended: &'a HashMap<String, String>, host: &'a str) -> Vec<&'a str> {
+    let mut variants: Vec<&str> = vended
+        .keys()
+        .filter_map(|key| key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX))
+        .filter(|key_host| *key_host != host && key_host.eq_ignore_ascii_case(host))
+        .collect();
+    variants.sort_unstable();
+    let exact = vended
+        .contains_key(&format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
+        .then_some(host);
+    exact.into_iter().chain(variants).collect()
 }
 
 fn vended_config_value(vended: &HashMap<String, String>, key: &str) -> Option<String> {

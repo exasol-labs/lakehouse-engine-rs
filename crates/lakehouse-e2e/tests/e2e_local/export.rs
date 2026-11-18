@@ -10,8 +10,9 @@ use crate::common::e2e_harness::{
     DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
     VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
     declared_types, exa_conn, export_error, exported_rows, failing_source, run_namespace, runtime,
+    try_create_virtual_schema_with_password,
 };
-use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
+use crate::common::exasol_ws::{ExaConn, error_text, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
 use crate::common::stack::{
     CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY,
@@ -103,6 +104,16 @@ fn missing_grant_error(user: &str) -> String {
     format!(
         "user {user} cannot read CONNECTION {DEFAULT_CATALOG_CONN_NAME} in script {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}"
     )
+}
+
+/// Static Azure storage fields over the local catalog, whose warehouse lies on `s3://`.
+fn azure_connection_password() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        account_name: Some("exporte2e".to_string()),
+        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
+        ..Default::default()
+    }
 }
 
 /// A table no earlier export wrote.
@@ -442,27 +453,21 @@ fn export_refuses_unwritable_connections_and_column_names() {
     stack();
     setup();
     let mut sys = exa_conn();
-    let azure = CatalogConnectionPassword {
-        warehouse: "s3://warehouse/".to_string(),
-        account_name: Some("exporte2e".to_string()),
-        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
-        ..Default::default()
+    let azure_role = CatalogConnectionPassword {
+        aws_assume_role_arn: Some("arn:aws:iam::000000000000:role/export-e2e".to_string()),
+        ..azure_connection_password()
     };
     let sigv4 = CatalogConnectionPassword {
         use_sigv4: true,
         ..local_stack_connection_password()
     };
     let catalog = iceberg_catalog_url_internal();
-    sys.execute(&build_create_connection_sql(
-        "EXPORT_E2E_AZURE_CREDS",
-        &catalog,
-        &azure,
-    ));
-    sys.execute(&build_create_connection_sql(
-        "EXPORT_E2E_SIGV4_CREDS",
-        &catalog,
-        &sigv4,
-    ));
+    for (name, password) in [
+        ("EXPORT_E2E_AZURE_ROLE_CREDS", &azure_role),
+        ("EXPORT_E2E_SIGV4_CREDS", &sigv4),
+    ] {
+        sys.execute(&build_create_connection_sql(name, &catalog, password));
+    }
     let through = |connection: &'static str, options: &str| {
         let table = new_table();
         let route = ExportRoute {
@@ -471,20 +476,32 @@ fn export_refuses_unwritable_connections_and_column_names() {
         };
         (route.export(&FAILING_SOURCE, &table, options), table)
     };
-    let azure_refusal = "supplies Azure storage field(s) account_name, account_key, but the export writes only to S3-compatible storage";
+    // The virtual schema's own refusal of this CONNECTION, before it contacts the catalog.
+    let role_refusal = "names aws_assume_role_arn but is missing field(s) access_key, secret_key";
+    let vs_error = error_text(
+        &try_create_virtual_schema_with_password(
+            &mut sys,
+            &VsProps::new("EXPORT_E2E_AZURE_ROLE_VS", "ns")
+                .with_catalog_conn_name("EXPORT_E2E_AZURE_ROLE_CREDS"),
+            &catalog,
+            &azure_role,
+        ),
+        "CREATE VIRTUAL SCHEMA",
+    );
+    assert!(vs_error.contains(role_refusal), "{vs_error}");
     let sigv4_refusal =
         "sets use_sigv4, but the export does not sign catalog requests with AWS SigV4";
     let repeated_name = new_table();
     let cases = [
         (
-            "Azure storage",
-            through("EXPORT_E2E_AZURE_CREDS", ""),
-            azure_refusal,
+            "Azure storage with an IAM role",
+            through("EXPORT_E2E_AZURE_ROLE_CREDS", ""),
+            role_refusal,
         ),
         (
-            "Azure storage, SINGLE_COMMIT",
-            through("EXPORT_E2E_AZURE_CREDS", "SINGLE_COMMIT = 'true'"),
-            azure_refusal,
+            "Azure storage with an IAM role, SINGLE_COMMIT",
+            through("EXPORT_E2E_AZURE_ROLE_CREDS", "SINGLE_COMMIT = 'true'"),
+            role_refusal,
         ),
         (
             "SigV4 signing",
@@ -519,6 +536,45 @@ fn export_refuses_unwritable_connections_and_column_names() {
             "{case}: the account key leaked: {error}"
         );
         assert!(!table_exists(&table), "{case}: {table} must not exist");
+    }
+}
+
+/// Scenario: A table location the CONNECTION's storage cannot address is refused
+#[test]
+fn export_through_azure_storage_into_an_s3_location_is_refused_naming_the_scheme() {
+    stack();
+    setup();
+    let mut sys = exa_conn();
+    let azure = azure_connection_password();
+    let connection = "EXPORT_E2E_AZURE_LOCATION_CREDS";
+    sys.execute(&build_create_connection_sql(
+        connection,
+        &iceberg_catalog_url_internal(),
+        &azure,
+    ));
+
+    for options in ["", "SINGLE_COMMIT = 'true'"] {
+        let table = new_table();
+        let route = ExportRoute {
+            connection,
+            ..DIRECT
+        };
+        let error = export_error(
+            &mut sys,
+            &route.export(SOURCE_TABLE, &table, options),
+            &[AZURE_ACCOUNT_KEY],
+        );
+
+        assert!(
+            error.contains(&format!("table {table} has the location s3://"))
+                && error.contains("whose scheme s3 the CONNECTION's Azure storage cannot address"),
+            "{options}: {error}"
+        );
+        let data_files = objects_under(&format!("{}/data/", table.replace('.', "/")));
+        assert!(
+            data_files.is_empty(),
+            "{options}: no data file may be written: {data_files:?}"
+        );
     }
 }
 

@@ -21,6 +21,14 @@ iceberg-catalog-rest = { workspace = true }
 # `ProvideCredential::provide_credential` takes its `Context`; the same pin iceberg-storage-opendal resolves.
 reqsign-core         = { workspace = true }
 
+# The ADLS write storage: object_store's Azure client asks its credential provider on each request.
+object_store = { workspace = true, features = ["azure"] }
+# iceberg's `Storage` and `StorageFactory` are `#[typetag::serde]` traits at the pinned revision.
+typetag      = "0.2"
+bytes        = "1"
+futures      = { workspace = true }
+percent-encoding = { workspace = true }
+
 async-trait = { workspace = true }
 rand        = { workspace = true }
 serde       = { workspace = true }
