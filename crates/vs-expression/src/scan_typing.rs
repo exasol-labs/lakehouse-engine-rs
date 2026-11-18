@@ -809,7 +809,7 @@ fn rewrite_scalar_function(
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
     let integer_positions: Vec<usize> = function
-        .integer_args
+        .integer_args()
         .iter()
         .filter(|arg| arg.position < args.len())
         .map(|&arg| {

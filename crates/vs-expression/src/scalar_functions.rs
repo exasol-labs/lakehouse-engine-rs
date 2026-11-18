@@ -33,16 +33,6 @@ pub(crate) struct IntegerArg {
     pub(crate) negative_is_null: bool,
 }
 
-const fn integer_arg(position: usize, negative_is_null: bool) -> IntegerArg {
-    IntegerArg {
-        position,
-        negative_is_null,
-    }
-}
-
-/// A length that returns NULL when negative.
-const LENGTH: IntegerArg = integer_arg(1, true);
-
 /// How a function's result type follows from its arguments' types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResultRule {
@@ -89,7 +79,6 @@ pub(crate) struct ScalarFunction {
     pub(crate) text_args: TextArgs,
     /// Text arguments that are parameters, not values: a format model or a unit.
     pub(crate) parameters: &'static [usize],
-    pub(crate) integer_args: &'static [IntegerArg],
     pub(crate) result: ResultRule,
     /// The DataFusion function of a same-arity call the renderer's generic arm emits.
     pub(crate) datafusion_call: Option<&'static str>,
@@ -102,7 +91,6 @@ impl ScalarFunction {
             exasol,
             text_args: TextArgs::Never,
             parameters: &[],
-            integer_args: &[],
             result: ResultRule::Other,
             datafusion_call: None,
         }
@@ -126,13 +114,6 @@ impl ScalarFunction {
 
     const fn parameters(self, parameters: &'static [usize]) -> Self {
         Self { parameters, ..self }
-    }
-
-    const fn integer_args(self, integer_args: &'static [IntegerArg]) -> Self {
-        Self {
-            integer_args,
-            ..self
-        }
     }
 
     const fn datafusion_call(self, datafusion_name: &'static str) -> Self {
@@ -201,7 +182,6 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
             .datafusion_call("upper"),
         F::verbatim("SUBSTR")
             .typed(T::First, R::Text)
-            .integer_args(&[integer_arg(1, false), integer_arg(2, true)])
             .datafusion_call("substr"),
         F::verbatim("TRIM")
             .typed(T::All, R::Text)
@@ -217,36 +197,30 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
             .datafusion_call("replace"),
         F::verbatim("REPEAT")
             .typed(T::First, R::Text)
-            .integer_args(&[integer_arg(1, false)])
             .datafusion_call("repeat"),
         F::verbatim("REVERSE")
             .typed(T::First, R::Text)
             .datafusion_call("reverse"),
         F::verbatim("LPAD")
             .typed(T::Pad, R::Text)
-            .integer_args(&[LENGTH])
             .datafusion_call("lpad"),
         F::verbatim("RPAD")
             .typed(T::Pad, R::Text)
-            .integer_args(&[LENGTH])
             .datafusion_call("rpad"),
         F::verbatim("ASCII")
             .typed(T::First, R::Integer)
             .datafusion_call("ascii"),
         F::verbatim("CHR")
             .typed(T::Never, R::Text)
-            .integer_args(&[integer_arg(0, false)])
             .datafusion_call("chr"),
         F::verbatim("INITCAP")
             .typed(T::First, R::Text)
             .datafusion_call("initcap"),
         F::verbatim("LEFT")
             .typed(T::First, R::Text)
-            .integer_args(&[LENGTH])
             .datafusion_call("left"),
         F::verbatim("RIGHT")
             .typed(T::First, R::Text)
-            .integer_args(&[LENGTH])
             .datafusion_call("right"),
         F::verbatim("TRANSLATE")
             .typed(T::All, R::Text)
@@ -262,7 +236,6 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
             .datafusion_call("ascii"),
         F::verbatim("UNICODECHR")
             .typed(T::Never, R::Text)
-            .integer_args(&[integer_arg(0, false)])
             .datafusion_call("chr"),
         // Exasol's INSTR/LOCATE accept the optional start argument natively.
         F::verbatim("INSTR").typed(T::FirstTwo, R::Integer),
@@ -302,6 +275,28 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         // adapter folds them into, so a missed call is refused, never computed per shard.
     ]
 };
+
+impl ScalarFunction {
+    pub(crate) fn integer_args(self) -> &'static [IntegerArg] {
+        const fn arg(position: usize, negative_is_null: bool) -> IntegerArg {
+            IntegerArg {
+                position,
+                negative_is_null,
+            }
+        }
+        const LENGTH: &[IntegerArg] = &[arg(1, true)];
+        const SUBSTR: &[IntegerArg] = &[arg(1, false), arg(2, true)];
+        const COUNT: &[IntegerArg] = &[arg(1, false)];
+        const CODE: &[IntegerArg] = &[arg(0, false)];
+        match self.name {
+            "LPAD" | "RPAD" | "LEFT" | "RIGHT" => LENGTH,
+            "SUBSTR" => SUBSTR,
+            "REPEAT" => COUNT,
+            "CHR" | "UNICODECHR" => CODE,
+            _ => &[],
+        }
+    }
+}
 
 pub(crate) fn scalar_function(name: &str) -> Option<ScalarFunction> {
     SCALAR_FUNCTIONS
