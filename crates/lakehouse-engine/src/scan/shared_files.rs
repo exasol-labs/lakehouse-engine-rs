@@ -1,7 +1,6 @@
 //! One scan's data files, shared by every byte range that reads them: a file's footer, the bytes
 //! fetched with it, its page index, and its access plan each load once.
 
-use crate::scan::read_budget::{ReadBudget, ReadLease};
 use crate::scan::row_deletes::DeleteLoads;
 use bytes::Bytes;
 use datafusion::common::DataFusionError;
@@ -112,16 +111,6 @@ pub(super) async fn read_footer(
     }
 }
 
-/// The row group whose column chunks hold `offset`.
-fn row_group_at(metadata: &ParquetMetaData, offset: u64) -> Option<usize> {
-    metadata.row_groups().iter().position(|row_group| {
-        row_group.columns().iter().any(|column| {
-            let (start, length) = column.byte_range();
-            (start..start + length).contains(&offset)
-        })
-    })
-}
-
 /// The span of every column and offset index, which the opener reads in one request.
 fn page_index_range(metadata: &ParquetMetaData) -> Option<Range<u64>> {
     let span = |offset: Option<i64>, length: Option<i32>| {
@@ -213,7 +202,6 @@ pub(super) struct ScanFiles {
     /// False when the scan reads too few columns for a whole-file fetch to pay off.
     whole_small_files: bool,
     held_bytes: Arc<MemoryReservation>,
-    read_budget: Arc<ReadBudget>,
     files: HashMap<Path, SharedFile>,
     deletes: Option<DeleteLoads>,
 }
@@ -233,7 +221,6 @@ impl ScanFiles {
         metadata_size_hint: Option<usize>,
         whole_small_files: bool,
         pool: &Arc<dyn MemoryPool>,
-        read_budget: Arc<ReadBudget>,
         files: impl IntoIterator<Item = (Path, u64, Option<String>)>,
         deletes: Option<DeleteLoads>,
     ) -> Self {
@@ -242,7 +229,6 @@ impl ScanFiles {
             metadata_size_hint: metadata_size_hint.unwrap_or(0) as u64,
             whole_small_files,
             held_bytes: Arc::new(MemoryConsumer::new("scan file bytes").register(pool)),
-            read_budget,
             files: files
                 .into_iter()
                 .map(|(location, size, delete_key)| {
@@ -416,7 +402,6 @@ impl ParquetFileReaderFactory for SharedReaderFactory {
             location,
             loads,
             range,
-            lease: None,
         }))
     }
 }
@@ -426,33 +411,11 @@ struct SharedFileReader {
     location: Path,
     loads: Arc<FileLoads>,
     range: Range<u64>,
-    /// The bytes fetched for the row group being read, with its index.
-    lease: Option<(usize, ReadLease)>,
 }
 
 impl SharedFileReader {
     fn file(&self) -> &SharedFile {
         &self.files.files[&self.location]
-    }
-
-    /// Waits for the read budget and holds `fetched` against it until this reader fetches
-    /// another row group or drops. The parquet decoder keeps a row group's bytes that long.
-    async fn admit(&mut self, fetched: &[Range<u64>]) {
-        let footer = self.loads.footer.get();
-        let Some(row_group) = fetched
-            .first()
-            .and_then(|first| row_group_at(&footer?.metadata, first.start))
-        else {
-            return;
-        };
-        let bytes = fetched.iter().map(|r| (r.end - r.start) as usize).sum();
-        match &mut self.lease {
-            Some((held, lease)) if *held == row_group => lease.extend(bytes).await,
-            lease => {
-                *lease = None;
-                *lease = Some((row_group, self.files.read_budget.admit(bytes).await));
-            }
-        }
     }
 }
 
@@ -464,16 +427,26 @@ impl Drop for SharedFileReader {
 
 impl AsyncFileReader for SharedFileReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
-        self.get_byte_ranges(vec![range])
-            .map(|fetched| Ok(fetched?.swap_remove(0)))
-            .boxed()
+        async move {
+            let file = self.file();
+            if let Some(bytes) = self.files.held(file, &self.loads, &range).await? {
+                return Ok(bytes);
+            }
+            self.files
+                .store
+                .get_range(&file.location, range)
+                .await
+                .map_err(external)
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
         async move {
+            let file = self.file();
             let mut held = Vec::with_capacity(ranges.len());
             for range in &ranges {
-                held.push(self.files.held(self.file(), &self.loads, range).await?);
+                held.push(self.files.held(file, &self.loads, range).await?);
             }
             let missing: Vec<Range<u64>> = ranges
                 .iter()
@@ -484,10 +457,9 @@ impl AsyncFileReader for SharedFileReader {
             let mut fetched = if missing.is_empty() {
                 Vec::new()
             } else {
-                self.admit(&missing).await;
                 self.files
                     .store
-                    .get_ranges(&self.location, &missing)
+                    .get_ranges(&file.location, &missing)
                     .await
                     .map_err(external)?
             }

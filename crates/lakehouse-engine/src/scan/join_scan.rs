@@ -11,7 +11,9 @@ use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::types::mapping::arrow_to_exasol_type;
 
-use super::raw_scan::{ScanLimits, emit_dataframe, physical_plan, plan_sql, register_file_list};
+use super::raw_scan::{
+    delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
+};
 use super::sql_support::{
     aliased_select, append_where, quote_ident, render_column, render_projection,
 };
@@ -68,7 +70,9 @@ async fn register_join_tables(
     // The dimension side registers against `join.storage`, never `common.storage`: a vended
     // credential is scoped to its own table, and its reads must redact against its own secrets.
     //
-    let limits = ScanLimits::new(ctx, spec);
+    // One delete-path read semaphore is shared by BOTH sides: DataFusion plans the two scan
+    // leaves concurrently, so a per-side semaphore would allow 2N concurrent reads instead of N.
+    let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
         JOIN_FACT_TABLE,
@@ -78,7 +82,7 @@ async fn register_join_tables(
         &spec.common.name_mapping,
         &spec.common.partition_columns,
         storage.primary(),
-        limits.clone(),
+        Arc::clone(&delete_path_read_limiter),
     )
     .await?;
     register_file_list(
@@ -90,7 +94,7 @@ async fn register_join_tables(
         &join.name_mapping,
         &join.partition_columns,
         dimension_backend,
-        limits,
+        delete_path_read_limiter,
     )
     .await?;
     Ok(())

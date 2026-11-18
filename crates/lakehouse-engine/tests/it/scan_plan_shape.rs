@@ -2,7 +2,6 @@ use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -10,13 +9,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::memory_pool::{
-    GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation,
-};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{
     ProjectedColumn, ScanUdfs, Shards, build_scan_driving_sql,
@@ -35,52 +30,23 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
-    write_local_parquet_rows(dir, 100, 100, 0)
-}
-
-fn write_local_parquet_rows(
-    dir: &std::path::Path,
-    rows: i64,
-    row_group_rows: usize,
-    name_padding: usize,
-) -> String {
-    write_local_parquet_columns(dir, rows, row_group_rows, name_padding, &["name"])
-}
-
-/// Writes `id` and one string column per name in `strings`, all with the same values.
-fn write_local_parquet_columns(
-    dir: &std::path::Path,
-    rows: i64,
-    row_group_rows: usize,
-    padding: usize,
-    strings: &[&str],
-) -> String {
-    let mut fields = vec![Field::new("id", DataType::Int64, false)];
-    fields.extend(
-        strings
-            .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, false)),
-    );
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
     let path = dir.join("plan_shape.parquet");
     let file = std::fs::File::create(&path).expect("create parquet file");
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(row_group_rows))
-        // Padded values are stored plain, so a string chunk is as large as its values.
-        .set_dictionary_enabled(padding == 0)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
-    let ids: Vec<i64> = (0..rows).collect();
-    let values: Vec<String> = (0..rows)
-        .map(|i| format!("row-{:0>padding$}", i % 100))
-        .collect();
-    let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(Int64Array::from(ids))];
-    columns.extend(
-        strings
-            .iter()
-            .map(|_| Arc::new(StringArray::from(values.clone())) as Arc<dyn Array>),
-    );
-    let batch = RecordBatch::try_new(schema, columns).expect("record batch");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let ids: Vec<i64> = (0..100).collect();
+    let names: Vec<String> = (0..100).map(|i| format!("row-{i}")).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("record batch");
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
     url::Url::from_file_path(&path)
@@ -369,34 +335,25 @@ fn leaf_file_groups(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(usize, bool)>)
     }
 }
 
-fn local_files(
-    dir: &std::path::Path,
-    count: usize,
-    write: impl Fn(&std::path::Path) -> String,
-) -> Vec<FileEntry> {
-    (0..count)
+/// Scenario: Every pushed plan shape keeps the scan's file groups
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_plan_shape_keeps_the_file_groups_the_scan_built() {
+    const TARGET: usize = 4;
+    const UNCUT: (usize, bool) = (TARGET, false);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let files: Vec<FileEntry> = (0..6)
         .map(|i| {
-            let dir = dir.join(format!("f{i}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let url = write(&dir);
+            let dir = tmp.path().join(format!("f{i}"));
+            std::fs::create_dir(&dir).unwrap();
+            let url = write_local_parquet(&dir);
             FileEntry::new(url.clone(), local_size(&url))
         })
-        .collect()
-}
-
-/// The plan of every pushed shape over `files`, the join against `dimension`.
-async fn pushed_plan_shapes(
-    files: &[FileEntry],
-    dimension: &[FileEntry],
-    target: usize,
-    runtime: &Arc<RuntimeEnv>,
-) -> Vec<(&'static str, Arc<dyn ExecutionPlan>, SessionContext)> {
-    let context = |spec: &ScanSpec| {
-        SessionContext::new_with_config_rt(session_config_for_spec(spec), Arc::clone(runtime))
-    };
+        .collect();
     let mut base = single_partition_spec(files[0].path.clone());
-    base.files = files.to_vec();
-    base.common.tuning.df_target_partitions = target;
+    base.files = files.clone();
+    base.common.tuning.df_target_partitions = TARGET;
+
     let mut limited = base.clone();
     limited.common.limit = Some(5);
     let mut top_n = limited.clone();
@@ -405,10 +362,8 @@ async fn pushed_plan_shapes(
         ascending: false,
         nulls_last: true,
     }];
-
-    let mut shapes = Vec::new();
     for (shape, spec) in [("filter", &base), ("limit", &limited), ("top-N", &top_n)] {
-        let ctx = context(spec);
+        let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
         register_files(
             &ctx,
             "scan_target",
@@ -420,10 +375,12 @@ async fn pushed_plan_shapes(
         let plan = build_raw_scan_physical_plan(&ctx, spec)
             .await
             .expect("build the raw plan");
-        shapes.push((shape, plan, ctx));
+        let mut leaves = Vec::new();
+        leaf_file_groups(&plan, &mut leaves);
+        assert_eq!(leaves, [UNCUT], "{shape}");
     }
 
-    let ctx = context(&base);
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&base));
     register_files(
         &ctx,
         "scan_target",
@@ -439,7 +396,9 @@ async fn pushed_plan_shapes(
         .create_physical_plan()
         .await
         .expect("build the aggregate plan");
-    shapes.push(("aggregate", aggregate, ctx));
+    let mut leaves = Vec::new();
+    leaf_file_groups(&aggregate, &mut leaves);
+    assert_eq!(leaves, [UNCUT], "aggregate");
 
     let mut join = base.clone();
     join.common.filter = None;
@@ -448,191 +407,17 @@ async fn pushed_plan_shapes(
         ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "NAME")),
     ];
     join.common.join = Some(JoinSpec {
-        files: dimension.to_vec(),
+        files,
         condition: r#""LHS_T0"."ID" = "LHS_T1"."ID""#.into(),
         ..scan_fixture::join_spec(join.common.storage.clone())
     });
-    let ctx = context(&join);
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&join));
     let plan = build_join_physical_plan(&ctx, &join, &scan_fixture::resolved_storage(&join))
         .await
         .expect("build the join plan");
-    shapes.push(("join", plan, ctx));
-    shapes
-}
-
-/// Scenario: Every pushed plan shape keeps the scan's file groups
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_plan_shape_keeps_the_file_groups_the_scan_built() {
-    const TARGET: usize = 4;
-    const UNCUT: (usize, bool) = (TARGET, false);
-
-    let tmp = tempfile::tempdir().unwrap();
-    let files = local_files(tmp.path(), 6, write_local_parquet);
-    let runtime = Arc::new(RuntimeEnv::default());
-    for (shape, plan, _) in pushed_plan_shapes(&files, &files, TARGET, &runtime).await {
-        let mut leaves = Vec::new();
-        leaf_file_groups(&plan, &mut leaves);
-        let scans = if shape == "join" { 2 } else { 1 };
-        assert_eq!(leaves, vec![UNCUT; scans], "{shape}");
-    }
-}
-
-/// A bounded pool that records its largest reservation. Infallible reservations can exceed
-/// the bound, which fails whichever operator asks the pool next.
-#[derive(Debug)]
-struct PeakPool {
-    pool: GreedyMemoryPool,
-    peak: AtomicUsize,
-}
-
-impl PeakPool {
-    fn record(&self) {
-        self.peak.fetch_max(self.pool.reserved(), Ordering::Relaxed);
-    }
-}
-
-impl std::fmt::Display for PeakPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.pool.fmt(f)
-    }
-}
-
-impl MemoryPool for PeakPool {
-    fn name(&self) -> &str {
-        self.pool.name()
-    }
-
-    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.pool.grow(reservation, additional);
-        self.record();
-    }
-
-    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
-        self.pool.shrink(reservation, shrink);
-    }
-
-    fn try_grow(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<()> {
-        self.pool.try_grow(reservation, additional)?;
-        self.record();
-        Ok(())
-    }
-
-    fn reserved(&self) -> usize {
-        self.pool.reserved()
-    }
-
-    fn memory_limit(&self) -> MemoryLimit {
-        self.pool.memory_limit()
-    }
-}
-
-/// Every pushed plan shape returns the same row count under a `pool_bytes` pool as unbounded,
-/// and never reserves more than the pool.
-async fn assert_plan_shapes_complete(files: &[FileEntry], target: usize, pool_bytes: usize) {
-    let tmp = tempfile::tempdir().unwrap();
-    let dimension = local_files(tmp.path(), 1, write_local_parquet);
-    let pool = Arc::new(PeakPool {
-        pool: GreedyMemoryPool::new(pool_bytes),
-        peak: AtomicUsize::new(0),
-    });
-    let tight = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
-        .build_arc()
-        .unwrap();
-    let unbounded = Arc::new(RuntimeEnv::default());
-
-    let rows = async |plan: Arc<dyn ExecutionPlan>, ctx: SessionContext, shape: &str| {
-        let batches = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            collect(plan, ctx.task_ctx()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("the {shape} plan waits forever"))
-        .unwrap_or_else(|e| panic!("the {shape} plan fails: {e}"));
-        batches.iter().map(RecordBatch::num_rows).sum::<usize>()
-    };
-    let budgeted = pushed_plan_shapes(files, &dimension, target, &tight).await;
-    let free = pushed_plan_shapes(files, &dimension, target, &unbounded).await;
-    for ((shape, plan, ctx), (_, free_plan, free_ctx)) in budgeted.into_iter().zip(free) {
-        let expected = rows(free_plan, free_ctx, shape).await;
-        assert!(expected > 0, "{shape}");
-        assert_eq!(rows(plan, ctx, shape).await, expected, "{shape}");
-        let peak = pool.peak.load(Ordering::Relaxed);
-        assert!(peak <= pool_bytes, "{shape}: {peak} bytes reserved");
-    }
-}
-
-/// Scenario: No pushed plan shape waits forever on the read budget
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_plan_shape_completes_when_the_read_budget_admits_one_row_group_at_a_time() {
-    let tmp = tempfile::tempdir().unwrap();
-    let files = local_files(tmp.path(), 2, |dir| {
-        write_local_parquet_rows(dir, 1_200_000, 300_000, 0)
-    });
-    // The budget is a quarter of the pool, below the 2.4 MB `id` chunk of one row group.
-    assert_plan_shapes_complete(&files, 4, 8 * 1024 * 1024).await;
-}
-
-/// Scenario: Every fetch of a row group waits on the read budget
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_plan_shape_completes_when_the_streams_row_groups_exceed_the_pool() {
-    let tmp = tempfile::tempdir().unwrap();
-    // 16 row groups of 6.6 MB. The filter reads the 0.4 MB `id` chunk first, so 16 streams
-    // are all admitted and then fetch 100 MB of `name` chunks between them.
-    let files = local_files(tmp.path(), 1, |dir| {
-        write_local_parquet_rows(dir, 800_000, 50_000, 120)
-    });
-    assert_plan_shapes_complete(&files, 16, 64 * 1024 * 1024).await;
-}
-
-/// Scenario: Only one stream reads beyond the read budget
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_filter_of_two_conjuncts_reserves_no_more_than_the_pool() {
-    const POOL_BYTES: usize = 64 * 1024 * 1024;
-    let tmp = tempfile::tempdir().unwrap();
-    // 16 row groups of 12.8 MB. Each conjunct fetches its own column, so a stream fetches
-    // the 0.4 MB `id` chunk, then the 6.2 MB `name` chunk, then the 6.2 MB `tag` chunk.
-    let files = local_files(tmp.path(), 1, |dir| {
-        write_local_parquet_columns(dir, 800_000, 50_000, 120, &["name", "tag"])
-    });
-    let mut spec = single_partition_spec(files[0].path.clone());
-    spec.files = files;
-    spec.common.tuning.df_target_partitions = 16;
-    spec.common.projection = vec!["ID".into(), "NAME".into(), "TAG".into()];
-    spec.common.filter = Some(r#""ID" >= 10 AND "NAME" <> 'row-7'"#.into());
-
-    let pool = Arc::new(PeakPool {
-        pool: GreedyMemoryPool::new(POOL_BYTES),
-        peak: AtomicUsize::new(0),
-    });
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
-        .build_arc()
-        .unwrap();
-    let ctx = SessionContext::new_with_config_rt(session_config_for_spec(&spec), runtime);
-    register_files(
-        &ctx,
-        "scan_target",
-        &spec,
-        &scan_fixture::resolved_storage(&spec),
-    )
-    .await
-    .expect("register the scan");
-    let plan = build_raw_scan_physical_plan(&ctx, &spec)
-        .await
-        .expect("build the raw plan");
-    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("the scan completes");
-
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 800_000 - 10);
-    let peak = pool.peak.load(Ordering::Relaxed);
-    assert!(peak <= POOL_BYTES, "{peak} bytes reserved");
+    let mut leaves = Vec::new();
+    leaf_file_groups(&plan, &mut leaves);
+    assert_eq!(leaves, [UNCUT, UNCUT], "both join sides");
 }
 
 fn row_scan_spec() -> ScanSpec {

@@ -59,7 +59,6 @@ mod store_router;
 
 mod delete_source;
 mod deletion_vectors;
-mod read_budget;
 mod row_deletes;
 mod scan_table;
 mod shared_files;
