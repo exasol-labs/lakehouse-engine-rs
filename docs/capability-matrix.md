@@ -49,7 +49,7 @@ The names come from the Exasol
 | `NULL` | ✓ |  |
 | `STRING` | ✓ |  |
 | `TIMESTAMP` | ✓ |  |
-| `TIMESTAMP_UTC` | ✓ | Folding zone; UTC against instant columns. |
+| `TIMESTAMP_UTC` | ✓ | Folding zone; UTC for instant columns. |
 
 ## Predicates
 

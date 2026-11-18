@@ -133,10 +133,10 @@ A `LIKE` without `ESCAPE` uses the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, wh
 
 ## Clock functions and TIMESTAMP WITH LOCAL TIME ZONE literals
 
-The adapter folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` in the zone of the `SESSION_TIME_ZONE` property, or in `DBTIMEZONE` when it is unset, because no adapter request carries `SESSIONTIMEZONE`. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal compares in the same zone, unless it compares with an [instant column](#instant-columns). In a session whose `SESSIONTIMEZONE` differs from that folding zone:
+The adapter folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` in the zone of the `SESSION_TIME_ZONE` property, or in `DBTIMEZONE` when it is unset, because no adapter request carries `SESSIONTIMEZONE`. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal compares in the same zone, except against an [instant column](#instant-columns). In a session whose `SESSIONTIMEZONE` differs from that folding zone:
 
 - `CURRENT_DATE`, and on Exasol 2025 a projected `LOCALTIMESTAMP`, return the folding zone's date and time.
-- For a `TIMESTAMP` column `ts` that is no instant column, `ts < CURRENT_TIMESTAMP`, `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, and `ts > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` compare `ts` with the instant's wall-clock time in the folding zone. Native Exasol compares in the session zone.
+- For a `TIMESTAMP` column `ts` that is not an instant column, `ts < CURRENT_TIMESTAMP`, `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, and `ts > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` compare `ts` with the instant's wall-clock time in the folding zone. Native Exasol compares in the session zone.
 - A projected `CURRENT_TIMESTAMP`, a projected `TIMESTAMP WITH LOCAL TIME ZONE` literal, and on Exasol 8 a projected `LOCALTIMESTAMP` still show the session's own value.
 
 For example, with `DBTIMEZONE` `EUROPE/BERLIN`, no `SESSION_TIME_ZONE`, and `ALTER SESSION SET TIME_ZONE = 'ASIA/TOKYO'`, `SELECT CURRENT_DATE FROM t` at 15:30 UTC returns the Berlin date, one day before the Tokyo date native Exasol returns.
@@ -147,7 +147,7 @@ Other differences of the folded values:
 - Exasol itself folds an expression over a clock function, such as `CURRENT_DATE - 7`, in the session zone before the adapter sees it. In one query, `CURRENT_DATE - 7` and a bare `CURRENT_DATE` can therefore come from two zones.
 - Every clock function of a statement over one virtual schema folds from one reading. A statement over two virtual schemas can fold two readings.
 
-**Workaround:** set `SESSION_TIME_ZONE` to the zone your sessions use, `ALTER VIRTUAL SCHEMA my_vs SET SESSION_TIME_ZONE = 'ASIA/TOKYO'`. To evaluate the clock functions and the literals in each session's own zone, at the cost of file pruning, exclude them. This does not apply to instant columns, which Exasol then compares as described under [Instant columns](#instant-columns):
+**Workaround:** set `SESSION_TIME_ZONE` to the zone your sessions use, `ALTER VIRTUAL SCHEMA my_vs SET SESSION_TIME_ZONE = 'ASIA/TOKYO'`. To evaluate the clock functions and the literals in each session's own zone, at the cost of file pruning, exclude them. This does not help for [instant columns](#instant-columns):
 
 ```sql
 ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_CURRENT_DATE, FN_CURRENT_TIMESTAMP, FN_LOCALTIMESTAMP, LITERAL_TIMESTAMP_UTC';
@@ -155,18 +155,18 @@ ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_CURRENT_DATE, FN_CURR
 
 ## Instant columns
 
-An Iceberg `timestamptz`, a Delta or Unity Catalog `timestamp`, and a direct-storage Parquet timestamp that is UTC-adjusted or INT96 hold instants. The virtual schema declares such an instant column a plain `TIMESTAMP` that holds each instant's UTC date and time, because Exasol refuses `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF output column and as an `EXPORT ... INTO SCRIPT` source column. A native `TIMESTAMP WITH LOCAL TIME ZONE` column shows each instant in the session zone and compares it there.
+Iceberg `timestamptz`, Delta and Unity Catalog `timestamp`, and UTC-adjusted or INT96 Parquet timestamps are instant columns. The virtual schema shows them as `TIMESTAMP` values in UTC. A native `TIMESTAMP WITH LOCAL TIME ZONE` column shows them in the session time zone.
 
-- A `TIMESTAMP WITH LOCAL TIME ZONE` value compared directly with an instant column compares the instants, so it returns the native rows in every session: `CURRENT_TIMESTAMP`, a literal such as `CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)`, an expression Exasol folds into one, such as `CURRENT_TIMESTAMP - INTERVAL '1' HOUR`, and on Exasol 8 `LOCALTIMESTAMP`. This holds for `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, and `IN`.
-- A plain `TIMESTAMP` or `DATE` value compares with the column's UTC date and time. Native Exasol compares it with the instant's date and time in the session zone. `SYSTIMESTAMP`, `SYSDATE`, `CURRENT_DATE`, and on Exasol 2025 `LOCALTIMESTAMP` are plain values.
-- An expression over the column, such as `ADD_HOURS(tz, 1) > CURRENT_TIMESTAMP`, and a comparison inside a select-list item that Exasol types `TIMESTAMP WITH LOCAL TIME ZONE`, compare the column's UTC date and time with the value's wall-clock time in the folding zone ([Clock functions](#clock-functions-and-timestamp-with-local-time-zone-literals)).
-- A comparison that Exasol evaluates itself reads the column's UTC date and time as session-local time: a join with a native `TIMESTAMP WITH LOCAL TIME ZONE` column, a predicate over a subquery Exasol does not push down, and any comparison under `EXCLUDED_CAPABILITIES`.
+- Compared with a `TIMESTAMP WITH LOCAL TIME ZONE` value, such as `CURRENT_TIMESTAMP - INTERVAL '1' HOUR`, an instant column returns the native rows.
+- Compared with a plain `TIMESTAMP` or `DATE` value, including `SYSTIMESTAMP` and `CURRENT_DATE`, it compares the UTC value. Native Exasol compares in the session time zone.
+- An expression over the column, such as `ADD_HOURS(tz, 1) > CURRENT_TIMESTAMP`, compares in the [folding zone](#clock-functions-and-timestamp-with-local-time-zone-literals).
+- A comparison Exasol runs itself, such as a join with a native `TIMESTAMP WITH LOCAL TIME ZONE` column, reads the UTC value as session time.
 
-For an instant at 09:30 UTC in a session whose zone is `EUROPE/BERLIN`, where the instant is 10:30:
+In an `EUROPE/BERLIN` session, for a row at 09:30 UTC:
 
-| Filter | Virtual schema | Native `TIMESTAMP WITH LOCAL TIME ZONE` column |
+| Filter | Virtual schema | Native |
 |---|---|---|
-| `tz > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` | the row | the row |
-| `tz > TIMESTAMP '2024-03-01 10:00:00'` | no row | the row |
+| `tz > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` | row | row |
+| `tz > TIMESTAMP '2024-03-01 10:00:00'` | no row | row |
 
-**Workaround:** to compare the instants with a plain value, write the value as a `TIMESTAMP WITH LOCAL TIME ZONE`: `tz > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)`. Where Exasol evaluates the comparison itself, convert the column to the session zone first: `CONVERT_TZ(tz, 'UTC', SESSIONTIMEZONE) > n.event_at`.
+**Workaround:** write the value as a `TIMESTAMP WITH LOCAL TIME ZONE`, as in the first filter. In a join with a native column, convert the column: `CONVERT_TZ(tz, 'UTC', SESSIONTIMEZONE)`.
