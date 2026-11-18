@@ -67,15 +67,13 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
 
-## TO_DATE and TO_TIMESTAMP with a format
+## TO_DATE with a format
 
-For a few input strings the scan fails where native Exasol parses the value:
+For one kind of input string the scan fails where native Exasol parses the value:
 
 | Expression | Virtual schema | Native Exasol |
 |---|---|---|
 | `TO_DATE('2024-01-01 ', 'YYYY-MM-DD')` (trailing space) | error | `2024-01-01` |
-| `TO_TIMESTAMP('2024-01-01', 'YYYY-MM-DD HH24:MI:SS')` (input shorter than the format) | error | `2024-01-01 00:00:00` |
-| `TO_TIMESTAMP('1600-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` | error | `1600-01-01 00:00:00` |
 
 ## CAST of text to a shorter VARCHAR
 
@@ -90,35 +88,19 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 
 ## ADD_DAYS, ADD_WEEKS, ADD_HOURS, and ADD_MINUTES before 1582-10-15
 
-The scan adds the count in the proleptic Gregorian calendar. Native Exasol uses the Julian calendar before 1582-10-15. A call returns a different value when the days between its argument and its result include February 29 of a year divisible by 100 but not by 400, which only the Julian calendar has, or cross 1582-10-15. A call whose arguments are all literals runs in Exasol, because Exasol computes it before pushdown.
-
-| Call | Native Exasol (2025.1.16) | Scan |
-|---|---|---|
-| `ADD_DAYS(d, 1)` with `d` = 1000-02-28 | `1000-02-29` | `1000-03-01` |
-| `ADD_DAYS(d, -1)` with `d` = 1500-03-01 | `1500-02-29` | `1500-02-28` |
-| `ADD_HOURS(d, 24)` with `d` = 1500-02-28 | `1500-02-29 00:00:00` | `1500-03-01 00:00:00` |
-| `ADD_DAYS(d, -1)` with `d` = 1582-10-15 | `1582-10-04` | `1582-10-14` |
-| `ADD_DAYS(d, -200000)` with `d` = 2024-01-01 | `1476-05-24` | `1476-06-02` |
+Before 1582-10-15, native Exasol uses the Julian calendar and the scan the proleptic Gregorian
+calendar. A call the scan computes can return a different date when it crosses a leap day only the
+Julian calendar has, or 1582-10-15. For example, `ADD_DAYS(d, 1)` with `d` = 1000-02-28 returns
+`1000-03-01` instead of `1000-02-29`.
 
 ## Nanosecond timestamps outside 1677 to 2262
 
-The scan holds an Iceberg `timestamp_ns` column and any `TIMESTAMP(7)` to `TIMESTAMP(9)` value
-in nanoseconds, which span only 1677-09-21 to 2262-04-11. A query fails when such a value meets
-a timestamp outside that span, such as a `9999-12-31` sentinel, or when `ADD_DAYS`,
-`ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over it leaves the span. The scan also converts to
-nanoseconds a DATE that `DATE_TRUNC` truncates, and a TIMESTAMP that `DATE_TRUNC` truncates to
-`week`, `month`, `quarter`, or `year`, so each fails on a value outside the span. Native Exasol
-returns rows.
+The scan computes a timestamp with more than 6 fractional digits in nanoseconds, which span only
+1677-09-21 to 2262-04-11. It does the same for `DATE_TRUNC` over a DATE, and over a TIMESTAMP to
+`week`, `month`, `quarter`, or `year`. A query fails when such a value meets or produces a date
+outside that span, such as a `9999-12-31` sentinel. Native Exasol returns rows.
 
-| Query | Scan |
-|---|---|
-| `WHERE ts_ns < TIMESTAMP '9999-12-31 00:00:00'` | error `Cannot cast … to Timestamp(ns)` |
-| `SELECT ADD_DAYS(ts_ns, 100000)` | error `datetime field overflow` |
-| `SELECT DATE_TRUNC('day', d)` with `d` = 9999-12-31 | error `Cannot cast … to Timestamp(ns)` |
-| `SELECT DATE_TRUNC('month', ts)` with `ts` = 9999-12-31 10:00:00 | error `Timestamp … out of range` |
-
-Workaround: `CAST(ts_ns AS TIMESTAMP(6))` for a nanosecond column, which covers Exasol's whole
-range. `DATE_TRUNC` has no workaround.
+Workaround: `CAST(ts_ns AS TIMESTAMP(6))` for a nanosecond column. `DATE_TRUNC` has none.
 
 ## JSON_VALUE without a DEFAULT ON ERROR
 

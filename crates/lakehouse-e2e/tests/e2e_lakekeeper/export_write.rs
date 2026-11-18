@@ -1,5 +1,5 @@
-//! `EXPORT ... INTO SCRIPT` into new tables of the Lakekeeper warehouses. Each test exports into
-//! namespaces of its own and reads the new tables back through a virtual schema over them.
+//! `EXPORT ... INTO SCRIPT` into tables of the Lakekeeper warehouses. Each test exports into
+//! namespaces of its own and reads the tables back through a virtual schema over them.
 
 use std::collections::BTreeSet;
 use std::sync::{LazyLock, OnceLock};
@@ -9,17 +9,17 @@ use serde_json::Value;
 use super::{CONN_STATIC, CONN_VENDED, LAKEKEEPER_CATALOG_URI_INTERNAL, setup};
 use crate::common::e2e_harness::{
     ExportRoute, NO_SECRETS, SCHEMA_NAME, VsProps, assert_holds_rows,
-    assert_refused_before_reading, create_proxied_schema_and_scripts,
-    create_virtual_schema_with_password, error_text, exa_conn, export_error, exported_rows,
-    failing_source, run_namespace,
+    assert_refused_before_reading, create_virtual_schema_with_password, exa_conn, export_error,
+    exported_rows, failing_source, run_namespace,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::lakekeeper::{
     WAREHOUSE_STATIC, WAREHOUSE_VENDED, lakekeeper_connection_password, table_metadata,
 };
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE};
-use crate::common::stack::{
-    self, CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, build_create_connection_sql,
+use crate::common::stack::{CatalogConnectionPassword, build_create_connection_sql};
+use crate::common::table_state::{
+    EXPORT_ID, assert_one_new_export, iceberg_columns, snapshot_ids, snapshots, summary_values,
 };
 
 const SOURCE_SCHEMA: &str = "LK_EXPORT_E2E";
@@ -27,10 +27,7 @@ const SOURCE_TABLE: &str = "LK_EXPORT_E2E.SRC_ROWS";
 const SOURCE_ROWS: i64 = 1_000;
 const TYPES_TABLE: &str = "LK_EXPORT_E2E.ALL_TYPES";
 const ROWS_16K: &str = "LK_EXPORT_E2E.ROWS_16K";
-const CROSS_JOIN_SIDE: &str = "LK_EXPORT_E2E.SIDE_20K";
 static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
-const ALREADY_EXISTS: &str = "already exists; the export only creates new tables";
-const PROXIED_CONN: &str = "LK_EXPORT_PROXY_CREDS";
 
 /// The Exasol source tables of the exports.
 fn sources() {
@@ -47,10 +44,6 @@ fn sources() {
         sys.execute(&format!(
             "CREATE OR REPLACE TABLE {ROWS_16K} AS \
              SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID FROM DUAL CONNECT BY LEVEL <= 16000"
-        ));
-        sys.execute(&format!(
-            "CREATE OR REPLACE TABLE {CROSS_JOIN_SIDE} AS \
-             SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID FROM DUAL CONNECT BY LEVEL <= 20000"
         ));
         sys.execute(&format!(
             "CREATE OR REPLACE TABLE {TYPES_TABLE} (ID DECIMAL(9,0), D9_0 DECIMAL(9,0), \
@@ -102,15 +95,6 @@ const VENDED: Target = Target {
     },
 };
 
-/// The static warehouse through the proxy-only scripts, so the proxy log shows each request.
-const PROXIED_STATIC: Target = Target {
-    route: ExportRoute {
-        script_schema: PROXY_ADAPTER_SCHEMA,
-        connection: PROXIED_CONN,
-    },
-    ..STATIC
-};
-
 impl Target {
     fn export(self, source: &str, table: &str, options: &str) -> String {
         self.route.export(source, table, options)
@@ -159,80 +143,12 @@ impl Target {
     }
 }
 
-/// Installs the proxy-only scripts and a CONNECTION to the static warehouse whose addresses
-/// only the forward proxy resolves.
-fn proxied_static() -> Target {
-    static DONE: OnceLock<()> = OnceLock::new();
-    DONE.get_or_init(|| {
-        setup();
-        let proxy_url = stack::proxy_url_internal();
-        let proxy = [("HTTP_PROXY", proxy_url.as_str())];
-        let password = STATIC.password().via_proxy();
-        let catalog = stack::via_proxy(LAKEKEEPER_CATALOG_URI_INTERNAL);
-        let token_uri = password
-            .oauth2_server_uri
-            .clone()
-            .expect("the OAuth2 client-credentials CONNECTION names a token endpoint");
-        let mut sys = exa_conn();
-        create_proxied_schema_and_scripts(
-            &mut sys,
-            PROXY_ADAPTER_SCHEMA,
-            &proxy,
-            &proxy,
-            &[&catalog, &token_uri, &password.endpoint],
-        );
-        sys.execute(&build_create_connection_sql(
-            PROXIED_CONN,
-            &catalog,
-            &password,
-        ));
-    });
-    PROXIED_STATIC
-}
-
 #[track_caller]
 fn assert_names(case: &str, error: &str, fragments: &[&str]) {
     assert!(
         fragments.iter().all(|fragment| error.contains(fragment)),
         "{case}: the error must name {fragments:?}: {error}"
     );
-}
-
-/// The name and Iceberg type of each column of `metadata`'s current schema.
-fn iceberg_columns(metadata: &Value) -> Vec<(&str, &str)> {
-    let schema_id = &metadata["current-schema-id"];
-    let schema = metadata["schemas"]
-        .as_array()
-        .and_then(|schemas| schemas.iter().find(|s| &s["schema-id"] == schema_id))
-        .unwrap_or_else(|| panic!("no current schema: {metadata}"));
-    schema["fields"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|field| {
-            (
-                field["name"].as_str().unwrap(),
-                field["type"].as_str().unwrap(),
-            )
-        })
-        .collect()
-}
-
-fn snapshots(metadata: &Value) -> &[Value] {
-    metadata["snapshots"].as_array().map_or(&[], Vec::as_slice)
-}
-
-/// The values of the snapshot summary property `key`, one per snapshot.
-fn summary_values(metadata: &Value, key: &str) -> Vec<String> {
-    snapshots(metadata)
-        .iter()
-        .map(|snapshot| {
-            snapshot["summary"][key]
-                .as_str()
-                .unwrap_or_else(|| panic!("a snapshot without {key}: {snapshot}"))
-                .to_string()
-        })
-        .collect()
 }
 
 /// Scenario: The export creates a missing namespace and table
@@ -252,7 +168,7 @@ fn export_creates_missing_namespace_and_table() {
         .unwrap_or_else(|| panic!("the catalog must hold {table}"));
     assert_eq!(
         iceberg_columns(&metadata),
-        [("ID", "decimal(9,0)"), ("LABEL", "string")]
+        [("ID", "decimal(9,0)", false), ("LABEL", "string", false)]
     );
     let vs = "LK_EXPORT_TWO_LEVELS";
     STATIC.read_back(vs, &namespace);
@@ -294,22 +210,23 @@ fn export_round_trips_every_supported_type() {
     }
 }
 
-/// The Iceberg column of each `TYPES_TABLE` column, as the export maps its Exasol type.
-const TYPES_ICEBERG_COLUMNS: [(&str, &str); 14] = [
-    ("ID", "decimal(9,0)"),
-    ("D9_0", "decimal(9,0)"),
-    ("D12_0", "decimal(12,0)"),
-    ("D18_0", "decimal(18,0)"),
-    ("D9_2", "decimal(9,2)"),
-    ("D18_2", "decimal(18,2)"),
-    ("D36_6", "decimal(36,6)"),
-    ("DBL", "double"),
-    ("FLAG", "boolean"),
-    ("TXT", "string"),
-    ("CHR", "string"),
-    ("DT", "date"),
-    ("TS", "timestamp"),
-    ("TS6", "timestamp"),
+/// The Iceberg column of each `TYPES_TABLE` column, as the export maps its Exasol type: every
+/// column optional.
+const TYPES_ICEBERG_COLUMNS: [(&str, &str, bool); 14] = [
+    ("ID", "decimal(9,0)", false),
+    ("D9_0", "decimal(9,0)", false),
+    ("D12_0", "decimal(12,0)", false),
+    ("D18_0", "decimal(18,0)", false),
+    ("D9_2", "decimal(9,2)", false),
+    ("D18_2", "decimal(18,2)", false),
+    ("D36_6", "decimal(36,6)", false),
+    ("DBL", "double", false),
+    ("FLAG", "boolean", false),
+    ("TXT", "string", false),
+    ("CHR", "string", false),
+    ("DT", "date", false),
+    ("TS", "timestamp", false),
+    ("TS6", "timestamp", false),
 ];
 
 /// Asserts that `table` holds the rows of `TYPES_TABLE`, each matched by its ID with equal
@@ -412,106 +329,6 @@ fn export_refuses_unsupported_column_types() {
     STATIC.assert_no_table("TIMESTAMP(9)", &table);
 }
 
-/// Scenario: An export into an existing table is refused
-#[test]
-fn export_refuses_an_existing_table() {
-    sources();
-    let target = proxied_static();
-    let existing = format!("{E2E_NAMESPACE}.{E2E_TABLE}");
-    let snapshot_ids = || {
-        let metadata = STATIC.metadata(&existing).expect("the seeded table exists");
-        summary_ids(&metadata)
-    };
-    let before = snapshot_ids();
-    let mut error = String::new();
-
-    let log = stack::proxy_log_during(|| {
-        error = assert_refused_before_reading(
-            "existing table",
-            &mut exa_conn(),
-            &target.export(&FAILING_SOURCE, &existing, ""),
-            &[&format!("table {existing} {ALREADY_EXISTS}")],
-            NO_SECRETS,
-        );
-    });
-
-    assert_eq!(snapshot_ids(), before, "the table keeps its snapshots");
-    let table_head = format!("/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE} HTTP");
-    let requests: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("Request"))
-        .collect();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|line| line.contains("HEAD ") && line.contains(&table_head))
-            .count(),
-        1,
-        "one table-existence check: {requests:#?}"
-    );
-    assert!(
-        !requests
-            .iter()
-            .any(|line| line.contains("/namespaces HTTP")),
-        "an existing table is refused before any namespace call: {requests:#?}"
-    );
-}
-
-fn summary_ids(metadata: &Value) -> BTreeSet<String> {
-    snapshots(metadata)
-        .iter()
-        .map(|snapshot| snapshot["snapshot-id"].to_string())
-        .collect()
-}
-
-/// Scenario: Two exports that create the same table leave one winner
-#[test]
-fn export_racing_exports_leave_one_winner() {
-    sources();
-    let namespace = run_namespace("race");
-    let table = format!("{namespace}.raced");
-    // The cross join takes seconds before its one row, so both statements pass the pre-read check.
-    let source = |marker: &str| {
-        format!(
-            "(SELECT '{marker}' AS MARKER, COUNT(*) AS N FROM {CROSS_JOIN_SIDE} a, \
-             {CROSS_JOIN_SIDE} b WHERE a.ID + b.ID > 0)"
-        )
-    };
-
-    let outcomes: Vec<(&str, Value)> = std::thread::scope(|scope| {
-        let racers: Vec<_> = ["A", "B"]
-            .map(|marker| {
-                let sql = STATIC.export(&source(marker), &table, "");
-                scope.spawn(move || (marker, exa_conn().try_execute(&sql)))
-            })
-            .into_iter()
-            .collect();
-        racers
-            .into_iter()
-            .map(|racer| racer.join().expect("an export thread"))
-            .collect()
-    });
-
-    let (winners, losers): (Vec<_>, Vec<_>) = outcomes
-        .iter()
-        .partition(|(_, response)| response["status"] == "ok");
-    assert_eq!(
-        winners.len(),
-        1,
-        "exactly one export succeeds: {outcomes:?}"
-    );
-    let error = error_text(&losers[0].1, "the losing export");
-    assert_names("losing export", &error, &[&table]);
-    let vs = "LK_EXPORT_RACE";
-    STATIC.read_back(vs, &namespace);
-    let markers = exa_conn().query_columns(&format!("SELECT MARKER FROM {vs}.RACED"));
-    assert_eq!(
-        markers,
-        [[Value::from(winners[0].0)]],
-        "only the winner's rows"
-    );
-}
-
 /// Scenario: Concurrent writers create one table, and every commit carries the export ID
 #[test]
 fn export_concurrent_writers_commit_once_with_the_export_id() {
@@ -533,9 +350,7 @@ fn export_concurrent_writers_commit_once_with_the_export_id() {
     let mut export_ids = BTreeSet::new();
     for table in tables {
         let metadata = VENDED.metadata(&format!("{namespace}.{table}")).unwrap();
-        let ids: BTreeSet<String> = summary_values(&metadata, "lakehouse.export-id")
-            .into_iter()
-            .collect();
+        let ids: BTreeSet<String> = summary_values(&metadata, EXPORT_ID).into_iter().collect();
         let writers: BTreeSet<String> = summary_values(&metadata, "lakehouse.export-writer")
             .into_iter()
             .collect();
@@ -679,16 +494,97 @@ fn export_single_commit_creates_the_table_with_its_rows() {
 #[test]
 fn export_empty_source_creates_no_table() {
     sources();
-    let table = format!("{}.t", run_namespace("empty"));
-    // A column type the writer refuses, which no writer checks when no row arrives.
-    let source = format!(
-        "(SELECT ID, CAST(TIMESTAMP '2024-01-01 00:00:00.123456789' AS TIMESTAMP(9)) AS TS9 \
-         FROM {SOURCE_TABLE} WHERE ID < 0)"
+    let existing = format!("{E2E_NAMESPACE}.{E2E_TABLE}");
+    let snapshots_of = |table: &str| STATIC.metadata(table).map(|m| snapshot_ids(&m));
+    let seeded = snapshots_of(&existing).expect("the seeded table exists");
+    // Columns no writer checks when no row arrives: a type the writer refuses for a new table,
+    // and a column the existing table lacks.
+    let cases = [
+        (
+            "new table",
+            format!("{}.t", run_namespace("empty")),
+            format!(
+                "(SELECT ID, CAST(TIMESTAMP '2024-01-01 00:00:00.123456789' AS TIMESTAMP(9)) \
+                 AS TS9 FROM {SOURCE_TABLE} WHERE ID < 0)"
+            ),
+            None,
+        ),
+        (
+            "existing table",
+            existing.clone(),
+            format!("(SELECT 'x' AS EXTRA FROM {SOURCE_TABLE} WHERE ID < 0)"),
+            Some(seeded),
+        ),
+    ];
+
+    for (case, table, source, expected_snapshots) in cases {
+        assert_eq!(
+            exported_rows(&mut exa_conn(), &STATIC.export(&source, &table, "")),
+            0,
+            "{case}"
+        );
+        assert_eq!(
+            snapshots_of(&table),
+            expected_snapshots,
+            "{case}: the snapshot IDs of {table}, None when it does not exist"
+        );
+    }
+}
+
+/// Scenario: An export appends its rows and leaves the table's data unchanged
+#[test]
+fn export_appends_into_a_table_an_export_created() {
+    sources();
+    // An append takes its storage credentials from `loadTable`, not from table creation.
+    let vended = VENDED.password();
+    assert!(
+        vended.endpoint.is_empty() && vended.access_key.is_empty() && vended.secret_key.is_empty(),
+        "the vended CONNECTION must hold no static storage field, which would override the vended one"
     );
+    let namespace = run_namespace("append");
+    let table = format!("{namespace}.appended");
+    let created = format!(
+        "(SELECT CAST(ID AS DECIMAL(18,0)) AS ID, CAST(ID / 100 AS DECIMAL(10,2)) AS AMOUNT, \
+         LABEL AS NAME FROM {SOURCE_TABLE} WHERE ID <= 500)"
+    );
+    // Another column order, and an ID of DECIMAL(9,0) that widens into decimal(18,0).
+    let appended = format!(
+        "(SELECT LABEL AS NAME, CAST(ID / 100 AS DECIMAL(10,2)) AS AMOUNT, ID \
+         FROM {SOURCE_TABLE} WHERE ID > 500)"
+    );
+    let columns = [
+        ("ID", "decimal(18,0)", false),
+        ("AMOUNT", "decimal(10,2)", false),
+        ("NAME", "string", false),
+    ];
 
     assert_eq!(
-        exported_rows(&mut exa_conn(), &STATIC.export(&source, &table, "")),
-        0
+        exported_rows(&mut exa_conn(), &VENDED.export(&created, &table, "")),
+        500
     );
-    STATIC.assert_no_table("empty source", &table);
+    let before = VENDED
+        .metadata(&table)
+        .expect("the first export creates the table");
+    assert_eq!(
+        exported_rows(
+            &mut exa_conn(),
+            &VENDED.export(&appended, &table, "WRITERS_PER_NODE = '2'")
+        ),
+        500
+    );
+
+    let after = VENDED.metadata(&table).unwrap();
+    assert_one_new_export("one snapshot per writer", &before, &after, 2);
+    assert_eq!(iceberg_columns(&after), columns);
+    let vs = "LK_EXPORT_APPEND";
+    VENDED.read_back(vs, &namespace);
+    assert_holds_rows(
+        &mut exa_conn(),
+        &format!("{vs}.APPENDED"),
+        &format!(
+            "SELECT CAST(ID AS DECIMAL(18,0)), CAST(ID / 100 AS DECIMAL(10,2)), LABEL \
+             FROM {SOURCE_TABLE}"
+        ),
+        SOURCE_ROWS,
+    );
 }

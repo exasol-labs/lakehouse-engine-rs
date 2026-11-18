@@ -51,7 +51,7 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 
 ### Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
 
-* *GIVEN* a `refresh` request without `requestedTables` whose schema-level `adapterNotes` holds the tuning values and one entry the adapter does not write, for a virtual schema whose tables carry identifier notes, or none because the schema predates them
+* *GIVEN* a `refresh` request without `requestedTables` whose schema-level `adapterNotes` holds one entry the adapter does not write, for a virtual schema whose tables carry identifier notes, or none because the schema predates them
 * *WHEN* the adapter builds the `refresh` response
 * *THEN* each returned virtual table's identifier note SHALL hold the catalog identifier this refresh resolved from the source, never a copy of a previous note
 * *AND* a virtual table that had no identifier note SHALL carry one afterwards, so its pushdown no longer fails
@@ -63,7 +63,7 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 * *WHEN* the user runs `ALTER VIRTUAL SCHEMA ... REFRESH TABLES TABLE_ONE`, which Exasol sends with `requestedTables` `["TABLE_ONE"]`
 * *THEN* the response SHALL return only `TABLE_ONE`, with column notes and an identifier note built from the source, and SHALL echo `requestedTables`, which the response to a `refresh` without `requestedTables` omits
 * *AND* `TABLE_ONE` SHALL declare `NEW_COL`, and `TABLE_TWO` SHALL keep its columns, column notes, and identifier note, or its lack of one, and stay queryable
-* *AND* the schema-level `adapterNotes` SHALL carry the tuning values derived from the request's properties and the `SKIPPED_TABLES` of the scenario "A partial refresh merges SKIPPED_TABLES with the persisted list"
+* *AND* the schema-level `adapterNotes` SHALL carry the `SKIPPED_TABLES` of the scenario "A partial refresh merges SKIPPED_TABLES with the persisted list"
 
 ### Scenario: A partial refresh drops a requested virtual table the source no longer serves
 

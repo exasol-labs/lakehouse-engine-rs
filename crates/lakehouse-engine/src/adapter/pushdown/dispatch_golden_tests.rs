@@ -4,9 +4,9 @@
 
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, float_div, full_row_n_scan_sql, parsed_pushdown, pd, projected_columns,
-    pushdown_request, request_sides, request_typed, round_of, sample_scan_storage, sample_storage,
-    scan_for, with_identifier_notes,
+    count_star, dispatch_base, dispatch_context, float_div, full_row_n_scan_sql, parsed_pushdown,
+    pd, projected_columns, pushdown_request, request_sides, request_typed, resolved_table,
+    round_of, sample_storage, scan_for, test_context, unqualified_shards, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -61,6 +61,10 @@ fn unmergeable_having_request() -> (Json, Vec<ExasolType>) {
 
 /// Non-numeric SUM target: declines grouped decomposition to the qualified wrapper.
 fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
+    group_by_fallback_builder().build()
+}
+
+fn group_by_fallback_builder() -> PushdownRequestBuilder {
     events_request()
         .group_by(vec![col("REGION")])
         .column(col("REGION"))
@@ -68,6 +72,12 @@ fn group_by_fallback_request() -> (Json, Vec<ExasolType>) {
             agg_item("SUM", Some("NAME"), false),
             ExasolType::decimal(30, 4),
         )
+}
+
+/// The filter names a column no other clause names, so the wrapper's fan-out emits it.
+fn group_by_fallback_rendering_filter_request() -> (Json, Vec<ExasolType>) {
+    group_by_fallback_builder()
+        .filter(compare("predicate_greater", col("AMOUNT"), num_lit(100)))
         .build()
 }
 
@@ -223,37 +233,15 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         RowProjection::Wrapped,
         "this fixture must exercise the wrapping guard, not a per-item projection"
     );
-    let result = build_dispatch_sql(
+    golden_dispatch(
         request,
         &pushdown,
         projection,
         &emitted,
         scan_for(&columns, pushdown.json()),
+        ScanWhere::Absent,
         None,
-        None,
-        None,
-        false,
-        &fixed_shards(),
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
     )
-    .expect("build_dispatch_sql must succeed for this fixture");
-    result["sql"]
-        .as_str()
-        .expect("pushdown response must carry a sql field")
-        .to_string()
 }
 
 /// Takes `pushdown_req` explicitly so callers can pass a stripped or alias-carrying
@@ -270,31 +258,59 @@ fn dispatch_sql_with_pushdown_req(
     let pushdown = PushdownRequest::parse(pushdown_req.clone())
         .expect("the fixture declares a valid selectListDataTypes");
     let columns = column_types(&col_types);
-    let result = build_dispatch_sql(
+    golden_dispatch(
         request,
         &pushdown,
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
         &golden_emission(request, &pushdown, &columns),
         scan_for(&columns, pushdown_req),
-        filter,
+        filter.map_or(ScanWhere::Absent, ScanWhere::Pushed),
+        limit,
+    )
+}
+
+/// Places the request's own filter through `split_where`, as `handle_pushdown` does.
+fn dispatch_sql_placing_filter(request: &Json) -> String {
+    let pushdown = parsed_pushdown(request);
+    let columns = column_types(&base_col_types());
+    let scan = scan_for(&columns, pushdown.json());
+    golden_dispatch(
+        request,
+        &pushdown,
+        RowProjection::Direct(Vec::new()),
+        &golden_emission(request, &pushdown, &columns),
+        scan,
+        scan.split_where(pushdown.json().get("filter")),
         None,
+    )
+}
+
+/// The dispatch SQL over [`fixed_shards`] of the `events` table.
+fn golden_dispatch(
+    request: &Json,
+    pushdown: &PushdownRequest,
+    projection: RowProjection,
+    emitted: &Emitted,
+    scan: ScanTranslator<'_>,
+    scan_where: ScanWhere<'_>,
+    limit: Option<u64>,
+) -> String {
+    let result = build_dispatch_sql(
+        request,
+        pushdown,
+        projection,
+        emitted,
+        scan,
+        scan_where,
         limit,
         false,
-        &fixed_shards(),
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(fixed_shards()),
+        dispatch_base(ResolvedScan {
+            logical_schema: Vec::new(),
+            partition_columns: Vec::new(),
+            ..resolved_table("s3://warehouse/db/events")
+        }),
+        &dispatch_context(),
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -312,6 +328,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &RowProjection::Direct(projected_columns(proj_cols, proj_types)),
         scan_for(&columns, &pd(request)),
         &EmptyRelation::single_scan(request, golden_emission(request, &pushdown, &columns)),
+        &test_context(),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
@@ -343,6 +360,13 @@ fn group_by_fallback_matches_golden() {
         None,
     );
     let expected = include_str!("testdata/dispatch_golden/group_by_fallback.sql");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn group_by_fallback_with_rendering_filter_matches_golden() {
+    let actual = dispatch_sql_placing_filter(&group_by_fallback_rendering_filter_request().0);
+    let expected = include_str!("testdata/dispatch_golden/group_by_fallback_rendering_filter.sql");
     assert_eq!(actual, expected);
 }
 
@@ -693,7 +717,7 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql};
+use super::joins::build_broadcast_join_sql;
 
 fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
     let mut request = pushdown_request(
@@ -739,22 +763,24 @@ fn resolved_customer_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
         table_identifier: "lh.customer".to_string(),
-        table_root: "s3://warehouse/lh/customer".to_string(),
-        files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
-        logical_schema: vec![LogicalField {
-            field_id: Some(1),
-            name: "CUSTOMER_KEY".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        }],
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: Vec::new(),
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/customer".to_string(),
+            files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
+            logical_schema: vec![LogicalField {
+                field_id: Some(1),
+                name: "CUSTOMER_KEY".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            }],
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: Vec::new(),
+            refused_columns: Vec::new(),
+        },
         total_bytes: 10,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
     }
 }
@@ -763,40 +789,25 @@ fn resolved_orders_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "ORDERS".to_string(),
         table_identifier: "lh.orders".to_string(),
-        table_root: "s3://warehouse/lh/orders".to_string(),
-        files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
-        logical_schema: vec![LogicalField {
-            field_id: Some(1),
-            name: "ORDERS_KEY".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        }],
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: Vec::new(),
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/orders".to_string(),
+            files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
+            logical_schema: vec![LogicalField {
+                field_id: Some(1),
+                name: "ORDERS_KEY".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            }],
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: Vec::new(),
+            refused_columns: Vec::new(),
+        },
         total_bytes: 100,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
-    }
-}
-
-fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
-    JoinScanRequestConfig {
-        cluster_nodes: 1,
-        parallelism_factor: 1,
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 0,
-        s3_max_connections: 1,
-        binary_as_string: false,
-        connection: &super::test_support::TEST_CONNECTION,
-        udf_name: SCAN_UDF_NAME,
-        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
     }
 }
 
@@ -815,11 +826,12 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         &parsed_pushdown(&request),
         &join,
         &request_sides(&request, &join),
+        &test_context(),
     )
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
     assert_eq!(
@@ -832,7 +844,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
-        &join_scan_tuning(),
+        &test_context(),
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(
@@ -863,11 +875,12 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         &parsed_pushdown(&request),
         &join,
         &request_sides(&request, &join),
+        &test_context(),
     )
     .expect("render_broadcast_join must not error for a well-formed request")
     .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &join_scan_tuning())
+    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
     assert_eq!(
@@ -880,7 +893,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
-        &join_scan_tuning(),
+        &test_context(),
     )
     .expect("build_n_scan_join_sql must succeed for this fixture");
     assert_eq!(

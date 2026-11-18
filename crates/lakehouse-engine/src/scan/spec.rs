@@ -345,7 +345,7 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 ///
 /// # `initial_default`
 ///
-/// The Iceberg `initial-default` (column-projection rule 3), encoded as the RAW primitive per tag:
+/// The Iceberg `initial-default` (column-projection rule 3), encoded per tag:
 ///
 /// | `arrow_type` | encoded text of `initial_default` |
 /// |---|---|
@@ -354,14 +354,14 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 /// | `"int64"` | decimal `i64` |
 /// | `"float32"` | `f32` in Rust `Display` form (round-trippable) |
 /// | `"float64"` | `f64` in Rust `Display` form (round-trippable) |
-/// | `"utf8"` | the string value verbatim |
+/// | `"utf8"` | a `string` verbatim; a `time` or out-of-domain `decimal` as the text a stored value reads as |
 /// | `"date32"` | `i32` days since the Unix epoch |
 /// | `"timestamp_us"` / `"timestamptz_us"` | `i64` microseconds |
 /// | `"timestamp_ns"` / `"timestamptz_ns"` | `i64` nanoseconds |
 /// | `"decimal128(p,s)"` | `i128` unscaled mantissa |
+/// | `"binary"` / `"fixed_size_binary(L)"` | lowercase hex of the bytes (`fixed` and `uuid`) |
 ///
-/// Non-primitive defaults and primitives reaching only the JSON-fallback `"utf8"` path encode
-/// `None` and fall through to NULL / required-error.
+/// A non-primitive default encodes `None` and falls through to NULL or the required-absent error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalField {
     /// Declared FIRST so a field-id-bound column serializes `"field_id":N` as its leading key.
@@ -883,6 +883,48 @@ impl From<(String, u64)> for FileEntry {
     }
 }
 
+/// The tuning every shard of a request runs with, resolved once by the adapter. On the wire its
+/// fields sit beside the other [`CommonScanSpec`] keys, and a field the blob lacks takes its
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScanTuning {
+    #[serde(default = "default_one_usize")]
+    pub df_target_partitions: usize,
+
+    #[serde(default = "default_batch_size")]
+    pub df_batch_size: usize,
+
+    #[serde(default = "default_one_usize")]
+    pub df_threads_per_udf: usize,
+
+    /// Fraction of the net per-instance budget given to the DataFusion memory pool.
+    #[serde(default = "default_memory_pool_fraction")]
+    pub memory_pool_fraction: f64,
+
+    /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance limit.
+    #[serde(default = "default_instance_overhead_mb")]
+    pub instance_overhead_mb: u64,
+
+    /// Concurrent connections held warm per host.
+    #[serde(default = "default_s3_max_connections")]
+    pub s3_max_connections: usize,
+}
+
+impl Default for ScanTuning {
+    /// Test-construction baseline. `s3_max_connections` is the fixture value `8`,
+    /// deliberately not serde's field-absent [`DEFAULT_S3_MAX_CONNECTIONS`].
+    fn default() -> Self {
+        Self {
+            df_target_partitions: default_one_usize(),
+            df_batch_size: default_batch_size(),
+            df_threads_per_udf: default_one_usize(),
+            memory_pool_fraction: default_memory_pool_fraction(),
+            instance_overhead_mb: default_instance_overhead_mb(),
+            s3_max_connections: 8,
+        }
+    }
+}
+
 /// Shard-invariant part of a [`ScanSpec`], serialized once as the first UDF argument.
 /// It has no `files` field, so the common blob can never carry one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -934,26 +976,8 @@ pub struct CommonScanSpec {
 
     pub storage: ScanStorage,
 
-    #[serde(default = "default_one_usize")]
-    pub df_target_partitions: usize,
-
-    #[serde(default = "default_batch_size")]
-    pub df_batch_size: usize,
-
-    #[serde(default = "default_one_usize")]
-    pub df_threads_per_udf: usize,
-
-    /// Fraction of the net per-instance budget given to the DataFusion memory pool.
-    #[serde(default = "default_memory_pool_fraction")]
-    pub memory_pool_fraction: f64,
-
-    /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance limit.
-    #[serde(default = "default_instance_overhead_mb")]
-    pub instance_overhead_mb: u64,
-
-    /// Concurrent connections held warm per host.
-    #[serde(default = "default_s3_max_connections")]
-    pub s3_max_connections: usize,
+    #[serde(flatten)]
+    pub tuning: ScanTuning,
 
     /// `BINARY_AS_STRING`: a top-level variable-length binary column reads as its UTF-8 text
     /// instead of hex (`vs-adapter/binary-column-rendering`).
@@ -981,8 +1005,7 @@ impl CommonScanSpec {
 }
 
 impl Default for CommonScanSpec {
-    /// Test-construction baseline. `s3_max_connections` is the fixture value `8`,
-    /// deliberately not serde's field-absent [`DEFAULT_S3_MAX_CONNECTIONS`].
+    /// Test-construction baseline, with [`ScanTuning::default`] as its tuning.
     fn default() -> Self {
         Self {
             table_root: String::new(),
@@ -998,12 +1021,7 @@ impl Default for CommonScanSpec {
             join: None,
             partition_columns: Vec::new(),
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps::default())),
-            df_target_partitions: default_one_usize(),
-            df_batch_size: default_batch_size(),
-            df_threads_per_udf: default_one_usize(),
-            memory_pool_fraction: default_memory_pool_fraction(),
-            instance_overhead_mb: default_instance_overhead_mb(),
-            s3_max_connections: 8,
+            tuning: ScanTuning::default(),
             binary_as_string: false,
         }
     }
@@ -1025,16 +1043,26 @@ fn default_one_usize() -> usize {
     1
 }
 
+/// DataFusion's default rows per RecordBatch.
+pub(crate) const DEFAULT_DF_BATCH_SIZE: usize = 8192;
+
 fn default_batch_size() -> usize {
-    8192
+    DEFAULT_DF_BATCH_SIZE
 }
+
+/// Fraction of the net per-instance RSS budget allocated to the DataFusion memory pool.
+pub(crate) const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 
 fn default_memory_pool_fraction() -> f64 {
-    0.6
+    DEFAULT_MEMORY_POOL_FRACTION
 }
 
+/// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
+/// applying the pool fraction.
+pub(crate) const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
+
 fn default_instance_overhead_mb() -> u64 {
-    200
+    DEFAULT_INSTANCE_OVERHEAD_MB
 }
 
 /// Defined here, not in `adapter`, so `scan::spec` has no reverse dependency on it.

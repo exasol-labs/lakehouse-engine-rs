@@ -3,7 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment, exact_type, render_exasol_fragment};
+use vs_expression::{ColumnNode, SqlFragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -48,7 +48,7 @@ pub(super) fn fold_nested_plans(
     for (plan, agg) in nested {
         let slot = fold_aggregate_plan(plans, plan_types, plan.clone(), None);
         if plan_types[slot].is_none() {
-            plan_types[slot] = exact_type(agg, scan.columns());
+            plan_types[slot] = scan.exact_type(agg);
         }
     }
 }
@@ -145,7 +145,7 @@ pub(super) fn render_scalar_over_merge(
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    let SqlFragment { mut sql, ty } = render_exasol_fragment(&sentinel_tree, scan.columns());
+    let SqlFragment { mut sql, ty } = scan.exasol_fragment(&sentinel_tree);
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;

@@ -1,9 +1,9 @@
 use super::attribution::JoinLegs;
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
-use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::support::RowProjection;
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::pushdown::{ResolvedScan, ScanUdfs};
 use crate::scan::spec::{FileEntry, LogicalField};
 use crate::types::exasol_type::ExasolType;
 use futures::FutureExt;
@@ -363,28 +363,15 @@ pub(super) fn customer_orders_sides(
     )
 }
 
-pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
-    JoinScanRequestConfig {
-        cluster_nodes: 1,
-        parallelism_factor: 1,
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 0,
-        s3_max_connections: 1,
-        binary_as_string: false,
-        connection: &crate::adapter::pushdown::test_support::TEST_CONNECTION,
-        udf_name: "SCAN",
-        distribute_udf_name: "DISTRIBUTE",
+/// [`test_context`] over UDFs named `SCAN` and `DISTRIBUTE`.
+pub(super) fn two_scan_tuning() -> PushdownContext<'static> {
+    PushdownContext {
+        udfs: ScanUdfs {
+            scan: "SCAN".into(),
+            distribute: "DISTRIBUTE".into(),
+        },
+        ..test_context()
     }
-}
-
-#[test]
-fn qualify_udf_uses_schema_and_falls_back_when_empty() {
-    assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
-    assert_eq!(qualify_udf(Some(""), "UDF"), "UDF");
-    assert_eq!(qualify_udf(None, "UDF"), "UDF");
 }
 
 const CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_name", "string")];
@@ -822,10 +809,8 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
         )
         .column(table_col("ORDERS", "X")),
     );
-    let customer = ResolvedJoinSide {
-        refused_columns: vec![unread_refused("Parquet", "x", None, "geometry")],
-        ..resolved_side("CUSTOMER", Vec::new())
-    };
+    let mut customer = resolved_side("CUSTOMER", Vec::new());
+    customer.scan.refused_columns = vec![unread_refused("Parquet", "x", None, "geometry")];
     let sides = request_typed(&request, &[customer, resolved_side("ORDERS", Vec::new())]);
     let emitted = vec![
         emitting_named(&sides[0].column_types, &["ID"]),
@@ -837,6 +822,7 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
         &detected_join(&request),
         &sides,
         emitted,
+        &test_context(),
     )
     .expect("ORDERS.X is readable");
 

@@ -15,6 +15,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use std::sync::Arc;
+use vs_expression::ExasolVersion;
 
 mod field_id_projection;
 pub(crate) use field_id_projection::{
@@ -34,6 +35,7 @@ pub use sql_support::build_alias_items;
 
 mod checked_div;
 mod datetime_add;
+mod to_timestamp;
 pub use datetime_add::CountArithmetic;
 mod exasol_numeric;
 mod json_value;
@@ -61,7 +63,7 @@ mod row_deletes;
 mod scan_table;
 
 mod partition_values;
-pub(crate) use partition_values::{non_null_partition_value, partition_scalar};
+pub(crate) use partition_values::{hex_scalar, non_null_partition_value, partition_scalar};
 
 mod raw_scan;
 pub use raw_scan::{
@@ -147,7 +149,8 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     binary_hex::register_binary_hex_udf(&ctx);
     binary_text::register_binary_text_udf(&ctx);
     checked_div::register_checked_float_div_udf(&ctx, raised.clone());
-    datetime_add::register_datetime_add_udfs(&ctx, count_arithmetic, raised);
+    datetime_add::register_datetime_add_udfs(&ctx, count_arithmetic, raised.clone());
+    to_timestamp::register_to_timestamp_udf(&ctx, raised);
     json_value::register_json_value_udfs(&ctx);
     ctx
 }
@@ -159,8 +162,8 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
 pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     let config = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(spec.common.df_target_partitions.max(1))
-        .with_batch_size(spec.common.df_batch_size.max(1))
+        .with_target_partitions(spec.common.tuning.df_target_partitions.max(1))
+        .with_batch_size(spec.common.tuning.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
         .set_bool(
@@ -207,7 +210,7 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 
     let storage = resolve_scan_storage(&spec.common, ctx)?;
 
-    let rt = build_scan_runtime(spec.common.df_threads_per_udf).map_err(UdfError::User)?;
+    let rt = build_scan_runtime(spec.common.tuning.df_threads_per_udf).map_err(UdfError::User)?;
 
     run_on_runtime(rt, run_scan_one(ctx, spec, &storage, build_session_context))
 }
@@ -225,7 +228,7 @@ pub async fn run_scan_one(
     ) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
-    let count_arithmetic = CountArithmetic::from_database_version(&ctx.database_version());
+    let count_arithmetic = CountArithmetic::from(ExasolVersion::of(&ctx.database_version()));
     let secrets = storage.all_secret_values();
     let redact = |e| emit::redact_scan_error(e, &secrets);
     let session_ctx =

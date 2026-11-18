@@ -7,8 +7,11 @@ use lakehouse_catalog::{CatalogColumn, ColumnSourceType, TableFormat};
 type ListingPipeline =
     fn(&[String], &CatalogListing, EngineTimestampSupport) -> Result<Vec<Json>, UdfError>;
 
-type CatalogClientConstruction =
-    fn(&ResolvedConnectionConfig, &Json, Option<String>) -> Result<Box<dyn ScanCatalog>, UdfError>;
+type CatalogClientConstruction = fn(
+    &ResolvedConnectionConfig,
+    &VsProperties,
+    Option<String>,
+) -> Result<Box<dyn ScanCatalog>, UdfError>;
 
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
@@ -26,7 +29,7 @@ fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
         let storage = connection::storage_block(&creds, false);
         construct_catalog_client(
             &resolved_connection(CatalogKind::Glue, address, storage, creds),
-            &json!({}),
+            &VsProperties::parse(&json!({}), Check::Lenient).expect("no property to parse"),
             None,
         )
     };

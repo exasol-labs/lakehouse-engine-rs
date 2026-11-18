@@ -17,7 +17,7 @@ The scan reads only the projected columns. The scan also evaluates select-list e
 
 ## Filtering
 
-Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. When DataFusion cannot render every conjunct of the pushed filter, the whole filter runs in Exasol SQL and the scan returns the referenced columns unfiltered. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
+Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol applies the predicates whose capability the adapter does not advertise, such as `REGEXP_LIKE`. A condition DataFusion cannot render runs in Exasol SQL on its own, and the scan still filters on the other conditions of the `AND`. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop. With a non-zero `OFFSET`, the shards do not stop early, and Exasol SQL applies the limit and the offset.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -48,7 +48,7 @@ A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32
 
 `ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
 or a broadcast join, no aggregation, and every sort key must be a bare projected column that is not
-JSON-fallback typed. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local
+JSON-fallback typed, or a constant. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local
 top-`n` rows. Exasol SQL then merges the `shard_count × n` rows with a final `ORDER BY ... LIMIT n`.
 The per-shard bounded top-N never carries an offset. A non-zero offset always
 declines to the row-scan wrapper. That wrapper renders the full `ORDER BY ... LIMIT n OFFSET m`
@@ -68,7 +68,10 @@ result in the correct order:
   because it already qualifies column references.
 
 Exasol does not re-sort once the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`,
-so the adapter renders every sort key Exasol pushes in Exasol SQL.
+so the adapter renders every sort key Exasol pushes in Exasol SQL, except a constant. Exasol reads a
+bare number in `ORDER BY` as a select-list position, and a constant does not change the order, so
+the adapter drops it. An `ORDER BY` of constants only with no `OFFSET` runs as a bare `LIMIT`. With
+an `OFFSET` it orders by one `FALSE` key, because Exasol rejects `OFFSET` without `ORDER BY`.
 
 The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
 
@@ -82,7 +85,7 @@ full scan.
 
 ## Scalar functions
 
-The scan computes these functions when DataFusion can render the whole filter or select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
+The scan computes these functions when DataFusion can render the filter condition or the whole select list that contains them. Otherwise the adapter renders them in Exasol SQL, and Exasol computes them over the scanned columns. The forms listed below run in Exasol SQL even when the rest of the expression could run in the scan. A few of these functions return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
 
 | Family | Capabilities | Example |
 |---|---|---|
@@ -94,13 +97,13 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 | JSON | `FN_JSON_VALUE` | `WHERE JSON_VALUE(doc, '$.locale') = 'de_DE'` |
 
-`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan over a `DATE` or `TIMESTAMP` argument and a numeric count. Over a `TIMESTAMP(7)` to `TIMESTAMP(9)`, the scan computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)). The argument can also be a `CASE`, `COALESCE`, `GREATEST`, or `LEAST` over only dates or only timestamps, `NULLIF`, `DATE_TRUNC`, or `TO_DATE`. Any other argument form (`TIMESTAMP WITH LOCAL TIME ZONE`, text, a `CASE` over a date and a timestamp, `TO_TIMESTAMP`, a text count, or a numeric literal count above 1e10 in magnitude) runs in Exasol SQL.
+`ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` run in the scan when the adapter knows the argument's `DATE` or `TIMESTAMP` type and the count is a number. Otherwise they run in Exasol SQL. A value with more than 6 fractional digits computes in nanoseconds, so a result outside 1677-09-21 to 2262-04-11 fails ([Semantic differences](semantic-differences.md#nanosecond-timestamps-outside-1677-to-2262)).
 
 `DIV` runs in the scan over integer operands. Decimal and DOUBLE operands run in Exasol SQL.
 
 A `CAST` to `INTERVAL`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE` runs in Exasol SQL. A cast that converts text by the session's NLS settings also does, see [Text and session settings](#text-and-session-settings).
 
-`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
+`TO_DATE` and `TO_TIMESTAMP` run in the scan with a string-literal format built from `YYYY`, `MM`, and `DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally `SS`, then optionally one `.FF3`, `.FF6`, or `.FF9`. The separators are `-` `/` `.` `,` `;` `:` `_` and space. Other formats run in Exasol SQL.
 
 `INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
 
@@ -123,7 +126,7 @@ Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and re
 
 Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A BOOLEAN cast to DECIMAL or compared with a number runs in the scan as 1 or 0, except an `IN` list of numbers over a BOOLEAN, which runs in Exasol SQL. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
-Such a condition runs in Exasol SQL. On a single table it takes the whole WHERE with it, so the scan filters no rows, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
+Such a condition runs in Exasol SQL on its own. On a single table the scan still filters on the other conditions of the `AND`, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
 
 | Runs in Exasol SQL | Runs in the scan |
 |---|---|
@@ -149,7 +152,7 @@ An aggregate argument can be a column or a scalar expression. Examples are `SUM(
 two-column binary arithmetic expression such as `SUM(price * discount)`. Statistical aggregates take
 the partial path only for a bare-column argument.
 
-A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or a type Exasol 8 and 2025 give alike, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A computed group key that is not selected, such as `GROUP BY qty * 2`, needs a CAST, while `GROUP BY COALESCE(d, DATE '2000-01-01')` and `GROUP BY qty > 5` split.
+A partial aggregate needs every partial column and group key in an exact type: the type the request states for a select item, a column, a CAST, or the type the running Exasol version gives an expression, such as DATE for a CASE, `COALESCE`, `GREATEST`, or `LEAST` over dates. Otherwise the scan only filters and projects. For example, `LENGTH(MAX(UPPER(s)))` alone runs in Exasol SQL, and with `MAX(UPPER(s))` also selected it splits. A date-part key that is not selected, such as `GROUP BY YEAR(d)`, splits, and another computed key, such as `GROUP BY qty * 2`, still needs a CAST. `GROUP BY COALESCE(d, DATE '2000-01-01')` and `GROUP BY qty > 5` split too.
 
 Each aggregate emits partial values instead of a final value:
 
@@ -169,7 +172,7 @@ Exasol SQL combines these partial values into the final result.
 |---|---|---|
 | Inner equi-join | `JOIN`, `JOIN_TYPE_INNER`, `JOIN_CONDITION_EQUI` | `FROM a JOIN b ON a.id = b.id` |
 
-A two-table inner equi-join, or a table joined to itself, whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them. Broadcast also requires, among other conditions, a join condition and filter that DataFusion can render and, without aggregation, sort keys that are projected columns. With an aggregate, `GROUP BY`, or `HAVING`, the broadcast scan emits only the columns the aggregation reads, and Exasol aggregates, sorts, and applies the `LIMIT` over the joined rows. Such a join is broadcast only when every smaller-side column the aggregation reads is a `DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`, or is a text column that a top-level `WHERE` limits to literals (`col = 'x'` or `col IN ('x', 'y')`). The broadcast repeats those columns on every joined row, so a long text column such as a description would send far more data than scanning each table separately. Wrapping the column in an expression such as `SUBSTR` does not help, because the scan emits only plain columns. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
+A two-table inner equi-join, or a table joined to itself, whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them. Broadcast also requires, among other conditions, a join condition and filter that DataFusion can render and, without aggregation, sort keys that are projected columns or constants. With an aggregate, `GROUP BY`, or `HAVING`, the broadcast scan emits only the columns the aggregation reads, and Exasol aggregates, sorts, and applies the `LIMIT` over the joined rows. Such a join is broadcast only when every smaller-side column the aggregation reads is a `DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`, or is a text column that a top-level `WHERE` limits to literals (`col = 'x'` or `col IN ('x', 'y')`). The broadcast repeats those columns on every joined row, so a long text column such as a description would send far more data than scanning each table separately. Wrapping the column in an expression such as `SUBSTR` does not help, because the scan emits only plain columns. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
 
 ## Handled by Exasol
 

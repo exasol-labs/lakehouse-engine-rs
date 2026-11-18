@@ -74,19 +74,34 @@ fn default_matches_serde_absent_except_s3_max_connections() {
     let d = CommonScanSpec::default();
 
     assert_eq!(d.table_root, from_absent.table_root);
-    assert_eq!(d.df_target_partitions, from_absent.df_target_partitions);
-    assert_eq!(d.df_batch_size, from_absent.df_batch_size);
-    assert_eq!(d.df_threads_per_udf, from_absent.df_threads_per_udf);
-    assert_eq!(d.memory_pool_fraction, from_absent.memory_pool_fraction);
-    assert_eq!(d.instance_overhead_mb, from_absent.instance_overhead_mb);
+    assert_eq!(
+        d.tuning.df_target_partitions,
+        from_absent.tuning.df_target_partitions
+    );
+    assert_eq!(d.tuning.df_batch_size, from_absent.tuning.df_batch_size);
+    assert_eq!(
+        d.tuning.df_threads_per_udf,
+        from_absent.tuning.df_threads_per_udf
+    );
+    assert_eq!(
+        d.tuning.memory_pool_fraction,
+        from_absent.tuning.memory_pool_fraction
+    );
+    assert_eq!(
+        d.tuning.instance_overhead_mb,
+        from_absent.tuning.instance_overhead_mb
+    );
     assert_eq!(
         s3_props(&d.storage).path_style,
         s3_props(&from_absent.storage).path_style
     );
     assert!(!s3_props(&d.storage).allow_http && !s3_props(&from_absent.storage).allow_http);
 
-    assert_eq!(d.s3_max_connections, 8);
-    assert_eq!(from_absent.s3_max_connections, DEFAULT_S3_MAX_CONNECTIONS);
+    assert_eq!(d.tuning.s3_max_connections, 8);
+    assert_eq!(
+        from_absent.tuning.s3_max_connections,
+        DEFAULT_S3_MAX_CONNECTIONS
+    );
 }
 
 #[test]
@@ -721,16 +736,16 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
 #[test]
 fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     let mut spec = sample_spec();
-    spec.common.df_target_partitions = 4;
-    spec.common.df_threads_per_udf = 2;
+    spec.common.tuning.df_target_partitions = 4;
+    spec.common.tuning.df_threads_per_udf = 2;
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
-        back.common.df_target_partitions, 4,
+        back.common.tuning.df_target_partitions, 4,
         "df_target_partitions must survive round-trip"
     );
     assert_eq!(
-        back.common.df_threads_per_udf, 2,
+        back.common.tuning.df_threads_per_udf, 2,
         "df_threads_per_udf must survive round-trip"
     );
 
@@ -750,11 +765,11 @@ fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
-        legacy.common.df_target_partitions, 1,
+        legacy.common.tuning.df_target_partitions, 1,
         "missing df_target_partitions must default to 1 (backward-compat)"
     );
     assert_eq!(
-        legacy.common.df_threads_per_udf, 1,
+        legacy.common.tuning.df_threads_per_udf, 1,
         "missing df_threads_per_udf must default to 1 (backward-compat)"
     );
 }
@@ -762,11 +777,11 @@ fn scan_spec_threading_fields_round_trip_and_default_to_one() {
 #[test]
 fn df_batch_size_round_trips_and_defaults() {
     let mut spec = sample_spec();
-    spec.common.df_batch_size = 4096;
+    spec.common.tuning.df_batch_size = 4096;
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
-        back.common.df_batch_size, 4096,
+        back.common.tuning.df_batch_size, 4096,
         "df_batch_size must survive round-trip"
     );
 
@@ -782,7 +797,7 @@ fn df_batch_size_round_trips_and_defaults() {
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
-        legacy.common.df_batch_size, 8192,
+        legacy.common.tuning.df_batch_size, 8192,
         "missing df_batch_size must default to 8192 (backward-compat)"
     );
 }
@@ -790,16 +805,16 @@ fn df_batch_size_round_trips_and_defaults() {
 #[test]
 fn scan_spec_memory_fields_round_trip_and_default() {
     let mut spec = sample_spec();
-    spec.common.memory_pool_fraction = 0.5;
-    spec.common.instance_overhead_mb = 256;
+    spec.common.tuning.memory_pool_fraction = 0.5;
+    spec.common.tuning.instance_overhead_mb = 256;
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
-        back.common.memory_pool_fraction, 0.5,
+        back.common.tuning.memory_pool_fraction, 0.5,
         "memory_pool_fraction must survive round-trip"
     );
     assert_eq!(
-        back.common.instance_overhead_mb, 256,
+        back.common.tuning.instance_overhead_mb, 256,
         "instance_overhead_mb must survive round-trip"
     );
 
@@ -810,11 +825,11 @@ fn scan_spec_memory_fields_round_trip_and_default() {
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
-        legacy.common.memory_pool_fraction, 0.6,
+        legacy.common.tuning.memory_pool_fraction, 0.6,
         "missing memory_pool_fraction must default to 0.6 (backward-compat)"
     );
     assert_eq!(
-        legacy.common.instance_overhead_mb, 200,
+        legacy.common.tuning.instance_overhead_mb, 200,
         "missing instance_overhead_mb must default to 200 (backward-compat)"
     );
 }
@@ -822,11 +837,11 @@ fn scan_spec_memory_fields_round_trip_and_default() {
 #[test]
 fn s3_max_connections_round_trips_and_defaults() {
     let mut spec = sample_spec();
-    spec.common.s3_max_connections = 32;
+    spec.common.tuning.s3_max_connections = 32;
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
-        back.common.s3_max_connections, 32,
+        back.common.tuning.s3_max_connections, 32,
         "s3_max_connections must survive round-trip"
     );
 
@@ -842,12 +857,12 @@ fn s3_max_connections_round_trips_and_defaults() {
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
-        legacy.common.s3_max_connections,
+        legacy.common.tuning.s3_max_connections,
         default_s3_max_connections(),
         "missing s3_max_connections must default to the built-in budget (backward-compat)"
     );
     assert!(
-        legacy.common.s3_max_connections >= 1,
+        legacy.common.tuning.s3_max_connections >= 1,
         "default s3_max_connections must be clamped to at least 1"
     );
 
@@ -857,19 +872,19 @@ fn s3_max_connections_round_trips_and_defaults() {
     }"#;
     let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
     assert_eq!(
-        legacy_common.s3_max_connections,
+        legacy_common.tuning.s3_max_connections,
         default_s3_max_connections(),
         "missing s3_max_connections must default on CommonScanSpec too (backward-compat)"
     );
 
     let split = spec.to_common();
     assert_eq!(
-        split.s3_max_connections, 32,
+        split.tuning.s3_max_connections, 32,
         "to_common must carry s3_max_connections through the split"
     );
     let merged = ScanSpec::from_parts(split, spec.files.clone());
     assert_eq!(
-        merged.common.s3_max_connections, 32,
+        merged.common.tuning.s3_max_connections, 32,
         "from_parts must carry s3_max_connections through the merge"
     );
 }

@@ -1,6 +1,7 @@
 use super::*;
+use crate::ExasolVersion;
 use crate::test_support::*;
-use crate::{CHECKED_INT_DIV_FN, SqlFragment, render_scan_expression};
+use crate::{CHECKED_INT_DIV_FN, SqlFragment};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -30,7 +31,9 @@ fn date_like(subject: Json) -> Json {
 }
 
 fn render(expr: &Json) -> Result<String, UdfError> {
-    render_scan_expression(expr, &columns()).map(|fragment| fragment.sql)
+    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .render_expression(expr)
+        .map(|fragment| fragment.sql)
 }
 
 /// Exasol converts these by the session's NLS settings: a date or non-integer number at a text
@@ -261,9 +264,9 @@ fn a_computed_integer_converts_like_a_column() {
             true,
         ),
         (
-            "SECOND of a DATE",
+            "SECOND of a DATE, DECIMAL(2,0) on Exasol 2025",
             scalar_fn("CONCAT", [second(col("D")), str_lit("x")]),
-            false,
+            true,
         ),
     ];
     for (label, expr, pushed) in cases {
@@ -318,7 +321,9 @@ fn second_renders_the_fraction_of_its_argument_precision() {
     for (argument, sql, ty) in cases {
         for expr in [second(argument.clone()), extract("SECOND", argument)] {
             assert_eq!(
-                render_scan_expression(&expr, &columns()).unwrap(),
+                ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                    .render_expression(&expr)
+                    .unwrap(),
                 SqlFragment::new(sql, Some(ty)),
                 "{expr}"
             );
@@ -327,10 +332,35 @@ fn second_renders_the_fraction_of_its_argument_precision() {
 }
 
 #[test]
-fn second_of_a_date_is_zero_without_an_exact_type() {
-    assert_eq!(
-        render_scan_expression(&second(col("D")), &columns()).unwrap(),
-        SqlFragment::new(r#"CAST(date_part('second', "D") AS DECIMAL(2,0))"#, None)
+fn second_of_a_date_takes_each_versions_type() {
+    let whole = r#"CAST(date_part('second', "D") AS DECIMAL(2,0))"#;
+    let cases = [
+        (
+            ExasolVersion::Exasol8,
+            r#"CAST((CAST((date_part('microsecond', CAST("D" AS TIMESTAMP(3))) / 1000) AS DECIMAL(5,0)) * CAST('0.001' AS DECIMAL(3,3))) AS DECIMAL(5,3))"#,
+            Some(ExasolType::decimal(5, 3)),
+        ),
+        (
+            ExasolVersion::Exasol2025,
+            whole,
+            Some(ExasolType::decimal(2, 0)),
+        ),
+        (ExasolVersion::Unknown, whole, None),
+    ];
+    for (version, sql, ty) in cases {
+        assert_eq!(
+            ScanTyping::new(&columns(), version)
+                .render_expression(&second(col("D")))
+                .unwrap(),
+            SqlFragment::new(sql, ty),
+            "{version:?}"
+        );
+    }
+    assert!(
+        ScanTyping::new(&columns(), ExasolVersion::Exasol8)
+            .render_expression(&scalar_fn("CONCAT", [second(col("D")), str_lit("x")]))
+            .is_err(),
+        "DECIMAL(5,3) converts to text by the session's NLS settings"
     );
 }
 
@@ -353,11 +383,13 @@ fn second_takes_a_computed_arguments_type_from_the_typed_pass() {
         (
             scalar_fn("DATE_TRUNC", [str_lit("month"), col("D")]),
             "second",
-            None,
+            Some(ExasolType::decimal(2, 0)),
         ),
     ];
     for (argument, unit, ty) in cases {
-        let fragment = render_scan_expression(&second(argument), &columns()).unwrap();
+        let fragment = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+            .render_expression(&second(argument))
+            .unwrap();
         assert!(
             fragment.sql.contains(&format!("date_part('{unit}'")),
             "{fragment:?}"
@@ -369,9 +401,18 @@ fn second_takes_a_computed_arguments_type_from_the_typed_pass() {
 #[test]
 fn second_over_any_other_argument_declines() {
     let local_time_zone = ExasolType::TimestampWithLocalTimeZone { precision: 6 };
-    for expr in [
+    for version_dependent in [
         second(scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")])),
         second(case_when([is_not_null(col("TS"))], [col("TS"), col("D")])),
+    ] {
+        assert!(
+            ScanTyping::new(&columns(), ExasolVersion::Unknown)
+                .render_expression(&version_dependent)
+                .is_err(),
+            "{version_dependent} must decline on an unknown version"
+        );
+    }
+    for expr in [
         second(col("S")),
         second(col("UNKNOWN")),
         second(cast_to(local_time_zone, col("TS"))),
@@ -778,13 +819,24 @@ fn infer_type_types_what_the_scan_declines() {
     ];
     for (label, node, expected) in cases {
         assert!(render(&node).is_err(), "{label} must decline in the scan");
-        assert_eq!(infer_type(&node, &columns()).exact(), expected, "{label}");
+        assert_eq!(
+            ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+                .infer_type(&node)
+                .exact(),
+            expected,
+            "{label}"
+        );
     }
 }
 
 #[test]
 fn a_scan_fragment_carries_the_column_or_cast_type_it_emits() {
-    let typed = |expr: &Json| render_scan_expression(expr, &columns()).unwrap().ty;
+    let typed = |expr: &Json| {
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+            .render_expression(expr)
+            .unwrap()
+            .ty
+    };
     assert_eq!(typed(&col("D")), Some(ExasolType::Date));
     assert_eq!(
         typed(&cast_to(ExasolType::decimal(12, 0), col("I"))),
@@ -795,14 +847,16 @@ fn a_scan_fragment_carries_the_column_or_cast_type_it_emits() {
 
 #[test]
 fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
-    let fragment =
-        render_scan_expression(&cast_to(ExasolType::varchar(20), col("S10")), &columns());
+    let fragment = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .render_expression(&cast_to(ExasolType::varchar(20), col("S10")));
     assert_eq!(fragment.unwrap().ty, Some(ExasolType::WIDEST_VARCHAR));
 }
 
 #[test]
 fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
-    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns());
+    let typed = |expr: &Json| {
+        crate::ScanTyping::new(&columns(), ExasolVersion::Exasol2025).exasol_fragment(expr)
+    };
     assert_eq!(
         typed(&cast_to(ExasolType::char(3), col("S10"))),
         SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))
@@ -877,13 +931,28 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
 }
 
 fn type_of(expr: &Json) -> Inferred {
-    let ty = type_scan_tree(expr, &columns()).unwrap().1;
-    assert_eq!(infer_type(expr, &columns()), ty, "{expr}");
+    let ty = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .type_scan_tree(expr)
+        .unwrap()
+        .1;
+    assert_eq!(
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).infer_type(expr),
+        ty,
+        "{expr}"
+    );
     ty
 }
 
 fn typed(expr: &Json) -> Json {
-    type_scan_tree(expr, &columns()).unwrap().0
+    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .type_scan_tree(expr)
+        .unwrap()
+        .0
+}
+
+/// A `TIMESTAMP(precision)` whose values hold `digits` fractional digits.
+const fn coarse(precision: u8, digits: u8) -> Inferred {
+    Inferred::CoarseTimestamp { precision, digits }
 }
 
 const fn timestamp(precision: u8) -> Inferred {
@@ -1003,11 +1072,6 @@ fn date_and_timestamp_types_follow_their_source() {
             timestamp(6),
         ),
         (
-            "CASE over a DATE and a TIMESTAMP(0), whose type differs by Exasol version",
-            case_when([col("B")], [col("D"), col("TS0")]),
-            Inferred::Unknown,
-        ),
-        (
             "CASE over a TIMESTAMP and an LTZ",
             case_when([col("B")], [col("TS"), col("LTZ")]),
             Inferred::Unknown,
@@ -1021,7 +1085,7 @@ fn date_and_timestamp_types_follow_their_source() {
                     scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY")]),
                 ],
             ),
-            Inferred::Partial(Partial::Timestamp),
+            timestamp(9),
         ),
         (
             "GREATEST over two dates",
@@ -1069,15 +1133,123 @@ fn date_and_timestamp_types_follow_their_source() {
             scalar_fn("TO_DATE", [col("S"), str_lit("YYYY-MM-DD")]),
             DATE,
         ),
-        (
-            "TO_TIMESTAMP",
-            scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")]),
-            Inferred::Partial(Partial::Timestamp),
-        ),
     ];
     for (label, expr, expected) in cases {
         assert_eq!(type_of(&expr), expected, "{label}");
     }
+}
+
+/// Scenario: An unknown Exasol version gives no form a version-dependent exact type
+#[test]
+fn version_dependent_forms_take_each_versions_type() {
+    use ExasolVersion::{Exasol8, Exasol2025, Unknown};
+    let to_timestamp = |argument| scalar_fn("TO_TIMESTAMP", [argument]);
+    let partial = Inferred::Partial(Partial::Timestamp);
+    let cases = [
+        (
+            "TO_TIMESTAMP over text",
+            scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")]),
+            [coarse(3, 0), coarse(9, 0), partial],
+        ),
+        (
+            "TO_TIMESTAMP over text with FF6",
+            scalar_fn(
+                "TO_TIMESTAMP",
+                [col("S"), str_lit("YYYY-MM-DD HH24:MI:SS.FF6")],
+            ),
+            [timestamp(3), coarse(9, 6), partial],
+        ),
+        (
+            "TO_TIMESTAMP over text with FF9",
+            scalar_fn(
+                "TO_TIMESTAMP",
+                [col("S"), str_lit("YYYY-MM-DD HH24:MI:SS.FF9")],
+            ),
+            [timestamp(3), timestamp(9), partial],
+        ),
+        (
+            "TO_TIMESTAMP over a DATE",
+            to_timestamp(col("D")),
+            [timestamp(3), timestamp(0), partial],
+        ),
+        (
+            "TO_TIMESTAMP over a TIMESTAMP(6)",
+            to_timestamp(col("TS")),
+            [timestamp(3), timestamp(6), partial],
+        ),
+        (
+            "TO_TIMESTAMP over a TIMESTAMP(3)",
+            to_timestamp(col("TS3")),
+            [timestamp(3), timestamp(3), timestamp(3)],
+        ),
+        (
+            "ADD_HOURS over a DATE",
+            scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]),
+            [timestamp(3), timestamp(0), partial],
+        ),
+        (
+            "a TIMESTAMP literal with 6 digits",
+            timestamp_lit("2024-01-01 00:00:00.123456"),
+            [timestamp(3), timestamp(6), partial],
+        ),
+        (
+            "a TIMESTAMP literal with 3 digits",
+            timestamp_lit("2024-01-01 00:00:00.123"),
+            [timestamp(3), timestamp(3), timestamp(3)],
+        ),
+        (
+            "CASE over a DATE and a TIMESTAMP(0)",
+            case_when([col("B")], [col("D"), col("TS0")]),
+            [DATE, timestamp(0), Inferred::Unknown],
+        ),
+        (
+            "CASE over a TIMESTAMP and a DATE",
+            case_when([col("B")], [col("TS3"), col("D")]),
+            [timestamp(3), timestamp(3), Inferred::Unknown],
+        ),
+        (
+            "CASE over NULL, a DATE, and a TIMESTAMP",
+            case_when([col("B"), col("B")], [null_lit(), col("D"), col("TS3")]),
+            [DATE, timestamp(3), Inferred::Unknown],
+        ),
+        (
+            "GREATEST over a DATE and a TIMESTAMP(6)",
+            scalar_fn("GREATEST", [col("D"), col("TS")]),
+            [DATE, timestamp(6), Inferred::Unknown],
+        ),
+        (
+            "SECOND of a DATE",
+            second(col("D")),
+            [
+                Inferred::Exact(ExasolType::decimal(5, 3)),
+                Inferred::Exact(ExasolType::decimal(2, 0)),
+                Inferred::Partial(Partial::Number),
+            ],
+        ),
+    ];
+    for (label, expr, expected) in cases {
+        for (version, expected) in [Exasol8, Exasol2025, Unknown].into_iter().zip(expected) {
+            assert_eq!(
+                ScanTyping::new(&columns(), version).infer_type(&expr),
+                expected,
+                "{label} on {version:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn exasol_8_brings_a_timestamp_after_a_date_to_the_date() {
+    let expr = case_when([col("B")], [col("D"), col("TS3")]);
+    let typed = ScanTyping::new(&columns(), ExasolVersion::Exasol8)
+        .type_scan_tree(&expr)
+        .unwrap()
+        .0;
+    assert_eq!(typed["results"][0], col("D"));
+    assert_eq!(
+        typed["results"][1]["dataType"],
+        exasol_type_to_json(&ExasolType::Date)
+    );
 }
 
 #[test]
@@ -1225,6 +1397,39 @@ fn date_trunc_over_a_date_returns_a_date() {
 }
 
 #[test]
+fn a_date_part_function_takes_its_fixed_native_type() {
+    for source in ["D", "TS", "TS0", "TS9"] {
+        for (name, ty) in [
+            ("YEAR", integer(4)),
+            ("MONTH", integer(2)),
+            ("DAY", integer(2)),
+            ("HOUR", integer(2)),
+            ("MINUTE", integer(2)),
+            ("WEEK", integer(2)),
+        ] {
+            assert_eq!(
+                type_of(&scalar_fn(name, [col(source)])),
+                ty,
+                "{name}({source})"
+            );
+        }
+        for (field, ty) in [
+            ("YEAR", integer(4)),
+            ("MONTH", integer(2)),
+            ("DAY", integer(2)),
+            ("HOUR", integer(2)),
+            ("MINUTE", integer(2)),
+        ] {
+            assert_eq!(
+                type_of(&extract(field, col(source))),
+                ty,
+                "EXTRACT({field} FROM {source})"
+            );
+        }
+    }
+}
+
+#[test]
 fn date_and_timestamp_text_conversion_declines() {
     let sources = [
         col("D"),
@@ -1270,10 +1475,6 @@ fn unmatched_date_addition_forms_decline() {
                 case_when([col("B")], [col("D"), col("LTZ")]),
             ),
             ("TO_DATE without a format", scalar_fn("TO_DATE", [col("S")])),
-            (
-                "TO_TIMESTAMP, whose precision differs by Exasol version",
-                scalar_fn("TO_TIMESTAMP", [col("S"), str_lit("YYYY-MM-DD")]),
-            ),
             ("an unknown column", col("UNKNOWN")),
         ];
         for (label, first) in first_arguments {
@@ -1598,5 +1799,56 @@ fn an_aggregate_over_an_argument_without_an_exact_type_has_no_exact_type() {
     for name in ["MAX", "SUM"] {
         let aggregate = agg_item_expr(name, sum.clone(), false);
         assert_eq!(type_of(&aggregate).exact(), None, "{name}");
+    }
+}
+
+/// A `TO_TIMESTAMP` computes at the unit of the digits its values hold, not of its declared
+/// `TIMESTAMP(9)`, and keeps 3 digits on Exasol 8.
+#[test]
+fn to_timestamp_computes_at_the_unit_of_its_digits() {
+    use ExasolVersion::{Exasol8, Exasol2025, Unknown};
+    let parsed = |format| scalar_fn("TO_TIMESTAMP", [col("S"), str_lit(format)]);
+    let fraction = "YYYY-MM-DD HH24:MI:SS.FF6";
+    let cases = [
+        (
+            Exasol2025,
+            scalar_fn("ADD_DAYS", [parsed("YYYY-MM-DD"), num_lit(1)]),
+            r#"vs_add_days(CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0) AS TIMESTAMP(6)), 1)"#,
+        ),
+        (
+            Exasol2025,
+            scalar_fn(
+                "ADD_DAYS",
+                [parsed("YYYY-MM-DD HH24:MI:SS.FF9"), num_lit(1)],
+            ),
+            r#"vs_add_days(CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 9) AS TIMESTAMP(9)), 1)"#,
+        ),
+        (
+            Exasol2025,
+            case_when([col("B")], [parsed("YYYY-MM-DD"), col("D")]),
+            r#"(CASE WHEN "B" THEN CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d', 0) AS TIMESTAMP(0)) ELSE CAST("D" AS TIMESTAMP(0)) END)"#,
+        ),
+        (
+            Exasol2025,
+            case_when([col("B")], [parsed(fraction), col("TS0")]),
+            r#"(CASE WHEN "B" THEN CAST(vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 6) AS TIMESTAMP(6)) ELSE CAST("TS0" AS TIMESTAMP(6)) END)"#,
+        ),
+        (
+            Exasol8,
+            parsed(fraction),
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 3)"#,
+        ),
+        (
+            Unknown,
+            parsed(fraction),
+            r#"vs_to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S%.f', 6)"#,
+        ),
+    ];
+    for (version, expr, sql) in cases {
+        let rendered = ScanTyping::new(&columns(), version)
+            .render_expression(&expr)
+            .unwrap()
+            .sql;
+        assert_eq!(rendered, sql, "{expr} on {version:?}");
     }
 }

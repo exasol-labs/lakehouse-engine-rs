@@ -21,6 +21,28 @@ case "$stack" in
   *) usage ;;
 esac
 
+# docker-db is amd64-only, so arm64 hosts default to Nano. The Makefile exports the same choice.
+if [[ -z "${EXASOL_FLAVOR:-}" ]]; then
+  if [[ "${EXASOL_IMAGE:-}" == *exasol/nano* ]]; then
+    EXASOL_FLAVOR=nano
+  elif [[ -n "${EXASOL_IMAGE:-}" ]]; then
+    EXASOL_FLAVOR=docker-db
+  else
+    case "$(uname -m)" in
+      arm64 | aarch64) EXASOL_FLAVOR=nano ;;
+      *) EXASOL_FLAVOR=docker-db ;;
+    esac
+  fi
+fi
+case "$EXASOL_FLAVOR" in
+  docker-db) ;;
+  nano) files+=(-f docker-compose.nano.yml) ;;
+  *)
+    echo "EXASOL_FLAVOR must be 'docker-db' or 'nano', got '$EXASOL_FLAVOR'" >&2
+    exit 2
+    ;;
+esac
+
 compose() {
   docker compose "${files[@]}" "$@"
 }
@@ -66,16 +88,52 @@ start() {
   esac
 }
 
+# Some Compose releases reject `up --wait` on a service without a healthcheck, which Nano
+# lacks, so Nano's exasol starts without waiting and wait_nano_sql probes it instead.
+up_wait() {
+  local services=() service
+  for service in "$@"; do
+    if [[ "$EXASOL_FLAVOR" == nano && "$service" == exasol ]]; then
+      compose up -d exasol
+    else
+      services+=("$service")
+    fi
+  done
+  if ((${#services[@]})); then
+    compose up -d --wait "${services[@]}"
+  fi
+}
+
+# A sidecar in Nano's network namespace sees the SQL port itself, where a published port
+# would accept before the DB does.
+wait_nano_sql() {
+  local container
+  container=$(compose ps -q exasol)
+  if ! docker run --rm --network "container:$container" debian:trixie-slim bash -c \
+    'for _ in $(seq 150); do (</dev/tcp/127.0.0.1/8563) 2>/dev/null && exit 0; sleep 2; done; exit 1'; then
+    echo "::error::Exasol Nano did not accept SQL connections within 300 s" >&2
+    compose logs exasol | tail -50
+    exit 1
+  fi
+}
+
 wait_healthy() {
+  wait_services
+  if [[ "$EXASOL_FLAVOR" == nano ]]; then
+    wait_nano_sql
+  fi
+}
+
+wait_services() {
   case "$stack" in
     e2e)
-      compose up -d --wait exasol proxy
+      up_wait exasol proxy
       await_exit spark-iceberg-fixtures
       ;;
-    lakekeeper) compose up -d --wait exasol seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
-    azure) compose up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
-    unity) compose up -d --wait exasol ;;
-    glue) compose up -d --wait exasol proxy ;;
+    lakekeeper) up_wait exasol seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
+    azure) up_wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
+    unity) up_wait exasol ;;
+    glue) up_wait exasol proxy ;;
     *) usage ;;
   esac
 }

@@ -43,8 +43,8 @@ pub(super) fn build_session_context(
     let spill = probe_tmp_spill();
     let runtime_env = build_runtime_env(
         memory_limit_bytes,
-        spec.common.memory_pool_fraction,
-        spec.common.instance_overhead_mb * 1024 * 1024,
+        spec.common.tuning.memory_pool_fraction,
+        spec.common.tuning.instance_overhead_mb * 1024 * 1024,
         spill,
     )
     .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
@@ -65,12 +65,17 @@ pub(super) fn build_session_context(
         let store: Arc<dyn ObjectStore> = if has_dimension_side {
             let mut routed = Vec::with_capacity(group.len());
             for side in group {
-                let inner = build_side_store(side, spec.common.s3_max_connections, &all_secrets)?;
+                let inner =
+                    build_side_store(side, spec.common.tuning.s3_max_connections, &all_secrets)?;
                 routed.push(RoutedSide::new(side, inner)?);
             }
             Arc::new(PrefixRoutingObjectStore::new(routed))
         } else {
-            build_side_store(group[0], spec.common.s3_max_connections, &all_secrets)?
+            build_side_store(
+                group[0],
+                spec.common.tuning.s3_max_connections,
+                &all_secrets,
+            )?
         };
         ctx.runtime_env().register_object_store(&store_url, store);
     }

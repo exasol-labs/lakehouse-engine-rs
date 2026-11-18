@@ -21,7 +21,7 @@ use parquet::file::statistics::Statistics;
 
 use std::collections::BTreeSet;
 
-use Placement::{OuterWhere, Scan};
+use Placement::{OuterWhere, Scan, Split};
 
 pub const VS_ICEBERG: &str = "PRUNING_ICEBERG";
 pub const VS_HIVE: &str = "PRUNING_HIVE";
@@ -33,14 +33,18 @@ pub const PRUNING_PARQUET_TABLE: &str = "pruning_cases_parquet";
 enum Placement {
     Scan,
     OuterWhere,
+    /// The scan filters on the conjuncts it renders, and the outer WHERE applies the rest.
+    Split,
 }
 
 impl Placement {
     fn holds(self, plan: &str) -> bool {
         let scan_filter = plan.contains(SCAN_FILTER);
+        let outer_where = plan.contains(OUTER_WHERE_ALIAS);
         match self {
             Placement::Scan => scan_filter,
-            Placement::OuterWhere => plan.contains(OUTER_WHERE_ALIAS) && !scan_filter,
+            Placement::OuterWhere => outer_where && !scan_filter,
+            Placement::Split => outer_where && scan_filter,
         }
     }
 }
@@ -361,7 +365,7 @@ const CASES: &[Case] = &[
     // An escaped ordinary character is itself, so these match rows only if the escape applies.
     Case::new("S LIKE 'xaa' ESCAPE 'a'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
     Case::new("P LIKE 'aa%' ESCAPE 'a'", Scan).every_format(&["a1", "a2"]),
-    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", OuterWhere)
+    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", Split)
         .iceberg_and_delta(&["a1", "a2", "b1"]),
     // A plain LIKE escapes with Exasol's default `\`, though Exasol sends no `escapeChar`.
     Case::new(r"S LIKE 'x\a%'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),

@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde_json::Value as Json;
 
 /// The conversion that parses with the format. Only `Timestamp` admits time elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,12 +11,30 @@ pub(crate) enum FormatTarget {
 }
 
 // The one place naming supported parts and separators. `-u` keeps `ſ` from matching `S`.
+// `FFn` without its dot declines: chrono reads no undotted fraction of 1 to n digits.
 static PARTS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i-u)\.?FF[369]|HH24|YYYY|MM|MI|DD|SS|[-/.,;:_ ]").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i-u)\.FF[369]|HH24|YYYY|MM|MI|DD|SS|[-/.,;:_ ]").unwrap());
+
+/// The format model of a `literal_string` format argument.
+pub(crate) fn format_literal(format: &Json) -> Option<&str> {
+    (format.get("type")?.as_str()? == "literal_string")
+        .then(|| format.get("value")?.as_str())
+        .flatten()
+}
 
 /// Translates an Exasol format model to a strftime pattern. `None` means no exact strftime
 /// equivalent exists, so the caller declines.
 pub(crate) fn strftime_pattern(format: &str, target: FormatTarget) -> Option<String> {
+    translate(format, target).map(|(pattern, _)| pattern)
+}
+
+/// The fractional-second digits a `TO_TIMESTAMP` over `format` keeps, 0 without an `FF` part.
+/// `None` when [`strftime_pattern`] does not translate `format`.
+pub(crate) fn fraction_digits(format: &str) -> Option<u8> {
+    translate(format, FormatTarget::Timestamp).map(|(_, counts)| counts.fraction_digits)
+}
+
+fn translate(format: &str, target: FormatTarget) -> Option<(String, PartCounts)> {
     let mut pattern = String::new();
     let mut end = 0;
     let mut counts = PartCounts::default();
@@ -26,12 +45,9 @@ pub(crate) fn strftime_pattern(format: &str, target: FormatTarget) -> Option<Str
         end = part.end();
         let part = part.as_str().to_ascii_uppercase();
         pattern.push_str(match part.as_str() {
-            ".FF3" => "%.3f",
-            ".FF6" => "%.6f",
-            ".FF9" => "%.9f",
-            "FF3" => "%3f",
-            "FF6" => "%6f",
-            "FF9" => "%9f",
+            // Exasol reads one or more digits for `.FFn` and cuts them to n, which the scan
+            // function does after `%.f` reads up to 9.
+            ".FF3" | ".FF6" | ".FF9" => "%.f",
             "HH24" => "%H",
             "YYYY" => "%Y",
             "MM" => "%m",
@@ -42,7 +58,7 @@ pub(crate) fn strftime_pattern(format: &str, target: FormatTarget) -> Option<Str
         });
         counts.add(&part);
     }
-    (end == format.len() && counts.is_supported(target)).then_some(pattern)
+    (end == format.len() && counts.is_supported(target)).then_some((pattern, counts))
 }
 
 #[derive(Default)]
@@ -54,6 +70,7 @@ struct PartCounts {
     minute: usize,
     second: usize,
     fraction: usize,
+    fraction_digits: u8,
 }
 
 impl PartCounts {
@@ -65,7 +82,10 @@ impl PartCounts {
             "HH24" => self.hour += 1,
             "MI" => self.minute += 1,
             "SS" => self.second += 1,
-            _ if part.contains("FF") => self.fraction += 1,
+            ".FF3" | ".FF6" | ".FF9" => {
+                self.fraction += 1;
+                self.fraction_digits = part.as_bytes()[3] - b'0';
+            }
             _ => {}
         }
     }

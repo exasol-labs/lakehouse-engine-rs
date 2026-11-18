@@ -23,7 +23,7 @@ use lakehouse_engine::scan::diagnostics::{
     OpenerCoverage, PhaseTimers, footer_refetch_count, reset_access_plan_cached_footers,
 };
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage, ScanTuning,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -160,7 +160,10 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
         table_root,
         projection: vec!["ID".into(), "NAME".into()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         logical_schema: vec![
             LogicalField {
                 field_id: Some(1),

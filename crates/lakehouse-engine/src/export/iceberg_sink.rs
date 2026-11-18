@@ -1,13 +1,14 @@
 //! The Iceberg sink: Arrow batches become Parquet data files under the table location, and one
 //! commit tagged with the writer adds them to the table.
 
+use super::batch::TableColumns;
 use super::target::ExportSink;
-use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
+use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{DataFile, DataFileFormat, PartitionKey};
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, Schema, SchemaRef};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -23,23 +24,24 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 const TARGET_FILE_SIZE: usize = 128 * 1024 * 1024;
 
-/// The table a writer's files go into: one the catalog holds, or one staged for `SINGLE_COMMIT`.
+/// The table a writer's files go into: one the catalog lists, created or loaded, or one staged for
+/// `SINGLE_COMMIT`.
 pub(super) enum OpenedTable {
-    Created(WriteTable),
+    Listed(WriteTable),
     Staged(StagedTable),
 }
 
 impl OpenedTable {
     fn table(&self) -> &Table {
         match self {
-            Self::Created(created) => created.table(),
+            Self::Listed(listed) => listed.table(),
             Self::Staged(staged) => staged.table(),
         }
     }
 
     fn secret_values(&self) -> Vec<String> {
         match self {
-            Self::Created(created) => created.secret_values(),
+            Self::Listed(listed) => listed.secret_values(),
             Self::Staged(staged) => staged.secret_values(),
         }
     }
@@ -51,7 +53,7 @@ pub(super) struct IcebergSink {
     session: TableWriteSession,
     opened: OpenedTable,
     tag: CommitTag,
-    schema: SchemaRef,
+    columns: TableColumns,
     writer: DataWriter,
     locations: RecordedLocations,
     /// Set after a commit whose outcome is unknown, when the table may hold the files.
@@ -59,7 +61,8 @@ pub(super) struct IcebergSink {
 }
 
 impl IcebergSink {
-    /// The table's schema carries its field IDs, which the Parquet writer matches columns by.
+    /// The table's current schema carries its field IDs, which the Parquet writer matches columns
+    /// by, and every data file carries the table's default partition spec.
     pub(super) async fn open(
         session: TableWriteSession,
         opened: OpenedTable,
@@ -73,8 +76,10 @@ impl IcebergSink {
                 error_chain(&error)
             ))
         };
-        let iceberg_schema = table.metadata().current_schema().clone();
-        let schema = Arc::new(schema_to_arrow_schema(&iceberg_schema).map_err(unwritable)?);
+        let metadata = table.metadata();
+        let iceberg_schema = metadata.current_schema().clone();
+        let columns = table_columns(table.identifier(), &iceberg_schema).map_err(unwritable)?;
+        let partition = partition_key(metadata.default_partition_spec(), iceberg_schema.clone());
         let locations = RecordedLocations {
             inner: DefaultLocationGenerator::new(table.metadata()).map_err(unwritable)?,
             recorded: Arc::default(),
@@ -85,21 +90,21 @@ impl IcebergSink {
             DataFileFormat::Parquet,
         );
         let files = RollingFileWriterBuilder::new(
-            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema),
+            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone()),
             TARGET_FILE_SIZE,
             table.file_io().clone(),
             locations.clone(),
             names,
         );
         let writer = DataFileWriterBuilder::new(files)
-            .build(None)
+            .build(Some(partition))
             .await
             .map_err(unwritable)?;
         Ok(Self {
             session,
             opened,
             tag,
-            schema,
+            columns,
             writer,
             locations,
             files_may_be_committed: false,
@@ -107,54 +112,43 @@ impl IcebergSink {
     }
 
     fn storage_error(&self, error: iceberg::Error) -> UdfError {
-        self.redacted(
-            format!(
-                "writing the data files of table {} to storage failed: {}",
-                self.opened.table().identifier(),
-                error_chain(&error)
-            ),
-            Vec::new(),
-        )
+        self.redacted(format!(
+            "writing the data files of table {} to storage failed: {}",
+            self.opened.table().identifier(),
+            error_chain(&error)
+        ))
     }
 
-    /// `message` without any storage credential the sink's tables have signed with.
-    fn redacted(&self, message: String, mut secrets: Vec<String>) -> UdfError {
-        secrets.extend(self.opened.secret_values());
+    /// `message` without any storage credential the sink's table signs with.
+    fn redacted(&self, message: String) -> UdfError {
+        let secrets = self.opened.secret_values();
         let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
         UdfError::User(redact_error_text(&message, &secrets))
     }
 
-    /// Appends to the table reloaded with every writer's commits so far, or creates the staged
-    /// table with the files.
+    /// Appends to the table reloaded with every writer's commits so far, under the schema and
+    /// partition spec the files were written with, or creates the staged table with the files.
     async fn commit(&mut self, files: Vec<DataFile>) -> Result<(), UdfError> {
-        let (committed, reloaded_secrets) = match &self.opened {
-            OpenedTable::Created(created) => {
-                let table = self
-                    .session
-                    .load_table(created.table().identifier())
-                    .await?;
-                let committed = self.session.append_files(&table, files, &self.tag).await;
-                (committed, table.secret_values())
+        let committed = match &self.opened {
+            OpenedTable::Listed(listed) => {
+                self.session.append_files(listed, files, &self.tag).await
             }
             OpenedTable::Staged(staged) => {
-                let committed = self.session.commit_staged(staged, files, &self.tag).await;
-                (committed, Vec::new())
+                self.session.commit_staged(staged, files, &self.tag).await
             }
         };
-        match committed {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.files_may_be_committed = error.outcome_unknown();
-                Err(self.redacted(error.to_string(), reloaded_secrets))
-            }
-        }
+        let Err(error) = committed else {
+            return Ok(());
+        };
+        self.files_may_be_committed = error.outcome_unknown();
+        Err(self.redacted(error.to_string()))
     }
 }
 
 #[async_trait(?Send)]
 impl ExportSink for IcebergSink {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn columns(&self) -> &TableColumns {
+        &self.columns
     }
 
     async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError> {
@@ -183,6 +177,28 @@ impl ExportSink for IcebergSink {
     }
 }
 
+/// The columns of `schema` as the batch builder binds the source to them, with each column's
+/// Iceberg type name, such as `long` or `decimal(20, 2)`, for a mismatch error.
+pub(super) fn table_columns(table: &TableIdent, schema: &Schema) -> iceberg::Result<TableColumns> {
+    Ok(TableColumns {
+        table: table.to_string(),
+        schema: Arc::new(schema_to_arrow_schema(schema)?),
+        type_names: schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.field_type.to_string())
+            .collect(),
+    })
+}
+
+/// The partition of every data file: `spec` with a null value per field. The target refuses a
+/// spec with a field other than `void`, whose value is always null.
+fn partition_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
+    let nulls = spec.fields().iter().map(|_| None).collect();
+    PartitionKey::new(spec.clone(), schema, nulls)
+}
+
 /// The table's default data file locations, each recorded so that `abort` can delete it.
 #[derive(Clone)]
 struct RecordedLocations {
@@ -200,8 +216,9 @@ impl RecordedLocations {
 }
 
 impl LocationGenerator for RecordedLocations {
-    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
-        let location = self.inner.generate_location(partition_key, file_name);
+    /// Every file lies directly under the data location: no data file has a partition value.
+    fn generate_location(&self, _: Option<&PartitionKey>, file_name: &str) -> String {
+        let location = self.inner.generate_location(None, file_name);
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

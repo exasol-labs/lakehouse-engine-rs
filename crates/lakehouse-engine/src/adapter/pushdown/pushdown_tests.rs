@@ -1,8 +1,9 @@
 use super::test_support::*;
 use super::*;
+use crate::adapter::tuning::Tuning;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
-    StorageProps,
+    ScanTuning, StorageProps,
 };
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
@@ -417,55 +418,109 @@ fn iceberg_declaration_omits_default_for_no_default_field() {
     );
 }
 
-/// Scenario: A decimal initial-default outside Exasol's DECIMAL domain is not encoded as a numeric default
+/// Scenario: The VS encodes each field's Iceberg initial-default once per query into the scan spec
 #[test]
-fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
-    use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+fn declaration_encodes_every_primitive_initial_default() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
     use std::sync::Arc;
 
-    let schema = Schema::builder()
-        .with_schema_id(1)
-        .with_fields(vec![
-            Arc::new(
-                NestedField::optional(
-                    1,
-                    "scale_over_precision",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 5,
-                        scale: 10,
-                    }),
-                )
-                .with_initial_default(Literal::decimal(1234)),
-            ),
-            Arc::new(
-                NestedField::optional(
-                    2,
-                    "zero_precision",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 0,
-                        scale: 0,
-                    }),
-                )
-                .with_initial_default(Literal::decimal(0)),
-            ),
-        ])
-        .build()
-        .unwrap();
+    // Each type reads as the text or hex a stored value of the column renders as.
+    let cases: Vec<(PrimitiveType, Literal, &str, &str)> = vec![
+        (
+            PrimitiveType::Time,
+            Literal::time((22 * 3600 + 31 * 60 + 8) * 1_000_000 + 123_456),
+            "utf8",
+            "22:31:08.123456",
+        ),
+        (
+            PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+            Literal::decimal(12_345),
+            "utf8",
+            "123.45",
+        ),
+        (
+            PrimitiveType::Binary,
+            Literal::binary([0xde, 0xad, 0xbe, 0xef]),
+            "binary",
+            "deadbeef",
+        ),
+        (
+            PrimitiveType::Fixed(4),
+            Literal::fixed([1, 2, 3, 4]),
+            "fixed_size_binary(4)",
+            "01020304",
+        ),
+        (
+            PrimitiveType::Uuid,
+            Literal::uuid_from_str("01234567-89ab-cdef-0123-456789abcdef").unwrap(),
+            "fixed_size_binary(16)",
+            "0123456789abcdef0123456789abcdef",
+        ),
+    ];
 
-    let logical = declared_logical_schema(&schema);
-
-    assert_eq!(logical.len(), 2);
-    for field in &logical {
+    for (primitive, default, tag, encoded) in cases {
+        let field = NestedField::required(1, "c", Type::Primitive(primitive.clone()))
+            .with_initial_default(default);
+        let declaration = decoded_notes(&iceberg_notes(&[Arc::new(field)])).remove(0);
+        assert_eq!(declaration.refused, None, "{primitive} must not be refused");
+        assert_eq!(declaration.source_type.arrow_type, tag, "{primitive} tag");
         assert_eq!(
-            field.arrow_type, "utf8",
-            "field {} must fall back to the utf8 tag",
-            field.name
+            declaration.source_type.initial_default.as_deref(),
+            Some(encoded),
+            "{primitive} default must read as a stored value renders"
         );
+    }
+}
+
+/// Scenario: A primitive initial-default that cannot be read at its column's declared type refuses the column
+#[test]
+fn declaration_refuses_a_column_whose_initial_default_cannot_be_rendered() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+    use std::sync::Arc;
+
+    let cases: Vec<(&str, PrimitiveType, Literal)> = vec![
+        (
+            "scale_over_precision",
+            PrimitiveType::Decimal {
+                precision: 5,
+                scale: 10,
+            },
+            Literal::decimal(1234),
+        ),
+        (
+            "zero_precision",
+            PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            },
+            Literal::decimal(0),
+        ),
+        (
+            "fixed_wrong_length",
+            PrimitiveType::Fixed(4),
+            Literal::fixed([1, 2, 3]),
+        ),
+        // Unreachable from catalog JSON, which iceberg-rust parses against the field's type.
+        ("mismatched_literal", PrimitiveType::Int, Literal::long(7)),
+    ];
+
+    for (name, primitive, default) in cases {
+        let field = NestedField::optional(1, name, Type::Primitive(primitive))
+            .with_initial_default(default);
+        let declaration = decoded_notes(&iceberg_notes(&[Arc::new(field)])).remove(0);
+        let reason = declaration
+            .refused
+            .unwrap_or_else(|| panic!("column '{name}' must be refused"));
         assert!(
-            field.initial_default.is_none(),
-            "field {} must encode no default under the utf8 tag",
-            field.name
+            reason.contains(&format!("'{name}'"))
+                && reason.contains("initial-default")
+                && !reason.contains("partition"),
+            "the reason must name the column and its initial-default, not a partition: {reason}"
         );
+        assert_eq!(declaration.source_type.initial_default, None);
     }
 }
 
@@ -627,7 +682,7 @@ fn guard_dispatch_sql(
             RowProjection::Direct(projected_columns(&proj_cols, &proj_types))
         },
         &column_types(&guard_col_types()),
-        (None, None),
+        ScanWhere::Absent,
         limit,
         logical_schema,
         &sample_scan_storage(),
@@ -645,7 +700,7 @@ fn dispatch_with(
     request: &Json,
     projection: RowProjection,
     col_types: &ColumnTypes,
-    (filter, declined_filter): (Option<String>, Option<&Json>),
+    scan_where: ScanWhere<'_>,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
     scan_storage: &ScanStorage,
@@ -659,25 +714,18 @@ fn dispatch_with(
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
         &single_table_emission(request, &pushdown, col_types)?,
         scan_for(col_types, &pushdown_req),
-        filter,
-        declined_filter,
+        scan_where,
         limit,
         order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        logical_schema,
-        Vec::new(),
-        Vec::new(),
-        scan_storage,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
+        CommonScanSpec {
+            storage: scan_storage.clone(),
+            ..dispatch_base(ResolvedScan {
+                logical_schema,
+                ..resolved_table("s3://warehouse/db/events")
+            })
+        },
+        &dispatch_context(),
     )
 }
 
@@ -840,34 +888,33 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
 }
 
 #[test]
-fn pruning_input_unchanged_when_df_render_declines() {
+fn a_split_where_keeps_each_declined_conjunct_as_exasol_sent_it() {
     // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
     // is rewritten, so the equality assertion distinguishes original from rewritten.
-    let filter = and([
-        compare("predicate_greater", col("id"), num_lit(5)),
-        declined_second_predicate(col("ts")),
-        compare(
-            "predicate_greater",
-            scalar_fn("LENGTH", [col("amount")]),
-            num_lit(5),
-        ),
-    ]);
-    let col_types = vec![
-        ("ID".to_string(), ExasolType::decimal(20, 0)),
-        ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
-        ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
-    ];
-    let (scan_filter, declined) = scan_over(&column_types(&col_types)).split_where(Some(&filter));
-
-    assert!(
-        scan_filter.is_none(),
-        "the DataFusion render must decline this filter: {scan_filter:?}"
+    let id_above_five = compare("predicate_greater", col("id"), num_lit(5));
+    let second = declined_second_predicate(col("ts"));
+    let length = compare(
+        "predicate_greater",
+        scalar_fn("LENGTH", [col("amount")]),
+        num_lit(5),
     );
+    let filter = and([id_above_five.clone(), second.clone(), length.clone()]);
+    let col_types = column_types(&[
+        ("ID", ExasolType::decimal(20, 0)),
+        ("TS", ExasolType::BARE_TIMESTAMP),
+        ("AMOUNT", ExasolType::decimal(18, 2)),
+    ]);
+    let scan_where = scan_over(&col_types).split_where(Some(&filter));
+
     assert_eq!(
-        declined,
-        Some(&filter),
-        "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
-             tree the resolver prunes with"
+        scan_where,
+        ScanWhere::Split {
+            pushed: scan_filter_sql(&id_above_five, &col_types)
+                .expect("the bare id comparison renders"),
+            declined: and([second, length]),
+        },
+        "the declined half must hold the declined conjuncts as Exasol sent them, not their scan \
+         rewrites"
     );
 }
 
@@ -1152,7 +1199,6 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     );
 }
 
-/// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
 fn declined_order_by_renders_every_ordering_in_full() {
     let ordered = guard_events()
@@ -1575,12 +1621,14 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             physical_name: None,
         }],
         storage: back.storage.clone(),
-        df_target_partitions: 1,
-        df_batch_size: 1024,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 4,
+        tuning: ScanTuning {
+            df_target_partitions: 1,
+            df_batch_size: 1024,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 4,
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -1669,25 +1717,16 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection,
         &emitting(&columns),
         scan_for(&columns, &pushdown_req),
-        None,
-        None,
+        ScanWhere::Absent,
         None,
         false,
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
-        vec!["LETTER".to_string()],
-        &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
+        &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
+        dispatch_base(ResolvedScan {
+            logical_schema: Vec::new(),
+            partition_columns: vec!["LETTER".to_string()],
+            ..resolved_table("s3://warehouse/db/events")
+        }),
+        &dispatch_context(),
     )
     .expect("build_dispatch_sql must succeed for the EVENTS fixture");
     let sql = result["sql"]
@@ -1702,27 +1741,31 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let fact = ResolvedJoinSide {
         table_name: "ORDERS".to_string(),
         table_identifier: "cat.sch.orders".to_string(),
-        table_root: "s3://warehouse/lh/orders".to_string(),
-        files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: Vec::new(),
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/orders".to_string(),
+            files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: Vec::new(),
+            refused_columns: Vec::new(),
+        },
         total_bytes: 100,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
         table_identifier: "cat.sch.customer".to_string(),
-        table_root: "s3://warehouse/lh/customer".to_string(),
-        files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        effective_storage: sample_storage(),
-        partition_columns: vec!["REGION".to_string()],
+        scan: ResolvedScan {
+            table_root: "s3://warehouse/lh/customer".to_string(),
+            files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: vec!["REGION".to_string()],
+            refused_columns: Vec::new(),
+        },
         total_bytes: 10,
-        refused_columns: Vec::new(),
         column_types: column_types(NO_COLUMNS),
     };
     let sides = broadcast_sides(fact, dimension, 1);
@@ -1733,19 +1776,17 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
             exa_type: ExasolType::decimal(20, 0),
         }],
     );
-    let tuning = super::joins::JoinScanRequestConfig {
-        cluster_nodes: 1,
-        parallelism_factor: 1,
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
-        binary_as_string: false,
-        connection: &super::test_support::TEST_CONNECTION,
-        udf_name: SCAN_UDF_NAME,
-        distribute_udf_name: DISTRIBUTE_FILES_UDF_NAME,
+    let base = test_context();
+    let tuning = PushdownContext {
+        tuning: Tuning {
+            scan: ScanTuning {
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+                ..base.tuning.scan
+            },
+            ..base.tuning
+        },
+        ..base
     };
     let join_sql = super::joins::build_broadcast_join_sql(&sides, &rendered, &tuning)
         .expect("selecting the wire storage must succeed")

@@ -6,9 +6,9 @@ use super::super::super::test_support::{
 };
 use super::super::ResolvedScan;
 use super::*;
-use crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::pushdown::test_support::connection_storage;
+use crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -682,7 +682,7 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
 
     for (value, source_type, tag, file_value) in cases {
         let declared = crate::types::mapping::arrow_type_from_tag(tag);
-        let rendered = render_identity_value(&Literal::Primitive(value.clone()), &source_type, tag)
+        let rendered = render_at_declared_type(&value, &source_type, tag)
             .unwrap_or_else(|e| panic!("{source_type} {value:?} must render at {tag}: {e}"));
         let converted = crate::scan::partition_scalar(&rendered, &declared)
             .unwrap_or_else(|e| panic!("'{rendered}' must convert back to {tag}: {e}"));
@@ -696,7 +696,7 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
         );
     }
 
-    let empty = render_identity_value(&Literal::string(""), &T::String, "utf8")
+    let empty = render_at_declared_type(&L::String(String::new()), &T::String, "utf8")
         .expect("an empty string renders");
     assert_eq!(
         crate::scan::non_null_partition_value(Some(&empty)),

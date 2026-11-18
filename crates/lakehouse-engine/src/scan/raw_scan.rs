@@ -82,7 +82,7 @@ pub(super) async fn physical_plan(df: DataFrame) -> Result<Arc<dyn ExecutionPlan
 /// and data-file footers alike), shared across all its providers. Sized per call, never at
 /// process scope. Clamped to 1 because `Semaphore::new(0)` would deadlock every read.
 pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(spec.common.s3_max_connections.max(1)))
+    Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1)))
 }
 
 async fn build_dataframe(

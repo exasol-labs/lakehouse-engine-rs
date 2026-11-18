@@ -251,15 +251,20 @@ pub(crate) fn partition_scalar(
     if !data_type.is_binary() {
         return ScalarValue::try_from_string(value.to_string(), data_type);
     }
-    let bytes = hex::decode(value).map_err(|e| {
-        DataFusionError::Execution(format!("a binary partition value must be hex: {e}"))
-    })?;
+    hex_scalar(value, data_type)
+        .map_err(|cause| DataFusionError::Execution(format!("a binary partition value {cause}")))
+}
+
+/// Decodes the lowercase hex that carries a binary value of `data_type`. The cause names no
+/// subject, so each caller states whose value it is.
+pub(crate) fn hex_scalar(value: &str, data_type: &DataType) -> Result<ScalarValue, String> {
+    let bytes = hex::decode(value).map_err(|e| format!("must be hex: {e}"))?;
     match data_type {
         DataType::FixedSizeBinary(width) if usize::try_from(*width).ok() != Some(bytes.len()) => {
-            Err(DataFusionError::Execution(format!(
-                "a fixed({width}) partition value must hold {width} bytes, not {}",
+            Err(format!(
+                "of type fixed({width}) must hold {width} bytes, not {}",
                 bytes.len()
-            )))
+            ))
         }
         DataType::FixedSizeBinary(width) => Ok(ScalarValue::FixedSizeBinary(*width, Some(bytes))),
         DataType::LargeBinary => Ok(ScalarValue::LargeBinary(Some(bytes))),

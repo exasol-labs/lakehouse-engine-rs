@@ -489,7 +489,7 @@ async fn plan_file_tasks(
     manifest_concurrency: NonZeroUsize,
     secrets: &[&str],
 ) -> Result<Vec<iceberg::scan::FileScanTask>, UdfError> {
-    let cores = crate::adapter::resolve_nr_of_cores() as usize;
+    let cores = crate::adapter::tuning::resolve_nr_of_cores() as usize;
     // iceberg-rust sets the manifest-file limit only together with the CPU-bound entry limit.
     let mut scan_builder = table
         .scan()
@@ -569,7 +569,12 @@ fn identity_partition_values(
                 .field_type
                 .as_primitive_type()?;
             let rendered = value
-                .map(|value| render_identity_value(value, source_type, &logical.arrow_type))
+                .map(|value| match value {
+                    iceberg::spec::Literal::Primitive(value) => {
+                        render_at_declared_type(value, source_type, &logical.arrow_type)
+                    }
+                    _ => Err("the partition struct holds a non-primitive value".to_string()),
+                })
                 .transpose()
                 .map_err(|cause| {
                     // Dropping the value would read the file's column, or NULL, in its place.
@@ -585,40 +590,41 @@ fn identity_partition_values(
         .collect()
 }
 
-/// A partition value's string form cannot hold arbitrary bytes, so a binary value travels as the
-/// lowercase hex that `scan::partition_scalar` decodes.
-fn identity_hex(
+/// A string cannot hold arbitrary bytes, so a binary value travels as the lowercase hex that
+/// `scan::hex_scalar` decodes.
+fn binary_hex(
     value: &iceberg::spec::PrimitiveLiteral,
     source_type: &iceberg::spec::PrimitiveType,
-) -> Option<String> {
+) -> Option<Result<String, String>> {
     use iceberg::spec::{PrimitiveLiteral as L, PrimitiveType as T};
     match (value, source_type) {
-        (L::Binary(bytes), T::Binary | T::Fixed(_)) => Some(hex::encode(bytes)),
+        (L::Binary(bytes), T::Fixed(len)) if u64::try_from(bytes.len()).ok() != Some(*len) => {
+            Some(Err(format!(
+                "a fixed({len}) value must hold {len} bytes, not {}",
+                bytes.len()
+            )))
+        }
+        (L::Binary(bytes), T::Binary | T::Fixed(_)) => Some(Ok(hex::encode(bytes))),
         // iceberg-rust holds a uuid as the big-endian `u128` of its 16 bytes.
-        (L::UInt128(uuid), T::Uuid) => Some(hex::encode(uuid.to_be_bytes())),
+        (L::UInt128(uuid), T::Uuid) => Some(Ok(hex::encode(uuid.to_be_bytes()))),
         _ => None,
     }
 }
 
 /// Casts as the scan's expression adapter casts a file column of another type than the declared
-/// one, so a reconstructed value reads exactly as a stored one. The result is the string
-/// `scan::partition_scalar` parses back at the declared type.
-fn render_identity_value(
-    value: &iceberg::spec::Literal,
+/// one, so a reconstructed value reads exactly as a stored one. The result is the string the scan
+/// parses back at the declared type. The cause names no subject, so each caller states whose value
+/// it is.
+fn render_at_declared_type(
+    value: &iceberg::spec::PrimitiveLiteral,
     source_type: &iceberg::spec::PrimitiveType,
     arrow_type_tag: &str,
 ) -> Result<String, String> {
-    let iceberg::spec::Literal::Primitive(value) = value else {
-        return Err(format!(
-            "the partition struct holds a non-primitive value for a {source_type} column"
-        ));
-    };
-    if let Some(hex) = identity_hex(value, source_type) {
-        return Ok(hex);
+    if let Some(hex) = binary_hex(value, source_type) {
+        return hex;
     }
-    let file_value = file_column_value(value, source_type).ok_or_else(|| {
-        format!("the partition struct holds a value of another type than the {source_type} column")
-    })?;
+    let file_value = file_column_value(value, source_type)
+        .ok_or_else(|| format!("a {source_type} column cannot hold the value {value:?}"))?;
     let declared = crate::types::mapping::arrow_type_from_tag(arrow_type_tag);
     let read = ColumnarValue::Array(file_value)
         .cast_to(&declared, None)
@@ -730,14 +736,30 @@ pub(super) fn declaration(field: &iceberg::spec::NestedField) -> ColumnDeclarati
         let member_path = (path != field.name).then_some(path.as_str());
         column_refusal("Iceberg", &field.name, member_path, &cause)
     });
-    let arrow_type = crate::types::mapping::iceberg_type_to_arrow(&field.field_type);
+    let arrow_type = crate::types::mapping::arrow_type_to_tag(
+        &crate::types::mapping::iceberg_type_to_arrow(&field.field_type),
+    );
+    // A dropped default would read NULL, or the required-absent error, for every older file.
+    let initial_default = encode_initial_default(field, &arrow_type);
+    let refused = refused.or_else(|| {
+        initial_default.as_ref().err().map(|cause| {
+            column_refusal(
+                "Iceberg",
+                &field.name,
+                None,
+                &format!(
+                    "has an initial-default that cannot be read at its declared type ({cause})"
+                ),
+            )
+        })
+    });
     ColumnDeclaration {
         source_type: LogicalField {
             field_id: Some(field.id),
             name: field.name.clone(),
-            arrow_type: crate::types::mapping::arrow_type_to_tag(&arrow_type),
+            arrow_type,
             nullable: !field.required,
-            initial_default: encode_initial_default(field),
+            initial_default: initial_default.ok().flatten(),
             nested: derive_nested_members(&field.field_type),
             physical_name: None,
         },
@@ -776,16 +798,26 @@ fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
     }
 }
 
-/// Reads `initial_default` only (`write_default` governs writes). Gated on the
-/// `PrimitiveType`, not the Arrow tag: several primitives collapse onto `"utf8"` and the
-/// scan side dispatches on the tag alone, so only primitives with a first-class Arrow tag
-/// are encoded (mirroring `iceberg_predicate::literal_to_datum`). Temporals carry their raw
-/// integer and decimals their unscaled `i128`, so the scan side needs no second parse.
-fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> {
+/// Reads `initial_default` only (`write_default` governs writes). A primitive whose Arrow tag holds
+/// it natively carries the raw value: the integer, days, ticks, or `i128` decimal mantissa. Every
+/// other primitive carries the text or hex a stored value of the column reads as, so the scan needs
+/// no second parse.
+fn encode_initial_default(
+    field: &iceberg::spec::NestedField,
+    arrow_type_tag: &str,
+) -> Result<Option<String>, String> {
     use iceberg::spec::{PrimitiveLiteral, PrimitiveType};
 
-    let primitive = field.field_type.as_primitive_type()?;
-    let literal = field.initial_default.as_ref()?.as_primitive_literal()?;
+    let Some(primitive) = field.field_type.as_primitive_type() else {
+        return Ok(None);
+    };
+    let Some(literal) = field
+        .initial_default
+        .as_ref()
+        .and_then(|default| default.as_primitive_literal())
+    else {
+        return Ok(None);
+    };
 
     let encoded = match (primitive, &literal) {
         (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v)) => v.to_string(),
@@ -807,7 +839,7 @@ fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> 
         {
             v.to_string()
         }
-        _ => return None,
+        _ => render_at_declared_type(&literal, primitive, arrow_type_tag)?,
     };
-    Some(encoded)
+    Ok(Some(encoded))
 }

@@ -13,7 +13,8 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, ScanStorage, ScanTuning, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
@@ -75,7 +76,10 @@ fn scan_spec(file_url: String) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url, size)])
@@ -200,7 +204,10 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
             allow_http: true,
             ..Default::default()
         })),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)

@@ -21,7 +21,8 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, ScanTuning, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -152,7 +153,10 @@ fn basic_partitioned_spec(
         filter,
         limit,
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)
@@ -318,7 +322,10 @@ fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
         logical_schema: logical_schema_with_flag(),
         partition_columns: vec!["letter".to_string(), "flag".to_string()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(files)
@@ -456,7 +463,10 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
         logical_schema: one_off_logical_schema(),
         partition_columns: vec!["letter".to_string()],
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![entry]);
@@ -620,7 +630,10 @@ fn scan_without_partition_columns_is_byte_identical() {
         table_root: table_root.clone(),
         logical_schema: unpartitioned_logical_schema(),
         storage: ScanStorage::Inline(dummy_storage()),
-        df_batch_size: 64,
+        tuning: ScanTuning {
+            df_batch_size: 64,
+            ..Default::default()
+        },
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(rel, size)]);

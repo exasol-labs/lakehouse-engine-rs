@@ -2,6 +2,7 @@ use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use super::context::PushdownContext;
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::support::{
@@ -16,6 +17,7 @@ pub(super) fn empty_result_sql(
     projection: &RowProjection,
     scan: ScanTranslator<'_>,
     relation: &EmptyRelation,
+    context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let sql = match classify_request_shape(bound, scan) {
         // Mirrors the non-empty merge's and wrapper's `selectList`-shaped output; a full-row shape
@@ -24,7 +26,7 @@ pub(super) fn empty_result_sql(
             empty_select_list_typed_sql(pushdown.select_types())
         }
         RequestShape::SingleGroupAgg { .. } | RequestShape::SingleGroupWrapper => {
-            relation.pushdown(pushdown)?
+            relation.pushdown(pushdown, context)?
         }
         RequestShape::RowScan => match projection {
             RowProjection::Wrapped => empty_select_list_typed_sql(pushdown.select_types()),

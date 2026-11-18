@@ -8,7 +8,7 @@ use crate::types::mapping::{arrow_time_unit, emitted_unit};
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -165,6 +165,7 @@ pub(crate) fn coerce_column(
     declared: &ColumnInfo,
     target: &DataType,
 ) -> Result<ArrayRef, UdfError> {
+    let target = &emitted_target(column.data_type(), target);
     if column.data_type() == target {
         return Ok(column.clone());
     }
@@ -187,6 +188,19 @@ pub(crate) fn coerce_column(
             column.data_type()
         ))
     })
+}
+
+/// `target`, except that a timestamp coarser than it widens only to milliseconds: the SLC emits
+/// any finer unit, and nanoseconds would add their 1677 to 2262 range (`emitted_unit`).
+fn emitted_target(column: &DataType, target: &DataType) -> DataType {
+    match (column, target) {
+        (DataType::Timestamp(held, None), DataType::Timestamp(declared, None))
+            if held < declared =>
+        {
+            DataType::Timestamp((*held).max(TimeUnit::Millisecond), None)
+        }
+        _ => target.clone(),
+    }
 }
 
 /// The scan's layer over the one column-metadata reader: the integer bins emit as the

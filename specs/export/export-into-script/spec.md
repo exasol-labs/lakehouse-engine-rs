@@ -1,12 +1,12 @@
 # Feature: EXPORT INTO SCRIPT Source Rows
 
-A user exports an Exasol table, a query over virtual schema tables, or a query that joins both, with `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT`. Exasol runs the same script as the writer over the source rows. The writers write the rows into the new Iceberg table that `TABLE_NAME` names, and Exasol reports the number of written rows as the statement's row count (#566).
+A user exports an Exasol table, a query over virtual schema tables, or a query that joins both, with `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT`. Exasol runs the same script as the writer over the source rows. The writers write the rows into the Iceberg table that `TABLE_NAME` names, which they create or append to, and Exasol reports the number of written rows as the statement's row count.
 
 ## Background
 
 * Statement, options, and writer count: export/export-options § Background.
-* "Read through a virtual schema" means a `SELECT` over a virtual schema that the same CONNECTION backs and that lists the new table.
-* A source with no rows creates no table and has its column types checked by no writer, so a zero-row source with a `TIMESTAMP(7)` to `TIMESTAMP(9)` column also succeeds with a row count of 0.
+* "Read through a virtual schema" means a `SELECT` over a virtual schema that the same CONNECTION backs and that lists the table.
+* A source with no rows reaches no writer. It creates no table, adds no snapshot to an existing table, and has its columns checked by no writer, so a zero-row source with a `TIMESTAMP(7)` to `TIMESTAMP(9)` column, or with columns that an existing table does not accept, also succeeds with a row count of 0.
 
 ## Scenarios
 
@@ -27,9 +27,9 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 ### Scenario: An empty source exports zero rows
 
 * *GIVEN* a query that returns no rows
-* *WHEN* a user exports it into a table that does not exist
+* *WHEN* a user exports it into a table that does not exist, or into an existing table whose columns do not match the query's
 * *THEN* the statement SHALL succeed with a row count of 0
-* *AND* the export SHALL NOT create the table
+* *AND* the export SHALL NOT create the table, and SHALL add no snapshot to the existing table
 
 ### Scenario: A whole-table export writes every source row
 

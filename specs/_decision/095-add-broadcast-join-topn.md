@@ -8,11 +8,11 @@
 
 ### Context
 
-A per-shard post-join top-N is correct only when each shard's ordering agrees with the Exasol wrapper's ranking of the merged rows. Three emitted values differ from the native value the scan reads: JSON or cast fallback columns arrive as text, an empty string arrives as NULL, and a float `NaN` arrives as NULL. A shard that ranked the native value could drop a row the wrapper needs and return wrong rows without error. The adapter cannot see which keys render as JSON, so a plan-time guard is not possible.
+A per-shard post-join top-N is correct only when each shard's ordering agrees with the Exasol wrapper's ranking of the merged rows. Some emitted values differ from the native value the scan reads (fallback columns arrive as text, and an empty string or a float `NaN` arrives as NULL), and the adapter cannot see at plan time which keys render as JSON.
 
 ### Decision
 
-A per-shard sort whose output a merge re-ranks ranks the value the merge sees, and the module that renders the emitted value owns that rule. The join scan sorts each post-join key over the same expression the select list emits. A string key maps an empty string to NULL, and a float key maps `NaN` to NULL. Direction and NULL placement render through the shared sort-key renderer.
+A per-shard sort whose output a merge re-ranks ranks the value the merge sees, and the module that renders the emitted value owns that rule. The join scan sorts each post-join key over the same expression the select list emits, so a string key maps an empty string to NULL and a float key maps `NaN` to NULL. Direction and NULL placement render through the shared sort-key renderer.
 
 ### Options Considered
 

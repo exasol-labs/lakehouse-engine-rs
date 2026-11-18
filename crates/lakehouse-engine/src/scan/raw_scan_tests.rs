@@ -120,7 +120,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
 #[test]
 fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     let mut spec = minimal_spec();
-    spec.common.s3_max_connections = 0;
+    spec.common.tuning.s3_max_connections = 0;
     assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
 }
 
@@ -1105,5 +1105,51 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     assert!(
         !text.contains(SENTINEL),
         "the resolved credential must be stripped from a raw-scan error: {text}"
+    );
+}
+
+#[tokio::test]
+async fn datafusion_truncates_an_overprecise_timestamp_literal() {
+    use datafusion::arrow::array::TimestampMillisecondArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::SessionContext;
+
+    // apache/datafusion#22142: DataFusion truncates a microsecond literal to the column's
+    // millisecond unit. A failure means the release carries apache/datafusion#22906, and
+    // `floor_timestamp_literals` (vs-expression `scan_typing.rs`) and this test go.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    )]));
+    let millis = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+        .and_then(|day| day.and_hms_milli_opt(0, 0, 0, 123))
+        .expect("2025-06-01 00:00:00.123 is a valid instant")
+        .and_utc()
+        .timestamp_millis();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![millis]))],
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+
+    let batches = ctx
+        .sql("SELECT ts FROM t WHERE ts = TIMESTAMP '2025-06-01 00:00:00.123456'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "DataFusion no longer truncates the literal to the column's unit: remove \
+         `floor_timestamp_literals` and this test"
     );
 }
