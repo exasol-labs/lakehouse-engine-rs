@@ -135,8 +135,8 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::shaped("CAST"),
         // MOD: Exasol requires `MOD(a, b)`, DataFusion the `%` operator.
         F::shaped("MOD").typed(T::Never, R::Arithmetic),
-        // CONCAT: Exasol's `||` treats NULL as '' and yields NULL only when all-empty;
-        // DataFusion reproduces that as `nullif(concat(...), '')`.
+        // CONCAT: Exasol's `||` treats NULL as '' and yields NULL only when all-empty, as
+        // DataFusion's `concat` does once the typed pass reads its empty result as NULL.
         F::shaped("CONCAT").typed(T::All, R::Text),
         F::shaped("CASE"),
         // VerbatimCall: applied to every remaining name uniformly, not only where the
@@ -184,9 +184,7 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::verbatim("RTRIM")
             .typed(T::All, R::Text)
             .datafusion_call("rtrim"),
-        F::verbatim("REPLACE")
-            .typed(T::All, R::Text)
-            .datafusion_call("replace"),
+        F::verbatim("REPLACE").typed(T::All, R::Text),
         F::verbatim("REPEAT")
             .typed(T::First, R::Text)
             .datafusion_call("repeat"),

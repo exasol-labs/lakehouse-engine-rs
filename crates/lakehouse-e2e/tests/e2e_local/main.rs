@@ -14,6 +14,7 @@ mod credential_exposure;
 mod date_add;
 mod direct_storage;
 mod emit_declaration;
+mod empty_string;
 mod export;
 mod export_append;
 mod harness_row_cap;

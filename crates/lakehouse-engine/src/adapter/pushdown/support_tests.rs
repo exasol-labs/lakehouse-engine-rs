@@ -1705,7 +1705,7 @@ fn mixed_col_types() -> Vec<(String, ExasolType)> {
 }
 
 #[test]
-fn a_text_to_text_cast_renders_unchanged() {
+fn a_text_to_text_cast_keeps_its_unsized_target() {
     let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(
             cast_to(ExasolType::WIDEST_VARCHAR, col("name")),
@@ -1725,8 +1725,8 @@ fn a_text_to_text_cast_renders_unchanged() {
         panic!("must be a rendered expression, not a full-row fallback: {items:?}");
     };
     assert_eq!(
-        expr, r#"CAST("NAME" AS VARCHAR)"#,
-        "a CAST of text to text renders unchanged: {expr}"
+        expr, r#"CAST(nullif("NAME", '') AS VARCHAR)"#,
+        "a CAST of text to text keeps its unsized target: {expr}"
     );
 }
 
@@ -1811,7 +1811,7 @@ fn selectlist_predicate_node_projects_as_expr() {
         (
             "predicate_in_constlist",
             in_list(col("name"), [str_lit("a"), str_lit("b")]),
-            r#"("NAME" IN ('a', 'b'))"#,
+            r#"(nullif("NAME", '') IN ('a', 'b'))"#,
         ),
         (
             "predicate_between",
@@ -1821,12 +1821,12 @@ fn selectlist_predicate_node_projects_as_expr() {
         (
             "predicate_is_null",
             is_null(col("name")),
-            r#"("NAME" IS NULL)"#,
+            r#"("NAME" IS NULL OR "NAME" = '')"#,
         ),
         (
             "predicate_is_not_null",
             is_not_null(col("name")),
-            r#"("NAME" IS NOT NULL)"#,
+            r#"("NAME" IS NOT NULL AND "NAME" <> '')"#,
         ),
         (
             "predicate_notequal",

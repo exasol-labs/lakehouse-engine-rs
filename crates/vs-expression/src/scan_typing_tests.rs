@@ -181,11 +181,11 @@ fn integer_and_text_sources_keep_their_pushdown() {
     );
     assert_eq!(
         render(&date_like(col("S"))).unwrap(),
-        r#"("S" LIKE '2024%')"#
+        r#"(nullif("S", '') LIKE '2024%')"#
     );
     assert_eq!(
         render(&scalar_fn("UPPER", [col("I")])).unwrap(),
-        r#"upper(CAST(CAST("I" AS DECIMAL(38,0)) AS VARCHAR))"#
+        r#"nullif(upper(CAST(CAST("I" AS DECIMAL(38,0)) AS VARCHAR)), '')"#
     );
 }
 
@@ -605,7 +605,7 @@ fn text_casts_to_shorter_or_ascii_varchar_unchecked_and_decline_char() {
     }
     assert_eq!(
         render(&cast_to(ExasolType::varchar(10), col("S"))).unwrap(),
-        r#"CAST("S" AS VARCHAR)"#
+        r#"CAST(nullif("S", '') AS VARCHAR)"#
     );
 }
 
@@ -1851,4 +1851,192 @@ fn to_timestamp_computes_at_the_unit_of_its_digits() {
             .sql;
         assert_eq!(rendered, sql, "{expr} on {version:?}");
     }
+}
+
+fn render_filter(expr: &Json) -> String {
+    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+        .render_filter(expr)
+        .unwrap()
+}
+
+#[test]
+fn a_string_column_inside_an_expression_reads_empty_as_null() {
+    let cases = [
+        (col("S"), r#""S""#),
+        (
+            scalar_fn("LENGTH", [col("S")]),
+            r#"character_length(nullif("S", ''))"#,
+        ),
+        (agg_item("MIN", Some("S"), false), r#"MIN(nullif("S", ''))"#),
+        (
+            agg_item("COUNT", Some("S10"), true),
+            r#"COUNT(DISTINCT nullif("S10", ''))"#,
+        ),
+        (
+            case_when([predicate_equal(col("S"), str_lit("x"))], [num_lit(1)]),
+            r#"(CASE WHEN (nullif("S", '') = 'x') THEN 1 END)"#,
+        ),
+        (scalar_fn("ABS", [col("I")]), r#"abs("I")"#),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected, "{expr}");
+    }
+}
+
+#[test]
+fn a_text_function_result_reads_empty_as_null() {
+    let cases = [
+        (
+            scalar_fn("RTRIM", [col("S"), col("S")]),
+            r#"nullif(rtrim(nullif("S", ''), nullif("S", '')), '')"#,
+        ),
+        (
+            scalar_fn("CONCAT", [col("S"), str_lit("x")]),
+            r#"nullif(concat(nullif("S", ''), 'x'), '')"#,
+        ),
+        (
+            scalar_fn("LENGTH", [scalar_fn("UPPER", [col("S")])]),
+            r#"character_length(nullif(upper(nullif("S", '')), ''))"#,
+        ),
+        (
+            scalar_fn("TO_DATE", [col("S"), str_lit("YYYY-MM-DD")]),
+            r#"to_date(nullif("S", ''), '%Y-%m-%d')"#,
+        ),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected, "{expr}");
+    }
+}
+
+#[test]
+fn a_filter_over_a_bare_string_column_keeps_the_bare_column() {
+    let s = || col("S");
+    let x = || str_lit("x");
+    let cases = [
+        (predicate_equal(s(), x()), r#"("S" = 'x')"#),
+        (compare("predicate_greater", s(), x()), r#"("S" > 'x')"#),
+        (
+            compare("predicate_greaterequal", s(), x()),
+            r#"("S" >= 'x')"#,
+        ),
+        (in_list(s(), [x(), str_lit("y")]), r#"("S" IN ('x', 'y'))"#),
+        (
+            between(s(), str_lit("a"), str_lit("b")),
+            r#"("S" BETWEEN 'a' AND 'b')"#,
+        ),
+        (
+            compare("predicate_notequal", s(), x()),
+            r#"(("S" <> 'x') AND ("S" <> ''))"#,
+        ),
+        (
+            compare("predicate_less", s(), x()),
+            r#"(("S" < 'x') AND ("S" <> ''))"#,
+        ),
+        (
+            compare("predicate_lessequal", s(), x()),
+            r#"(("S" <= 'x') AND ("S" <> ''))"#,
+        ),
+        (like(s(), "x%"), r#"(("S" LIKE 'x%') AND ("S" <> ''))"#),
+        // A literal on the left reads as the mirrored comparison.
+        (compare("predicate_less", x(), s()), r#"('x' < "S")"#),
+        (
+            compare("predicate_greater", x(), s()),
+            r#"(('x' > "S") AND ("S" <> ''))"#,
+        ),
+        (
+            and([
+                predicate_equal(col("I"), num_lit(1)),
+                or([predicate_equal(s(), x()), like(s(), "y")]),
+            ]),
+            r#"(("I" = 1) AND (("S" = 'x') OR (("S" LIKE 'y') AND ("S" <> ''))))"#,
+        ),
+        (
+            predicate_equal(s(), col("S10")),
+            r#"(("S" = "S10") AND ("S" <> ''))"#,
+        ),
+        (
+            compare("predicate_less", s(), col("S10")),
+            r#"(nullif("S", '') < nullif("S10", ''))"#,
+        ),
+        (
+            predicate_equal(s(), scalar_fn("UPPER", [col("S10")])),
+            r#"(nullif("S", '') = nullif(upper(nullif("S10", '')), ''))"#,
+        ),
+        (
+            not(predicate_equal(s(), x())),
+            r#"(NOT (nullif("S", '') = 'x'))"#,
+        ),
+        (
+            not(in_list(s(), [x()])),
+            r#"(NOT (nullif("S", '') IN ('x')))"#,
+        ),
+    ];
+    for (filter, expected) in cases {
+        assert_eq!(render_filter(&filter), expected, "{filter}");
+    }
+    // Outside a filter a FALSE result differs from a NULL one.
+    assert_eq!(
+        render(&predicate_equal(s(), x())).unwrap(),
+        r#"(nullif("S", '') = 'x')"#
+    );
+}
+
+#[test]
+fn a_null_test_over_a_bare_string_column_holds_for_an_empty_string() {
+    let cases = [
+        (is_null(col("S")), r#"("S" IS NULL OR "S" = '')"#),
+        (is_not_null(col("S")), r#"("S" IS NOT NULL AND "S" <> '')"#),
+        (
+            not(is_not_null(col("S"))),
+            r#"(NOT ("S" IS NOT NULL AND "S" <> ''))"#,
+        ),
+        (is_null(col("I")), r#"("I" IS NULL)"#),
+        (
+            is_null(scalar_fn("LTRIM", [col("S")])),
+            r#"(nullif(ltrim(nullif("S", '')), '') IS NULL)"#,
+        ),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render_filter(&expr), expected, "{expr}");
+        assert_eq!(render(&expr).unwrap(), expected, "{expr}");
+    }
+}
+
+#[test]
+fn replace_reads_a_null_search_as_no_match_and_a_null_replacement_as_empty() {
+    let cases = [
+        (
+            scalar_fn("REPLACE", [col("S"), str_lit("U"), null_lit()]),
+            r#"nullif(CASE WHEN 'U' IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), 'U', coalesce(NULL, '')) END, '')"#,
+        ),
+        (
+            scalar_fn("REPLACE", [col("S"), col("S10")]),
+            r#"nullif(CASE WHEN nullif("S10", '') IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), nullif("S10", ''), coalesce(NULL, '')) END, '')"#,
+        ),
+    ];
+    for (expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected, "{expr}");
+    }
+    assert!(render(&scalar_fn("REPLACE", [col("S")])).is_err());
+}
+
+#[test]
+fn a_string_column_operand_reads_empty_as_null() {
+    let operand = |expr: &Json| {
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
+            .render_operand(expr)
+            .unwrap()
+    };
+    assert_eq!(
+        operand(&col("S10")),
+        SqlFragment::new(
+            r#"nullif("S10", '')"#.to_string(),
+            Some(ExasolType::WIDEST_VARCHAR)
+        )
+    );
+    assert_eq!(operand(&col("I")).sql, r#""I""#);
+    assert_eq!(
+        operand(&scalar_fn("LENGTH", [col("S")])).sql,
+        r#"character_length(nullif("S", ''))"#
+    );
 }

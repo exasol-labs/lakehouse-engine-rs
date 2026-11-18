@@ -193,6 +193,14 @@ pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
 /// pass knows.
 pub(crate) const SECOND_NODE: &str = "scan_second";
 
+/// Synthetic node: its text argument with an empty string read as NULL, because Exasol has no
+/// empty string and DataFusion keeps one as a value (#203).
+pub(crate) const EMPTY_AS_NULL_NODE: &str = "scan_empty_as_null";
+/// Synthetic node: `IS NULL` of a bare string column, which also holds for an empty string.
+pub(crate) const TEXT_IS_NULL_NODE: &str = "scan_text_is_null";
+/// Synthetic node: `IS NOT NULL` of a bare string column, which fails for an empty string.
+pub(crate) const TEXT_IS_NOT_NULL_NODE: &str = "scan_text_is_not_null";
+
 /// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
 pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
     ExasolType::decimal(2 + fraction, fraction)
@@ -468,7 +476,7 @@ impl<'a> ScanTyping<'a> {
     /// which refuses a text operand that Exasol rejects and DataFusion cannot combine.
     pub fn render_conjunct(self, conjunct: &Json) -> Result<String, UdfError> {
         refuse_implicit_text(conjunct, &[self.infer_type(conjunct)])?;
-        Ok(self.render_expression(conjunct)?.sql)
+        self.render_filter_root(conjunct)
     }
 
     /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent
@@ -486,12 +494,36 @@ impl<'a> ScanTyping<'a> {
     /// Rewrites `node` for the DataFusion dialect and derives its type, post-order. Text passes only
     /// where Exasol takes text; elsewhere Exasol converts it by the session's NLS settings.
     pub(crate) fn type_scan_tree(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+        self.type_at(node, Position::Value)
+    }
+
+    /// [`Self::type_scan_tree`] for the root of a filter or of a join condition.
+    pub(crate) fn type_scan_filter(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+        self.type_at(node, Position::Filter)
+    }
+
+    /// [`Self::type_scan_tree`] for an operand of a computation the caller renders around it, such
+    /// as an aggregate argument.
+    pub(crate) fn type_scan_operand(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+        let (typed, ty) = self.type_at(node, Position::Value)?;
+        Ok((empty_as_null(node, typed, ty), ty))
+    }
+
+    fn type_at(self, node: &Json, position: Position) -> Result<(Json, Inferred), UdfError> {
         if let Some(ty) = leaf_type(node, self.columns) {
             return Ok((node.clone(), ty));
         }
         let mut out = node.clone();
+        let bare = self.bare_form(node, position);
+        let child_position = match kind(node) {
+            "predicate_and" | "predicate_or" => position,
+            _ => Position::Value,
+        };
         let children = ChildTypes::collect(node, |field, index, child| {
-            let (rewritten, ty) = self.type_scan_tree(child)?;
+            let (mut rewritten, ty) = self.type_at(child, child_position)?;
+            if bare.is_none() {
+                rewritten = empty_as_null(child, rewritten, ty);
+            }
             match index {
                 Some(i) => out[field][i] = rewritten,
                 None => out[field] = rewritten,
@@ -500,7 +532,68 @@ impl<'a> ScanTyping<'a> {
         })?;
         let ty = self.node_type(node, &children);
         self.rewrite_for_scan(node, &mut out, &children, ty)?;
+        if let Some(bare) = bare {
+            bare.apply(&mut out);
+        }
         Ok((out, ty))
+    }
+
+    /// The form of `node` that keeps its string columns bare, so statistics still prune it.
+    fn bare_form(self, node: &Json, position: Position) -> Option<BareForm> {
+        let text_column = |operand: &Json| {
+            kind(operand) == "column"
+                && leaf_type(operand, self.columns).is_some_and(Inferred::is_text)
+        };
+        let literal = |operand: &Json| matches!(kind(operand), "literal_string" | "literal_null");
+        let subject = || {
+            node.get("expression")
+                .filter(|subject| text_column(subject))
+        };
+        let op = kind(node);
+        match op {
+            "predicate_is_null" => return subject().map(|_| BareForm::IsNull),
+            "predicate_is_not_null" => return subject().map(|_| BareForm::IsNotNull),
+            _ if position == Position::Value => return None,
+            _ => {}
+        }
+        match op {
+            "predicate_in_constlist" => {
+                let values = node.get("arguments")?.as_array()?;
+                (subject().is_some() && values.iter().all(literal)).then_some(BareForm::Unguarded)
+            }
+            "predicate_between" => {
+                (subject().is_some() && literal(node.get("left")?) && literal(node.get("right")?))
+                    .then_some(BareForm::Unguarded)
+            }
+            "predicate_like" => subject()
+                .filter(|_| node.get("pattern").is_some_and(literal))
+                .map(|column| BareForm::Guarded(column.clone())),
+            "predicate_equal"
+            | "predicate_notequal"
+            | "predicate_less"
+            | "predicate_lessequal"
+            | "predicate_greater"
+            | "predicate_greaterequal" => {
+                let (left, right) = (node.get("left")?, node.get("right")?);
+                let (column, op) = if text_column(left) && literal(right) {
+                    (left, op)
+                } else if literal(left) && text_column(right) {
+                    (right, mirrored(op))
+                } else if op == "predicate_equal" && text_column(left) && text_column(right) {
+                    // Equal columns are both empty or neither, so one guard covers both.
+                    return Some(BareForm::Guarded(left.clone()));
+                } else {
+                    return None;
+                };
+                Some(match op {
+                    "predicate_notequal" | "predicate_less" | "predicate_lessequal" => {
+                        BareForm::Guarded(column.clone())
+                    }
+                    _ => BareForm::Unguarded,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Exasol's type of a non-column `node` whose children are typed.
@@ -626,6 +719,55 @@ impl<'a> ScanTyping<'a> {
                 _ => SecondCall::Unsupported,
             },
             _ => SecondCall::NotSecond,
+        }
+    }
+}
+
+/// Where a node sits. Under the root of a filter or of a join condition, reached through `AND` and
+/// `OR` only, a FALSE result drops a row exactly as a NULL one does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+    Filter,
+    Value,
+}
+
+/// `typed`, the rewrite of the operand `node`, with a string column's empty strings read as NULL.
+fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
+    if kind(node) == "column" && ty.is_text() {
+        wrap(EMPTY_AS_NULL_NODE, typed)
+    } else {
+        typed
+    }
+}
+
+/// A predicate over bare string columns that reads an empty string as NULL without wrapping the
+/// column, which statistics pruning could not read through.
+enum BareForm {
+    IsNull,
+    IsNotNull,
+    /// A comparison that is never TRUE for an empty string.
+    Unguarded,
+    /// A comparison that could be TRUE for an empty string, so it adds that the column is not one.
+    Guarded(Json),
+}
+
+impl BareForm {
+    fn apply(self, out: &mut Json) {
+        match self {
+            Self::IsNull => *out = wrap(TEXT_IS_NULL_NODE, out["expression"].take()),
+            Self::IsNotNull => *out = wrap(TEXT_IS_NOT_NULL_NODE, out["expression"].take()),
+            Self::Unguarded => {}
+            Self::Guarded(column) => {
+                let not_empty = serde_json::json!({
+                    "type": "predicate_notequal",
+                    "left": column,
+                    "right": {"type": "literal_string", "value": ""},
+                });
+                *out = serde_json::json!({
+                    "type": "predicate_and",
+                    "expressions": [out.take(), not_empty],
+                });
+            }
         }
     }
 }
@@ -788,6 +930,7 @@ fn rewrite_scalar_function(
         ResultRule::Truncated if args.get(1) == Some(&DATE) => {
             *out = cast_node(ExasolType::Date, out.take());
         }
+        ResultRule::Text => *out = wrap(EMPTY_AS_NULL_NODE, out.take()),
         _ => {}
     }
     Ok(())

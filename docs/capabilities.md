@@ -139,6 +139,14 @@ Such a condition runs in Exasol SQL on its own. On a single table the scan still
 | `TO_DATE(s)` | `TO_DATE(s, 'YYYY-MM-DD')` |
 | `MAX(CAST(d AS VARCHAR(10)))` | `CAST(MAX(d) AS VARCHAR(10))` |
 
+### Empty strings
+
+Exasol has no empty string: it stores `''` as `NULL`. A data file can hold one, and a text function such as `RTRIM(c, c)` can return one, so the scan reads an empty string as `NULL` wherever it computes with it: in a filter, a function argument, an aggregate, a join key, and the sort key of a per-shard top-N. `c IS NULL` is true for a stored `''`, `COUNT(c)` and `MIN(c)` skip it, and `c <> 'x'` drops its row, as on native Exasol.
+
+`REPLACE` reads a `NULL` search text as "replace nothing" and a `NULL` or omitted replacement as "remove the search text". Every other string function returns `NULL` for a `NULL` argument. All of these forms run in the scan.
+
+A comparison, `IN`, `BETWEEN`, or `LIKE` of a bare string column with literals, and `IS [NOT] NULL` over one, skip row groups by their statistics as before. Under a `NOT`, and in a comparison of two string columns other than `=`, the scan reads the column through `nullif(c, '')` and skips no row groups. [File pruning](#file-pruning) at plan time is the same in both cases.
+
 ## Aggregation
 
 When DataFusion can render the aggregates and group keys, each shard computes a partial aggregate and Exasol SQL merges them. Otherwise the scan only filters and projects, and Exasol SQL aggregates the scanned rows. `HAVING` always runs in Exasol SQL, over the merged aggregates.
