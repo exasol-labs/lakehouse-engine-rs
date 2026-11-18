@@ -13,7 +13,7 @@ use crate::exasol_type::{
 };
 use crate::json_value::{JsonValueCall, returning_type};
 use crate::scalar_functions::{
-    DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
+    DateResult, IntegerArg, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
 use crate::timestamp::{TimestampLiteral, TimestampUnit};
 use crate::version::ExasolVersion;
@@ -189,6 +189,11 @@ pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
 /// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
 /// (apache/datafusion#16797).
 pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
+/// Synthetic node: a string function's numeric argument as the `Int64` DataFusion requires,
+/// rounded as Exasol rounds it.
+pub(crate) const INTEGER_ARGUMENT_NODE: &str = "scan_integer_argument";
+const ROUND: &str = "scanRound";
+const NEGATIVE_IS_NULL: &str = "scanNegativeIsNull";
 /// Synthetic node: the seconds of its argument with `fraction` fractional digits, which only this
 /// pass knows.
 pub(crate) const SECOND_NODE: &str = "scan_second";
@@ -307,6 +312,53 @@ fn to_text(node: Json, ty: Inferred) -> Result<Json, UdfError> {
             "converting {} to text depends on the session's NLS settings",
             short(&node)
         )))
+    }
+}
+
+/// `node` at an [`IntegerArg`] position. A non-negative integer literal is already `Int64`.
+fn to_integer_argument(
+    node: Json,
+    ty: Inferred,
+    arg: IntegerArg,
+    function: &str,
+) -> Result<Json, UdfError> {
+    let literal = kind(&node) == "literal_exactnumeric"
+        && match &node["value"] {
+            Json::Number(n) => n.is_u64(),
+            Json::String(s) => s.parse::<i64>().is_ok_and(|v| v >= 0),
+            _ => false,
+        };
+    if literal {
+        return Ok(node);
+    }
+    let round = if ty.is_integer() {
+        false
+    } else if ty.is_numeric() {
+        true
+    } else {
+        return Err(decline(format!(
+            "{function} needs a number of known type for {}",
+            short(&node)
+        )));
+    };
+    let mut out = wrap(INTEGER_ARGUMENT_NODE, node);
+    out[ROUND] = round.into();
+    out[NEGATIVE_IS_NULL] = arg.negative_is_null.into();
+    Ok(out)
+}
+
+/// The DataFusion SQL of an [`INTEGER_ARGUMENT_NODE`] over its rendered argument.
+pub(crate) fn render_integer_argument(node: &Json, inner: &str) -> String {
+    let flag = |field: &str| node.get(field).and_then(Json::as_bool).unwrap_or(false);
+    let value = if flag(ROUND) {
+        format!("CAST(round({inner}) AS BIGINT)")
+    } else {
+        format!("CAST({inner} AS BIGINT)")
+    };
+    if flag(NEGATIVE_IS_NULL) {
+        format!("(CASE WHEN {value} >= 0 THEN {value} END)")
+    } else {
+        value
     }
 }
 
@@ -756,6 +808,17 @@ fn rewrite_scalar_function(
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
+    let integer_positions: Vec<usize> = function
+        .integer_args
+        .iter()
+        .filter(|arg| arg.position < args.len())
+        .map(|&arg| {
+            let i = arg.position;
+            out["arguments"][i] =
+                to_integer_argument(out["arguments"][i].take(), args[i], arg, function.name)?;
+            Ok(i)
+        })
+        .collect::<Result<_, UdfError>>()?;
     if function.result == ResultRule::Unified {
         return unify_branches(node, out, "arguments", args, ty);
     }
@@ -771,7 +834,11 @@ fn rewrite_scalar_function(
         let converted: Vec<Inferred> = args
             .iter()
             .enumerate()
-            .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
+            .filter(|(i, _)| {
+                !text_positions.contains(i)
+                    && !integer_positions.contains(i)
+                    && !function.parameters.contains(i)
+            })
             .map(|(_, ty)| *ty)
             .collect();
         refuse_implicit_text(node, &converted)?;

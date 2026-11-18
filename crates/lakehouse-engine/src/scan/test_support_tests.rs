@@ -1,6 +1,6 @@
 //! Scan-side builders and runners: Parquet fixture files, minimal scan and join specs, inline
 //! and refusing storage backends, a host runner that executes a scan into a sink context, and a
-//! direct scalar UDF invocation, and a scan session over one in-memory table.
+//! direct scalar UDF invocation.
 
 use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::raw_scan::{build_scan_sql, register_files};
@@ -13,13 +13,9 @@ use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStor
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use arrow::util::display::array_value_to_string;
 use datafusion::common::config::ConfigOptions;
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
-use datafusion::prelude::SessionConfig;
 use parquet::arrow::ArrowWriter;
 use std::path::Path;
 use std::sync::Arc;
@@ -277,22 +273,4 @@ impl exasol_udf_sdk::context::UdfContext for SinkCtx {
     ) -> Result<(), exasol_udf_sdk::error::UdfError> {
         Ok(())
     }
-}
-
-/// A scan session whose table `t` holds `batch`.
-pub(super) fn scan_session_over(batch: RecordBatch) -> SessionContext {
-    let ctx =
-        crate::scan::scan_session_context(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
-    ctx.register_table("t", Arc::new(table)).unwrap();
-    ctx
-}
-
-/// The first column of `sql`'s result as display text, NULL as empty.
-pub(super) async fn first_column(ctx: &SessionContext, sql: &str) -> Vec<String> {
-    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    batches
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|r| array_value_to_string(b.column(0), r).unwrap()))
-        .collect()
 }

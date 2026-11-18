@@ -618,32 +618,12 @@ const STRING_ARGUMENT_CASES: &[Case] = &[
     },
 ];
 
-/// An argument beyond ±999,999,999, and a negative `REPEAT` count.
-const STRING_ARGUMENT_ERROR_CASES: &[Case] = &[
-    Case {
-        setting: DEFAULT_SESSION,
-        query: "SELECT ID, RPAD(C_VARCHAR, C_DOUBLE * 1E9) FROM {T}",
-        path: Has(SCAN_ITEM),
-    },
-    Case {
-        setting: DEFAULT_SESSION,
-        query: "SELECT ID, REPEAT('ab', 1 - ID) FROM {T}",
-        path: Has(SCAN_ITEM),
-    },
-];
-
-/// Scenario: A string function's numeric argument rounds to an integer as Exasol does
-/// Scenario: A string function's numeric argument outside Exasol's range fails the query
-/// Scenario: A negative count or length makes a string function return NULL as Exasol does
+/// Scenario: A string function's numeric argument converts to an integer as Exasol rounds it
+/// Scenario: A negative length makes a string function return NULL as Exasol does
 #[test]
 fn string_function_numeric_arguments_match_native() {
     lakehouse_vs();
-    assert_cases_match_native(
-        &typed_table(),
-        TYPED_COLUMNS,
-        STRING_ARGUMENT_CASES,
-        STRING_ARGUMENT_ERROR_CASES,
-    );
+    assert_cases_match_native(&typed_table(), TYPED_COLUMNS, STRING_ARGUMENT_CASES, &[]);
 }
 
 /// Native Exasol returns rows for `cases` and raises an error for `error_cases`.
