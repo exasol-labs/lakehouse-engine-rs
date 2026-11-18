@@ -168,14 +168,21 @@ pub fn vs_lineitem_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_LINEITEM_TABLE)
 }
 
-/// Holds native copies of the fact, dimension, events, and labels tables under their virtual
-/// names, so a join query that names its schema `{T}` runs over either.
+/// Holds native copies of the fact, dimension, lineitem, events, and labels tables under their
+/// virtual names, so a join query that names its schema `{T}` runs over either.
 pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
 
-/// Copies the fact, dimension, events, and labels tables of `source_vs` into [`JOIN_ORACLE`].
+/// Copies the fact, dimension, lineitem, events, and labels tables of `source_vs` into
+/// [`JOIN_ORACLE`].
 pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
-    for table in [E2E_FACT_TABLE, E2E_DIM_TABLE, E2E_TABLE, E2E_TABLE_2] {
+    for table in [
+        E2E_FACT_TABLE,
+        E2E_DIM_TABLE,
+        E2E_LINEITEM_TABLE,
+        E2E_TABLE,
+        E2E_TABLE_2,
+    ] {
         conn.execute(&format!(
             "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
             vs_table(JOIN_ORACLE, table),

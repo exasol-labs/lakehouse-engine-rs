@@ -90,9 +90,13 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_UNICODE",
     "FN_UNICODECHR",
     "FN_UPPER",
-    // The now-family (CURRENT_DATE/CURRENT_TIMESTAMP/SYSDATE/SYSTIMESTAMP) is not
-    // advertised: the scan UDF sees neither SESSIONTIMEZONE nor DBTIMEZONE and would
-    // read its UTC container clock once per shard, while Exasol's is statement-constant.
+    // The adapter folds each clock call into a literal from one reading per statement, so the
+    // scan never reads a clock. DBTIMEZONE and SESSIONTIMEZONE stay with Exasol.
+    "FN_CURRENT_DATE",
+    "FN_CURRENT_TIMESTAMP",
+    "FN_LOCALTIMESTAMP",
+    "FN_SYSDATE",
+    "FN_SYSTIMESTAMP",
     "FN_DATE_TRUNC",
     "FN_DAY",
     "FN_EXTRACT",

@@ -6,7 +6,7 @@
 
 > **In development.** `EXPORT ... INTO SCRIPT` is not ready for use. Syntax, options and permissions may change.
 
-`EXPORT ... INTO SCRIPT` writes the rows of an Exasol table, a query on virtual schema tables, or a query that joins both into a new Iceberg table or an existing one. It writes through the Iceberg REST catalog that a CONNECTION names, onto S3-compatible storage. For a new table it creates the namespace and the table, and into an existing table it appends. Exasol reports the number of written rows as the statement's row count.
+`EXPORT ... INTO SCRIPT` writes the rows of an Exasol table, a query on virtual schema tables, or a query that joins both into a new Iceberg table or an existing one. It writes through the Iceberg REST catalog that a CONNECTION names, onto S3-compatible storage or Azure Data Lake Storage Gen2. For a new table it creates the namespace and the table, and into an existing table it appends. Exasol reports the number of written rows as the statement's row count.
 
 Export is in development and opt-in, so the installer creates `LAKEHOUSE_EXPORT` only with `--with-export`. Releases from v0.58.4 contain it. On an earlier release, the script fails with `F-UDF-CL-RUST-9001: Loader error: no entry point found`.
 
@@ -53,7 +53,7 @@ The statement fails before it reads any source row when any of these holds:
 | `SINGLE_COMMIT` | no | `true` or `false`, in any letter case. | `false` |
 | `ALLOW_HTTP` | no | `true` or `false`, in any letter case. | `false` |
 
-Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to the catalog address, the OAuth2 server, the AWS STS endpoint, the CONNECTION's storage endpoint, or a storage endpoint that the catalog vends. Without it, an `http://` address fails the statement with an error that names the CONNECTION field and `ALLOW_HTTP`.
+Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to the catalog address, the OAuth2 server, the AWS STS endpoint, the CONNECTION's storage endpoint, or a storage endpoint that the catalog vends. Without it, an `http://` address fails the statement with an error that names the CONNECTION field and `ALLOW_HTTP`. A vended `abfs://` table location also needs `ALLOW_HTTP = 'true'`, as it does for a virtual schema, although the export writes it over HTTPS. Without it, the writer fails with an error that names the table and `ALLOW_HTTP`.
 
 ## The table
 
@@ -133,6 +133,7 @@ Iceberg REST makes a new table appear with its data through staged table creatio
 - A rerun of a failed export without `SINGLE_COMMIT` appends every row again on top of the commits that stayed. Before a rerun, find the committed snapshots by the failed statement's `lakehouse.export-id` and roll them back with another engine, or export with `SINGLE_COMMIT`.
 - A NULL for a required column and a value outside an `int` or `long` column's range show only in the rows of the writer that reads them. With `SINGLE_COMMIT` the export then leaves the table unchanged. Without it, writers that committed first keep their commits.
 - Parallel writers that append to one table retry conflicting commits up to the table's `commit.retry.num-retries`, and at least 20 times, as often as on a table the export creates. Many writers on one table can still exhaust it: lower `WRITERS_PER_NODE`, or raise the property above 20.
+- Between two attempts of one commit a writer waits the table's `commit.retry.min-wait-ms` (default 100 ms), doubled after each retry up to its `commit.retry.max-wait-ms` (default 60 s), plus up to a tenth more at random.
 - Each writer commits into the schema and partition spec it checked (see [How an export runs](#how-an-export-runs)). Each commit reloads the table first and fails if it was upgraded to format version 3. An upgrade that lands between that reload and the commit, and changes neither the snapshot, the schema, nor the partition spec, is not detected.
 - A failed writer deletes the data files it wrote and did not commit, best effort. The files of a writer that crashed, was killed, or could not delete them remain. When the table exists they lie under the table location, where Iceberg orphan-file removal finds them. After a failed `SINGLE_COMMIT` export into a new table no table exists, so they need a cleanup in storage, under the location the catalog chose for the table.
 - A writer whose commit outcome is unknown keeps its data files, because the table may hold them.
@@ -142,10 +143,11 @@ Iceberg REST makes a new table appear with its data through staged table creatio
 The export uses the same CONNECTION as a virtual schema over the catalog (see [Catalogs](catalogs.md)), with these requirements:
 
 - The catalog is an Iceberg REST catalog that needs no AWS SigV4 signing. A CONNECTION with `"use_sigv4": true`, as for AWS Glue's Iceberg REST endpoint, is refused.
-- The storage is S3-compatible. A CONNECTION with an Azure storage field (`account_name`, `account_key`, `sas_token`) is refused, and so is a table location whose scheme is not `s3` or `s3a`.
+- The storage is S3-compatible or ADLS Gen2, with the storage fields a virtual schema reads with: S3 keys, an IAM role, an Azure `account_name` with `account_key` or `sas_token`, or vended credentials. A CONNECTION that `CREATE VIRTUAL SCHEMA` refuses before it contacts the catalog, such as one with Azure storage fields and `aws_assume_role_arn`, is refused with the same error.
+- The table location must be one the storage can address: `s3://` or `s3a://` for S3 keys or a role, `abfss://` for Azure fields, and any of these or `abfs://` for vended credentials. A writer refuses any other location, with an error that names the table and the scheme, before it writes a data file.
 - The catalog identity may create namespaces and tables and commit to them. Static storage keys need write access to the warehouse location. A read-only CONNECTION cannot export.
 
-With `"use_vended_credentials": true`, the writers use the storage credentials that the catalog vends for the table. A writer renews them through the catalog's `loadCredentials` endpoint five minutes before they expire. Lakekeeper vends credentials for one hour and offers `loadCredentials`. On a catalog without that endpoint, a writer that outlives its credentials fails, with an error that names the table and their expiry. An OAuth2 token is renewed before it expires.
+With `"use_vended_credentials": true`, the writers use the storage credentials that the catalog vends for the table: S3 keys, or an ADLS SAS for the table location's host. A writer renews them through the catalog's `loadCredentials` endpoint five minutes before they expire, at the expiry the catalog states in `s3.session-token-expires-at-ms` or `adls.sas-token-expires-at-ms.<host>`, and signs every later storage request with the renewed credentials. Credentials without a stated expiry are used as vended and never renewed. Lakekeeper vends credentials for one hour, states their expiry, and offers `loadCredentials`. On a catalog without that endpoint, a writer that outlives its credentials fails, with an error that names the table and their expiry. An OAuth2 token is renewed before it expires.
 
 With `aws_assume_role_arn`, a writer must finish within the role session, one hour by default, because the export does not renew assumed-role credentials.
 

@@ -5,8 +5,8 @@ use crate::iceberg_io::{authed_get_json, build_signed_request, redact_catalog_te
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
 use crate::sts::AssumedRole;
-use crate::vended::{covering_credential, s3_credentials};
-use crate::{CatalogProps, ConnectionCreds, VendedS3Credentials};
+use crate::vended::covering_credential;
+use crate::{CatalogProps, ConnectionCreds, VendedCredentialSet};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use iceberg::{NamespaceIdent, TableIdent};
@@ -368,7 +368,7 @@ impl CatalogSession {
         &self,
         ident: &TableIdent,
         location: &str,
-    ) -> Result<VendedS3Credentials, UdfError> {
+    ) -> Result<VendedCredentialSet, UdfError> {
         let path = format!("{}/credentials", table_ident_path(ident));
         let answer = self
             .send(Method::GET, &path, None, RepeatSafety::Safe)
@@ -379,14 +379,9 @@ impl CatalogSession {
                 answer.status
             )));
         }
-        let config = read_credentials(&answer.body, location).map_err(|cause| {
-            UdfError::User(format!("loadCredentials of table '{ident}' {cause}"))
-        })?;
-        s3_credentials(&config, location).map_err(|error| {
-            UdfError::User(format!(
-                "loadCredentials of table '{ident}' failed: {error}"
-            ))
-        })
+        read_credentials(&answer.body, location)
+            .map(VendedCredentialSet)
+            .map_err(|cause| UdfError::User(format!("loadCredentials of table '{ident}' {cause}")))
     }
 
     async fn build_request(

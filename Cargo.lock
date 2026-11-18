@@ -3478,15 +3478,20 @@ name = "lakehouse-catalog-write"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "exasol-udf-sdk",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "lakehouse-catalog",
+ "object_store",
+ "percent-encoding",
  "rand 0.8.6",
  "reqsign-core",
  "serde",
  "serde_json",
  "tokio",
+ "typetag",
 ]
 
 [[package]]
@@ -3507,6 +3512,7 @@ dependencies = [
  "chrono",
  "exasol-udf-sdk",
  "futures",
+ "hmac 0.12.1",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -3519,6 +3525,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rsa",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tpchgen",
  "tungstenite",
@@ -3526,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.59.1"
+version = "0.60.1"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3534,6 +3541,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "datafusion",
  "delta_kernel",
  "delta_kernel_default_engine",

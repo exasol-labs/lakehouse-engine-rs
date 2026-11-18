@@ -60,21 +60,16 @@ fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
             vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "warehouse"],
         ),
         (
-            "Azure account key",
-            serde_json::json!({ "warehouse": "wh", "account_name": "acct", "account_key": SECRET }),
+            "a shared check: Azure storage with an IAM role",
+            serde_json::json!({
+                "warehouse": "wh",
+                "account_name": "acct",
+                "account_key": SECRET,
+                "aws_assume_role_arn": "arn:aws:iam::1:role/r",
+            }),
             vec![
                 "CONNECTION 'LAKEHOUSE_CATALOG_CREDS'",
-                "account_name, account_key",
-                "S3-compatible",
-            ],
-        ),
-        (
-            "Azure SAS token",
-            serde_json::json!({ "warehouse": "wh", "account_name": "acct", "sas_token": SECRET }),
-            vec![
-                "CONNECTION 'LAKEHOUSE_CATALOG_CREDS'",
-                "sas_token",
-                "S3-compatible",
+                "aws_assume_role_arn",
             ],
         ),
         (
@@ -102,6 +97,27 @@ fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
             );
         }
         assert!(!message.contains(SECRET), "{case}: {message}");
+    }
+}
+
+#[test]
+fn an_azure_connection_is_read_with_its_account_key_or_sas_token() {
+    for (field, value) in [("account_key", SECRET), ("sas_token", "sv=1&sig=s")] {
+        let mut password = serde_json::json!({ "warehouse": "wh", "account_name": "acct" });
+        password[field] = value.into();
+
+        let connection = read_connection(
+            &context("https://catalog.example.com", password),
+            CONNECTION,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{field}: {error}"));
+
+        assert_eq!(
+            connection.creds.account_name.as_deref(),
+            Some("acct"),
+            "{field}"
+        );
     }
 }
 
