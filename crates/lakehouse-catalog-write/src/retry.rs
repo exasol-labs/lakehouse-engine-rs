@@ -6,7 +6,10 @@ use std::time::Duration;
 
 /// Iceberg's `commit.retry.num-retries` default, also the bound of namespace and table creation.
 pub(crate) const DEFAULT_RETRIES: u32 = 4;
-const NUM_RETRIES_PROPERTY: &str = "commit.retry.num-retries";
+pub(crate) const NUM_RETRIES_PROPERTY: &str = "commit.retry.num-retries";
+/// The commit retries of an export's table: all of its writers commit to that one table, so
+/// they collide far more often than Iceberg's default of 4 allows for.
+pub(crate) const EXPORT_RETRIES: u32 = 20;
 /// Iceberg's `commit.retry.min-wait-ms` and `commit.retry.max-wait-ms` defaults.
 const MIN_WAIT: Duration = Duration::from_millis(100);
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -20,6 +23,12 @@ pub(crate) fn commit_retries(properties: &HashMap<String, String>) -> u32 {
         .get(NUM_RETRIES_PROPERTY)
         .and_then(|retries| retries.parse().ok())
         .unwrap_or(DEFAULT_RETRIES)
+}
+
+/// The retries of an append to a table with `properties`: at least [`EXPORT_RETRIES`], because
+/// a table another engine created rarely sets the property for the export's writer fan-out.
+pub(crate) fn append_retries(properties: &HashMap<String, String>) -> u32 {
+    commit_retries(properties).max(EXPORT_RETRIES)
 }
 
 /// The wait before retry number `retry` (1 for the first): 100 ms doubled for each later retry,

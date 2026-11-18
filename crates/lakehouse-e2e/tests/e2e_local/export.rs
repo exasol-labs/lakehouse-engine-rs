@@ -4,27 +4,24 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
-use futures::TryStreamExt;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use object_store::ObjectStore;
-use object_store::path::Path as ObjectStorePath;
 
 use crate::common::e2e_harness::{
     DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
     VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
-    declared_types, exa_conn, export_error, exported_rows, failing_source, local_stack_s3_store,
-    run_namespace, runtime,
+    declared_types, exa_conn, export_error, exported_rows, failing_source, run_namespace, runtime,
 };
 use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
 use crate::common::stack::{
-    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY,
+    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY,
     build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url_internal,
     local_stack_connection_password, proxy_log_during,
 };
+use crate::common::table_state::{WAREHOUSE_BUCKET, objects_under};
 use crate::fixtures::{
-    LAKEHOUSE_VS, PROXY_ICEBERG_CREDS, lakehouse_vs, proxy_virtual_schemas, seed_catalog, stack,
-    vs_table,
+    EXPORT_DIRECT as DIRECT, EXPORT_PROXIED as PROXIED, LAKEHOUSE_VS, lakehouse_vs,
+    proxy_virtual_schemas, seed_catalog, stack, vs_table,
 };
 
 const EXPORT_SCHEMA: &str = "EXPORT_E2E";
@@ -37,7 +34,6 @@ const MAX_WRITERS: i64 = 300;
 const EXPORTER_PASSWORD: &str = "ExportE2eUser2026x";
 const ROLE_EXPORTER: &str = "EXPORT_E2E_ROLE_EXPORTER";
 const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
-const WAREHOUSE_BUCKET: &str = "warehouse";
 
 static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
@@ -119,18 +115,6 @@ fn new_table() -> String {
     )
 }
 
-const DIRECT: ExportRoute = ExportRoute {
-    script_schema: SCHEMA_NAME,
-    connection: DEFAULT_CATALOG_CONN_NAME,
-};
-
-/// The proxy-only scripts and CONNECTION of `proxy_virtual_schemas`, so a `scripts/proxy/filter`
-/// line can inject a catalog or storage fault.
-const PROXIED: ExportRoute = ExportRoute {
-    script_schema: PROXY_ADAPTER_SCHEMA,
-    connection: PROXY_ICEBERG_CREDS,
-};
-
 fn export_into(source: &str, tail: &str) -> String {
     DIRECT.export_into(source, tail)
 }
@@ -166,20 +150,6 @@ fn namespace_exists(namespace: &str) -> bool {
     runtime()
         .block_on(seed_catalog(runtime(), "export").namespace_exists(&ident))
         .unwrap_or_else(|e| panic!("check namespace {namespace}: {e}"))
-}
-
-/// The keys under `prefix` of the warehouse bucket.
-fn objects_under(prefix: &str) -> Vec<String> {
-    let store = local_stack_s3_store(WAREHOUSE_BUCKET);
-    let prefix = ObjectStorePath::from(prefix);
-    runtime()
-        .block_on(
-            store
-                .list(Some(&prefix))
-                .map_ok(|object| object.location.to_string())
-                .try_collect(),
-        )
-        .unwrap_or_else(|e| panic!("list {WAREHOUSE_BUCKET}/{prefix}: {e}"))
 }
 
 /// Scenario: A whole-table export writes every source row
@@ -685,6 +655,7 @@ fn export_errors_carry_no_connection_password() {
         "columns": ["X"],
         "single_commit": false,
         "allow_http": true,
+        "append": false,
     });
     let forged_writer_call =
         format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");

@@ -59,7 +59,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 
 ### Export
 
-14. **Export into a new Iceberg table**: `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT` writes source rows into a new Iceberg table through the Iceberg REST catalog.
+14. **Export into an Iceberg table**: `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT` writes source rows into a new Iceberg table, or appends them to an existing one, through the Iceberg REST catalog.
 
 ## Out of Scope
 
@@ -70,7 +70,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 - General and multi-way joins and complex query rewrites (only broadcast-eligible inner equi-joins are pushed down, see Core Capability 6)
 - **Explicit non-goals (not building):** Reyden, Lakehouse RT, a DataFusion cluster scheduler, an Iceberg cache, a Databricks acceleration layer, a materialized query engine
 
-Every query is executed independently, starts from source metadata, and leaves no state behind. An export creates its namespace and table, and a failed export can leave data files in storage.
+Every query is executed independently, starts from source metadata, and leaves no state behind. An export creates its namespace and table or appends to an existing table, and a failed export can leave data files in storage.
 
 Architecture: see specs/architecture.md.
 

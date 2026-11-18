@@ -8,12 +8,14 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::name_mapping_fixtures::{
-    NESTED_IMPORT_DIR, NESTED_ROWS, NESTED_STREET_NAMES, NESTED_TABLE, NESTED_UNMAPPED_NAME,
-    PROJECTION_IMPORT_DIR, PROJECTION_ROWS, PROJECTION_TABLE, PROJECTION_UNMAPPED,
+    NAMESPACE, NESTED_IMPORT_DIR, NESTED_ROWS, NESTED_STREET_NAMES, NESTED_TABLE,
+    NESTED_UNMAPPED_NAME, PROJECTION_IMPORT_DIR, PROJECTION_ROWS, PROJECTION_TABLE,
+    PROJECTION_UNMAPPED,
 };
 use crate::common::raw_parquet::get_fixture_object;
+use crate::common::table_state::load_table;
 use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, stack, vs_table};
-use crate::identity_partition::{load_table, planned_footers};
+use crate::identity_partition::planned_footers;
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -88,7 +90,7 @@ fn nested_name_map_fixture_holds_the_shapes_the_row_test_needs() {
     stack();
     assert_only_imports_lack_field_ids(NESTED_TABLE, NESTED_IMPORT_DIR);
 
-    let table = load_table(NESTED_TABLE);
+    let table = load_table(NAMESPACE, NESTED_TABLE);
     let mapping = name_mapping(&table);
     let addr =
         mapped_field(mapping.fields(), "addr").expect("fixture guard: the mapping maps addr");
@@ -169,7 +171,7 @@ fn projection_by_id_fixture_holds_the_shapes_the_row_test_needs() {
     stack();
     assert_only_imports_lack_field_ids(PROJECTION_TABLE, PROJECTION_IMPORT_DIR);
 
-    let table = load_table(PROJECTION_TABLE);
+    let table = load_table(NAMESPACE, PROJECTION_TABLE);
     let mapping = name_mapping(&table);
     let info =
         mapped_field(mapping.fields(), "info").expect("fixture guard: the mapping maps info");

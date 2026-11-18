@@ -13,9 +13,9 @@ fn granted(ctx: TestContext) -> TestContext {
     ctx.with_connection(CONNECTION, sentinel_connection())
 }
 
-/// The writer SELECT the hook plans before it makes any catalog call.
+/// The writer SELECT the hook plans before it makes any catalog call, as for a new table.
 fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
-    plan_export(ctx, json).map(|plan| plan.select)
+    plan_export(ctx, json).map(|plan| plan.select.render(&plan.spec.render()))
 }
 
 /// The writer plan of a group, with the context standing on its first row as in a real run.
@@ -186,6 +186,10 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
             "JSON of another shape",
             Value::String(r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","extra":1}"#.to_string()),
         ),
+        (
+            "a spec without append",
+            Value::String(spec_without("append")),
+        ),
     ];
 
     for (case, first) in cases {
@@ -242,12 +246,17 @@ fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
             "columns": ["ID", "a\"b"],
             "single_commit": false,
             "allow_http": false,
+            "append": false,
         })
     );
-    let mut writer = writer_context(vec![writer_row(&first.to_string(), 1)]);
-    writer.next().unwrap();
-    let read = WriterSpec::read(&writer).expect("the writer accepts it");
-    assert_eq!(read.render(), first.to_string());
+    let mut appending = first.clone();
+    appending["append"] = true.into();
+    for spec in [first, appending] {
+        let mut writer = writer_context(vec![writer_row(&spec.to_string(), 1)]);
+        writer.next().unwrap();
+        let read = WriterSpec::read(&writer).expect("the writer accepts it");
+        assert_eq!(read.render(), spec.to_string());
+    }
 }
 
 #[test]
@@ -301,15 +310,13 @@ mod sql {
     const WRITER_SPEC: &str = r#"{"connection":"C"}"#;
 
     fn select_for(columns: &[&str], writers: WriterLayout, node_count: usize) -> String {
-        let source_columns: Vec<String> = columns.iter().map(ToString::to_string).collect();
         WriterSelect {
-            script_schema: "LHVS",
-            writer_spec: WRITER_SPEC,
-            source_columns: &source_columns,
+            script_schema: "LHVS".to_string(),
+            source_columns: columns.iter().map(ToString::to_string).collect(),
             writers,
             node_count,
         }
-        .render()
+        .render(WRITER_SPEC)
     }
 
     fn group_key(sql: &str) -> &str {
@@ -374,15 +381,13 @@ mod sql {
 
     #[test]
     fn writer_spec_and_schema_are_quoted_for_sql() {
-        let source_columns = vec![r#""T"."A""#.to_string()];
         let sql = WriterSelect {
-            script_schema: r#"my"schema"#,
-            writer_spec: r#"{"connection":"A'B\"C"}"#,
-            source_columns: &source_columns,
+            script_schema: r#"my"schema"#.to_string(),
+            source_columns: vec![r#""T"."A""#.to_string()],
             writers: WriterLayout::PerNode(1),
             node_count: 1,
         }
-        .render();
+        .render(r#"{"connection":"A'B\"C"}"#);
 
         assert!(
             sql.starts_with(
@@ -401,8 +406,16 @@ fn writer_spec(single_commit: bool) -> String {
         "columns": ["ID"],
         "single_commit": single_commit,
         "allow_http": false,
+        "append": false,
     })
     .to_string()
+}
+
+/// `writer_spec(false)` without the field `name`.
+fn spec_without(name: &str) -> String {
+    let mut spec: serde_json::Value = serde_json::from_str(&writer_spec(false)).unwrap();
+    spec.as_object_mut().unwrap().remove(name);
+    spec.to_string()
 }
 
 fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
@@ -447,13 +460,25 @@ fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
 
     assert_eq!(plan.spec.export_id, "00ff");
     assert!(plan.spec.single_commit);
-    let fields: Vec<_> = plan
-        .schema
+    let WriterTable::New { schema, .. } = plan.table else {
+        panic!("a spec that does not append creates its table");
+    };
+    let fields: Vec<_> = schema
         .fields()
         .iter()
         .map(|field| (field.name().as_str(), field.is_nullable()))
         .collect();
     assert_eq!(fields, [("ID", true)]);
+}
+
+#[test]
+fn an_appending_writer_derives_no_table_schema_from_its_source() {
+    let appending = writer_spec(false).replace(r#""append":false"#, r#""append":true"#);
+
+    let plan = writer_plan(&mut group(&appending, 1, "TIMESTAMP(9)"))
+        .expect("the table's columns, not the source's types, decide an append");
+
+    assert!(matches!(plan.table, WriterTable::Existing));
 }
 
 #[test]
