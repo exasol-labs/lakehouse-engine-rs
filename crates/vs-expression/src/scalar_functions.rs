@@ -272,3 +272,7 @@ pub(crate) fn scalar_function(name: &str) -> Option<ScalarFunction> {
         .find(|f| f.name.eq_ignore_ascii_case(name))
         .copied()
 }
+
+#[cfg(test)]
+#[path = "scalar_functions_tests.rs"]
+mod tests;
