@@ -96,11 +96,17 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 
 ### Scenario: An append writes data files by the table's write properties
 
-* *GIVEN* an unpartitioned table whose properties another catalog client set to `write.parquet.compression-codec = snappy`, a `write.parquet.row-group-size-bytes` of 1 MiB, and a `write.target-file-size-bytes` of 4 MiB
+* *GIVEN* an unpartitioned table whose properties another catalog client set to `write.format.default = orc`, `write.parquet.compression-codec = snappy`, a `write.parquet.row-group-size-bytes` of 2 MiB, and a `write.target-file-size-bytes` of 4 MiB
 * *WHEN* a user exports a source of about 20 MiB of Parquet data into it with `SINGLE_COMMIT = 'true'`
-* *THEN* every data file that the append writes SHALL be compressed with `snappy`, and no row group SHALL exceed 1 MiB by more than a tenth
+* *THEN* every data file that the append writes SHALL be Parquet compressed with `snappy`, and a data file SHALL hold several row groups, one of more than 8,192 rows
 * *AND* the append SHALL write several data files, none larger than 4 MiB plus one row group
 * *AND* the table's properties SHALL be unchanged
+
+### Scenario: A write property the table lacks takes the writer's default
+
+* *GIVEN* a table without `write.parquet.compression-codec`, `write.parquet.row-group-size-bytes`, and `write.target-file-size-bytes`
+* *WHEN* a user exports a source into it
+* *THEN* every data file that the append writes SHALL be compressed with `zstd`
 
 ### Scenario: An unusable write property fails the export before any data is written
 

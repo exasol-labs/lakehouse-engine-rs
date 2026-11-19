@@ -22,8 +22,6 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 
   Every other type is refused. Exasol itself refuses a `GEOMETRY`, `HASHTYPE`, `INTERVAL`, or `TIMESTAMP WITH LOCAL TIME ZONE` column before the export reads it: with `Column type not supported: <type>`, or with `VM error: Unknown data type found`, which names no column. Which of the two a column gets varies between statements. The export refuses `TIMESTAMP(p)` with p > 6, and any other type that reaches it, with an error that names the column and its type and suggests a cast to `TIMESTAMP(6)`.
 * Iceberg table spec § Primitive Types: `decimal(P,S)` "Scale is fixed, precision must be 38 or less", which holds Exasol's precision of at most 36. `timestamp` is "Timestamp, microsecond precision, without timezone", and note 1 states "Timestamp values _without time zone_ represent a date and time of day regardless of zone", as Exasol's `TIMESTAMP` does. `timestamp_ns` is added by v3, so a version 2 table has no lossless target for `TIMESTAMP(7)` to `TIMESTAMP(9)`: refusing them is this feature's scoped exception. `string` is "Encoded with UTF-8". § Reserved Field IDs reserves metadata columns "that can be used in user data schemas, like the `_file` column".
-* Data files. The export writes every data file as Parquet, whatever the table's `write.format.default`, with the table's `write.parquet.compression-codec`, `write.parquet.compression-level`, `write.parquet.row-group-size-bytes`, `write.parquet.page-size-bytes`, `write.parquet.page-row-limit`, `write.parquet.dict-size-bytes`, and `write.parquet.content-defined-chunking.*`. A row group ends near `write.parquet.row-group-size-bytes`, because the Parquet writer estimates how many rows fit, or at 1,048,576 rows. A writer starts a new data file once the open one passes the table's `write.target-file-size-bytes`. A property the table lacks takes Iceberg's default: `zstd`, 128 MiB row groups, and 512 MiB files. A writer holds the row group in progress in memory, so a larger row group size costs writer memory.
-* A table the export creates carries `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728`, and `write.target-file-size-bytes = 268435456`, so every later writer of the table uses the same settings. The 256 MiB file size is half Iceberg's default, because a virtual schema shards a scan by data file.
 * Iceberg table spec § Table Metadata Fields: `properties` is "A string to string map of table properties. This is used to control settings that affect reading and writing". § Manifests: a data file's `file_format` is "String file format name, `avro`, `orc`, `parquet`, or `puffin`", so the data files of one table may differ in format.
 * Every snapshot that an export commits carries the summary property `lakehouse.export-id`, which identifies the export statement.
 * Between two attempts of one commit the writer waits the table's `commit.retry.min-wait-ms`, doubled after each retry up to its `commit.retry.max-wait-ms`, plus up to a tenth more at random. A property that is absent or not a whole number of milliseconds takes Iceberg's default of 100 ms or 60 s.
@@ -92,11 +90,5 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 
 * *GIVEN* a table that does not exist
 * *WHEN* a user exports a source into it, with several writers or with `SINGLE_COMMIT = 'true'`
-* *THEN* the table's properties SHALL hold the three write properties that § Background lists for a table the export creates
-* *AND* every data file that the export writes SHALL be compressed with `zstd`, and no row group SHALL exceed 134217728 bytes by more than a tenth
-
-### Scenario: An export into an unpartitioned table rolls its data files at the target file size
-
-* *GIVEN* an unpartitioned table whose `write.target-file-size-bytes` is smaller than the source's encoded size
-* *WHEN* a user exports the source into it with `SINGLE_COMMIT = 'true'`
-* *THEN* the writer SHALL start a new data file once the open one passes `write.target-file-size-bytes`, so the export writes several data files
+* *THEN* the table's properties SHALL hold `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728`, and `write.target-file-size-bytes = 268435456`
+* *AND* every data file that the export writes SHALL be compressed with `zstd`

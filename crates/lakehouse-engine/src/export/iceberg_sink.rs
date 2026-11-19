@@ -152,7 +152,7 @@ impl IcebergSink {
         ))
     }
 
-    /// Writes each of `partitions` into its own data file, one file open at a time.
+    /// Writes each of `partitions` into data files of its own, one file open at a time.
     async fn write_out(&mut self, partitions: Vec<Partition>) -> Result<(), UdfError> {
         for (key, batches) in partitions {
             let written = write_partition(&self.writers, key, batches).await;
@@ -241,6 +241,13 @@ impl ExportSink for IcebergSink {
     async fn abort(&mut self) {
         if self.files_may_be_committed {
             return;
+        }
+        // Closing completes an open upload, which a delete of the unfinished file would not find.
+        if let Rows::Streamed {
+            writer: Some(open), ..
+        } = &mut self.rows
+        {
+            let _ = open.close().await;
         }
         let file_io = self.opened.table().file_io();
         for location in self.locations.recorded() {
@@ -334,7 +341,7 @@ pub(super) fn data_file_settings(
         let value = properties.get(key).map_or("", String::as_str);
         format!("invalid write property {key} = '{value}': {cause}")
     };
-    if let Some((key, cause)) = unreadable(&table).or_else(|| refused(&table)) {
+    if let Some((key, cause)) = unreadable(properties, &table).or_else(|| refused(&table)) {
         return Err(named(key, &cause));
     }
     let settings = ParquetWriterBuilder::from_table_properties(&table, schema)
@@ -349,7 +356,15 @@ pub(super) fn data_file_settings(
 }
 
 /// The first property whose value does not read, with iceberg-rust's error.
-fn unreadable(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
+fn unreadable(
+    properties: &HashMap<String, String>,
+    table: &TableProperties<'_>,
+) -> Option<(&'static str, String)> {
+    // iceberg-rust parses the level as a u8 inside the codec's reading, whose error names the codec.
+    let level = TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL;
+    if let Some(Err(error)) = properties.get(level).map(|value| value.parse::<u8>()) {
+        return Some((level, error.to_string()));
+    }
     let chunking = match table.cdc_enabled() {
         Ok(enabled) => enabled,
         Err(error) => {
@@ -367,23 +382,11 @@ fn unreadable(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
     WRITE_PROPERTIES
         .iter()
         .chain(chunked)
-        .find_map(|(key, read)| {
-            let error = read(table).err()?;
-            let cause = error_chain(&error);
-            // The codec's reading also parses the compression level.
-            let key = if *key == TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC
-                && cause.contains(TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL)
-            {
-                TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL
-            } else {
-                key
-            };
-            Some((key, cause))
-        })
+        .find_map(|(key, read)| Some((*key, error_chain(&read(table).err()?))))
 }
 
-/// A value that iceberg-rust reads but parquet-rs panics or hangs on, or refuses only at the first
-/// write.
+/// A value that iceberg-rust reads but the export cannot write with, refused before any data is
+/// written.
 fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
     let refusal = |key, cause: &str| Some((key, cause.to_string()));
     if table.parquet_compression_codec().ok() == Some(CompressionCodec::Lzo) {
@@ -398,7 +401,7 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
             "a row group needs at least 1 byte",
         );
     }
-    // parquet-rs writes a column in steps of this many rows, so 0 never advances.
+    // A limit of 0 kept the writer at full CPU without finishing.
     if table.parquet_page_row_limit().ok() == Some(0) {
         return refusal(
             TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT,
@@ -411,7 +414,8 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
     let min = table.cdc_min_chunk_size().ok()?;
     let max = table.cdc_max_chunk_size().ok()?;
     let norm = table.cdc_norm_level().ok()?;
-    // parquet-rs casts both sizes to i64, so a larger one turns negative at the first write.
+    // The chunking checks below match parquet-rs's refusals, as
+    // `a_refused_chunking_setting_is_one_parquet_rs_cannot_write` shows.
     let too_large = "a chunk size must be at most 9223372036854775807";
     if i64::try_from(min).is_err() {
         return refusal(
@@ -437,7 +441,6 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
             "the maximum chunk size must exceed the minimum",
         );
     }
-    // parquet-rs's chunking mask: floor(log2(((min + max) / 2 - min) / 8)) - norm, within 1..=63.
     // `(max - min) / 2` equals `(min + max) / 2 - min` and cannot overflow.
     let target = (max - min) / 2 / 8;
     let bits = target.checked_ilog2().map_or(0, |bits| bits as i64) - i64::from(norm);

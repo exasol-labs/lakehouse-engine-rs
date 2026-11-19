@@ -28,9 +28,13 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
         .collect()
 }
 
-/// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
-#[tokio::test]
-async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
+/// A sink that writes into a new unpartitioned table, whose catalog answers a commit with a 504,
+/// the requests the catalog received, and a batch of two rows for it.
+async fn new_table_sink() -> (
+    Box<dyn crate::export::target::ExportSink>,
+    Arc<Mutex<Vec<String>>>,
+    RecordBatch,
+) {
     let table = with_short_commit_waits(LOAD_TABLE_NO_SNAPSHOTS);
     let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
         if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
@@ -66,6 +70,14 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
     let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
     let batch = RecordBatch::try_new(sink.columns().schema.clone(), vec![ids, names]).unwrap();
 
+    sink.write(&batch).await.unwrap();
+    (sink, requests, batch)
+}
+
+/// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
+#[tokio::test]
+async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
+    let (mut sink, requests, batch) = new_table_sink().await;
     sink.write(&batch).await.unwrap();
     let finished = sink.finish().await.unwrap_err().to_string();
     sink.abort().await;
@@ -211,9 +223,71 @@ fn an_unusable_write_property_is_named_with_its_value() {
         let error = data_file_settings(&properties(&pairs), date_columns(1))
             .err()
             .unwrap_or_else(|| panic!("{pairs:?} was accepted"));
+        let prefix = format!("invalid write property {named}: ");
+        assert!(error.starts_with(&prefix), "{pairs:?}: {error}");
+        let key = named.split(" = ").next().unwrap();
         assert!(
-            error.starts_with(&format!("invalid write property {named}: ")),
-            "{pairs:?}: {error}"
+            !error[prefix.len()..].replace(key, "").contains("write."),
+            "{pairs:?} names another property: {error}"
         );
     }
+}
+
+/// The chunk sizes and normalization levels the export refuses are exactly those parquet-rs
+/// fails to write with.
+#[test]
+fn a_refused_chunking_setting_is_one_parquet_rs_cannot_write() {
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::{CdcOptions, WriterProperties};
+    let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
+    let column: ArrayRef = Arc::new(StringArray::from(vec!["x"; 64]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+    for min in [1_usize, 1_000, 256 * 1024] {
+        for max in [min + 1, min + 16, min + 1_000, 1 << 20, 1 << 40, 1 << 63] {
+            for norm in [-60, -3, 0, 3, 20, 40] {
+                let options = CdcOptions {
+                    min_chunk_size: min,
+                    max_chunk_size: max,
+                    norm_level: norm,
+                };
+                let props = WriterProperties::builder()
+                    .set_content_defined_chunking(Some(options))
+                    .build();
+                let parquet_fails = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props))
+                    .and_then(|mut writer| writer.write(&batch).and_then(|()| writer.close()))
+                    .is_err();
+                let (min, max, norm) = (min.to_string(), max.to_string(), norm.to_string());
+                let refused = data_file_settings(
+                    &properties(&[
+                        ("write.parquet.content-defined-chunking.enabled", "true"),
+                        (
+                            "write.parquet.content-defined-chunking.min-chunk-size",
+                            &min,
+                        ),
+                        (
+                            "write.parquet.content-defined-chunking.max-chunk-size",
+                            &max,
+                        ),
+                        ("write.parquet.content-defined-chunking.norm-level", &norm),
+                    ]),
+                    date_columns(1),
+                )
+                .is_err();
+                assert_eq!(refused, parquet_fails, "min {min}, max {max}, norm {norm}");
+            }
+        }
+    }
+}
+
+/// An open data file becomes an object on abort, so its delete removes it and no upload stays open.
+#[tokio::test]
+async fn abort_closes_the_open_data_file_before_deleting_it() {
+    let (mut sink, requests, batch) = new_table_sink().await;
+
+    sink.write(&batch).await.unwrap();
+    sink.abort().await;
+
+    let written = data_file_paths(&requests, "PUT");
+    assert_eq!(written.len(), 1);
+    assert_eq!(data_file_paths(&requests, "DELETE"), written);
 }

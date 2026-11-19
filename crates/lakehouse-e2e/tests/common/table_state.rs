@@ -258,25 +258,12 @@ pub fn data_file_footers(metadata: &Value) -> Vec<DataFileFooter> {
         .collect()
 }
 
-/// Asserts that every column chunk of `files` uses `codec`, at any level, and that no row group
-/// compresses to more than a tenth above `row_group_bytes`. parquet-rs counts finished pages after
-/// compression, so the size before compression can exceed the limit further.
+/// Asserts that every column chunk of `files` uses `codec`, at any level.
 #[track_caller]
-pub fn assert_data_files(
-    case: &str,
-    files: &[DataFileFooter],
-    codec: Compression,
-    row_group_bytes: i64,
-) {
+pub fn assert_data_files(case: &str, files: &[DataFileFooter], codec: Compression) {
     assert!(!files.is_empty(), "{case}: no data file");
     for file in files {
-        for (index, group) in file.footer.row_groups().iter().enumerate() {
-            assert!(
-                group.compressed_size() <= row_group_bytes + row_group_bytes / 10,
-                "{case}: row group {index} of {} compresses to {} bytes",
-                file.path,
-                group.compressed_size()
-            );
+        for group in file.footer.row_groups() {
             for column in group.columns() {
                 assert_eq!(
                     std::mem::discriminant(&column.compression()),

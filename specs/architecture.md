@@ -109,7 +109,7 @@
 - Each node scans only its assigned files, with no overlap between shards.
 - The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
 - The export writer count is G = node count × `WRITERS_PER_NODE` (default 1), clamped to at least 1 and at most 300, or 1 with `SINGLE_COMMIT = 'true'`. Each source row reaches exactly one writer, and a source with at least G rows runs exactly G writers.
-- An export writer into a partitioned table buffers each partition's rows and keeps their Arrow memory within min(max((memory limit − 200 MB) × 0.5, 64 MiB), 512 MiB), or 512 MiB when the limit is unknown. At the budget it writes the partition with the most buffered rows into one data file, so it has at most one data file open at a time. A writer into an unpartitioned table buffers no rows beyond the Parquet row group in progress.
+- An export writer into a partitioned table buffers each partition's rows and keeps their Arrow memory within min(max((memory limit − 200 MB) × 0.5, 64 MiB), 512 MiB), or 512 MiB when the limit is unknown. At the budget it writes out the partition with the most buffered rows, into one or more data files that roll over at `write.target-file-size-bytes`, so it has at most one data file open at a time. A writer into an unpartitioned table buffers no rows beyond the Parquet row group in progress.
 - The DataFusion memory pool is max((memory limit − 200 MB overhead) × 0.6, 256 MiB), or 1 GiB when the limit is unknown.
 - The scan spills to `/tmp` when `/tmp` is a writable non-tmpfs disk. Otherwise it returns a `ResourcesExhausted` error past the pool budget.
 - The scan streams one `RecordBatch` at a time and never collects the full result.

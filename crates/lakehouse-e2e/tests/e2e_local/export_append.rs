@@ -17,9 +17,9 @@ use crate::common::export_append_fixtures::{
     V3_COLUMNS,
 };
 use crate::common::table_state::{
-    assert_data_files, assert_one_new_export, data_file_footers, data_prefix, iceberg_columns,
-    local_table_metadata, objects_under, remove_table_properties, reset_to_unexported_snapshot,
-    set_table_properties, snapshot_ids,
+    DataFileFooter, assert_data_files, assert_one_new_export, data_file_footers, data_prefix,
+    iceberg_columns, local_table_metadata, objects_under, remove_table_properties,
+    reset_to_unexported_snapshot, set_table_properties, snapshot_ids,
 };
 use crate::fixtures::{
     EXPORT_DIRECT, EXPORT_PROXIED, lakehouse_vs, proxy_virtual_schemas, stack, vs_table,
@@ -402,63 +402,93 @@ fn wide_rows(rows: u32) -> String {
     format!("(SELECT * FROM {WIDE_ROWS} WHERE ID <= {rows})")
 }
 
-/// A new table of `WIDE_ROWS`' columns, created by an export of its first 10 rows.
-fn wide_table(name: &str) -> (String, String) {
+/// A new table of `WIDE_ROWS`' columns, created by an export of its first 10 rows with `options`.
+fn wide_table(name: &str, options: &str) -> (String, String) {
     let namespace = run_namespace("write_properties");
     let table = format!("{namespace}.{name}");
     exported_rows(
         &mut exa_conn(),
-        &EXPORT_DIRECT.export(&wide_rows(10), &table, ""),
+        &EXPORT_DIRECT.export(&wide_rows(10), &table, options),
     );
     (namespace, table)
 }
 
-/// Scenario: A table the export creates carries its write properties
-/// Scenario: An append writes data files by the table's write properties
-/// Scenario: An export into an unpartitioned table rolls its data files at the target file size
-#[test]
-fn export_append_follows_the_table_write_properties() {
-    stack();
-    setup();
-    let (namespace, table) = wide_table("snappy");
-    let created = local_table_metadata(&namespace, "snappy");
+/// Asserts that the table `metadata` describes carries the write properties of a created table.
+#[track_caller]
+fn assert_created_properties(case: &str, metadata: &Value) {
     let properties = [
         "write.parquet.compression-codec",
         "write.parquet.row-group-size-bytes",
         "write.target-file-size-bytes",
     ]
-    .map(|key| created["properties"][key].as_str());
+    .map(|key| metadata["properties"][key].as_str());
     assert_eq!(
         properties,
-        [Some("zstd"), Some("134217728"), Some("268435456")]
+        [Some("zstd"), Some("134217728"), Some("268435456")],
+        "{case}"
     );
+}
+
+/// The data files of the table `metadata` describes that are not among `old`, the objects
+/// `objects_under` listed before.
+fn new_data_files(old: &[String], metadata: &Value) -> Vec<DataFileFooter> {
+    data_file_footers(metadata)
+        .into_iter()
+        .filter(|file| !old.contains(&file.path))
+        .collect()
+}
+
+/// Scenario: A table the export creates carries its write properties
+/// Scenario: An append writes data files by the table's write properties
+/// Scenario: A write property the table lacks takes the writer's default
+#[test]
+fn export_append_follows_the_table_write_properties() {
+    stack();
+    setup();
+    let (namespace, table) = wide_table("snappy", "");
+    let created = local_table_metadata(&namespace, "snappy");
+    assert_created_properties("several writers", &created);
     assert_data_files(
         "created table",
         &data_file_footers(&created),
         Compression::ZSTD(ZstdLevel::default()),
-        128 * MIB,
     );
     set_table_properties(
         &namespace,
         "snappy",
         &[
+            ("write.format.default", "orc"),
             ("write.parquet.compression-codec", "snappy"),
-            ("write.parquet.row-group-size-bytes", "1048576"),
+            ("write.parquet.row-group-size-bytes", "2097152"),
             ("write.target-file-size-bytes", "4194304"),
         ],
     );
     let before = local_table_metadata(&namespace, "snappy");
+    let old = objects_under(&data_prefix(&before));
 
     let sql = EXPORT_DIRECT.export(WIDE_ROWS, &table, "SINGLE_COMMIT = 'true'");
     assert_eq!(exported_rows(&mut exa_conn(), &sql), 200_000);
 
     let after = local_table_metadata(&namespace, "snappy");
-    // Every file but the 10-row one of the creating export.
-    let added: Vec<_> = data_file_footers(&after)
-        .into_iter()
-        .filter(|file| file.footer.file_metadata().num_rows() > 10)
+    let added = new_data_files(&old, &after);
+    assert_data_files("snappy append", &added, Compression::SNAPPY);
+    // A 2 MiB row group holds several 8,192-row input batches, and the default 128 MiB one would
+    // hold a whole 4 MiB file.
+    let groups: Vec<_> = added
+        .iter()
+        .map(|file| {
+            file.footer
+                .row_groups()
+                .iter()
+                .map(|group| group.num_rows())
+                .collect::<Vec<_>>()
+        })
         .collect();
-    assert_data_files("snappy append", &added, Compression::SNAPPY, MIB);
+    assert!(
+        groups.iter().any(|rows| rows.len() > 1)
+            && groups.iter().flatten().any(|rows| *rows > 8_192),
+        "a data file of several row groups, one of more than 8,192 rows: {groups:?}"
+    );
     let sizes: Vec<u64> = added.iter().map(|file| file.size).collect();
     assert!(
         sizes.len() > 1 && sizes.iter().all(|size| *size <= 5 * MIB as u64),
@@ -466,7 +496,7 @@ fn export_append_follows_the_table_write_properties() {
     );
     assert_eq!(after["properties"], before["properties"]);
 
-    // Without the properties, an append takes Iceberg's defaults.
+    // Without the properties, an append takes the writer's defaults.
     remove_table_properties(
         &namespace,
         "snappy",
@@ -476,27 +506,32 @@ fn export_append_follows_the_table_write_properties() {
             "write.target-file-size-bytes",
         ],
     );
+    let old = objects_under(&data_prefix(&after));
     let sql = EXPORT_DIRECT.export(&wide_rows(5), &table, "");
     assert_eq!(exported_rows(&mut exa_conn(), &sql), 5);
-    let defaulted: Vec<_> = data_file_footers(&local_table_metadata(&namespace, "snappy"))
-        .into_iter()
-        .filter(|file| file.footer.file_metadata().num_rows() == 5)
-        .collect();
+    let defaulted = new_data_files(&old, &local_table_metadata(&namespace, "snappy"));
     assert_data_files(
         "append without write properties",
         &defaulted,
         Compression::ZSTD(ZstdLevel::default()),
-        128 * MIB,
     );
 }
 
+/// Scenario: A table the export creates carries its write properties
 /// Scenario: An unusable write property fails the export before any data is written
 #[test]
 fn export_refuses_unusable_write_properties() {
     stack();
     setup();
-    // parquet-rs itself refuses lzo only at the first write; unit tests name every other value.
-    let (namespace, table) = wide_table("lzo");
+    // Unit tests name every other value.
+    let (namespace, table) = wide_table("lzo", "SINGLE_COMMIT = 'true'");
+    let created = local_table_metadata(&namespace, "lzo");
+    assert_created_properties("SINGLE_COMMIT", &created);
+    assert_data_files(
+        "created with SINGLE_COMMIT",
+        &data_file_footers(&created),
+        Compression::ZSTD(ZstdLevel::default()),
+    );
     set_table_properties(
         &namespace,
         "lzo",

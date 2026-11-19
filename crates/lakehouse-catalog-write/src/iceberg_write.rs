@@ -832,7 +832,6 @@ fn creation_request(
             TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_string(),
             (128 * MIB).to_string(),
         ),
-        // Half Iceberg's default, because a virtual schema shards a scan by data file.
         (
             TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
             (256 * MIB).to_string(),
