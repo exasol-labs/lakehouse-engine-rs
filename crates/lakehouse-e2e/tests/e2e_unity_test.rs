@@ -17,9 +17,10 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
-    Format, PRUNING_PARQUET_TABLE, VS_UNITY, assert_cases_hold,
-    assert_grouped_aggregates_match_oracle, assert_one_shaped_file_per_label,
-    assert_single_group_aggregates_match_oracle, parse_footer, sorted_ids,
+    CLOCK_FOLDING_ZONE, Format, PRUNING_PARQUET_TABLE, VS_UNITY, assert_cases_hold,
+    assert_grouped_aggregates_match_oracle, assert_instant_clock_cases_hold,
+    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle, parse_footer,
+    sorted_ids,
 };
 use common::pruning_fixture::{
     PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PRUNING_TYPED_PARTITION_COLUMN, d_text,
@@ -171,7 +172,8 @@ fn setup() {
             &mut conn,
             &VsProps::new(VS_UNITY, PRUNING_UNITY_NAMESPACE)
                 .with_catalog_kind("UNITY_CATALOG")
-                .with_catalog_conn_name(PRUNING_DELTA_CONN),
+                .with_catalog_conn_name(PRUNING_DELTA_CONN)
+                .with_property("SESSION_TIME_ZONE", CLOCK_FOLDING_ZONE),
             UNITY_CATALOG_URI_INTERNAL,
             &local_stack_connection_password(),
         );
@@ -2740,6 +2742,15 @@ fn delta_pruning_keeps_every_file_with_a_matching_row() {
 fn unity_parquet_partition_pruning_keeps_every_file_with_a_matching_row() {
     setup();
     assert_cases_hold(&mut exa_conn(), Format::UnityParquet);
+}
+
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value beside an instant operand compares the instants
+#[test]
+fn delta_and_unity_parquet_instant_columns_compare_with_a_tstz_value_as_instants() {
+    setup();
+    let mut conn = exa_conn();
+    assert_instant_clock_cases_hold(&mut conn, Format::Delta);
+    assert_instant_clock_cases_hold(&mut conn, Format::UnityParquet);
 }
 
 /// Scenario: A partition value compares under its column's declared type

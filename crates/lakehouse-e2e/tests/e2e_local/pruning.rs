@@ -8,9 +8,9 @@ use crate::common::e2e_harness::{
 };
 use crate::common::identity_partition_fixtures::TYPES_TABLE;
 use crate::common::pruning_cases::{
-    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_clock_cases_hold,
-    assert_grouped_aggregates_match_oracle, assert_one_shaped_file_per_label,
-    assert_single_group_aggregates_match_oracle,
+    CLOCK_FOLDING_ZONE, Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_clock_cases_hold,
+    assert_grouped_aggregates_match_oracle, assert_instant_clock_cases_hold,
+    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle,
 };
 use crate::common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
@@ -42,12 +42,17 @@ fn setup() {
         for statement in oracle_statements() {
             conn.execute(&statement);
         }
-        create_virtual_schema(&mut conn, &VsProps::new(VS_ICEBERG, PRUNING_NAMESPACE));
+        create_virtual_schema(
+            &mut conn,
+            &VsProps::new(VS_ICEBERG, PRUNING_NAMESPACE)
+                .with_property("SESSION_TIME_ZONE", CLOCK_FOLDING_ZONE),
+        );
         create_virtual_schema_with_password(
             &mut conn,
             &VsProps::new(VS_HIVE, "")
                 .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_HIVE),
+                .with_catalog_conn_name(CONN_HIVE)
+                .with_property("SESSION_TIME_ZONE", CLOCK_FOLDING_ZONE),
             PRUNING_HIVE_BASE,
             &hive_storage_password(),
         );
@@ -146,15 +151,18 @@ fn hive_grouped_aggregates_match_the_oracle() {
 }
 
 /// Scenario: A filter on a clock function or a time zone literal prunes files at plan time
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
 #[test]
 fn clock_and_tstz_filters_prune_files() {
     setup();
     let mut conn = exa_conn();
     // In a session whose zone is the folding zone, the TSTZ literal folds to its own wall clock.
-    let db_timezone = conn.query_columns("SELECT DBTIMEZONE")[0][0].clone();
-    let db_timezone = db_timezone.as_str().expect("DBTIMEZONE is text");
-    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
+    conn.execute(&format!(
+        "ALTER SESSION SET TIME_ZONE = '{CLOCK_FOLDING_ZONE}'"
+    ));
     assert_clock_cases_hold(&mut conn, Format::Iceberg);
+    assert_instant_clock_cases_hold(&mut conn, Format::Iceberg);
+    assert_instant_clock_cases_hold(&mut conn, Format::Hive);
 
     // `dt` is an identity partition holding 2024-02-29 and NULL.
     lakehouse_vs();

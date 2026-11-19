@@ -139,10 +139,10 @@ A `LIKE` without `ESCAPE` uses the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, wh
 
 ## Clock functions and TIMESTAMP WITH LOCAL TIME ZONE literals
 
-The adapter folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` in the zone of the `SESSION_TIME_ZONE` property, or in `DBTIMEZONE` when it is unset, because no adapter request carries `SESSIONTIMEZONE`. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal compares in the same zone. In a session whose `SESSIONTIMEZONE` differs from that folding zone:
+The adapter folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` in the zone of the `SESSION_TIME_ZONE` property, or in `DBTIMEZONE` when it is unset, because no adapter request carries `SESSIONTIMEZONE`. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal compares in the same zone, except beside an [instant column](#instant-columns), where every clock value is UTC. In a session whose `SESSIONTIMEZONE` differs from that folding zone:
 
 - `CURRENT_DATE`, and on Exasol 2025 a projected `LOCALTIMESTAMP`, return the folding zone's date and time.
-- `ts < CURRENT_TIMESTAMP`, `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, and `ts > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` compare `ts` with the instant's wall-clock time in the folding zone. Native Exasol compares in the session zone.
+- For a `TIMESTAMP` column `ts` that is not an instant column, `ts < CURRENT_TIMESTAMP`, `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, and `ts > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` compare `ts` with the instant's wall-clock time in the folding zone. Native Exasol compares in the session zone.
 - A projected `CURRENT_TIMESTAMP`, a projected `TIMESTAMP WITH LOCAL TIME ZONE` literal, and on Exasol 8 a projected `LOCALTIMESTAMP` still show the session's own value.
 
 For example, with `DBTIMEZONE` `EUROPE/BERLIN`, no `SESSION_TIME_ZONE`, and `ALTER SESSION SET TIME_ZONE = 'ASIA/TOKYO'`, `SELECT CURRENT_DATE FROM t` at 15:30 UTC returns the Berlin date, one day before the Tokyo date native Exasol returns.
@@ -153,8 +153,29 @@ Other differences of the folded values:
 - Exasol itself folds an expression over a clock function, such as `CURRENT_DATE - 7`, in the session zone before the adapter sees it. In one query, `CURRENT_DATE - 7` and a bare `CURRENT_DATE` can therefore come from two zones.
 - Every clock function of a statement over one virtual schema folds from one reading. A statement over two virtual schemas can fold two readings.
 
-**Workaround:** set `SESSION_TIME_ZONE` to the zone your sessions use, `ALTER VIRTUAL SCHEMA my_vs SET SESSION_TIME_ZONE = 'ASIA/TOKYO'`. To evaluate the clock functions and the literals in each session's own zone, at the cost of file pruning, exclude them:
+**Workaround:** set `SESSION_TIME_ZONE` to the zone your sessions use, `ALTER VIRTUAL SCHEMA my_vs SET SESSION_TIME_ZONE = 'ASIA/TOKYO'`. To evaluate the clock functions and the literals in each session's own zone, at the cost of file pruning, exclude them. Do not exclude them over [instant columns](#instant-columns): Exasol then compares the column's UTC value with session time, so comparisons with `CURRENT_TIMESTAMP` or a `TIMESTAMP WITH LOCAL TIME ZONE` value stop returning the native rows outside a UTC session:
 
 ```sql
 ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_CURRENT_DATE, FN_CURRENT_TIMESTAMP, FN_LOCALTIMESTAMP, LITERAL_TIMESTAMP_UTC';
 ```
+
+## Instant columns
+
+Iceberg `timestamptz`, Delta and Unity Catalog `timestamp`, and UTC-adjusted or INT96 Parquet timestamps are instant columns. The virtual schema shows them as `TIMESTAMP` values in UTC and treats every value beside them as UTC: it reads a plain `TIMESTAMP` or `DATE` value as UTC, and folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `SYSDATE`, `SYSTIMESTAMP`, and `TIMESTAMP WITH LOCAL TIME ZONE` values to their UTC date or date and time. So a query over instant columns returns what native Exasol returns in a UTC session over a `TIMESTAMP WITH LOCAL TIME ZONE` column with the same instants.
+
+Write times in UTC, or run `ALTER SESSION SET TIME_ZONE = 'UTC'`. In another session zone, native Exasol shows such a column in the session zone and reads a plain value as session time, so these differ:
+
+- The virtual schema shows the column, and a projected expression over it such as `GREATEST(tz, CURRENT_TIMESTAMP)`, in UTC. Native Exasol shows the session time.
+- A plain value, such as `tz > TIMESTAMP '2024-03-01 10:00:00'` or `tz >= CURRENT_DATE`, compares in UTC. Native Exasol compares in the session zone. A `TIMESTAMP WITH LOCAL TIME ZONE` value, such as `CURRENT_TIMESTAMP - INTERVAL '1' HOUR`, names an instant, so a comparison with it returns the native rows in every session zone, also through `MAX(tz)`, `ADD_HOURS(tz, 1)`, `COALESCE(tz, ...)`, or `CASE`.
+- A function that reads the date or time of day, such as `CAST(tz AS DATE)`, `EXTRACT`, `TO_CHAR`, `DATE_TRUNC`, or `DAYS_BETWEEN`, reads the UTC value. `ADD_DAYS` and longer steps add whole UTC days, so across a daylight saving change they differ from native by the shift.
+- A comparison Exasol runs itself, such as `tz + INTERVAL '1' HOUR > CURRENT_TIMESTAMP`, a filter above a subquery with `LIMIT`, or a join with a native `TIMESTAMP WITH LOCAL TIME ZONE` column, reads the UTC value as session time. Write `ADD_HOURS(tz, 1)` in place of the interval.
+- An operand that mixes an instant column with another column, such as `ADD_DAYS(ts, DAY(tz))`, counts as UTC.
+
+In an `EUROPE/BERLIN` session, for a row at 09:30 UTC:
+
+| Filter | Virtual schema | Native |
+|---|---|---|
+| `tz > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` | row | row |
+| `tz > TIMESTAMP '2024-03-01 10:00:00'` | no row | row |
+
+**Workaround:** use a UTC session, or write a plain value in UTC or as a `TIMESTAMP WITH LOCAL TIME ZONE`, as in the first filter. In a join with a native column, use a UTC session. `CONVERT_TZ(tz, 'UTC', SESSIONTIMEZONE)` also converts the column, but misses rows in the hour that repeats when clocks go back.

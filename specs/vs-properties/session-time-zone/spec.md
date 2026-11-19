@@ -5,7 +5,7 @@ The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in fo
 ## Background
 
 * No adapter or UDF request carries `SESSIONTIMEZONE`. Exasol sets the `TZ` environment variable of the adapter VM to `DBTIMEZONE`, as a zone name or, for a numeric zone, expectedly as a POSIX `UTC±N` string with the sign inverted. A `%env TZ=<zone>;` line in the adapter script source overrides it.
-* The folding zone is the `SESSION_TIME_ZONE` zone when the property is set, and the `TZ` zone otherwise. It applies to `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, and every compared `TIMESTAMP WITH LOCAL TIME ZONE` literal.
+* The folding zone is the `SESSION_TIME_ZONE` zone when the property is set, and the `TZ` zone otherwise. It applies to `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, and every compared `TIMESTAMP WITH LOCAL TIME ZONE` literal, except beside an instant operand (`pushdown/pushdown-planning-clock-functions`), where every clock function and such a literal folds to its UTC date or date and time.
 * Exasol parses `ALTER VIRTUAL SCHEMA ... SET TIME_ZONE` as its own syntax and refuses a quoted property name, so the property is not named `TIME_ZONE`.
 * `docs/semantic-differences.md` lists where the folded values differ from native Exasol.
 
@@ -21,7 +21,7 @@ The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in fo
 
 ### Scenario: A session zone that differs from the folding zone gets the folding zone's values
 
-* *GIVEN* a virtual schema without `SESSION_TIME_ZONE`, and a session with `ALTER SESSION SET TIME_ZONE = 'ASIA/TOKYO'` while `DBTIMEZONE` is not `ASIA/TOKYO`
+* *GIVEN* a virtual schema without `SESSION_TIME_ZONE`, a virtual table `t` whose `TIMESTAMP` column `ts` is no instant column, and a session with `ALTER SESSION SET TIME_ZONE = 'ASIA/TOKYO'` while `DBTIMEZONE` is not `ASIA/TOKYO`
 * *WHEN* the session runs `SELECT CURRENT_DATE, LOCALTIMESTAMP FROM t`, `SELECT CURRENT_TIMESTAMP FROM t`, and `SELECT COUNT(*) FROM t WHERE ts > CAST(TIMESTAMP '<x>' AS TIMESTAMP WITH LOCAL TIME ZONE)`
 * *THEN* `CURRENT_DATE` SHALL be the date in the `TZ` zone, not in `ASIA/TOKYO`, and on Exasol 2025 `LOCALTIMESTAMP` SHALL be the wall-clock time in the `TZ` zone, as `docs/semantic-differences.md` documents
 * *AND* the comparison SHALL compare `ts` with the instant's wall-clock time in the `TZ` zone, not with `<x>`
@@ -37,9 +37,9 @@ The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in fo
 ### Scenario: An unreadable TZ fails only a query that needs it
 
 * *GIVEN* an adapter script whose source holds `%env TZ=NOT/A_ZONE;`, and a virtual schema on it without `SESSION_TIME_ZONE`
-* *WHEN* the user runs a query over a virtual table that uses `SYSDATE`, a query that compares with a `TIMESTAMP WITH LOCAL TIME ZONE` literal, and a query that uses neither
+* *WHEN* the user runs a query over a virtual table that uses `SYSDATE`, a query that compares a `TIMESTAMP` column that is no instant column with a `TIMESTAMP WITH LOCAL TIME ZONE` literal, a query that compares an instant column with that literal, and a query that uses neither a clock function nor such a literal
 * *THEN* the first two queries SHALL fail with an error that names the `TZ` value `NOT/A_ZONE`, and MUST NOT fold in UTC or in any other zone
-* *AND* the query that uses neither SHALL succeed
+* *AND* the query over the instant column and the query that uses neither SHALL succeed, because neither reads `TZ`
 * *AND* the same failure SHALL occur when `TZ` is empty or unset
 * *AND* after `ALTER VIRTUAL SCHEMA ... SET SESSION_TIME_ZONE = 'EUROPE/BERLIN'`, the query with the `TIMESTAMP WITH LOCAL TIME ZONE` literal and a query that uses only `CURRENT_DATE`, `CURRENT_TIMESTAMP`, or `LOCALTIMESTAMP` SHALL succeed, because they then do not read `TZ`
 

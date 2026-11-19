@@ -2,10 +2,12 @@
 //! the parse of a table's notes into the declared schema a pushdown plans from. CREATE, REFRESH,
 //! and SET write notes and every pushdown reads them, so no other module knows the format.
 
+use arrow::datatypes::DataType;
 use exasol_udf_sdk::error::UdfError;
 use serde::{Deserialize, Serialize};
 
 use crate::scan::spec::LogicalField;
+use crate::types::mapping::arrow_type_from_tag;
 
 /// Exasol persists at most this many characters of one column's `adapterNotes` and rejects the
 /// statement above it (sqlCode 04000). The limit counts characters, not bytes.
@@ -35,6 +37,17 @@ impl ColumnDeclaration {
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("a column declaration always serializes")
     }
+}
+
+/// Whether the column a note declares holds UTC instants, as every zoned source timestamp does
+/// because the read normalizes each zone to UTC; `false` for an unreadable note.
+pub fn declares_utc_instants(note: &str) -> bool {
+    serde_json::from_str::<ColumnDeclaration>(note).is_ok_and(|declaration| {
+        matches!(
+            arrow_type_from_tag(&declaration.source_type.arrow_type),
+            DataType::Timestamp(_, Some(_))
+        )
+    })
 }
 
 /// Passes `note` through unchanged when Exasol will persist it, so a pushdown never plans from a

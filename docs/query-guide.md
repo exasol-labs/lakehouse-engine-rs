@@ -128,6 +128,10 @@ zone can get a different date than native Exasol around midnight, and the two fo
 within one query. See
 [Semantic differences](semantic-differences.md#clock-functions-and-timestamp-with-local-time-zone-literals).
 
+Beside an [instant column](semantic-differences.md#instant-columns), such as an Iceberg
+`timestamptz`, every clock function uses UTC instead, as the column does. Write times compared
+with such a column in UTC, or run `ALTER SESSION SET TIME_ZONE = 'UTC'`.
+
 ### Keep filters the engine can't run out of `OR`
 
 Exasol runs the filters the engine doesn't support, such as `REGEXP_LIKE`. When they are combined
