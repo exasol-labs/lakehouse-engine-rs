@@ -89,16 +89,9 @@ The adapter pushes an ordered top-N query (single table, no GROUP BY, no aggrega
 * *WHEN* the adapter generates the pushdown SQL
 * *THEN* the credential-reference guarantee of `storage-access/scan-spec-credential-reference` SHALL apply, so no credential value appears in generated SQL or error messages
 
-### Scenario: A constant sort key does not decide the bounded top-N path
+### Scenario: A per-shard top-N ranks a stored empty string as NULL
 
-* *GIVEN* a single-table row-scan query with `LIMIT n` whose `ORDER BY` mixes constant keys with bare projected column keys (`SELECT id, 1 FROM t ORDER BY 2 DESC, 1 LIMIT 3`)
-* *WHEN* the adapter checks whether the query is an ordered top-N
-* *THEN* the adapter SHALL check the non-constant keys only, so the query above runs as a per-shard bounded top-N on `id`
-* *AND* the merged result SHALL equal the same query on a single node, ids 1, 2, 3
-
-### Scenario: An ORDER BY of constants only runs as an unordered LIMIT
-
-* *GIVEN* a single-table row-scan query whose every `ORDER BY` key is a constant, with `LIMIT n` and no offset (`SELECT id, 1 FROM t ORDER BY 2 LIMIT 3`)
-* *WHEN* the adapter builds the pushdown SQL
-* *THEN* the adapter SHALL plan the query as one without an `ORDER BY`, so each shard carries the row limit `n` and no sort, as for a bare `LIMIT`
-* *AND* the query SHALL return `n` distinct rows of the table, because a constant ordering admits any `n` rows
+* *GIVEN* a virtual table whose files span several shards and whose string column `label` stores `''` in some rows
+* *WHEN* a single-table `ORDER BY label LIMIT n` is pushed down as a per-shard bounded sort
+* *THEN* each shard SHALL rank a row that stores `''` as NULL, placed by the key's NULL placement
+* *AND* the result SHALL equal the same query without pushdown, for `NULLS FIRST` and for `NULLS LAST`

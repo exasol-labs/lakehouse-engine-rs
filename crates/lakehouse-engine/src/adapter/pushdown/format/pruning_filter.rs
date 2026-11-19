@@ -76,10 +76,28 @@ impl<C: Clone> PruningFilter<C> {
             "predicate_and" => Self::And(parse_all(operands(node)?)),
             "predicate_or" => Self::Or(parse_all(operands(node)?)),
             "predicate_not" => Self::Not(Box::new(Self::parse(node.get("expression")?, resolve))),
-            "predicate_is_null" | "predicate_is_not_null" => Self::NullTest {
-                column: resolve(subject_column(node)?)?.0,
-                is_null: kind == "predicate_is_null",
-            },
+            "predicate_is_null" | "predicate_is_not_null" => {
+                let (column, data_type) = resolve(subject_column(node)?)?;
+                let is_null = kind == "predicate_is_null";
+                let empty = data_type.as_ref().and_then(empty_value).map(|literal| {
+                    let comparison = if is_null {
+                        Comparison::Equal
+                    } else {
+                        Comparison::NotEqual
+                    };
+                    Self::Compare {
+                        column: column.clone(),
+                        comparison,
+                        literal,
+                    }
+                });
+                let null_test = Self::NullTest { column, is_null };
+                match empty {
+                    None => null_test,
+                    Some(empty) if is_null => Self::Or(vec![null_test, empty]),
+                    Some(empty) => Self::And(vec![null_test, empty]),
+                }
+            }
             "predicate_in_constlist" => {
                 let (column, arguments) = in_operands(node)?;
                 let (column, data_type) = resolve(column)?;
@@ -119,6 +137,16 @@ impl<C: Clone> PruningFilter<C> {
             }
             _ => return None,
         })
+    }
+}
+
+/// The value of a `data_type` column that Exasol reads as NULL although a file's null count
+/// leaves it out: the empty string, and the empty value of a variable-length binary column.
+fn empty_value(data_type: &DataType) -> Option<ScalarValue> {
+    match data_type {
+        DataType::Binary => Some(ScalarValue::Binary(Some(Vec::new()))),
+        text if text.is_string() => ScalarValue::try_from_string(String::new(), text).ok(),
+        _ => None,
     }
 }
 

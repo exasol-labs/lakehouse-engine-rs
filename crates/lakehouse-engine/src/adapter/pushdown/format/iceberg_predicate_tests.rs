@@ -97,8 +97,16 @@ fn every_leaf_and_junction_lowers_to_its_iceberg_predicate() {
             on_amount("predicate_greaterequal"),
             amount().greater_than_or_equal_to(Datum::long(100)),
         ),
-        (is_null(col("NAME")), name().is_null()),
-        (is_not_null(col("NAME")), name().is_not_null()),
+        (
+            is_null(col("NAME")),
+            name().is_null().or(name().equal_to(Datum::string(""))),
+        ),
+        (
+            is_not_null(col("NAME")),
+            name()
+                .is_not_null()
+                .and(name().not_equal_to(Datum::string(""))),
+        ),
         (
             in_list(col("NAME"), [str_lit("alice"), str_lit("bob")]),
             name().is_in([Datum::string("alice"), Datum::string("bob")]),

@@ -1849,7 +1849,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 
     assert!(
         sql.contains(&embedded_group_keys(&[
-            r#"CAST("NAME" AS VARCHAR)"#.to_string()
+            r#"CAST(nullif("NAME", '') AS VARCHAR)"#.to_string()
         ])),
         "an unprojected VARCHAR-declared group key must reach the scan unpadded: {sql}"
     );

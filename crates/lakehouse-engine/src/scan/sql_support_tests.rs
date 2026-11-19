@@ -74,3 +74,32 @@ fn render_column_diverts_a_nested_column_to_the_json_render_function() {
         "a nested column must be routed through the JSON render function, not CAST"
     );
 }
+
+#[test]
+fn a_sort_target_ranks_the_value_the_shard_emits() {
+    let label = ColumnRef::from("LABEL");
+    let cases = [
+        (Some(DataType::Utf8), r#"nullif("LABEL", '')"#),
+        (Some(DataType::Binary), r#"nullif("LABEL", '')"#),
+        (
+            Some(DataType::Float64),
+            r#"CASE WHEN isnan("LABEL") THEN NULL ELSE "LABEL" END"#,
+        ),
+        (Some(DataType::Int64), r#""LABEL""#),
+        (None, r#""LABEL""#),
+    ];
+    for (data_type, expected) in cases {
+        assert_eq!(
+            render_sort_target(&label, data_type.as_ref()),
+            expected,
+            "{data_type:?}"
+        );
+    }
+    assert_eq!(
+        render_sort_target(
+            &ColumnRef::qualified("LHS_T1", "LABEL"),
+            Some(&DataType::Utf8)
+        ),
+        r#"nullif("LHS_T1"."LABEL", '')"#
+    );
+}
