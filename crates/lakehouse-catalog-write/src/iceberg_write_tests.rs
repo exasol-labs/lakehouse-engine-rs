@@ -5,7 +5,7 @@ use crate::test_support::{
     RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
     catalog, data_file, ident, memory_table, requests_starting, session, with_short_commit_waits,
 };
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
 use lakehouse_catalog::{AdlsCred, StorageProps};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -175,10 +175,10 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     let writes = static_writes(&uri).await;
 
     let raced = writes
-        .create_table(&ident("ns", "t"), schema(), TAGGED_EXPORT_ID)
+        .create_table(&ident("ns", "t"), schema(), None, TAGGED_EXPORT_ID)
         .await;
     let foreign = writes
-        .create_table(&ident("ns", "t"), schema(), "another-export")
+        .create_table(&ident("ns", "t"), schema(), None, "another-export")
         .await;
 
     assert_eq!(
@@ -209,7 +209,7 @@ async fn a_create_without_an_answer_and_without_a_table_is_sent_again() {
     let writes = static_writes(&uri).await;
 
     writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -226,7 +226,7 @@ async fn a_create_the_catalog_refuses_fails_at_once_naming_the_table() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -248,7 +248,7 @@ async fn a_create_the_catalog_stays_busy_for_fails_after_its_retries() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -292,7 +292,7 @@ async fn a_create_whose_connection_is_refused_is_sent_again_until_its_retries_ru
     let writes = static_writes(&catalog_gone_after_config().await).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -313,7 +313,7 @@ async fn an_unreadable_create_answer_fails_quoting_none_of_it() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -338,14 +338,14 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
 
     let refused = vended_writes(&uri, false)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
         .to_string();
     let allowed = vended_writes(&uri, true)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -483,7 +483,7 @@ async fn a_refused_stage_fails_quoting_the_status_and_naming_the_catalog() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -512,7 +512,7 @@ async fn an_unreadable_stage_answer_fails_stating_that_single_commit_needs_stage
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -543,7 +543,7 @@ async fn a_stage_answer_followed_by_a_table_this_export_created_drops_it() {
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -575,7 +575,7 @@ async fn a_stage_answer_followed_by_a_table_it_cannot_drop_says_the_table_must_b
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -601,7 +601,7 @@ async fn a_stage_answer_followed_by_another_exports_table_leaves_it_and_says_so(
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "another-export")
+        .stage_table(&ident("ns", "staged"), schema(), None, "another-export")
         .await
         .err()
         .unwrap()
@@ -661,7 +661,7 @@ async fn a_missing_namespace_level_is_created_and_one_created_meanwhile_counts_a
 
 #[test]
 fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
-    let request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let request = creation_request(&ident("ns", "t"), schema(), None, "e1");
 
     let sent = serde_json::to_value(&request).unwrap();
 
@@ -676,11 +676,32 @@ fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
     );
     assert_eq!(sent["schema"]["fields"][0]["name"], "ID");
     assert!(sent.get("stage-create").is_none(), "{sent}");
+    assert!(sent.get("partition-spec").is_none(), "{sent}");
+}
+
+#[test]
+fn a_create_request_carries_the_partition_spec() {
+    let spec = PartitionSpec::builder(schema())
+        .add_partition_field("ID", "ID_bucket", Transform::Bucket(4))
+        .unwrap()
+        .build()
+        .unwrap()
+        .into_unbound();
+
+    let request = creation_request(&ident("ns", "t"), schema(), Some(spec), "e1");
+
+    let sent = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        sent["partition-spec"]["fields"],
+        serde_json::json!([
+            {"source-id": 1, "field-id": 1000, "name": "ID_bucket", "transform": "bucket[4]"}
+        ])
+    );
 }
 
 #[test]
 fn a_stage_request_asks_for_staged_creation() {
-    let mut request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let mut request = creation_request(&ident("ns", "t"), schema(), None, "e1");
     request.stage_create = Some(true);
 
     let sent = serde_json::to_value(&request).unwrap();

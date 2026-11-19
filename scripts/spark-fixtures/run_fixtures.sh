@@ -49,6 +49,7 @@ FIXTURES=(
   create_identity_partition_fixture.sql
   create_name_mapping_fixture.sql
   create_export_append_fixture.sql
+  create_export_partition_fixture.sql
   create_int96_timestamp_fixture.sql
 )
 (cd /fixtures && cat "${FIXTURES[@]}") > /tmp/fixtures.sql

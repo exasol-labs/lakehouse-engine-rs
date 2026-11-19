@@ -9,7 +9,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * Catalog, storage, and credentials: export/export-catalog-storage § Background.
 * Before it reads any source row the export makes catalog calls only: it authenticates, checks whether the table exists, and, when it does not, creates every missing level of the namespace, even when it then writes no rows or fails. It never writes to storage at that point, so a storage error shows when the writers write, and in parallel mode a failed export can leave an empty table behind. A table that another statement creates after that check fails the writers with an error that names the table.
 * `SINGLE_COMMIT`: export/export-single-commit § Background.
-* Type mapping. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
+* Type mapping. The export creates format-version 2 tables, unpartitioned unless `PARTITION_BY` is given (export/export-partitioned-iceberg-table). Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
 
   | Exasol type | Iceberg type |
   |-------------|--------------|

@@ -13,7 +13,6 @@
 --     id 2  every column set, negative numbers
 --     id 3  every optional column NULL
 --   odd_types      (id BIGINT NOT NULL, ratio FLOAT, note STRING), id 1
---   partitioned    format version 2, identity(day), (id BIGINT, day DATE), id 1
 --   v3             format version 3, (id BIGINT), id 1
 --   v1_void_column format version 1, identity(day) dropped after the rows: a void field named day,
 --     (id BIGINT, day DATE), id 1
@@ -94,17 +93,6 @@ USING iceberg
 TBLPROPERTIES ('format-version' = '2');
 
 INSERT INTO rest_catalog.e2e_export_append.odd_types VALUES (1, CAST(0.5 AS FLOAT), 'one');
-
--- partitioned
-
-DROP TABLE IF EXISTS rest_catalog.e2e_export_append.partitioned;
-
-CREATE TABLE rest_catalog.e2e_export_append.partitioned (id BIGINT, day DATE)
-USING iceberg
-PARTITIONED BY (day)
-TBLPROPERTIES ('format-version' = '2');
-
-INSERT INTO rest_catalog.e2e_export_append.partitioned VALUES (1, DATE '2024-01-15');
 
 -- v3
 

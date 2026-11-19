@@ -34,6 +34,8 @@ pub mod e2e_harness;
 pub mod exasol_ws;
 #[cfg(feature = "exasol-e2e")]
 pub mod export_append_fixtures;
+#[cfg(feature = "exasol-e2e")]
+pub mod export_partition_fixtures;
 #[cfg(feature = "glue-e2e")]
 pub mod glue;
 #[cfg(feature = "exasol-e2e")]
