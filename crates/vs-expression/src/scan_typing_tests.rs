@@ -1072,11 +1072,6 @@ fn date_and_timestamp_types_follow_their_source() {
             timestamp(6),
         ),
         (
-            "CASE over a TIMESTAMP and an LTZ",
-            case_when([col("B")], [col("TS"), col("LTZ")]),
-            Inferred::Unknown,
-        ),
-        (
             "CASE over a TIMESTAMP and a TO_TIMESTAMP",
             case_when(
                 [col("B")],
@@ -1136,6 +1131,60 @@ fn date_and_timestamp_types_follow_their_source() {
     ];
     for (label, expr, expected) in cases {
         assert_eq!(type_of(&expr), expected, "{label}");
+    }
+}
+
+#[test]
+fn a_timestamp_with_local_time_zone_keeps_its_type_as_exasol_does() {
+    let ltz = |precision| Inferred::Exact(ExasolType::TimestampWithLocalTimeZone { precision });
+    let cases = [
+        (
+            "CASE over a TIMESTAMP(9) and an LTZ(6)",
+            case_when([col("B")], [col("TS9"), col("LTZ")]),
+            ltz(9),
+        ),
+        (
+            "CASE over an LTZ(6) and a TIMESTAMP(3)",
+            case_when([col("B")], [col("LTZ"), col("TS3")]),
+            ltz(6),
+        ),
+        (
+            "CASE over an LTZ and NULL",
+            case_when([col("B")], [col("LTZ"), null_lit()]),
+            ltz(6),
+        ),
+        (
+            "GREATEST over a TIMESTAMP(0) and an LTZ(6)",
+            scalar_fn("GREATEST", [col("TS0"), col("LTZ")]),
+            ltz(6),
+        ),
+        (
+            "ADD_HOURS over an LTZ",
+            scalar_fn("ADD_HOURS", [col("LTZ"), num_lit("1")]),
+            ltz(6),
+        ),
+        (
+            "ADD_DAYS over an LTZ",
+            scalar_fn("ADD_DAYS", [col("LTZ"), num_lit("1")]),
+            ltz(6),
+        ),
+        (
+            "DATE_TRUNC over an LTZ",
+            scalar_fn("DATE_TRUNC", [str_lit("day"), col("LTZ")]),
+            ltz(6),
+        ),
+        (
+            "MAX over an LTZ",
+            agg_item_expr("MAX", col("LTZ"), false),
+            ltz(6),
+        ),
+    ];
+    for (name, expr, expected) in cases {
+        assert_eq!(
+            ScanTyping::new(&columns(), ExasolVersion::Exasol2025).infer_type(&expr),
+            expected,
+            "{name}"
+        );
     }
 }
 

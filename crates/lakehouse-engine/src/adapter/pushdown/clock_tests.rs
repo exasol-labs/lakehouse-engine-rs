@@ -7,8 +7,8 @@ use crate::adapter::pushdown::test_support::{
 use crate::types::exasol_type::ExasolType;
 use chrono::TimeZone as _;
 use vs_expression::test_support::{
-    agg_item_expr, between, case_when, compare, date_lit, in_list, lit, num_lit, numbered_col,
-    predicate_equal, scalar_fn, table_col, timestamp_lit,
+    agg_item_expr, and, between, case_when, cast_to, compare, date_lit, in_list, is_not_null, lit,
+    num_lit, numbered_col, predicate_equal, scalar_fn, table_col, timestamp_lit,
 };
 
 /// 2024-01-15 23:30:45.123456789 UTC: 18:30 on the 15th in New York (`TZ`), 08:30 on the 16th
@@ -365,38 +365,128 @@ fn tstz_values_compared_with_an_instant_column_fold_to_utc() {
     }
 }
 
-/// Only a TSTZ value set directly against the instant column folds to UTC: an expression over
-/// the column, and every value inside a TSTZ-typed select-list item, keep the folding-zone rule.
+/// A TSTZ value folds to UTC beside an operand that reads an instant column and that native
+/// Exasol types TSTZ, in every clause; any other one keeps the folding-zone rule.
 #[test]
-fn only_a_value_compared_directly_with_an_instant_column_folds_to_utc() {
+fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
     let tstz = ExasolType::TimestampWithLocalTimeZone { precision: 3 };
     let now = || scalar_fn("CURRENT_TIMESTAMP", []);
+    let at_nine = || tstz_lit("2024-03-01 09:00:00.000");
+    let less = |left, right| compare("predicate_less", left, right);
+    let coalesced = case_when(
+        [is_not_null(tz())],
+        [tz(), timestamp_lit("2000-01-01 00:00:00")],
+    );
     let request = with_tz_source("timestamptz_us", |b| {
-        b.item(compare("predicate_less", tz(), now()), ExasolType::Boolean)
-            .item(
-                case_when([compare("predicate_less", tz(), now())], [now(), tz()]),
-                tstz,
-            )
-            .filter(compare(
-                "predicate_less",
-                scalar_fn("ADD_HOURS", [tz(), num_lit("1")]),
-                tstz_lit("2024-03-01 09:00:00.000"),
-            ))
-            .field("having", compare("predicate_less", now(), tz()))
+        b.item(
+            scalar_fn("HOURS_BETWEEN", [now(), tz()]),
+            ExasolType::DoublePrecision,
+        )
+        .item(
+            case_when(
+                [less(at_nine(), agg_item_expr("MAX", tz(), false))],
+                [num_lit("1"), num_lit("0")],
+            ),
+            ExasolType::decimal(1, 0),
+        )
+        .item(case_when([less(tz(), now())], [now(), tz()]), tstz)
+        .item(now(), tstz)
+        .filter(and([
+            less(at_nine(), scalar_fn("ADD_HOURS", [tz(), num_lit("1")])),
+            less(at_nine(), coalesced),
+            less(at_nine(), cast_to(tstz, ts())),
+            less(
+                at_nine(),
+                scalar_fn("ADD_DAYS", [ts(), scalar_fn("DAY", [tz()])]),
+            ),
+            less(at_nine(), cast_to(ExasolType::timestamp(3), tz())),
+            less(at_nine(), case_when([less(at_nine(), tz())], [ts(), ts()])),
+            less(at_nine(), case_when([is_not_null(tz())], [tz(), now()])),
+            less(at_nine(), scalar_fn("GREATEST", [tz(), at_nine()])),
+        ]))
+        .field("having", less(at_nine(), agg_item_expr("MIN", tz(), false)))
     });
 
     let json = folded(&tokyo_clock(), &request).expect("the request folds");
 
+    let utc_nine = timestamp_lit("2024-03-01 09:00:00.000");
+    let tokyo_nine = timestamp_lit("2024-03-01 18:00:00.000");
     let utc_now = timestamp_lit("2024-01-15 23:30:45.123");
-    assert_eq!(json["selectList"][0]["right"], utc_now);
+    let expected = [
+        (
+            "HOURS_BETWEEN(now, TZ)",
+            "/selectList/0/arguments/0",
+            &utc_now,
+        ),
+        (
+            "CASE WHEN MAX(TZ) > v",
+            "/selectList/1/arguments/0/left",
+            &utc_nine,
+        ),
+        (
+            "TSTZ item: WHEN TZ < now",
+            "/selectList/2/arguments/0/right",
+            &utc_now,
+        ),
+        (
+            "TSTZ item: THEN now ELSE TZ",
+            "/selectList/2/results/0",
+            &utc_now,
+        ),
+        (
+            "ADD_HOURS(TZ, 1) > v",
+            "/filter/expressions/0/left",
+            &utc_nine,
+        ),
+        (
+            "COALESCE(TZ, plain) > v",
+            "/filter/expressions/1/left",
+            &utc_nine,
+        ),
+        (
+            "CAST(TS AS TSTZ) > v",
+            "/filter/expressions/2/left",
+            &tokyo_nine,
+        ),
+        (
+            "ADD_DAYS(TS, DAY(TZ)) > v",
+            "/filter/expressions/3/left",
+            &tokyo_nine,
+        ),
+        (
+            "CAST(TZ AS TIMESTAMP) > v",
+            "/filter/expressions/4/left",
+            &tokyo_nine,
+        ),
+        (
+            "CASE WHEN TZ > v",
+            "/filter/expressions/5/right/arguments/0/left",
+            &utc_nine,
+        ),
+        (
+            "CASE WHEN TZ > v ... > v",
+            "/filter/expressions/5/left",
+            &tokyo_nine,
+        ),
+        (
+            "COALESCE(TZ, now) > v",
+            "/filter/expressions/6/left",
+            &utc_nine,
+        ),
+        (
+            "GREATEST(TZ, v) > v",
+            "/filter/expressions/7/left",
+            &utc_nine,
+        ),
+        ("MIN(TZ) > v", "/having/left", &utc_nine),
+    ];
+    for (shape, pointer, literal) in expected {
+        assert_eq!(json.pointer(pointer), Some(literal), "{shape} at {pointer}");
+    }
     assert_eq!(
-        json["selectList"][1]["arguments"][0]["right"],
-        tstz_lit("2024-01-15 23:30:45.123")
-    );
-    assert_eq!(json["having"]["left"], utc_now);
-    assert_eq!(
-        json["filter"]["right"],
-        timestamp_lit("2024-03-01 18:00:00.000")
+        json["selectList"][3],
+        tstz_lit("2024-01-15 23:30:45.123"),
+        "a TSTZ item beside no instant column keeps the instant"
     );
 }
 

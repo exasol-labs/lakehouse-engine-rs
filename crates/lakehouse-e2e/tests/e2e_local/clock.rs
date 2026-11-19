@@ -383,9 +383,9 @@ fn clock_functions_match_native_when_the_session_zone_matches() {
     );
 }
 
-/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value beside an instant operand compares the instants
 #[test]
-fn a_tstz_value_compared_with_an_instant_column_compares_the_instants() {
+fn a_tstz_value_beside_an_instant_operand_compares_the_instants() {
     const INSTANT_VS: &str = "CLOCK_VS_INSTANTS";
     // 23:30 on March 1st in Kiritimati is 09:30 UTC, row 2's instant.
     const ROW_2_IN_KIRITIMATI: &str =
@@ -403,15 +403,33 @@ fn a_tstz_value_compared_with_an_instant_column_compares_the_instants() {
         format!("TZ IN ({TSTZ_BOUNDARY})"),
         format!("TZ IN ({ROW_2_IN_KIRITIMATI})"),
         format!("TZ <= {ROW_2_IN_KIRITIMATI}"),
+        format!("ADD_HOURS(TZ, 1) > {ROW_2_IN_KIRITIMATI}"),
+        format!("COALESCE(TZ, TIMESTAMP '2000-01-01 00:00:00') >= {ROW_2_IN_KIRITIMATI}"),
     ];
     if local_is_tstz {
         predicates.push("TZ < LOCALTIMESTAMP".to_string());
     }
-    let projected = |relation: &str| {
-        format!(
-            "SELECT CASE WHEN TZ < CURRENT_TIMESTAMP THEN 1 ELSE 0 END FROM {relation} \
-             ORDER BY ID"
-        )
+    // A wall clock in the folding zone moves the bound past row 2 (eu) or row 3 (us).
+    let queries = |relation: &str| {
+        [
+            format!(
+                "SELECT CASE WHEN TZ < CURRENT_TIMESTAMP THEN 1 ELSE 0 END FROM {relation} \
+                 ORDER BY ID"
+            ),
+            format!("SELECT HOURS_BETWEEN({ROW_2_IN_KIRITIMATI}, TZ) FROM {relation} ORDER BY ID"),
+            format!(
+                "SELECT REGION FROM {relation} GROUP BY REGION \
+                 HAVING MAX(TZ) >= {ROW_2_IN_KIRITIMATI} ORDER BY REGION"
+            ),
+            format!(
+                "SELECT REGION FROM {relation} GROUP BY REGION \
+                 HAVING MIN(TZ) <= {ROW_2_IN_KIRITIMATI} ORDER BY REGION"
+            ),
+            format!(
+                "SELECT REGION, CASE WHEN MAX(TZ) >= {ROW_2_IN_KIRITIMATI} THEN 1 ELSE 0 END \
+                 FROM {relation} GROUP BY REGION ORDER BY REGION"
+            ),
+        ]
     };
 
     set_session_zone(&mut conn, KIRITIMATI);
@@ -456,11 +474,28 @@ fn a_tstz_value_compared_with_an_instant_column_compares_the_instants() {
         for predicate in &predicates {
             assert_instant_rows(&mut conn, INSTANT_VS, predicate);
         }
-        let through_vs = conn.query_columns(&projected(&table(INSTANT_VS)));
-        let native = conn.query_columns(&projected(INSTANT_ORACLE));
+        for (query, oracle_query) in queries(&table(INSTANT_VS))
+            .iter()
+            .zip(queries(INSTANT_ORACLE))
+        {
+            assert_eq!(
+                conn.query_columns(query),
+                conn.query_columns(&oracle_query),
+                "{folding_zone} folding zone, {session_zone} session: {query}"
+            );
+        }
+        let greatest = format!("GREATEST(TZ, {ROW_2_IN_KIRITIMATI})");
         assert_eq!(
-            through_vs, native,
-            "{folding_zone} folding zone, {session_zone} session: the projected comparison"
+            conn.query_columns(&format!(
+                "SELECT {greatest} FROM {} ORDER BY ID",
+                table(INSTANT_VS)
+            )),
+            conn.query_columns(&format!(
+                "SELECT CONVERT_TZ(CAST({greatest} AS TIMESTAMP), SESSIONTIMEZONE, 'UTC') \
+                 FROM {INSTANT_ORACLE} ORDER BY ID"
+            )),
+            "{folding_zone} folding zone, {session_zone} session: a projected TSTZ expression \
+             over an instant column shows its UTC value"
         );
     }
 }

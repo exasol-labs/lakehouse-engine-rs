@@ -157,10 +157,12 @@ ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_CURRENT_DATE, FN_CURR
 
 Iceberg `timestamptz`, Delta and Unity Catalog `timestamp`, and UTC-adjusted or INT96 Parquet timestamps are instant columns. The virtual schema shows them as `TIMESTAMP` values in UTC. A native `TIMESTAMP WITH LOCAL TIME ZONE` column shows them in the session time zone.
 
-- Compared with a `TIMESTAMP WITH LOCAL TIME ZONE` value, such as `CURRENT_TIMESTAMP - INTERVAL '1' HOUR`, an instant column returns the native rows.
+- Compared with a `TIMESTAMP WITH LOCAL TIME ZONE` value, such as `CURRENT_TIMESTAMP - INTERVAL '1' HOUR`, an instant column returns the native rows. So does an expression over it that native Exasol types `TIMESTAMP WITH LOCAL TIME ZONE`, such as `MAX(tz)`, `ADD_HOURS(tz, 1)`, or `COALESCE(tz, ...)`, and `HOURS_BETWEEN(CURRENT_TIMESTAMP, tz)` returns the native value.
 - Compared with a plain `TIMESTAMP` or `DATE` value, including `SYSTIMESTAMP` and `CURRENT_DATE`, it compares the UTC value. Native Exasol compares in the session time zone.
-- An expression over the column, such as `ADD_HOURS(tz, 1) > CURRENT_TIMESTAMP`, compares in the [folding zone](#clock-functions-and-timestamp-with-local-time-zone-literals).
-- A comparison Exasol runs itself, such as a join with a native `TIMESTAMP WITH LOCAL TIME ZONE` column, reads the UTC value as session time.
+- A projected expression over the column, such as `GREATEST(tz, CURRENT_TIMESTAMP)`, shows its UTC value, as the column does.
+- Any other expression over the column, such as `CAST(tz AS TIMESTAMP) > CURRENT_TIMESTAMP`, compares in the [folding zone](#clock-functions-and-timestamp-with-local-time-zone-literals).
+- A function that reads the date or time of day, such as `DATE_TRUNC`, `CAST(tz AS DATE)`, `EXTRACT`, or `TO_CHAR`, reads the UTC value. `ADD_DAYS` and longer steps add whole UTC days, so across a daylight saving change they differ from native by the shift.
+- A comparison Exasol runs itself, such as a join with a native `TIMESTAMP WITH LOCAL TIME ZONE` column or `tz + INTERVAL '1' HOUR > CURRENT_TIMESTAMP`, reads the UTC value as session time. Write `ADD_HOURS(tz, 1)` in place of the interval.
 
 In an `EUROPE/BERLIN` session, for a row at 09:30 UTC:
 
