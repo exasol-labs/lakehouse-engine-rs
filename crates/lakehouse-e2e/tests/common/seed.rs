@@ -1089,6 +1089,91 @@ pub async fn seed_blank_label_table(catalog_url: &str, warehouse: &str) -> Resul
     Ok(())
 }
 
+pub const EMPTY_STRING_NAMESPACE: &str = "e2e_empty_string";
+pub const EMPTY_STRING_TABLE: &str = "empty_strings";
+
+type EmptyStringRow = (
+    i64,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static [u8]>,
+);
+
+/// `(id, s, k, b)` per data file of [`EMPTY_STRING_TABLE`]. The first file holds empty values
+/// and no NULL, the second NULLs and no empty value, the third neither. `b` holds UTF-8, so
+/// `BINARY_AS_STRING` reads it.
+pub const EMPTY_STRING_FILES: [&[EmptyStringRow]; 3] = [
+    &[
+        (1, Some("event-01"), Some("event-01"), Some(b"a")),
+        (2, Some(""), Some(""), Some(b"")),
+        (3, Some("TRUCK"), Some("x"), Some(b"b")),
+        (4, Some(""), Some("TRUCK"), Some(b"c")),
+    ],
+    &[
+        (5, None, None, None),
+        (6, Some("zulu"), Some("zulu"), Some(b"d")),
+        (7, Some("yankee"), None, None),
+    ],
+    &[
+        (8, Some("x-ray"), Some("x-ray"), Some(b"e")),
+        (9, Some("whiskey"), Some("U"), Some(b"f")),
+    ],
+];
+
+fn make_empty_string_batch(rows: &[EmptyStringRow]) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, true),
+        Field::new("k", DataType::Utf8, true),
+        Field::new("b", DataType::LargeBinary, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.1))),
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.2))),
+            Arc::new(LargeBinaryArray::from_iter(rows.iter().map(|row| row.3))),
+        ],
+    )
+    .expect("empty_strings RecordBatch construction is infallible")
+}
+
+/// Strings and variable-length binary values that are empty, NULL, or neither, one data file per
+/// entry of [`EMPTY_STRING_FILES`] (#203).
+pub async fn seed_empty_strings(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-empty-strings").await?;
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "s", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "k", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(4, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+        ])
+        .build()
+        .context("build empty_strings Iceberg schema")?;
+    let files = EMPTY_STRING_FILES.iter().map(|rows| {
+        (
+            EMPTY_STRING_TABLE.to_string(),
+            Struct::empty(),
+            vec![make_empty_string_batch(rows)],
+        )
+    });
+    seed_table(
+        &catalog,
+        EMPTY_STRING_NAMESPACE,
+        EMPTY_STRING_TABLE,
+        schema,
+        unpartitioned(),
+        HashMap::new(),
+        files,
+    )
+    .await
+    .context("seed empty_strings table")
+}
+
 pub const CLUSTERED_JOIN_NAMESPACE: &str = "e2e_join_clustered";
 pub const CLUSTERED_FACT_TABLE: &str = "fact_clustered";
 pub const CLUSTERED_DIM_TABLE: &str = "dim_clustered";

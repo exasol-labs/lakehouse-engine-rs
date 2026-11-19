@@ -36,6 +36,7 @@ GROUP BY l_returnflag;
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
 | [Capability matrix](capability-matrix.md) | Every Exasol Virtual Schema capability, and whether the adapter advertises it. |
 | [Tuning](tuning.md) | Configuration parameters reference and runtime telemetry. |
+| [Writing efficient queries](query-guide.md) | How to write filters, joins, and aggregations so they push down: the forms to prefer and the forms to avoid. |
 | [Debugging pushdown](debugging-pushdown.md) | Use `EXPLAIN VIRTUAL` to inspect what the adapter pushes down for a query. |
 | [Semantic differences](semantic-differences.md) | Known cases where a pushed-down query returns a different result than native Exasol. |
 
@@ -44,5 +45,6 @@ GROUP BY l_returnflag;
 - **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data, and [Security](security.md) to give the Virtual Schema's owner its grants before creating it.
 - **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
 - **Tuning a running deployment?** Read [Capabilities](capabilities.md) and [Tuning](tuning.md).
+- **Writing queries against lakehouse tables?** Read [Writing efficient queries](query-guide.md).
 - **A query does not push down the way you expect?** Read [Debugging pushdown](debugging-pushdown.md).
 - **A result differs from the same query on a native table?** Read [Semantic differences](semantic-differences.md).
