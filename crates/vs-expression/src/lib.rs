@@ -18,8 +18,8 @@ use json_value::{Fallback, JsonValueCall, Returning};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{
-    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
-    seconds_type, timestamp_digits,
+    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_ARGUMENT_NODE, INTEGER_TEXT_NODE, SECOND_NODE,
+    render_integer_argument, second_fraction, seconds_type, timestamp_digits,
 };
 pub use scan_typing::{ColumnTypeLookup, ScanTyping};
 use timestamp::{TimestampLiteral, TimestampUnit};
@@ -116,14 +116,23 @@ fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
 
 /// Converting the UTC-normalized wire value into `SESSIONTIMEZONE` reproduces
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
-/// session-local (verified live).
+/// session-local (verified live). A bare TSTZ cast keeps 3 fractional digits, so a longer value
+/// names its precision; Exasol 8 never sends more than 3 and has no precision syntax.
 fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
-        Some(_) => format!(
-            "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)",
-            render_exasol_timestamp_literal(value)
-        ),
+        Some(v) => {
+            let digits = v
+                .as_str()
+                .map_or(0, |s| TimestampLiteral(s).type_precision());
+            let cast_type = ExasolType::TimestampWithLocalTimeZone {
+                precision: u8::try_from(digits.max(3)).unwrap_or(u8::MAX),
+            };
+            format!(
+                "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS {cast_type})",
+                render_exasol_timestamp_literal(value)
+            )
+        }
     }
 }
 
@@ -483,9 +492,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             )));
         }
         "literal_timestamputc" => {
-            // Exasol's real wire name for a TSTZ literal. DataFusion keeps
-            // declining it: TSTZ coercion against a naive `timestamp_us` column is
-            // unverified (#242).
+            // Exasol's real wire name for a TSTZ literal. Its comparison depends on the
+            // session zone, so the adapter folds a compared one into a plain timestamp
+            // literal and the DataFusion dialect declines any left over.
             if dialect == Dialect::Exasol {
                 return Ok(Some(render_exasol_tstz_literal(value("value"))));
             }
@@ -695,7 +704,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             render_cast(args, value("dataType"), dialect)
         }
         // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE | SECOND_NODE
+        INTEGER_TEXT_NODE
+        | BOOLEAN_TEXT_NODE
+        | BOOLEAN_NUMBER_NODE
+        | SECOND_NODE
+        | INTEGER_ARGUMENT_NODE
             if dialect == Dialect::DataFusion =>
         {
             let arg = value("arguments")
@@ -707,6 +720,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(match kind {
                 INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
                 BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                INTEGER_ARGUMENT_NODE => render_integer_argument(expr, &inner),
                 SECOND_NODE => {
                     let fraction = second_fraction(expr)
                         .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;

@@ -325,13 +325,12 @@ const COMBINATIONS: &[Combination] = &[
                       ORDER BY o.O_ORDERDATE LIMIT 3 OFFSET 2",
                 pushdown: Pushdown::One(BROADCAST_FULL_ROW),
             },
-            // A condition beyond the one equality is never broadcast.
             Query {
                 source: Source::Join,
                 sql: "SELECT c.C_NAME, o.O_ORDERDATE FROM {T}.FACT_ORDERS o \
                       JOIN {T}.DIM_CUSTOMER c \
                       ON o.O_CUSTKEY = c.C_CUSTKEY AND o.O_ORDERKEY > c.C_CUSTKEY",
-                pushdown: Pushdown::One(&[PathCheck::NScan(2), PathCheck::Has(FACT_FULL_ROW)]),
+                pushdown: Pushdown::One(BROADCAST_FULL_ROW),
             },
             Query {
                 source: Source::Join,

@@ -97,7 +97,8 @@ fn refused_statements_name_the_offending_part_and_its_accepted_form() {
             spec_with(&[("TABLE_NAME", "ns.t"), ("FORMAT", "csv")]),
             vec![
                 "unknown option FORMAT",
-                "CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, and ALLOW_HTTP",
+                "CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, ALLOW_HTTP, and \
+                 PARTITION_BY",
             ],
         ),
         (
@@ -209,8 +210,19 @@ fn accepted_statements_yield_the_connection_table_writer_layout_and_http_consent
                 table_name: "ns.t".to_string(),
                 writers,
                 allow_http,
+                partition_by: None,
             },
             "{case}"
         );
     }
+}
+
+/// The hook parses `PARTITION_BY` against the source columns, so the options keep it verbatim.
+#[test]
+fn partition_by_is_kept_verbatim() {
+    let spec = spec_with(&[("TABLE_NAME", "ns.t"), ("PARTITION_BY", " day(D), ID ")]);
+
+    let options = ExportOptions::from_spec(&spec).unwrap();
+
+    assert_eq!(options.partition_by.as_deref(), Some(" day(D), ID "));
 }

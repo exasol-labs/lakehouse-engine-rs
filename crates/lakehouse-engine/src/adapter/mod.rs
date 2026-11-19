@@ -20,6 +20,7 @@ mod statement_state;
 mod table_filter;
 pub mod table_identity;
 pub mod tables;
+mod time_zone;
 mod tuning;
 
 use crate::adapter::capabilities::get_capabilities_response;
@@ -31,7 +32,8 @@ use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::{Check, PROP_CATALOG_CONNECTION, PROP_NAMESPACE, VsProperties};
 use crate::adapter::pushdown::{
-    ConnectionStorage, PushdownContext, ScanCatalog, ScanUdfs, declare_columns, handle_pushdown,
+    ConnectionStorage, PushdownContext, ScanCatalog, ScanUdfs, StatementClock, declare_columns,
+    handle_pushdown, statement_instant,
 };
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
@@ -96,6 +98,11 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             let cluster_nodes = cluster_nodes_from_context(ctx);
             let version = ExasolVersion::of(&ctx.database_version());
             let binary_as_string = props.checked.binary_as_string;
+            let clock = StatementClock::new(
+                statement_instant(),
+                std::env::var("TZ").ok(),
+                props.checked.session_time_zone,
+            );
 
             state.block_on(|statement| async move {
                 let context = PushdownContext {
@@ -105,6 +112,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
                     tuning,
                     binary_as_string,
                     version,
+                    clock,
                 };
                 handle_pushdown_request(request, statement, &check, &context).await
             })

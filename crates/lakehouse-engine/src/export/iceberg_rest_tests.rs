@@ -21,11 +21,9 @@ fn a_table_name_with_a_namespace_of_several_levels_opens_a_target() {
     assert!(target(connection(), "sales.eu.orders").is_ok());
 }
 
-/// Scenario: A partitioned or format-version 3 table is refused before any data is written
+/// Scenario: A format-version 3 table is refused before any data is written
 #[test]
-fn only_an_unpartitioned_table_of_format_version_1_or_2_takes_appends() {
-    let partitioned = "table ns.t is partitioned by p0 (identity), p2 (day); the export appends \
-                       only to unpartitioned tables";
+fn only_a_table_of_format_version_1_or_2_takes_appends() {
     let version_3 = "table ns.t has format version 3; the export appends only to tables of \
                      format version 1 or 2";
     let cases = [
@@ -43,7 +41,14 @@ fn only_an_unpartitioned_table_of_format_version_1_or_2_takes_appends() {
             FormatVersion::V2,
             &[Transform::Identity, Transform::Void, Transform::Day],
             0,
-            Some(partitioned),
+            None,
+        ),
+        (
+            "a bucket and a month field",
+            FormatVersion::V1,
+            &[Transform::Bucket(4), Transform::Month],
+            0,
+            None,
         ),
         ("format version 1", FormatVersion::V1, &[], 0, None),
         (
@@ -75,25 +80,44 @@ fn only_an_unpartitioned_table_of_format_version_1_or_2_takes_appends() {
 fn a_void_partition_field_named_like_a_column_is_refused_naming_it() {
     // Spark keeps a dropped version 1 identity field as `void` under its column's name, which the
     // partition spec builder refuses, so the spec comes from JSON as a catalog serves it.
-    let spec: PartitionSpec = serde_json::from_value(serde_json::json!({
-        "spec-id": 1,
-        "fields": [
-            {"name": "c0", "transform": "void", "source-id": 1, "field-id": 1000},
-            {"name": "p1", "transform": "void", "source-id": 2, "field-id": 1001},
-        ],
-    }))
-    .unwrap();
+    let spec = |first: &str, source: i32| -> PartitionSpec {
+        serde_json::from_value(serde_json::json!({
+            "spec-id": 1,
+            "fields": [
+                {"name": "c0", "transform": first, "source-id": source, "field-id": 1000},
+                {"name": "p1", "transform": "void", "source-id": 2, "field-id": 1001},
+            ],
+        }))
+        .unwrap()
+    };
     let table = TableIdent::from_strs(["ns", "t"]).unwrap();
-
-    let refused = refuse_unappendable(&table, FormatVersion::V1, &spec, &date_columns(2)).err();
+    let refused = |first: &str, source: i32| {
+        refuse_unappendable(
+            &table,
+            FormatVersion::V1,
+            &spec(first, source),
+            &date_columns(2),
+        )
+        .err()
+        .map(|error| error.to_string())
+    };
 
     assert_eq!(
-        refused.map(|error| error.to_string()),
+        refused("void", 1),
         Some(
             "LAKEHOUSE_EXPORT: table ns.t keeps the dropped partition field c0 (void) under the \
              name of a column; the export appends only to tables whose partition fields are not \
              named like a column"
                 .to_string()
         )
+    );
+    assert_eq!(
+        refused("identity", 1),
+        None,
+        "an identity field is named like its column"
+    );
+    assert!(
+        refused("identity", 2).is_some(),
+        "an identity field of another column named like c0"
     );
 }

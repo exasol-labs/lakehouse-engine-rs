@@ -159,6 +159,22 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     assert_eq!(ordinary_plans(&items, scan).len(), 2);
 }
 
+/// A folded clock function reaches a single-group select list as a literal beside its
+/// aggregates, and must keep the partial/merge split.
+#[test]
+fn a_literal_beside_an_aggregate_keeps_the_single_group_split() {
+    let (req, scan) = pushdown_request("T", &AGGREGATED)
+        .item(date_lit("2024-03-01"), ExasolType::Date)
+        .count_star()
+        .build_scanned();
+    let items = detect_aggregates(&req, scan).expect("a literal beside COUNT(*) must decompose");
+    let plans = single_group_plans(&items, req.select_types(), scan).expect("typed plans");
+    let merge = single_group_merge_select(&items, &plans, req.select_types(), scan)
+        .expect("the literal renders in the merge select");
+    assert_eq!(merge.len(), 2);
+    assert!(merge[0].contains("DATE '2024-03-01'"), "{merge:?}");
+}
+
 #[test]
 fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     let (req, scan) = pushdown_request("T", &AGGREGATED)

@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 22] = [
+const ALL_NAMES: [&str; 23] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -24,6 +24,7 @@ const ALL_NAMES: [&str; 22] = [
     "TABLE_INCLUDE",
     "TABLE_EXCLUDE",
     "EXCLUDED_CAPABILITIES",
+    "SESSION_TIME_ZONE",
 ];
 
 /// Name, minimum, and maximum of each whole-number tuning property.
@@ -91,13 +92,14 @@ fn every_known_name_passes() {
         ("TABLE_INCLUDE", "ORDERS*, ?_LOG"),
         ("TABLE_EXCLUDE", "TMP_*"),
         ("EXCLUDED_CAPABILITIES", "FN_PRED_LIKE, LIMIT"),
+        ("SESSION_TIME_ZONE", "Asia/Tokyo"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 22 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 23 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 22 names of vs-properties/property-name-validation"
+        "the adapter must accept exactly the 23 names of vs-properties/property-name-validation"
     );
 
     strict(&props(&valid_values)).expect("every known name with a valid value passes");
@@ -302,6 +304,31 @@ fn boolean_properties_accept_true_or_false_in_any_case() {
             );
         }
     }
+}
+
+#[test]
+fn time_zone_accepts_an_exasol_zone_name_in_any_case_and_reads_a_rejected_one_as_absent() {
+    let checked =
+        strict(&props(&[("SESSION_TIME_ZONE", "europe/berlin")])).expect("a zone name passes");
+    assert_eq!(
+        checked.session_time_zone,
+        Some(TimeZone::Named(chrono_tz::Europe::Berlin))
+    );
+    let msg = message(&[("SESSION_TIME_ZONE", "MARS/OLYMPUS")]);
+    assert!(
+        msg.contains(&invalid_entry(
+            "SESSION_TIME_ZONE",
+            "MARS/OLYMPUS",
+            "a time zone name from EXA_TIME_ZONES"
+        )),
+        "{msg}"
+    );
+    let lenient = checked_values(
+        &props(&[("SESSION_TIME_ZONE", "MARS/OLYMPUS")]),
+        Check::Lenient,
+    )
+    .expect("a lenient read never fails");
+    assert_eq!(lenient.session_time_zone, None);
 }
 
 /// A pushdown reads a rejected boolean as `false`, so a schema persisted before the check plans.

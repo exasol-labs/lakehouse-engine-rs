@@ -1,13 +1,13 @@
 use super::*;
-use crate::retry::backoff_wait;
+use crate::retry::Waits;
 use crate::test_support::{
     COMMIT_CONFLICT, CREATE_CONFLICT, LOAD_TABLE_NO_SNAPSHOTS, LOAD_TABLE_TAGGED, PREFIX_CONFIG,
     RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
-    catalog, data_file, ident, memory_table, requests_starting, session,
+    catalog, data_file, ident, memory_table, requests_starting, session, with_short_commit_waits,
 };
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
-use lakehouse_catalog::{StorageProps, system_clock};
+use lakehouse_catalog::{AdlsCred, StorageProps};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,14 +74,14 @@ fn load_table_with_retries(retries: u32) -> String {
 fn memory_write_table() -> WriteTable {
     WriteTable {
         table: memory_table(LOAD_TABLE_NO_SNAPSHOTS, &ident("ns", "t")),
-        credentials: StorageCredentials::keys("", "", None, system_clock()),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     }
 }
 
 fn memory_staged_table() -> StagedTable {
     StagedTable(WriteTable {
         table: memory_table(STAGE_TABLE, &ident("ns", "staged")),
-        credentials: StorageCredentials::keys("", "", None, system_clock()),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     })
 }
 
@@ -175,10 +175,10 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     let writes = static_writes(&uri).await;
 
     let raced = writes
-        .create_table(&ident("ns", "t"), schema(), TAGGED_EXPORT_ID)
+        .create_table(&ident("ns", "t"), schema(), None, TAGGED_EXPORT_ID)
         .await;
     let foreign = writes
-        .create_table(&ident("ns", "t"), schema(), "another-export")
+        .create_table(&ident("ns", "t"), schema(), None, "another-export")
         .await;
 
     assert_eq!(
@@ -209,7 +209,7 @@ async fn a_create_without_an_answer_and_without_a_table_is_sent_again() {
     let writes = static_writes(&uri).await;
 
     writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -226,7 +226,7 @@ async fn a_create_the_catalog_refuses_fails_at_once_naming_the_table() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -248,7 +248,7 @@ async fn a_create_the_catalog_stays_busy_for_fails_after_its_retries() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -292,7 +292,7 @@ async fn a_create_whose_connection_is_refused_is_sent_again_until_its_retries_ru
     let writes = static_writes(&catalog_gone_after_config().await).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -313,7 +313,7 @@ async fn an_unreadable_create_answer_fails_quoting_none_of_it() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -338,14 +338,14 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
 
     let refused = vended_writes(&uri, false)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
         .to_string();
     let allowed = vended_writes(&uri, true)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -360,29 +360,118 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
     assert_eq!(secrets, RECORDED_PLACEHOLDERS[..3]);
 }
 
-/// Scenario: A table location outside S3-compatible storage is refused
-#[tokio::test]
-async fn an_abfss_stage_answer_is_refused_naming_the_table_and_the_scheme() {
-    let abfss = STAGE_TABLE.replace(
-        "s3://warehouse/lakehouse_vended/",
-        "abfss://warehouse@account.dfs.core.windows.net/",
-    );
-    let (uri, _) = catalog(PREFIX_CONFIG, routes(vec![(TABLES, (200, abfss))])).await;
-    let writes = vended_writes(&uri, true).await;
+fn azure_storage() -> WriteStorage {
+    WriteStorage::Static(StorageBackend::Adls {
+        account_name: "account".into(),
+        cred: AdlsCred::AccountKey("c2VjcmV0LWtleQ==".into()),
+    })
+}
 
-    let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
-        .await
-        .err()
-        .unwrap()
-        .to_string();
+fn vended_storage() -> WriteStorage {
+    WriteStorage::Vended(StaticStoreAddress::default())
+}
 
-    assert_eq!(
-        refused,
-        "table ns.staged has the location abfss://warehouse@account.dfs.core.windows.net/\
-         01a1bf3b-af23-7020-ac26-0a0912b927ee, whose scheme abfss is no S3-compatible storage; \
-         the export writes only to s3:// or s3a:// locations"
+#[test]
+fn a_location_its_storage_cannot_address_is_refused_naming_the_table_and_the_scheme() {
+    let abfss = "abfss://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs = "abfs://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs_needs_allow_http = "plaintext scheme abfs needs the export option ALLOW_HTTP = \
+                                 'true', which acknowledges that the export writes the location \
+                                 over HTTPS";
+    // (case, storage, ALLOW_HTTP, location, the vended backend it selects or the refusal's tail)
+    type Case<'a> = (
+        &'a str,
+        WriteStorage,
+        bool,
+        &'a str,
+        Result<&'a str, &'a str>,
     );
+    let cases: [Case; 10] = [
+        (
+            "static S3 on abfss",
+            static_storage(),
+            false,
+            abfss,
+            Err("scheme abfss the CONNECTION's S3 storage cannot address"),
+        ),
+        (
+            "static S3 on s3a",
+            static_storage(),
+            false,
+            "s3a://warehouse/ns/t",
+            Ok("none"),
+        ),
+        (
+            "static Azure on s3",
+            azure_storage(),
+            true,
+            "s3://warehouse/ns/t",
+            Err("scheme s3 the CONNECTION's Azure storage cannot address"),
+        ),
+        (
+            "static Azure on abfs",
+            azure_storage(),
+            true,
+            abfs,
+            Err("scheme abfs the CONNECTION's Azure storage cannot address"),
+        ),
+        (
+            "static Azure on abfss",
+            azure_storage(),
+            false,
+            abfss,
+            Ok("none"),
+        ),
+        (
+            "vended on gs",
+            vended_storage(),
+            true,
+            "gs://warehouse/ns/t",
+            Err("scheme gs vended storage cannot address"),
+        ),
+        (
+            "vended on abfs without ALLOW_HTTP",
+            vended_storage(),
+            false,
+            abfs,
+            Err(abfs_needs_allow_http),
+        ),
+        (
+            "vended on abfs with ALLOW_HTTP",
+            vended_storage(),
+            true,
+            abfs,
+            Ok("ADLS"),
+        ),
+        (
+            "vended on abfss",
+            vended_storage(),
+            false,
+            abfss,
+            Ok("ADLS"),
+        ),
+        (
+            "vended on s3a",
+            vended_storage(),
+            false,
+            "s3a://warehouse/ns/t",
+            Ok("S3"),
+        ),
+    ];
+
+    for (case, storage, allow_http, location, expected) in cases {
+        let checked = refuse_unaddressable(&storage, allow_http, &ident("ns", "t"), location)
+            .map(|kind| match kind {
+                None => "none",
+                Some(VendedBackendKind::S3) => "S3",
+                Some(VendedBackendKind::Adls) => "ADLS",
+            })
+            .map_err(|error| error.to_string());
+
+        let expected = expected
+            .map_err(|tail| format!("table ns.t has the location {location}, whose {tail}"));
+        assert_eq!(checked, expected, "{case}");
+    }
 }
 
 #[tokio::test]
@@ -394,7 +483,7 @@ async fn a_refused_stage_fails_quoting_the_status_and_naming_the_catalog() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -423,7 +512,7 @@ async fn an_unreadable_stage_answer_fails_stating_that_single_commit_needs_stage
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -454,7 +543,7 @@ async fn a_stage_answer_followed_by_a_table_this_export_created_drops_it() {
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -486,7 +575,7 @@ async fn a_stage_answer_followed_by_a_table_it_cannot_drop_says_the_table_must_b
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -512,7 +601,7 @@ async fn a_stage_answer_followed_by_another_exports_table_leaves_it_and_says_so(
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "another-export")
+        .stage_table(&ident("ns", "staged"), schema(), None, "another-export")
         .await
         .err()
         .unwrap()
@@ -572,7 +661,7 @@ async fn a_missing_namespace_level_is_created_and_one_created_meanwhile_counts_a
 
 #[test]
 fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
-    let request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let request = creation_request(&ident("ns", "t"), schema(), None, "e1");
 
     let sent = serde_json::to_value(&request).unwrap();
 
@@ -587,11 +676,32 @@ fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
     );
     assert_eq!(sent["schema"]["fields"][0]["name"], "ID");
     assert!(sent.get("stage-create").is_none(), "{sent}");
+    assert!(sent.get("partition-spec").is_none(), "{sent}");
+}
+
+#[test]
+fn a_create_request_carries_the_partition_spec() {
+    let spec = PartitionSpec::builder(schema())
+        .add_partition_field("ID", "ID_bucket", Transform::Bucket(4))
+        .unwrap()
+        .build()
+        .unwrap()
+        .into_unbound();
+
+    let request = creation_request(&ident("ns", "t"), schema(), Some(spec), "e1");
+
+    let sent = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        sent["partition-spec"]["fields"],
+        serde_json::json!([
+            {"source-id": 1, "field-id": 1000, "name": "ID_bucket", "transform": "bucket[4]"}
+        ])
+    );
 }
 
 #[test]
 fn a_stage_request_asks_for_staged_creation() {
-    let mut request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let mut request = creation_request(&ident("ns", "t"), schema(), None, "e1");
     request.stage_create = Some(true);
 
     let sent = serde_json::to_value(&request).unwrap();
@@ -816,7 +926,7 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
             .collect::<Vec<_>>()
     };
     assert!(
-        arrived(LOAD_T)[1] - arrived(COMMIT_T)[0] >= backoff_wait(1, 0.0),
+        arrived(LOAD_T)[1] - arrived(COMMIT_T)[0] >= Waits::DEFAULT.backoff(1, 0.0),
         "a reload before the wait goes stale when another writer commits during the wait"
     );
 }
@@ -875,8 +985,7 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     assert_eq!(requests_starting(&requests, LOAD_T).len(), 2);
 }
 
-/// The paused clock skips the backoff waits of the 20 retries an append makes at least.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the_last_outcome() {
     for (status, unknown) in [
         (409, false),
@@ -889,7 +998,10 @@ async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the
             PREFIX_CONFIG,
             routes(vec![
                 (COMMIT_T, (status, "{}".into())),
-                (LOAD_T, (200, load_table_with_retries(1))),
+                (
+                    LOAD_T,
+                    (200, with_short_commit_waits(&load_table_with_retries(1))),
+                ),
             ]),
         )
         .await;
@@ -1034,7 +1146,7 @@ fn load_table_with_ids(schema_id: i32, spec_id: i32) -> String {
 fn memory_write_table_with_ids(schema_id: i32, spec_id: i32) -> WriteTable {
     WriteTable {
         table: memory_table(&load_table_with_ids(schema_id, spec_id), &ident("ns", "t")),
-        credentials: StorageCredentials::keys("", "", None, system_clock()),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     }
 }
 

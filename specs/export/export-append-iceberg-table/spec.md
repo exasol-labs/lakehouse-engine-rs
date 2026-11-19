@@ -22,7 +22,7 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
   Every other pair is a type mismatch. No Exasol type fills a `float`, `timestamp_ns`, `timestamptz_ns`, `time`, `uuid`, `fixed`, `binary`, `struct`, `list`, or `map` column.
 * An `int` or `long` column takes a `DECIMAL(p,0)` of any precision, so Exasol `INTEGER` and `BIGINT` fill both, and a value outside the column's range fails the export. A `timestamptz` column takes a `TIMESTAMP` value as a date and time in UTC, the inverse of how a virtual schema reads a `timestamptz` column.
 * A column mismatch is a table column that no export column matches, even an optional one, an export column that matches no table column, a matched pair whose types § Background does not accept, or an ambiguous name. A table column that an ambiguous name matches is listed under that ambiguity only, not as unmatched. One error names the table and lists every mismatch, with the names of its columns and the Exasol type of each export column and the Iceberg type of each table column.
-* The export refuses a partitioned table, whose current partition spec has a field with a transform other than `void`, and a table of format version 3 or later. The error names the table and its partition fields or its format version. A table whose partition fields were all removed or replaced by `void` is not partitioned.
+* The export refuses a table of format version 3 or later, with an error that names the table and its format version. It appends to a partitioned table as export/export-partitioned-iceberg-table states.
 * The export also refuses a table whose current partition spec has a `void` field named like a table column, the shape Apache Spark leaves when it drops an identity partition field of a format version 1 table. The error names the table and the field.
 * The export checks the table and the columns before it writes any data, and only when the source has rows (export/export-into-script § Background). Every writer checks the same table, so a column mismatch fails the export before any write in every mode.
 * A value failure is a NULL for a required column or a value outside an `int` or `long` column's range. Each writer finds it only in its own rows, and the error names the table and the column of the first such value. The one-error mismatch list covers column mismatches only. With `SINGLE_COMMIT` a value failure leaves the table unchanged. Without it, writers that committed before the failure keep their commits.
@@ -70,14 +70,6 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * *AND* the table SHALL keep its snapshots unchanged
 * *AND* the export SHALL write no data file
 
-### Scenario: A partitioned or format-version 3 table is refused before any data is written
-
-* *GIVEN* a table whose current partition spec has a field with a transform other than `void`, or a table of format version 3
-* *WHEN* a user exports a source with rows into it
-* *THEN* the export SHALL fail with an error that names the table and its partition fields, or its format version
-* *AND* the table SHALL keep its snapshots unchanged
-* *AND* the export SHALL write no data file
-
 ### Scenario: A void partition field named like a column is refused before any data is written
 
 * *GIVEN* a format version 1 table whose dropped identity partition field stays as a `void` field named like its column
@@ -100,3 +92,11 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * *WHEN* a user exports a source of 1,000 rows into it with `SINGLE_COMMIT = 'true'`
 * *THEN* the export SHALL succeed, and the table SHALL gain exactly one snapshot, which adds the 1,000 rows and carries the export's `lakehouse.export-id`
 * *AND* the table's earlier snapshots SHALL be unchanged
+
+### Scenario: A format-version 3 table is refused before any data is written
+
+* *GIVEN* a table of format version 3
+* *WHEN* a user exports a source with rows into it
+* *THEN* the export SHALL fail with an error that names the table and its format version
+* *AND* the table SHALL keep its snapshots unchanged
+* *AND* the export SHALL write no data file

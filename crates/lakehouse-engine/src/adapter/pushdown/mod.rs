@@ -30,6 +30,9 @@ use support::{
 };
 use vs_expression::strip_table_alias;
 
+mod clock;
+pub(crate) use clock::{StatementClock, statement_instant};
+
 mod context;
 pub(crate) use context::PushdownContext;
 pub use context::{ScanUdfs, Shards};
@@ -111,6 +114,7 @@ pub(crate) async fn handle_pushdown(
             .cloned()
             .unwrap_or(Json::Null),
     )?;
+    let pushdown = context.clock.fold(pushdown)?;
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.

@@ -1,0 +1,139 @@
+//! A writer's partition buffer: rows wait in memory per partition of the table's current spec, and
+//! the largest partitions go out as data files whenever the buffer passes its budget.
+
+use arrow::record_batch::RecordBatch;
+use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::spec::{PartitionKey, PartitionSpec, SchemaRef, Struct};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const MIB: u64 = 1024 * 1024;
+/// The engine's own share of the per-instance limit, the same as the scan's.
+const OVERHEAD_BYTES: u64 = crate::scan::spec::DEFAULT_INSTANCE_OVERHEAD_MB * MIB;
+const MIN_BUDGET_BYTES: u64 = 64 * MIB;
+/// A larger buffer would only make larger data files.
+const MAX_BUDGET_BYTES: u64 = 512 * MIB;
+
+/// The Arrow memory a writer may buffer: half the per-instance `memory_limit` after the overhead,
+/// within 64 and 512 MiB, or 512 MiB when the limit is unknown (0).
+pub(super) fn buffer_budget(memory_limit: u64) -> usize {
+    let budget = match memory_limit {
+        0 => MAX_BUDGET_BYTES,
+        limit => {
+            (limit.saturating_sub(OVERHEAD_BYTES) / 2).clamp(MIN_BUDGET_BYTES, MAX_BUDGET_BYTES)
+        }
+    };
+    usize::try_from(budget).unwrap_or(usize::MAX)
+}
+
+/// The positions in `sizes` to write out, largest first, until the rest fit `budget`.
+pub(super) fn write_out(sizes: &[usize], budget: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]));
+    let mut total: usize = sizes.iter().sum();
+    order
+        .into_iter()
+        .take_while(|&index| {
+            let over = total > budget;
+            total -= sizes[index];
+            over
+        })
+        .collect()
+}
+
+/// The one partition of an unpartitioned `spec`: a null value per field. iceberg-rust's fast
+/// append refuses a data file of another spec ID or partition arity than the table's default spec.
+fn null_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
+    let nulls = spec.fields().iter().map(|_| None).collect();
+    PartitionKey::new(spec.clone(), schema, nulls)
+}
+
+/// How a batch splits into partitions: an unpartitioned spec has one key, whose values are null.
+enum Split {
+    Unpartitioned(PartitionKey),
+    ByValue(Box<RecordBatchPartitionSplitter>),
+}
+
+struct Buffered {
+    key: PartitionKey,
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+}
+
+/// One partition's buffered rows, ready to go into a data file.
+pub(super) type Partition = (PartitionKey, Vec<RecordBatch>);
+
+pub(super) struct PartitionBuffer {
+    split: Split,
+    budget: usize,
+    buffered: HashMap<Struct, Buffered>,
+}
+
+impl PartitionBuffer {
+    pub(super) fn new(
+        schema: SchemaRef,
+        spec: &PartitionSpec,
+        budget: usize,
+    ) -> iceberg::Result<Self> {
+        // iceberg-rust's splitter refuses a spec without a field other than `void`.
+        let split = if spec.is_unpartitioned() {
+            Split::Unpartitioned(null_key(spec, schema))
+        } else {
+            Split::ByValue(Box::new(
+                RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    schema,
+                    Arc::new(spec.clone()),
+                )?,
+            ))
+        };
+        Ok(Self {
+            split,
+            budget,
+            buffered: HashMap::new(),
+        })
+    }
+
+    /// Buffers `batch`'s rows by partition and hands back the partitions that must go out so
+    /// that the rest fit the budget.
+    pub(super) fn push(&mut self, batch: &RecordBatch) -> iceberg::Result<Vec<Partition>> {
+        let parts = match &self.split {
+            Split::Unpartitioned(key) => vec![(key.clone(), batch.clone())],
+            Split::ByValue(splitter) => splitter.split(batch)?,
+        };
+        for (key, part) in parts {
+            let bytes = part.get_array_memory_size();
+            let entry = self
+                .buffered
+                .entry(key.data().clone())
+                .or_insert_with(|| Buffered {
+                    key,
+                    batches: Vec::new(),
+                    bytes: 0,
+                });
+            entry.batches.push(part);
+            entry.bytes += bytes;
+        }
+        let values: Vec<Struct> = self.buffered.keys().cloned().collect();
+        let sizes: Vec<usize> = values
+            .iter()
+            .map(|value| self.buffered[value].bytes)
+            .collect();
+        Ok(write_out(&sizes, self.budget)
+            .into_iter()
+            .filter_map(|index| self.buffered.remove(&values[index]))
+            .map(|buffered| (buffered.key, buffered.batches))
+            .collect())
+    }
+
+    /// Every partition still buffered.
+    pub(super) fn drain(&mut self) -> Vec<Partition> {
+        self.buffered
+            .drain()
+            .map(|(_, buffered)| (buffered.key, buffered.batches))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[path = "fanout_tests.rs"]
+mod tests;
