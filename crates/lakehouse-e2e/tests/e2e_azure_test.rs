@@ -9,13 +9,13 @@ mod common;
 
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, VsProps,
+    ADAPTER_SCRIPT_NAME, ExportRoute, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, VsProps,
     assert_decimal_orders_numerically, create_proxied_schema_and_scripts,
     create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
-    exa_conn_redacting, explain_virtual_sql, install_slc, parse_int, projection_rows, runtime,
-    upload_so, value_to_string,
+    exa_conn_redacting, explain_virtual_sql, exported_rows, install_slc, parse_int,
+    projection_rows, runtime, upload_so, value_to_string,
 };
-use common::exasol_ws::ExaConn;
+use common::exasol_ws::{ExaConn, error_text};
 use common::lakekeeper::{
     self, AdlsWarehouseProfile, lakekeeper_adls_connection_password,
     lakekeeper_connection_password, lakekeeper_create_adls_warehouse,
@@ -33,10 +33,10 @@ use common::stack::{
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use futures::FutureExt;
-use object_store::azure::MicrosoftAzureBuilder;
+use futures::{FutureExt, TryStreamExt};
+use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -187,6 +187,28 @@ impl AzureFixture {
     }
 }
 
+/// A CONNECTION that holds a storage field would let the engine reach the container without ever
+/// exercising the vended SAS.
+fn assert_vended_only(password: &CatalogConnectionPassword) {
+    assert!(
+        password.use_vended_credentials,
+        "the vended ADLS CONNECTION must request access delegation"
+    );
+    assert!(
+        password.account_name.is_none()
+            && password.account_key.is_none()
+            && password.sas_token.is_none(),
+        "a vended ADLS CONNECTION must carry NO Azure storage field"
+    );
+    assert!(
+        password.endpoint.is_empty()
+            && password.region.is_empty()
+            && password.access_key.is_empty()
+            && password.secret_key.is_empty(),
+        "a vended CONNECTION must carry no static S3 storage field either"
+    );
+}
+
 /// The readback catches a create Lakekeeper silently rejected for overlapping a
 /// sibling's storage profile, which would otherwise surface as an opaque seed error.
 fn create_warehouse_and_confirm(profile: &AdlsWarehouseProfile) -> String {
@@ -308,6 +330,16 @@ fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
     .expect("azure direct-storage events batch construction is infallible")
 }
 
+/// The run's container, signed with the account key.
+fn azure_store(container: &str, account: &str, key: &str) -> MicrosoftAzure {
+    MicrosoftAzureBuilder::new()
+        .with_account(account)
+        .with_container_name(container)
+        .with_access_key(key)
+        .build()
+        .unwrap_or_else(|e| panic!("configure Azure object store for container {container}: {e}"))
+}
+
 fn write_azure_parquet_fixture(
     container: &str,
     account: &str,
@@ -315,12 +347,7 @@ fn write_azure_parquet_fixture(
     path: &str,
     batch: RecordBatch,
 ) {
-    let store = MicrosoftAzureBuilder::new()
-        .with_account(account)
-        .with_container_name(container)
-        .with_access_key(key)
-        .build()
-        .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
+    let store = azure_store(container, account, key);
     runtime().block_on(async {
         store
             .put(
@@ -340,23 +367,7 @@ fn azure_static_and_vended_creds_end_to_end() {
     let fixture = AzureFixture::provision();
     let mut conn = exa_conn_redacting();
 
-    assert!(
-        fixture.vended_password.use_vended_credentials,
-        "the vended ADLS CONNECTION must request access delegation"
-    );
-    assert!(
-        fixture.vended_password.account_name.is_none()
-            && fixture.vended_password.account_key.is_none(),
-        "a vended ADLS CONNECTION must carry NO Azure storage field: an account name or account \
-         key present would let the scan read the container without ever exercising the vended SAS"
-    );
-    assert!(
-        fixture.vended_password.endpoint.is_empty()
-            && fixture.vended_password.region.is_empty()
-            && fixture.vended_password.access_key.is_empty()
-            && fixture.vended_password.secret_key.is_empty(),
-        "a vended CONNECTION must carry no static S3 storage field either"
-    );
+    assert_vended_only(&fixture.vended_password);
 
     let vended_profile = lakekeeper_warehouse_storage_profile(&fixture.vended_arm.warehouse);
     assert_eq!(
@@ -573,6 +584,148 @@ fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &A
         !explained.contains(&account_key),
         "EXPLAIN VIRTUAL output must never leak the Azure account key"
     );
+}
+
+const VS_SAS: &str = "AZ_SAS_LAKEHOUSE";
+const CONN_SAS: &str = "AZ_SAS_CATALOG_CREDS";
+const CONN_S3_ON_ADLS: &str = "AZ_S3_KEYS_CATALOG_CREDS";
+const EXPORT_SOURCE: &str = "AZ_EXPORT_E2E.SRC_ROWS";
+const EXPORT_SOURCE_ROWS: i64 = 500;
+
+/// Scenario: Static and vended credentials write a table on ADLS Gen2
+/// Scenario: A table location the CONNECTION's storage cannot address is refused
+#[test]
+fn azure_export_writes_and_appends_with_account_key_sas_and_vended_credentials() {
+    let fixture = AzureFixture::provision();
+    assert_vended_only(&fixture.vended_password);
+    let mut conn = exa_conn_redacting();
+    conn.execute("CREATE SCHEMA IF NOT EXISTS AZ_EXPORT_E2E");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {EXPORT_SOURCE} AS SELECT \
+           CAST(LEVEL AS DECIMAL(9,0)) AS ID, CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL \
+         FROM DUAL CONNECT BY LEVEL <= {EXPORT_SOURCE_ROWS}"
+    ));
+    // A service SAS of the run's container, so the CONNECTION holds no account key.
+    let sas_password = CatalogConnectionPassword {
+        account_key: None,
+        sas_token: Some(azure::container_sas(
+            &fixture.account_name,
+            &azure::account_key(),
+            &fixture.container_name,
+        )),
+        ..lakekeeper_adls_connection_password(
+            &fixture.static_arm.warehouse,
+            &fixture.account_name,
+            &azure::account_key(),
+        )
+    };
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_SAS, E2E_NAMESPACE).with_catalog_conn_name(CONN_SAS),
+        LAKEKEEPER_CATALOG_URI_INTERNAL,
+        &sas_password,
+    );
+    let arms = [
+        (CONN_STATIC, VS_STATIC, "exported_by_key", ""),
+        (CONN_SAS, VS_SAS, "exported_by_sas", ""),
+        (
+            CONN_VENDED,
+            VS_VENDED,
+            "exported_vended",
+            "SINGLE_COMMIT = 'true'",
+        ),
+    ];
+
+    for (connection, _, table, options) in arms {
+        let route = ExportRoute {
+            script_schema: SCHEMA_NAME,
+            connection,
+        };
+        let sql = route.export(EXPORT_SOURCE, &format!("{E2E_NAMESPACE}.{table}"), options);
+        for pass in ["create", "append"] {
+            assert_eq!(
+                exported_rows(&mut conn, &sql),
+                EXPORT_SOURCE_ROWS,
+                "{connection} {pass}"
+            );
+        }
+    }
+
+    // Static S3 keys address only `s3://` and `s3a://`, so the ADLS warehouse's `abfss://`
+    // location is refused before the writer configures any storage.
+    conn.execute(&build_create_connection_sql(
+        CONN_S3_ON_ADLS,
+        LAKEKEEPER_CATALOG_URI_INTERNAL,
+        &lakekeeper_connection_password(&fixture.static_arm.warehouse, false),
+    ));
+    for options in ["", "SINGLE_COMMIT = 'true'"] {
+        let table = format!("{E2E_NAMESPACE}.exported_by_s3_keys");
+        let route = ExportRoute {
+            script_schema: SCHEMA_NAME,
+            connection: CONN_S3_ON_ADLS,
+        };
+        let error = error_text(
+            &conn.try_execute(&route.export(EXPORT_SOURCE, &table, options)),
+            "EXPORT through S3 keys into ADLS",
+        );
+        assert!(
+            error.contains(&format!("table {table} has the location abfss://"))
+                && error.contains("whose scheme abfss the CONNECTION's S3 storage cannot address"),
+            "{options}: {error}"
+        );
+        let location = error
+            .split_once("has the location ")
+            .and_then(|(_, rest)| rest.split_once(", whose"))
+            .map(|(location, _)| location)
+            .unwrap_or_else(|| panic!("{options}: no table location in {error}"));
+        let data_files = azure_objects_under(&fixture, &format!("{location}/data/"));
+        assert!(
+            data_files.is_empty(),
+            "{options}: no data file may be written: {data_files:?}"
+        );
+    }
+
+    for (connection, vs, table, _) in arms {
+        conn.execute(&format!("ALTER VIRTUAL SCHEMA {vs} REFRESH"));
+        let rows = conn.query_columns(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT ID), SUM(ID) FROM {vs}.{}",
+            table.to_uppercase()
+        ));
+        let counts: Vec<String> = rows
+            .iter()
+            .map(|column| value_to_string(&column[0]))
+            .collect();
+        let n = EXPORT_SOURCE_ROWS;
+        assert_eq!(
+            counts,
+            [
+                (2 * n).to_string(),
+                n.to_string(),
+                (n * (n + 1)).to_string()
+            ],
+            "{connection}: every source row must read back twice"
+        );
+    }
+}
+
+/// The objects under the `abfss://` prefix `location` in the run's container.
+fn azure_objects_under(fixture: &AzureFixture, location: &str) -> Vec<String> {
+    let key = location
+        .strip_prefix(&fixture.abfss_prefix())
+        .unwrap_or_else(|| panic!("{location} lies outside the run's container"));
+    let store = azure_store(
+        &fixture.container_name,
+        &fixture.account_name,
+        &azure::account_key(),
+    );
+    runtime().block_on(async {
+        store
+            .list(Some(&ObjectStorePath::from(key)))
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
+            .await
+            .unwrap_or_else(|e| panic!("list Azure objects under {location}: {e}"))
+    })
 }
 
 #[test]

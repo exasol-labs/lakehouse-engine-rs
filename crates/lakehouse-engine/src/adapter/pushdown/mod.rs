@@ -30,6 +30,9 @@ use support::{
 };
 use vs_expression::strip_table_alias;
 
+mod clock;
+pub(crate) use clock::{StatementClock, statement_instant};
+
 mod context;
 pub(crate) use context::PushdownContext;
 pub use context::{ScanUdfs, Shards};
@@ -111,6 +114,7 @@ pub(crate) async fn handle_pushdown(
             .cloned()
             .unwrap_or(Json::Null),
     )?;
+    let pushdown = context.clock.fold(pushdown)?;
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.
@@ -181,7 +185,7 @@ pub(crate) async fn handle_pushdown(
 }
 
 /// `emitted` is the single-table emission every row fan-out of the request draws its columns
-/// from.
+/// from, except the wrapper of a split WHERE, whose filter is only the declined conjuncts.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
     request: &Json,
@@ -197,7 +201,7 @@ fn build_dispatch_sql(
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
-    let fallback = || {
+    let fallback = |emitted: &Emitted| {
         qualified_single_table_fallback_pushdown(
             request,
             pushdown,
@@ -211,8 +215,18 @@ fn build_dispatch_sql(
 
     // Ahead of shape routing so it applies before aggregating, grouping, and
     // truncating (`_decision/045`).
-    if let ScanWhere::Declined(_) = scan_where {
-        return fallback();
+    match &scan_where {
+        ScanWhere::Declined(_) => return fallback(emitted),
+        ScanWhere::Split { declined, .. } => {
+            // The wrapper never applies a rendered conjunct, so a column that only a rendered
+            // conjunct names stays out of the fan-out.
+            return fallback(&single_table_emission(
+                request,
+                &pushdown.with_filter(declined.clone()),
+                scan.columns(),
+            )?);
+        }
+        ScanWhere::Absent | ScanWhere::Pushed(_) => {}
     }
     let filter = scan_where.pushed();
 
@@ -259,7 +273,7 @@ fn build_dispatch_sql(
             );
             let Some(sql) = sql else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback();
+                return fallback(emitted);
             };
             return Ok(pushdown_response(sql));
         }
@@ -268,7 +282,7 @@ fn build_dispatch_sql(
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
             // aggregate the materialized rows (#82). No outer WHERE is needed: an
             // untranslatable filter never reaches this arm.
-            return fallback();
+            return fallback(emitted);
         }
         RequestShape::SingleGroupAgg {
             items,
@@ -303,7 +317,7 @@ fn build_dispatch_sql(
             // subqueries ("emitting function in expression"). Use the qualified wrapper,
             // narrowed to referenced columns (#160).
             if has_distinct(&items) {
-                return fallback();
+                return fallback(emitted);
             }
             let merge_select =
                 single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
@@ -314,14 +328,14 @@ fn build_dispatch_sql(
             });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback();
+                return fallback(emitted);
             };
             (Some((plans, merge_inputs)), Vec::new())
         }
         // An item only Exasol computes goes to the qualified wrapper. `project_columns` decides
         // it, never a column-count comparison, which can coincide (#196).
         RequestShape::RowScan => match projection {
-            RowProjection::Wrapped => return fallback(),
+            RowProjection::Wrapped => return fallback(emitted),
             RowProjection::Direct(projection) => (None, projection),
         },
     };

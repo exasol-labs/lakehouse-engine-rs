@@ -4,27 +4,25 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
-use futures::TryStreamExt;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use object_store::ObjectStore;
-use object_store::path::Path as ObjectStorePath;
+use iceberg::{Catalog, NamespaceIdent};
 
 use crate::common::e2e_harness::{
     DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
     VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
-    declared_types, exa_conn, export_error, exported_rows, failing_source, local_stack_s3_store,
-    run_namespace, runtime,
+    declared_types, exa_conn, export_error, exported_rows, failing_source, run_namespace, runtime,
+    try_create_virtual_schema_with_password,
 };
-use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
+use crate::common::exasol_ws::{ExaConn, error_text, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
 use crate::common::stack::{
-    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY,
+    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY,
     build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url_internal,
     local_stack_connection_password, proxy_log_during,
 };
+use crate::common::table_state::{WAREHOUSE_BUCKET, objects_under, table_exists};
 use crate::fixtures::{
-    LAKEHOUSE_VS, PROXY_ICEBERG_CREDS, lakehouse_vs, proxy_virtual_schemas, seed_catalog, stack,
-    vs_table,
+    EXPORT_DIRECT as DIRECT, EXPORT_PROXIED as PROXIED, LAKEHOUSE_VS, lakehouse_vs,
+    proxy_virtual_schemas, seed_catalog, stack, vs_table,
 };
 
 const EXPORT_SCHEMA: &str = "EXPORT_E2E";
@@ -37,7 +35,6 @@ const MAX_WRITERS: i64 = 300;
 const EXPORTER_PASSWORD: &str = "ExportE2eUser2026x";
 const ROLE_EXPORTER: &str = "EXPORT_E2E_ROLE_EXPORTER";
 const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
-const WAREHOUSE_BUCKET: &str = "warehouse";
 
 static FAILING_SOURCE: LazyLock<String> = LazyLock::new(|| failing_source(SOURCE_TABLE));
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
@@ -109,6 +106,16 @@ fn missing_grant_error(user: &str) -> String {
     )
 }
 
+/// Static Azure storage fields over the local catalog, whose warehouse lies on `s3://`.
+fn azure_connection_password() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        account_name: Some("exporte2e".to_string()),
+        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
+        ..Default::default()
+    }
+}
+
 /// A table no earlier export wrote.
 fn new_table() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -118,18 +125,6 @@ fn new_table() -> String {
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
-
-const DIRECT: ExportRoute = ExportRoute {
-    script_schema: SCHEMA_NAME,
-    connection: DEFAULT_CATALOG_CONN_NAME,
-};
-
-/// The proxy-only scripts and CONNECTION of `proxy_virtual_schemas`, so a `scripts/proxy/filter`
-/// line can inject a catalog or storage fault.
-const PROXIED: ExportRoute = ExportRoute {
-    script_schema: PROXY_ADAPTER_SCHEMA,
-    connection: PROXY_ICEBERG_CREDS,
-};
 
 fn export_into(source: &str, tail: &str) -> String {
     DIRECT.export_into(source, tail)
@@ -153,33 +148,11 @@ fn connection_secrets() -> [String; 2] {
     [password.access_key, password.secret_key]
 }
 
-fn table_exists(table: &str) -> bool {
-    let ident = TableIdent::from_strs(table.split('.'))
-        .unwrap_or_else(|e| panic!("{table} is not a table name: {e}"));
-    runtime()
-        .block_on(seed_catalog(runtime(), "export").table_exists(&ident))
-        .unwrap_or_else(|e| panic!("check table {table}: {e}"))
-}
-
 fn namespace_exists(namespace: &str) -> bool {
     let ident = NamespaceIdent::new(namespace.to_string());
     runtime()
         .block_on(seed_catalog(runtime(), "export").namespace_exists(&ident))
         .unwrap_or_else(|e| panic!("check namespace {namespace}: {e}"))
-}
-
-/// The keys under `prefix` of the warehouse bucket.
-fn objects_under(prefix: &str) -> Vec<String> {
-    let store = local_stack_s3_store(WAREHOUSE_BUCKET);
-    let prefix = ObjectStorePath::from(prefix);
-    runtime()
-        .block_on(
-            store
-                .list(Some(&prefix))
-                .map_ok(|object| object.location.to_string())
-                .try_collect(),
-        )
-        .unwrap_or_else(|e| panic!("list {WAREHOUSE_BUCKET}/{prefix}: {e}"))
 }
 
 /// Scenario: A whole-table export writes every source row
@@ -342,7 +315,7 @@ fn export_refuses_invalid_statements_before_reading() {
             "unknown option",
             export_sql(&FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
             vec![
-                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, and ALLOW_HTTP"
+                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, SINGLE_COMMIT, ALLOW_HTTP, and PARTITION_BY"
                     .to_string(),
             ],
         ),
@@ -472,27 +445,21 @@ fn export_refuses_unwritable_connections_and_column_names() {
     stack();
     setup();
     let mut sys = exa_conn();
-    let azure = CatalogConnectionPassword {
-        warehouse: "s3://warehouse/".to_string(),
-        account_name: Some("exporte2e".to_string()),
-        account_key: Some(AZURE_ACCOUNT_KEY.to_string()),
-        ..Default::default()
+    let azure_role = CatalogConnectionPassword {
+        aws_assume_role_arn: Some("arn:aws:iam::000000000000:role/export-e2e".to_string()),
+        ..azure_connection_password()
     };
     let sigv4 = CatalogConnectionPassword {
         use_sigv4: true,
         ..local_stack_connection_password()
     };
     let catalog = iceberg_catalog_url_internal();
-    sys.execute(&build_create_connection_sql(
-        "EXPORT_E2E_AZURE_CREDS",
-        &catalog,
-        &azure,
-    ));
-    sys.execute(&build_create_connection_sql(
-        "EXPORT_E2E_SIGV4_CREDS",
-        &catalog,
-        &sigv4,
-    ));
+    for (name, password) in [
+        ("EXPORT_E2E_AZURE_ROLE_CREDS", &azure_role),
+        ("EXPORT_E2E_SIGV4_CREDS", &sigv4),
+    ] {
+        sys.execute(&build_create_connection_sql(name, &catalog, password));
+    }
     let through = |connection: &'static str, options: &str| {
         let table = new_table();
         let route = ExportRoute {
@@ -501,20 +468,32 @@ fn export_refuses_unwritable_connections_and_column_names() {
         };
         (route.export(&FAILING_SOURCE, &table, options), table)
     };
-    let azure_refusal = "supplies Azure storage field(s) account_name, account_key, but the export writes only to S3-compatible storage";
+    // The virtual schema's own refusal of this CONNECTION, before it contacts the catalog.
+    let role_refusal = "names aws_assume_role_arn but is missing field(s) access_key, secret_key";
+    let vs_error = error_text(
+        &try_create_virtual_schema_with_password(
+            &mut sys,
+            &VsProps::new("EXPORT_E2E_AZURE_ROLE_VS", "ns")
+                .with_catalog_conn_name("EXPORT_E2E_AZURE_ROLE_CREDS"),
+            &catalog,
+            &azure_role,
+        ),
+        "CREATE VIRTUAL SCHEMA",
+    );
+    assert!(vs_error.contains(role_refusal), "{vs_error}");
     let sigv4_refusal =
         "sets use_sigv4, but the export does not sign catalog requests with AWS SigV4";
     let repeated_name = new_table();
     let cases = [
         (
-            "Azure storage",
-            through("EXPORT_E2E_AZURE_CREDS", ""),
-            azure_refusal,
+            "Azure storage with an IAM role",
+            through("EXPORT_E2E_AZURE_ROLE_CREDS", ""),
+            role_refusal,
         ),
         (
-            "Azure storage, SINGLE_COMMIT",
-            through("EXPORT_E2E_AZURE_CREDS", "SINGLE_COMMIT = 'true'"),
-            azure_refusal,
+            "Azure storage with an IAM role, SINGLE_COMMIT",
+            through("EXPORT_E2E_AZURE_ROLE_CREDS", "SINGLE_COMMIT = 'true'"),
+            role_refusal,
         ),
         (
             "SigV4 signing",
@@ -549,6 +528,45 @@ fn export_refuses_unwritable_connections_and_column_names() {
             "{case}: the account key leaked: {error}"
         );
         assert!(!table_exists(&table), "{case}: {table} must not exist");
+    }
+}
+
+/// Scenario: A table location the CONNECTION's storage cannot address is refused
+#[test]
+fn export_through_azure_storage_into_an_s3_location_is_refused_naming_the_scheme() {
+    stack();
+    setup();
+    let mut sys = exa_conn();
+    let azure = azure_connection_password();
+    let connection = "EXPORT_E2E_AZURE_LOCATION_CREDS";
+    sys.execute(&build_create_connection_sql(
+        connection,
+        &iceberg_catalog_url_internal(),
+        &azure,
+    ));
+
+    for options in ["", "SINGLE_COMMIT = 'true'"] {
+        let table = new_table();
+        let route = ExportRoute {
+            connection,
+            ..DIRECT
+        };
+        let error = export_error(
+            &mut sys,
+            &route.export(SOURCE_TABLE, &table, options),
+            &[AZURE_ACCOUNT_KEY],
+        );
+
+        assert!(
+            error.contains(&format!("table {table} has the location s3://"))
+                && error.contains("whose scheme s3 the CONNECTION's Azure storage cannot address"),
+            "{options}: {error}"
+        );
+        let data_files = objects_under(&format!("{}/data/", table.replace('.', "/")));
+        assert!(
+            data_files.is_empty(),
+            "{options}: no data file may be written: {data_files:?}"
+        );
     }
 }
 
@@ -685,6 +703,8 @@ fn export_errors_carry_no_connection_password() {
         "columns": ["X"],
         "single_commit": false,
         "allow_http": true,
+        "append": false,
+        "partition_by": [],
     });
     let forged_writer_call =
         format!("SELECT {SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}('{writer_spec}', 1) FROM DUAL");

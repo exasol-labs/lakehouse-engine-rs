@@ -16,8 +16,7 @@ use tokio::sync::Semaphore;
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{
-    FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
-    render_order_by_clause,
+    ColumnRef, FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
 };
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
@@ -25,7 +24,7 @@ use crate::scan::{diagnostics, emit_phase_telemetry};
 use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanGroups;
-use super::sql_support::{aliased_select, append_where, render_projection};
+use super::sql_support::{aliased_select, append_where, render_projection, render_sort_target};
 
 const SCAN_TARGET: &str = "scan_target";
 const RAW_SQL_ERROR: &str = "DataFusion SQL error";
@@ -350,23 +349,32 @@ pub(super) async fn build_scan_sql(
         spec.common.projection.clone()
     };
 
-    let select_clause = render_projection(&proj_items, |column| {
+    let column_type = |column: &ColumnRef| {
         let lower = column.name.to_lowercase();
         schema
             .fields()
             .iter()
             .find(|f| f.name().to_lowercase() == lower)
             .map(|f| f.data_type())
-    });
+    };
+    let select_clause = render_projection(&proj_items, column_type);
     let mut sql = format!("SELECT {select_clause} FROM ({inner})");
     append_where(&mut sql, spec.common.filter.as_deref());
 
-    // Rendered by the SAME `render_order_by_clause` as the adapter's outer merge SQL, so shard
-    // and merge sorts rank identically, including NULL placement. Before LIMIT so DataFusion
-    // folds it into a bounded TopK.
+    // Direction and NULL placement render through the same seam as the adapter's outer merge
+    // SQL, so shard and merge sorts rank identically. Before LIMIT so DataFusion folds it into a
+    // bounded TopK.
     if !spec.common.order_by.is_empty() {
+        let elements: Vec<String> = spec
+            .common
+            .order_by
+            .iter()
+            .map(|key| {
+                key.render_ordered(&render_sort_target(&key.column, column_type(&key.column)))
+            })
+            .collect();
         sql.push_str(" ORDER BY ");
-        sql.push_str(&render_order_by_clause(&spec.common.order_by));
+        sql.push_str(&elements.join(", "));
     }
 
     if let Some(limit) = spec.common.limit {

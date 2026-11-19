@@ -1650,7 +1650,6 @@ fn selectlist_aggregate_item_routes_to_the_wrapper() {
     );
 }
 
-/// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
     let filter_json = predicate_equal(col("id"), num_lit(42));
@@ -1675,35 +1674,6 @@ fn filter_in_common_arg() {
     assert!(
         common.contains("\"filter\"") && common.contains("42"),
         "filter must be pushed into the common arg: {common}"
-    );
-}
-
-#[test]
-fn nested_like_decline_routes_to_wrapper_where() {
-    let filter = and([
-        string_equal("T", "STATUS", "OPEN"),
-        like(table_col("T", "AMOUNT"), "9%"),
-    ]);
-    let request = pushdown_request(
-        "T",
-        &[
-            ("STATUS", ExasolType::WIDEST_VARCHAR),
-            ("AMOUNT", ExasolType::decimal(9, 2)),
-        ],
-    )
-    .filter(filter)
-    .build()
-    .0;
-
-    let sql = declined_filter_wrapper_sql(&request);
-
-    let where_at = sql
-        .find(r#"AS "LHS_T0" WHERE "#)
-        .unwrap_or_else(|| panic!("the declined filter must reach the wrapper: {sql}"));
-    assert!(
-        sql[where_at..].contains(r#""LHS_T0"."AMOUNT" LIKE '9%'"#)
-            && sql[where_at..].contains(r#""LHS_T0"."STATUS" = 'OPEN'"#),
-        "the wrapper WHERE must carry the WHOLE declined filter, both conjuncts: {sql}"
     );
 }
 
@@ -1735,7 +1705,7 @@ fn mixed_col_types() -> Vec<(String, ExasolType)> {
 }
 
 #[test]
-fn a_text_to_text_cast_renders_unchanged() {
+fn a_text_to_text_cast_keeps_its_unsized_target() {
     let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(
             cast_to(ExasolType::WIDEST_VARCHAR, col("name")),
@@ -1755,8 +1725,8 @@ fn a_text_to_text_cast_renders_unchanged() {
         panic!("must be a rendered expression, not a full-row fallback: {items:?}");
     };
     assert_eq!(
-        expr, r#"CAST("NAME" AS VARCHAR)"#,
-        "a CAST of text to text renders unchanged: {expr}"
+        expr, r#"CAST(nullif("NAME", '') AS VARCHAR)"#,
+        "a CAST of text to text keeps its unsized target: {expr}"
     );
 }
 
@@ -1841,7 +1811,7 @@ fn selectlist_predicate_node_projects_as_expr() {
         (
             "predicate_in_constlist",
             in_list(col("name"), [str_lit("a"), str_lit("b")]),
-            r#"("NAME" IN ('a', 'b'))"#,
+            r#"(nullif("NAME", '') IN ('a', 'b'))"#,
         ),
         (
             "predicate_between",
@@ -1851,12 +1821,12 @@ fn selectlist_predicate_node_projects_as_expr() {
         (
             "predicate_is_null",
             is_null(col("name")),
-            r#"("NAME" IS NULL)"#,
+            r#"(("NAME" IS NULL) OR ("NAME" = ''))"#,
         ),
         (
             "predicate_is_not_null",
             is_not_null(col("name")),
-            r#"("NAME" IS NOT NULL)"#,
+            r#"(("NAME" IS NOT NULL) AND ("NAME" <> ''))"#,
         ),
         (
             "predicate_notequal",

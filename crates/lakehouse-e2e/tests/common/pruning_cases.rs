@@ -21,7 +21,7 @@ use parquet::file::statistics::Statistics;
 
 use std::collections::BTreeSet;
 
-use Placement::{OuterWhere, Scan};
+use Placement::{OuterWhere, Scan, Split};
 
 pub const VS_ICEBERG: &str = "PRUNING_ICEBERG";
 pub const VS_HIVE: &str = "PRUNING_HIVE";
@@ -33,14 +33,18 @@ pub const PRUNING_PARQUET_TABLE: &str = "pruning_cases_parquet";
 enum Placement {
     Scan,
     OuterWhere,
+    /// The scan filters on the conjuncts it renders, and the outer WHERE applies the rest.
+    Split,
 }
 
 impl Placement {
     fn holds(self, plan: &str) -> bool {
         let scan_filter = plan.contains(SCAN_FILTER);
+        let outer_where = plan.contains(OUTER_WHERE_ALIAS);
         match self {
             Placement::Scan => scan_filter,
-            Placement::OuterWhere => plan.contains(OUTER_WHERE_ALIAS) && !scan_filter,
+            Placement::OuterWhere => outer_where && !scan_filter,
+            Placement::Split => outer_where && scan_filter,
         }
     }
 }
@@ -361,7 +365,7 @@ const CASES: &[Case] = &[
     // An escaped ordinary character is itself, so these match rows only if the escape applies.
     Case::new("S LIKE 'xaa' ESCAPE 'a'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
     Case::new("P LIKE 'aa%' ESCAPE 'a'", Scan).every_format(&["a1", "a2"]),
-    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", OuterWhere)
+    Case::new("S LIKE 'xaa' ESCAPE 'a' AND SECOND(TS, 3) >= 0", Split)
         .iceberg_and_delta(&["a1", "a2", "b1"]),
     // A plain LIKE escapes with Exasol's default `\`, though Exasol sends no `escapeChar`.
     Case::new(r"S LIKE 'x\a%'", Scan).iceberg_and_delta(&["a1", "a2", "b1"]),
@@ -473,10 +477,30 @@ fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<Stri
     })
 }
 
+/// Filters on a clock function or a time zone literal. Every `DT` lies before today, and in a
+/// session zone that is `DBTIMEZONE` the literal's bound is `TZ < TIMESTAMP '2024-01-01 00:10:00'`.
+const CLOCK_CASES: &[Case] = &[
+    Case::new("DT >= CURRENT_DATE", Scan).iceberg_and_delta(&[]),
+    Case::new(
+        "TZ < CAST(TIMESTAMP '2024-01-01 00:10:00' AS TIMESTAMP WITH LOCAL TIME ZONE)",
+        Scan,
+    )
+    .iceberg_and_delta(&["b1", "n1"]),
+];
+
 /// Runs every case against `format`'s virtual schema, which the caller's setup has created,
 /// and fails once with every failed case.
 pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
-    let failures: Vec<String> = CASES
+    assert_listed_cases_hold(conn, format, CASES);
+}
+
+/// [`assert_cases_hold`] over the clock and time zone literal cases.
+pub fn assert_clock_cases_hold(conn: &mut ExaConn, format: Format) {
+    assert_listed_cases_hold(conn, format, CLOCK_CASES);
+}
+
+fn assert_listed_cases_hold(conn: &mut ExaConn, format: Format, cases: &[Case]) {
+    let failures: Vec<String> = cases
         .iter()
         .filter(|case| !(case.typed_partition && matches!(format, Format::Hive)))
         .filter_map(|case| case_failures(conn, format, case))
@@ -485,7 +509,7 @@ pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
         failures.is_empty(),
         "{} of {} pruning cases failed:\n{}",
         failures.len(),
-        CASES.len(),
+        cases.len(),
         failures.join("\n")
     );
 }
@@ -569,7 +593,7 @@ const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
         "SELECT COUNT(*) FROM {T} WHERE {F} HAVING SUM(ID) > 0",
         false,
     ),
-    ("SELECT 'X', COUNT(*) FROM {T} WHERE {F}", false),
+    ("SELECT 'X', COUNT(*) FROM {T} WHERE {F}", true),
     ("SELECT 1 FROM {T} WHERE {F} HAVING COUNT(*) > 0", false),
     ("SELECT LENGTH(MAX(UPPER(P))) FROM {T} WHERE {F}", false),
     (

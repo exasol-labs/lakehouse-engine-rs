@@ -2,12 +2,16 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
-use crate::retry::{DEFAULT_RETRIES, Retries, commit_retries};
+use crate::adls_storage::adls_file_io;
+use crate::retry::{
+    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, Waits, append_retries,
+    commit_retries,
+};
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
-use crate::vended_refresh::{StorageCredentials, VendedTable};
+use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Schema, TableMetadata};
+use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -15,8 +19,9 @@ use iceberg_catalog_rest::{
 };
 use lakehouse_catalog::{
     AssumedRole, CatalogResponse, CatalogSendError, CatalogSession, ConnectionCreds, EpochClock,
-    RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, namespace_tables_path,
-    resolve_vended_storage, scheme_of, system_clock, table_ident_path, vended_s3_credentials,
+    RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, VendedBackendKind,
+    VendedCredentialSet, classify_vended_scheme, namespace_tables_path, resolve_vended_storage,
+    scheme_of, system_clock, table_ident_path,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -25,15 +30,12 @@ use std::sync::Arc;
 
 const EXPORT_ID_PROPERTY: &str = "lakehouse.export-id";
 const EXPORT_WRITER_PROPERTY: &str = "lakehouse.export-writer";
-/// Concurrent writers of one export all commit to the table it creates, so it allows many more
-/// commit retries than Iceberg's default of 4.
-const CREATED_TABLE_PROPERTIES: [(&str, &str); 2] =
-    [("format-version", "2"), ("commit.retry.num-retries", "20")];
 
 /// Where an export table's storage credentials come from. Every kind reaches the table's FileIO
 /// through one credential source, which renews the credentials its own way.
 pub enum WriteStorage {
-    /// The CONNECTION's own storage keys, which do not expire.
+    /// The CONNECTION's own storage credentials, S3 keys or an Azure account key or SAS, which
+    /// do not expire.
     Static(StorageBackend),
     /// The credentials of an IAM role the CONNECTION names, assumed again before they expire.
     /// `backend` carries the store's address.
@@ -93,7 +95,7 @@ impl CommitTag {
 /// credentials, which renew themselves when the catalog vends them.
 pub struct WriteTable {
     table: Table,
-    credentials: StorageCredentials,
+    credentials: TableCredentials,
 }
 
 /// A table staged for `SINGLE_COMMIT`: invisible in the catalog until [`TableWriteSession::
@@ -231,12 +233,9 @@ impl TableWriteSession {
         self.session.catalog_uri()
     }
 
-    /// Refuses `table` when the catalog already holds it, because the export only creates tables.
-    pub async fn refuse_existing_table(&self, table: &TableIdent) -> Result<(), UdfError> {
-        if self.session.table_exists(table).await? {
-            return Err(existing_table_error(table));
-        }
-        Ok(())
+    /// Whether the catalog holds `table`.
+    pub async fn table_exists(&self, table: &TableIdent) -> Result<bool, UdfError> {
+        self.session.table_exists(table).await
     }
 
     /// Creates each level of `namespace` that the catalog does not hold, top-down. A level is
@@ -261,16 +260,18 @@ impl TableWriteSession {
         self.open(table, answer)
     }
 
-    /// Creates the table as format version 2, tagged with the export's ID. When another writer of
-    /// the same export created it first, also after an unknown outcome of this request, the
-    /// writer gets that table; a table of anything else is refused.
+    /// Creates the table as format version 2 with `partition_spec`, tagged with the export's ID.
+    /// When another writer of the same export created it first, also after an unknown outcome of
+    /// this request, the writer gets that table; a table of anything else is refused.
     pub async fn create_table(
         &self,
         table: &TableIdent,
         schema: Schema,
+        partition_spec: Option<UnboundPartitionSpec>,
         export_id: &str,
     ) -> Result<WriteTable, UdfError> {
-        let body = encoded(table, &creation_request(table, schema, export_id))?;
+        let request = creation_request(table, schema, partition_spec, export_id);
+        let body = encoded(table, &request)?;
         let mut retries = Retries::new(DEFAULT_RETRIES);
         loop {
             let cause = match self
@@ -304,9 +305,10 @@ impl TableWriteSession {
         &self,
         table: &TableIdent,
         schema: Schema,
+        partition_spec: Option<UnboundPartitionSpec>,
         export_id: &str,
     ) -> Result<StagedTable, UdfError> {
-        let mut request = creation_request(table, schema, export_id);
+        let mut request = creation_request(table, schema, partition_spec, export_id);
         request.stage_create = Some(true);
         let body = encoded(table, &request)?;
         let answer = match self
@@ -331,9 +333,8 @@ impl TableWriteSession {
         Ok(StagedTable(self.open(table, staged)?))
     }
 
-    /// The error for a catalog that ignored `stage-create` and created the table. The table is
-    /// dropped when its `lakehouse.export-id` shows this export created it, so a later export into
-    /// the name does not fail with "already exists"; else the error says it must be dropped.
+    /// The error for a catalog that ignored `stage-create`. A table this export created is dropped,
+    /// so the failed export leaves no empty table behind; else the error says to drop it.
     async fn ignored_staging(&self, table: &TableIdent, export_id: &str) -> UdfError {
         let ignored = format!(
             "the catalog {} ignored staged creation (stage-create): table {} became visible \
@@ -361,26 +362,44 @@ impl TableWriteSession {
         UdfError::User(format!("{ignored}; {outcome}"))
     }
 
-    /// Adds `files` to `table` in one snapshot tagged with `tag`. A conflict (HTTP 409), a busy
-    /// catalog (429, 503), a request that never reached the catalog, or a lost answer (502, 504, a
-    /// broken transport) waits, then reloads the table: a snapshot with the tag means the commit
-    /// landed, else the snapshot is rebuilt on the reloaded metadata and sent again, up to the
-    /// table's `commit.retry.num-retries` times. Every other answer fails at once.
+    /// Adds `files`, written under `written`, to the table in one snapshot tagged with `tag`. The
+    /// table is reloaded first, so the snapshot holds every commit of other writers so far. A
+    /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
+    /// or a lost answer (502, 504, a broken transport) waits, then reloads the table: a snapshot
+    /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
+    /// and sent again, up to the table's `commit.retry.num-retries` times, and at least 20. Every
+    /// other answer fails at once.
     pub async fn append_files(
         &self,
-        table: &WriteTable,
+        written: &WriteTable,
         files: Vec<DataFile>,
         tag: &CommitTag,
     ) -> Result<(), CommitError> {
-        let ident = table.table.identifier();
-        let mut retries = Retries::new(commit_retries(table.table.metadata().properties()));
-        let mut base = table.table.clone();
+        let ident = written.table.identifier();
+        // A fast append asserts neither the schema nor the partition spec the files were written
+        // under, so every commit pins both.
+        let checked = TableShape::of(written.table.metadata());
+        let reloaded = self
+            .session
+            .load_table_with_all_snapshots(ident)
+            .await
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        refuse_reloaded(checked, &reloaded.metadata)
+            .map_err(|change| CommitError::new(ident, change, false))?;
+        // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
+        let mut base = rebuilt(&written.table, reloaded)
+            .map_err(|error| CommitError::new(ident, error, false))?;
+        let mut retries = Retries::with_waits(
+            append_retries(base.metadata().properties()),
+            Waits::of_table(base.metadata().properties()),
+        );
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
                 .await
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
-            let body = commit_request(ident, captured.requirements, captured.updates)
+            let requirements = checked.pinned(captured.requirements);
+            let body = commit_request(ident, requirements, captured.updates)
                 .map_err(|error| CommitError::new(ident, error, last_outcome_unknown))?;
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
@@ -398,6 +417,8 @@ impl TableWriteSession {
             if tag.is_on(&reloaded.metadata) {
                 return Ok(());
             }
+            refuse_reloaded(checked, &reloaded.metadata)
+                .map_err(|change| CommitError::new(ident, change, false))?;
             if !may_retry {
                 return Err(exhausted_commit_error(ident, &retries, &failure));
             }
@@ -422,7 +443,10 @@ impl TableWriteSession {
         let body = staged_commit(table, files, tag)
             .await
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(commit_retries(table.metadata().properties()));
+        let mut retries = Retries::with_waits(
+            commit_retries(table.metadata().properties()),
+            Waits::of_table(table.metadata().properties()),
+        );
         loop {
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
@@ -518,7 +542,7 @@ impl TableWriteSession {
             .map(String::as_str)
             != Some(export_id)
         {
-            return Err(existing_table_error(table));
+            return Err(created_by_another_statement(table));
         }
         self.open(table, existing).map(Some)
     }
@@ -583,76 +607,185 @@ impl TableWriteSession {
         })
     }
 
-    /// The table of a load, create, or stage answer, with a FileIO over its location. Only an
-    /// `s3` or `s3a` location is accepted, before any storage is configured.
+    /// The table of a load, create, or stage answer, with a FileIO over its location. A location
+    /// the storage cannot address is refused before any storage is configured.
     fn open(&self, table: &TableIdent, answer: LoadTableResult) -> Result<WriteTable, UdfError> {
         let location = answer.metadata.location().to_string();
-        let scheme = scheme_of(&location);
-        if !matches!(scheme.as_str(), "s3" | "s3a") {
-            return Err(UdfError::User(format!(
-                "table {} has the location {location}, whose scheme {scheme} is no S3-compatible \
-                 storage; the export writes only to s3:// or s3a:// locations",
-                table
-            )));
-        }
-        let (file_io, credentials) = self.storage_of(table, &answer, location)?;
+        let vended_kind = refuse_unaddressable(&self.storage, self.allow_http, table, &location)?;
+        let (file_io, credentials) = self.storage_of(table, &answer, location, vended_kind)?;
         let table = iceberg_table(table, answer, file_io)
             .map_err(|error| UdfError::User(format!("could not open table {}: {error}", table)))?;
         Ok(WriteTable { table, credentials })
     }
 
     /// The FileIO of the table at `location` and the credential source it signs with: the
-    /// CONNECTION's own keys, the credentials of its role, or the credentials `answer` vends. Each
-    /// is seeded into a source that renews it its own way.
+    /// CONNECTION's own credentials, the credentials of its role, or the credentials `answer`
+    /// vends, of the backend `vended_kind` selects. Each is seeded into a source that renews it its
+    /// own way.
     fn storage_of(
         &self,
         table: &TableIdent,
         answer: &LoadTableResult,
         location: String,
-    ) -> Result<(FileIO, StorageCredentials), UdfError> {
-        let (backend, credentials) = match &self.storage {
-            WriteStorage::Static(backend) => {
-                let StorageBackend::S3(props) = backend else {
-                    return Err(adls_refused());
-                };
+        vended_kind: Option<VendedBackendKind>,
+    ) -> Result<(FileIO, TableCredentials), UdfError> {
+        match &self.storage {
+            WriteStorage::Static(StorageBackend::Adls { cred, .. }) => {
+                Ok(adls_storage(&location, AdlsCredentials::connection(cred)?))
+            }
+            WriteStorage::Static(backend @ StorageBackend::S3(props)) => {
                 let keys = StorageCredentials::keys(
                     &props.access_key,
                     &props.secret_key,
                     props.session_token.as_deref(),
-                    self.clock.clone(),
                 );
-                (backend.clone(), keys)
+                s3_storage(backend, keys)
             }
             WriteStorage::AssumedRole { backend, role } => {
-                (backend.clone(), StorageCredentials::role(role.clone()))
+                s3_storage(backend, StorageCredentials::role(role.clone()))
             }
             WriteStorage::Vended(address) => {
-                let seed = vended_s3_credentials(answer, &location)?;
                 let vended = VendedTable {
                     session: self.session.clone(),
                     table: table.clone(),
-                    location,
+                    location: location.clone(),
                     allow_http: self.allow_http,
                 };
+                let set = VendedCredentialSet::of(answer, &location);
+                if let Some(VendedBackendKind::Adls) = vended_kind {
+                    let seed = set.adls_sas(&location)?;
+                    let credentials = AdlsCredentials::vended(vended, seed, self.clock.clone())?;
+                    return Ok(adls_storage(&location, credentials));
+                }
+                let seed = set.s3(&location)?;
                 let credentials = StorageCredentials::vended(vended, seed, self.clock.clone())?;
-                let backend = resolve_vended_storage(
-                    answer,
-                    answer.metadata.location(),
-                    self.allow_http,
-                    address,
-                )?;
-                (backend, credentials)
+                let backend = resolve_vended_storage(answer, &location, self.allow_http, address)?;
+                s3_storage(&backend, credentials)
             }
-        };
-        let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
-        Ok((file_io, credentials))
+        }
     }
 }
 
-fn adls_refused() -> UdfError {
-    UdfError::User(
-        "an AWS credential loader signs only S3 storage requests, but the storage is ADLS".into(),
+/// Refuses a location the storage cannot address: the CONNECTION's S3 storage, by keys or a role,
+/// addresses `s3` and `s3a`, its Azure storage `abfss`, and vended storage all four schemes,
+/// `abfs` only under the export's `ALLOW_HTTP`. Returns the backend a vended location selects.
+fn refuse_unaddressable(
+    storage: &WriteStorage,
+    allow_http: bool,
+    table: &TableIdent,
+    location: &str,
+) -> Result<Option<VendedBackendKind>, UdfError> {
+    let scheme = scheme_of(location);
+    let storage = match storage {
+        WriteStorage::Static(backend) | WriteStorage::AssumedRole { backend, .. } => {
+            if backend.addresses_scheme(&scheme) {
+                return Ok(None);
+            }
+            match backend {
+                StorageBackend::S3(_) => "the CONNECTION's S3 storage",
+                StorageBackend::Adls { .. } => "the CONNECTION's Azure storage",
+            }
+        }
+        WriteStorage::Vended(_) => match classify_vended_scheme(&scheme) {
+            // object_store writes `abfs` over HTTPS too; ALLOW_HTTP acknowledges the upgrade, as
+            // the virtual schema's property does.
+            Some(VendedBackendKind::Adls) if scheme == "abfs" && !allow_http => {
+                return Err(UdfError::User(format!(
+                    "table {table} has the location {location}, whose plaintext scheme abfs needs \
+                     the export option ALLOW_HTTP = 'true', which acknowledges that the export \
+                     writes the location over HTTPS"
+                )));
+            }
+            Some(kind) => return Ok(Some(kind)),
+            None => "vended storage",
+        },
+    };
+    Err(UdfError::User(format!(
+        "table {table} has the location {location}, whose scheme {scheme} {storage} cannot address"
+    )))
+}
+
+fn s3_storage(
+    backend: &StorageBackend,
+    credentials: StorageCredentials,
+) -> Result<(FileIO, TableCredentials), UdfError> {
+    let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
+    Ok((file_io, TableCredentials::S3(credentials)))
+}
+
+fn adls_storage(location: &str, credentials: AdlsCredentials) -> (FileIO, TableCredentials) {
+    (
+        adls_file_io(location, credentials.clone()),
+        TableCredentials::Adls(credentials),
     )
+}
+
+/// What a writer's data files depend on: the field IDs of the current schema, and the partition
+/// spec their partition values follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableShape {
+    schema_id: i32,
+    spec_id: i32,
+}
+
+impl TableShape {
+    fn of(metadata: &TableMetadata) -> Self {
+        Self {
+            schema_id: metadata.current_schema_id(),
+            spec_id: metadata.default_partition_spec_id(),
+        }
+    }
+
+    /// `requirements` plus the assertions that the table still has this schema and partition spec.
+    fn pinned(self, mut requirements: Vec<TableRequirement>) -> Vec<TableRequirement> {
+        requirements.push(TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: self.schema_id,
+        });
+        requirements.push(TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: self.spec_id,
+        });
+        requirements
+    }
+}
+
+/// Why the writer's files cannot go onto `reloaded`: a schema or partition spec other than the one
+/// it checked, or format version 3 or later, whose row lineage the export does not maintain. No
+/// Iceberg REST requirement asserts the format version, so only a reload can see an upgrade.
+fn refuse_reloaded(checked: TableShape, reloaded: &TableMetadata) -> Result<(), String> {
+    refuse_changed(checked, TableShape::of(reloaded))?;
+    let version = reloaded.format_version();
+    if version > FormatVersion::V2 {
+        return Err(format!(
+            "it was upgraded to format version {} after the writer checked the table",
+            version as u8
+        ));
+    }
+    Ok(())
+}
+
+/// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
+/// depend on did.
+fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), String> {
+    let mut changes = Vec::new();
+    if reloaded.schema_id != checked.schema_id {
+        changes.push(format!(
+            "its current schema ID changed from {} to {}",
+            checked.schema_id, reloaded.schema_id
+        ));
+    }
+    if reloaded.spec_id != checked.spec_id {
+        changes.push(format!(
+            "its default partition spec ID changed from {} to {}",
+            checked.spec_id, reloaded.spec_id
+        ));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} after the writer checked the table",
+        changes.join(" and ")
+    ))
 }
 
 /// What an HTTP status says about a state-changing request.
@@ -677,17 +810,22 @@ fn classify(status: u16) -> Outcome {
     }
 }
 
-fn creation_request(table: &TableIdent, schema: Schema, export_id: &str) -> CreateTableRequest {
-    let mut properties: HashMap<String, String> = CREATED_TABLE_PROPERTIES
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    properties.insert(EXPORT_ID_PROPERTY.to_string(), export_id.to_string());
+fn creation_request(
+    table: &TableIdent,
+    schema: Schema,
+    partition_spec: Option<UnboundPartitionSpec>,
+    export_id: &str,
+) -> CreateTableRequest {
+    let properties = HashMap::from([
+        ("format-version".to_string(), "2".to_string()),
+        (NUM_RETRIES_PROPERTY.to_string(), EXPORT_RETRIES.to_string()),
+        (EXPORT_ID_PROPERTY.to_string(), export_id.to_string()),
+    ]);
     CreateTableRequest {
         name: table.name.clone(),
         location: None,
         schema,
-        partition_spec: None,
+        partition_spec,
         write_order: None,
         stage_create: None,
         properties,
@@ -766,9 +904,10 @@ fn staged_creation_error(table: &TableIdent, cause: impl fmt::Display) -> UdfErr
     ))
 }
 
-fn existing_table_error(table: &TableIdent) -> UdfError {
+fn created_by_another_statement(table: &TableIdent) -> UdfError {
     UdfError::User(format!(
-        "table {table} already exists; the export only creates new tables"
+        "table {table} was created by another statement after the export checked that it does \
+         not exist"
     ))
 }
 

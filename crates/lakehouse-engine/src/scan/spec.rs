@@ -310,8 +310,8 @@ pub fn render_ordered(expr: &str, ascending: bool, nulls_last: bool) -> String {
 }
 
 /// E.g. `"L_EXTENDEDPRICE" DESC NULLS LAST, "L_ORDERKEY" ASC NULLS FIRST`, without the
-/// `ORDER BY` keyword. Shared by the adapter's merge sort and the scan's per-shard sort. Empty
-/// keys yield an empty string, which callers must guard.
+/// `ORDER BY` keyword, for the adapter's merge sort. Empty keys yield an empty string, which
+/// callers must guard.
 pub fn render_order_by_clause(keys: &[SortKey]) -> String {
     keys.iter()
         .map(SortKey::render_order_by_element)

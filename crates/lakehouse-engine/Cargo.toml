@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.58.5"
+version = "0.60.0"
 edition = "2024"
 license.workspace = true
 
@@ -54,6 +54,7 @@ serde_json = { workspace = true }
 jiter      = { workspace = true }
 
 chrono  = { workspace = true }
+chrono-tz = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
 percent-encoding = { workspace = true }

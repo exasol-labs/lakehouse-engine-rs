@@ -120,7 +120,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     let junction = or([and([equal, negated]), sales_equal("S", "x")]);
     assert_eq!(
         rendered(&junction),
-        "(((\"_LH_BYTES_B\" = X'0a') AND (NOT (\"B\" = '0a'))) OR (\"S\" = 'x'))"
+        "(((\"_LH_BYTES_B\" = X'0a') AND (NOT (nullif(\"B\", '') = '0a'))) OR (\"S\" = 'x'))"
     );
 }
 

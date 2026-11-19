@@ -158,7 +158,7 @@ from the virtual schema's notes instead.
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
 | `--slc-version <v>` | Both targets. Pins the SLC version. Default: the version the engine release pins through its `exasol-udf-sdk` dependency. |
 | `--skip-slc` | Both targets. Skips the SLC download and registration. Every other step still runs. |
-| `--with-export` | Both targets. Also creates `LAKEHOUSE_EXPORT` and prints the export grants. In development, not ready for use: no release contains export yet, so the script fails with a loader error unless the engine is built from source. |
+| `--with-export` | Both targets. Also creates `LAKEHOUSE_EXPORT` and prints the export grants. In development, not ready for use. Releases from v0.58.4 contain export; on an earlier release, the script fails with a loader error. |
 | `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`, or the host's architecture for a local Exasol Personal deployment. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
 | `--help` | Prints this reference. Needs no network access and no credentials. |
 
@@ -221,9 +221,9 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
-- **Exporting rows** (**in development, not ready for use**; it counts rows and writes nothing to the lakehouse; opt-in): `--with-export` also creates `LAKEHOUSE_EXPORT` and
-  prints the export role statements, which the installer never runs. No release contains export
-  yet, so the script works only on an engine built from source. See [Export](export.md).
+- **Exporting rows** (**in development, not ready for use**; opt-in): `--with-export` also creates `LAKEHOUSE_EXPORT`
+  and prints the export role statements, which the installer never runs. Releases from v0.58.4
+  contain export. See [Export](export.md).
 - **Before granting other users access**, read [Security](security.md). A user who only queries
   the Virtual Schema needs `CREATE SESSION` and `SELECT` on it, and nothing else.
 
@@ -272,6 +272,11 @@ EMITS (...) AS
   name the proxy without them, but anyone who can read the script source can read them.
 - Re-running the install command recreates the scripts without the `%env` lines. Add them again
   afterwards.
+
+A `%env TZ=<zone>;` line in the `LAKEHOUSE_ADAPTER` source replaces the `DBTIMEZONE` that Exasol
+sets there. It changes the zone in which `SYSDATE` and `SYSTIMESTAMP` fold, and without `SESSION_TIME_ZONE`
+also `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` ([Capabilities](capabilities.md)).
+A query that needs that zone fails when `TZ` names no zone.
 
 ## Local dev stack
 
@@ -534,8 +539,8 @@ here `LHVS`: the adapter calls them schema-qualified, using its own running-scri
 configured property. `LAKEHOUSE_VERSION` carries no such constraint — it needs no adapter and no
 Virtual Schema — but this installer still creates it alongside the other three for convenience.
 
-Export is in development and not ready for use: it counts rows and writes nothing to the lakehouse. To create its script by hand, or with `--with-export`, run the statement
-below over an engine built from source. No release contains export yet. See [Export](export.md).
+Export is in development and not ready for use. Releases from v0.58.4 contain it. To create its
+script by hand, or with `--with-export`, run the statement below. See [Export](export.md).
 
 ```sql
 CREATE OR REPLACE RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)

@@ -2,14 +2,16 @@
 //! calls the same script as the writer. No log event, script output, or CONNECTION value.
 
 mod batch;
+mod fanout;
 mod iceberg_rest;
 mod iceberg_sink;
 mod options;
+mod partition_by;
 mod target;
 
 use crate::exasol::{group_count, quote_ident, sql_string_literal};
 use arrow::datatypes::Schema;
-use batch::{BatchBuilder, arrow_schema};
+use batch::{BatchBuilder, SourceColumns, arrow_schema};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::ExportSpec;
@@ -17,29 +19,31 @@ use exasol_udf_sdk::value::ColumnInfo;
 use iceberg::metadata_columns::is_metadata_column_name;
 use lakehouse_catalog_write::CommitTag;
 use options::{ExportOptions, WriterLayout, check_table_name};
+use partition_by::{PARTITION_BY, PartitionField};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
-use target::{ExportConnection, ExportSink, read_connection};
+use target::{ExportConnection, ExportSink, ExportTarget, TableMode, read_connection};
 use tokio::runtime::Runtime;
 
 /// The script name the installer creates and the writer SELECT calls.
 pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
 
-/// Answers Exasol's `generate_sql_for_export_spec` call with the writer SELECT. It refuses
-/// an invalid statement, a CONNECTION the script cannot read, and a table the catalog already
-/// holds, before any source row is read. The SELECT carries the CONNECTION name and no value.
+/// Answers `generate_sql_for_export_spec` with the writer SELECT, which holds no CONNECTION value.
+/// Before any row is read, it checks the statement and CONNECTION, and whether the table exists.
 pub fn generate_export_sql(ctx: &mut dyn UdfContext, json: &str) -> Result<String, UdfError> {
-    let plan = plan_export(ctx, json)?;
-    let target = iceberg_rest::target(plan.connection, &plan.table)?;
-    export_runtime()?.block_on(target.prepare())?;
-    Ok(plan.select)
+    let ExportPlan {
+        connection,
+        mut spec,
+        select,
+    } = plan_export(ctx, json)?;
+    let target = iceberg_rest::target(connection, &spec.table)?;
+    spec.set_mode(export_runtime()?.block_on(target.prepare())?)?;
+    Ok(select.render(&spec.render()))
 }
 
-/// Runs one writer invocation over its SET group and returns the group's row count. It
-/// reads the CONNECTION again, because a direct `SELECT` call skips the export hook. A writer
-/// opens its table at its first row, so an empty group creates no table and checks no column
-/// type.
+/// Runs one writer over its SET group and returns its row count. It reads the CONNECTION again,
+/// as a direct `SELECT` skips the hook, and opens the table at its first row, so never for none.
 pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
     // The host opens a SET group on its first row, and its first next() returns true without
     // advancing.
@@ -53,43 +57,47 @@ pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
         export_id: plan.spec.export_id.clone(),
         writer_id: new_writer_id(),
     };
-    let mut sink =
-        runtime.block_on(target.open_table(&plan.schema, &tag, plan.spec.single_commit))?;
-    write_rows(ctx, &runtime, sink.as_mut())
+    let budget = fanout::buffer_budget(ctx.memory_limit());
+    let mut sink = runtime.block_on(plan.table.open(target.as_ref(), &tag, budget))?;
+    write_rows(ctx, &runtime, sink.as_mut(), &plan.source)
 }
 
 /// What the hook decides before its first network call.
 struct ExportPlan {
     connection: ExportConnection,
-    table: String,
-    /// The writer SELECT the hook answers with.
-    select: String,
+    /// The writer spec, complete once the catalog check sets `append`.
+    spec: WriterSpec,
+    select: WriterSelect,
 }
 
 fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfError> {
     let spec = ExportSpec::from_json(json)?;
     let options = ExportOptions::from_spec(&spec)?;
     let columns = column_names(&spec.source_column_names)?;
+    let partition_by = match &options.partition_by {
+        Some(value) => partition_by::parse(value, &columns)?,
+        None => Vec::new(),
+    };
     let connection = read_connection(ctx, &options.connection_name, options.allow_http)?;
     let writer_spec = WriterSpec {
         connection: options.connection_name,
-        table: options.table_name.clone(),
+        table: options.table_name,
         export_id: new_export_id(),
         columns,
         single_commit: options.writers == WriterLayout::SingleCommit,
         allow_http: options.allow_http,
+        append: false,
+        partition_by,
     };
     let select = WriterSelect {
-        script_schema: &ctx.script_schema(),
-        writer_spec: &writer_spec.render(),
-        source_columns: &spec.source_column_names,
+        script_schema: ctx.script_schema(),
+        source_columns: spec.source_column_names,
         writers: options.writers,
         node_count: ctx.node_count() as usize,
-    }
-    .render();
+    };
     Ok(ExportPlan {
         connection,
-        table: options.table_name,
+        spec: writer_spec,
         select,
     })
 }
@@ -99,17 +107,67 @@ fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfEr
 struct WriterPlan {
     spec: WriterSpec,
     connection: ExportConnection,
-    schema: Schema,
+    source: SourceColumns,
+    table: WriterTable,
+}
+
+/// The table a writer opens: a new one of the source's schema and partition fields, or the one
+/// the hook found.
+enum WriterTable {
+    New {
+        schema: Schema,
+        partition_by: Vec<PartitionField>,
+        single_commit: bool,
+    },
+    Existing,
+}
+
+impl WriterTable {
+    async fn open(
+        &self,
+        target: &dyn ExportTarget,
+        tag: &CommitTag,
+        budget: usize,
+    ) -> Result<Box<dyn ExportSink>, UdfError> {
+        match self {
+            Self::New {
+                schema,
+                partition_by,
+                single_commit,
+            } => {
+                target
+                    .open_new_table(schema, partition_by, tag, *single_commit, budget)
+                    .await
+            }
+            Self::Existing => target.open_existing_table(tag, budget).await,
+        }
+    }
 }
 
 fn plan_writer(ctx: &dyn UdfContext) -> Result<WriterPlan, UdfError> {
     let spec = WriterSpec::read(ctx)?;
     let connection = read_connection(ctx, &spec.connection, spec.allow_http)?;
-    let schema = arrow_schema(&spec.columns, &source_columns(ctx, spec.columns.len())?)?;
+    let source = SourceColumns {
+        names: spec.columns.clone(),
+        columns: source_columns(ctx, spec.columns.len())?,
+    };
+    // An existing table's columns, not the source's, decide what the writer accepts.
+    let table = if spec.append {
+        WriterTable::Existing
+    } else {
+        let schema = arrow_schema(&source.names, &source.columns)?;
+        partition_by::check_types(&spec.partition_by, &source)?;
+        WriterTable::New {
+            schema,
+            partition_by: spec.partition_by.clone(),
+            single_commit: spec.single_commit,
+        }
+    };
     Ok(WriterPlan {
         spec,
         connection,
-        schema,
+        source,
+        table,
     })
 }
 
@@ -126,6 +184,10 @@ struct WriterSpec {
     columns: Vec<String>,
     single_commit: bool,
     allow_http: bool,
+    /// Whether the table existed when the hook checked it, so the writers append to it.
+    append: bool,
+    /// The partition fields of a table the writers create, empty for an unpartitioned one.
+    partition_by: Vec<PartitionField>,
 }
 
 impl WriterSpec {
@@ -137,8 +199,23 @@ impl WriterSpec {
             "columns": self.columns,
             "single_commit": self.single_commit,
             "allow_http": self.allow_http,
+            "append": self.append,
+            "partition_by": self.partition_by,
         })
         .to_string()
+    }
+
+    /// Records whether the writers append, refusing `PARTITION_BY` for a table that exists.
+    fn set_mode(&mut self, mode: TableMode) -> Result<(), UdfError> {
+        self.append = mode == TableMode::Append;
+        if self.append && !self.partition_by.is_empty() {
+            return Err(refusal(format_args!(
+                "table {} exists, and {PARTITION_BY} applies only to a table the export creates; \
+                 remove {PARTITION_BY} to append to the table",
+                self.table
+            )));
+        }
+        Ok(())
     }
 
     fn read(ctx: &dyn UdfContext) -> Result<Self, UdfError> {
@@ -176,8 +253,8 @@ fn export_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
         .map_err(|error| refusal(format_args!("could not build the Tokio runtime: {error}")))
 }
 
-/// The column names of the new table: the last identifier of each source column reference,
-/// such as `A` of `"T"."A"`. Iceberg resolves a reserved metadata column name to that column.
+/// The source column names: the last identifier of each source column reference, such as `A` of
+/// `"T"."A"`. Iceberg resolves a reserved metadata column name to that column.
 fn column_names(references: &[String]) -> Result<Vec<String>, UdfError> {
     let names: Vec<String> = references.iter().map(|r| last_identifier(r)).collect();
     for (index, name) in names.iter().enumerate() {
@@ -228,27 +305,26 @@ fn refusal(message: impl std::fmt::Display) -> UdfError {
 
 /// The SELECT the export hook answers with. It calls the export script itself as the
 /// writer, so `run` sees the writer spec first and then the source columns.
-struct WriterSelect<'a> {
-    script_schema: &'a str,
-    writer_spec: &'a str,
+struct WriterSelect {
+    script_schema: String,
     /// Quoted column references as Exasol passes them, for example `"T"."A"`.
-    source_columns: &'a [String],
+    source_columns: Vec<String>,
     writers: WriterLayout,
     node_count: usize,
 }
 
-impl WriterSelect<'_> {
+impl WriterSelect {
     /// Exasol binds `DUAL` to the export source. Every source row reaches exactly one of
     /// G writers through the `MOD(ROWNUM, G)` group key.
-    fn render(&self) -> String {
-        let arguments = std::iter::once(sql_string_literal(self.writer_spec))
+    fn render(&self, writer_spec: &str) -> String {
+        let arguments = std::iter::once(sql_string_literal(writer_spec))
             .chain(self.source_columns.iter().cloned())
             .collect::<Vec<_>>()
             .join(", ");
         // The key stays top-level: an export SELECT over a subquery of DUAL fails.
         format!(
             "SELECT {}.{}({arguments}) FROM DUAL GROUP BY MOD(ROWNUM, {})",
-            quote_ident(self.script_schema),
+            quote_ident(&self.script_schema),
             quote_ident(EXPORT_SCRIPT_NAME),
             self.group_count(),
         )
@@ -278,8 +354,9 @@ fn write_rows(
     ctx: &mut dyn UdfContext,
     runtime: &Runtime,
     sink: &mut dyn ExportSink,
+    source: &SourceColumns,
 ) -> Result<i64, UdfError> {
-    let written = stream_rows(ctx, runtime, sink);
+    let written = stream_rows(ctx, runtime, sink, source);
     if written.is_err() {
         runtime.block_on(sink.abort());
     }
@@ -290,8 +367,9 @@ fn stream_rows(
     ctx: &mut dyn UdfContext,
     runtime: &Runtime,
     sink: &mut dyn ExportSink,
+    source: &SourceColumns,
 ) -> Result<i64, UdfError> {
-    let mut batch = BatchBuilder::bind(sink.schema())?;
+    let mut batch = BatchBuilder::bind(sink.columns(), source)?;
     let mut rows = 0;
     loop {
         batch.append_row(ctx)?;

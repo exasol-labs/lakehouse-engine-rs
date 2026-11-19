@@ -1,13 +1,13 @@
 use super::*;
-use crate::retry::backoff_wait;
+use crate::retry::Waits;
 use crate::test_support::{
     COMMIT_CONFLICT, CREATE_CONFLICT, LOAD_TABLE_NO_SNAPSHOTS, LOAD_TABLE_TAGGED, PREFIX_CONFIG,
     RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
-    catalog, data_file, ident, memory_table, requests_starting, session,
+    catalog, data_file, ident, memory_table, requests_starting, session, with_short_commit_waits,
 };
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
-use lakehouse_catalog::{StorageProps, system_clock};
+use lakehouse_catalog::{AdlsCred, StorageProps};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -61,22 +61,27 @@ fn tag() -> CommitTag {
     }
 }
 
-/// A table of [`LOAD_TABLE_NO_SNAPSHOTS`] over in-memory storage, allowing `retries` commit retries.
-fn memory_write_table(retries: u32) -> WriteTable {
-    let answer = LOAD_TABLE_NO_SNAPSHOTS.replace(
+/// [`LOAD_TABLE_NO_SNAPSHOTS`] allowing `retries` commit retries.
+fn load_table_with_retries(retries: u32) -> String {
+    LOAD_TABLE_NO_SNAPSHOTS.replace(
         "\"commit.retry.num-retries\": \"20\"",
         &format!("\"commit.retry.num-retries\": \"{retries}\""),
-    );
+    )
+}
+
+/// A table of [`LOAD_TABLE_NO_SNAPSHOTS`] over in-memory storage. Its commit retries come from the
+/// table that `append_files` reloads.
+fn memory_write_table() -> WriteTable {
     WriteTable {
-        table: memory_table(&answer, &ident("ns", "t")),
-        credentials: StorageCredentials::keys("", "", None, system_clock()),
+        table: memory_table(LOAD_TABLE_NO_SNAPSHOTS, &ident("ns", "t")),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     }
 }
 
 fn memory_staged_table() -> StagedTable {
     StagedTable(WriteTable {
         table: memory_table(STAGE_TABLE, &ident("ns", "staged")),
-        credentials: StorageCredentials::keys("", "", None, system_clock()),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
     })
 }
 
@@ -155,6 +160,7 @@ async fn a_namespace_level_without_an_answer_is_sent_again() {
     assert_eq!(requests_starting(&requests, "POST ").len(), 2);
 }
 
+/// Scenario: Two exports that create the same table leave one winner
 #[tokio::test]
 async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it() {
     let (uri, _) = catalog(
@@ -169,10 +175,10 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     let writes = static_writes(&uri).await;
 
     let raced = writes
-        .create_table(&ident("ns", "t"), schema(), TAGGED_EXPORT_ID)
+        .create_table(&ident("ns", "t"), schema(), None, TAGGED_EXPORT_ID)
         .await;
     let foreign = writes
-        .create_table(&ident("ns", "t"), schema(), "another-export")
+        .create_table(&ident("ns", "t"), schema(), None, "another-export")
         .await;
 
     assert_eq!(
@@ -181,7 +187,8 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
     );
     assert_eq!(
         foreign.err().unwrap().to_string(),
-        "table ns.t already exists; the export only creates new tables"
+        "table ns.t was created by another statement after the export checked that it does not \
+         exist"
     );
 }
 
@@ -202,7 +209,7 @@ async fn a_create_without_an_answer_and_without_a_table_is_sent_again() {
     let writes = static_writes(&uri).await;
 
     writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -219,7 +226,7 @@ async fn a_create_the_catalog_refuses_fails_at_once_naming_the_table() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -241,7 +248,7 @@ async fn a_create_the_catalog_stays_busy_for_fails_after_its_retries() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -285,7 +292,7 @@ async fn a_create_whose_connection_is_refused_is_sent_again_until_its_retries_ru
     let writes = static_writes(&catalog_gone_after_config().await).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -306,7 +313,7 @@ async fn an_unreadable_create_answer_fails_quoting_none_of_it() {
     let writes = static_writes(&uri).await;
 
     let failed = writes
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -331,14 +338,14 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
 
     let refused = vended_writes(&uri, false)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
         .to_string();
     let allowed = vended_writes(&uri, true)
         .await
-        .create_table(&ident("ns", "t"), schema(), "e1")
+        .create_table(&ident("ns", "t"), schema(), None, "e1")
         .await
         .unwrap();
 
@@ -353,29 +360,118 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
     assert_eq!(secrets, RECORDED_PLACEHOLDERS[..3]);
 }
 
-/// Scenario: A table location outside S3-compatible storage is refused
-#[tokio::test]
-async fn an_abfss_stage_answer_is_refused_naming_the_table_and_the_scheme() {
-    let abfss = STAGE_TABLE.replace(
-        "s3://warehouse/lakehouse_vended/",
-        "abfss://warehouse@account.dfs.core.windows.net/",
-    );
-    let (uri, _) = catalog(PREFIX_CONFIG, routes(vec![(TABLES, (200, abfss))])).await;
-    let writes = vended_writes(&uri, true).await;
+fn azure_storage() -> WriteStorage {
+    WriteStorage::Static(StorageBackend::Adls {
+        account_name: "account".into(),
+        cred: AdlsCred::AccountKey("c2VjcmV0LWtleQ==".into()),
+    })
+}
 
-    let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
-        .await
-        .err()
-        .unwrap()
-        .to_string();
+fn vended_storage() -> WriteStorage {
+    WriteStorage::Vended(StaticStoreAddress::default())
+}
 
-    assert_eq!(
-        refused,
-        "table ns.staged has the location abfss://warehouse@account.dfs.core.windows.net/\
-         01a1bf3b-af23-7020-ac26-0a0912b927ee, whose scheme abfss is no S3-compatible storage; \
-         the export writes only to s3:// or s3a:// locations"
+#[test]
+fn a_location_its_storage_cannot_address_is_refused_naming_the_table_and_the_scheme() {
+    let abfss = "abfss://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs = "abfs://warehouse@account.dfs.core.windows.net/ns/t";
+    let abfs_needs_allow_http = "plaintext scheme abfs needs the export option ALLOW_HTTP = \
+                                 'true', which acknowledges that the export writes the location \
+                                 over HTTPS";
+    // (case, storage, ALLOW_HTTP, location, the vended backend it selects or the refusal's tail)
+    type Case<'a> = (
+        &'a str,
+        WriteStorage,
+        bool,
+        &'a str,
+        Result<&'a str, &'a str>,
     );
+    let cases: [Case; 10] = [
+        (
+            "static S3 on abfss",
+            static_storage(),
+            false,
+            abfss,
+            Err("scheme abfss the CONNECTION's S3 storage cannot address"),
+        ),
+        (
+            "static S3 on s3a",
+            static_storage(),
+            false,
+            "s3a://warehouse/ns/t",
+            Ok("none"),
+        ),
+        (
+            "static Azure on s3",
+            azure_storage(),
+            true,
+            "s3://warehouse/ns/t",
+            Err("scheme s3 the CONNECTION's Azure storage cannot address"),
+        ),
+        (
+            "static Azure on abfs",
+            azure_storage(),
+            true,
+            abfs,
+            Err("scheme abfs the CONNECTION's Azure storage cannot address"),
+        ),
+        (
+            "static Azure on abfss",
+            azure_storage(),
+            false,
+            abfss,
+            Ok("none"),
+        ),
+        (
+            "vended on gs",
+            vended_storage(),
+            true,
+            "gs://warehouse/ns/t",
+            Err("scheme gs vended storage cannot address"),
+        ),
+        (
+            "vended on abfs without ALLOW_HTTP",
+            vended_storage(),
+            false,
+            abfs,
+            Err(abfs_needs_allow_http),
+        ),
+        (
+            "vended on abfs with ALLOW_HTTP",
+            vended_storage(),
+            true,
+            abfs,
+            Ok("ADLS"),
+        ),
+        (
+            "vended on abfss",
+            vended_storage(),
+            false,
+            abfss,
+            Ok("ADLS"),
+        ),
+        (
+            "vended on s3a",
+            vended_storage(),
+            false,
+            "s3a://warehouse/ns/t",
+            Ok("S3"),
+        ),
+    ];
+
+    for (case, storage, allow_http, location, expected) in cases {
+        let checked = refuse_unaddressable(&storage, allow_http, &ident("ns", "t"), location)
+            .map(|kind| match kind {
+                None => "none",
+                Some(VendedBackendKind::S3) => "S3",
+                Some(VendedBackendKind::Adls) => "ADLS",
+            })
+            .map_err(|error| error.to_string());
+
+        let expected = expected
+            .map_err(|tail| format!("table ns.t has the location {location}, whose {tail}"));
+        assert_eq!(checked, expected, "{case}");
+    }
 }
 
 #[tokio::test]
@@ -387,7 +483,7 @@ async fn a_refused_stage_fails_quoting_the_status_and_naming_the_catalog() {
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -416,7 +512,7 @@ async fn an_unreadable_stage_answer_fails_stating_that_single_commit_needs_stage
     let writes = static_writes(&uri).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "e1")
+        .stage_table(&ident("ns", "staged"), schema(), None, "e1")
         .await
         .err()
         .unwrap()
@@ -447,7 +543,7 @@ async fn a_stage_answer_followed_by_a_table_this_export_created_drops_it() {
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -479,7 +575,7 @@ async fn a_stage_answer_followed_by_a_table_it_cannot_drop_says_the_table_must_b
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), TAGGED_EXPORT_ID)
+        .stage_table(&ident("ns", "staged"), schema(), None, TAGGED_EXPORT_ID)
         .await
         .err()
         .unwrap()
@@ -505,7 +601,7 @@ async fn a_stage_answer_followed_by_another_exports_table_leaves_it_and_says_so(
     let writes = vended_writes(&uri, true).await;
 
     let refused = writes
-        .stage_table(&ident("ns", "staged"), schema(), "another-export")
+        .stage_table(&ident("ns", "staged"), schema(), None, "another-export")
         .await
         .err()
         .unwrap()
@@ -565,7 +661,7 @@ async fn a_missing_namespace_level_is_created_and_one_created_meanwhile_counts_a
 
 #[test]
 fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
-    let request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let request = creation_request(&ident("ns", "t"), schema(), None, "e1");
 
     let sent = serde_json::to_value(&request).unwrap();
 
@@ -580,11 +676,32 @@ fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
     );
     assert_eq!(sent["schema"]["fields"][0]["name"], "ID");
     assert!(sent.get("stage-create").is_none(), "{sent}");
+    assert!(sent.get("partition-spec").is_none(), "{sent}");
+}
+
+#[test]
+fn a_create_request_carries_the_partition_spec() {
+    let spec = PartitionSpec::builder(schema())
+        .add_partition_field("ID", "ID_bucket", Transform::Bucket(4))
+        .unwrap()
+        .build()
+        .unwrap()
+        .into_unbound();
+
+    let request = creation_request(&ident("ns", "t"), schema(), Some(spec), "e1");
+
+    let sent = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        sent["partition-spec"]["fields"],
+        serde_json::json!([
+            {"source-id": 1, "field-id": 1000, "name": "ID_bucket", "transform": "bucket[4]"}
+        ])
+    );
 }
 
 #[test]
 fn a_stage_request_asks_for_staged_creation() {
-    let mut request = creation_request(&ident("ns", "t"), schema(), "e1");
+    let mut request = creation_request(&ident("ns", "t"), schema(), None, "e1");
     request.stage_create = Some(true);
 
     let sent = serde_json::to_value(&request).unwrap();
@@ -687,16 +804,20 @@ fn a_connection_that_vends_gets_vended_storage_and_one_with_keys_its_own() {
 #[tokio::test]
 async fn unknown_outcome_with_tagged_reload_commits_once() {
     for status in [500, 502, 503, 504] {
-        let (uri, requests) = catalog(
-            PREFIX_CONFIG,
-            routes(vec![
-                (COMMIT_T, (status, "<html>gateway timeout</html>".into())),
-                (LOAD_T, (200, LOAD_TABLE_TAGGED.into())),
-            ]),
-        )
+        let load = in_turn(vec![
+            (200, LOAD_TABLE_NO_SNAPSHOTS.into()),
+            (200, LOAD_TABLE_TAGGED.into()),
+        ]);
+        let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
+            if line.starts_with(LOAD_T) {
+                load()
+            } else {
+                (status, "<html>gateway timeout</html>".into())
+            }
+        })
         .await;
         let writes = static_writes(&uri).await;
-        let table = memory_write_table(20);
+        let table = memory_write_table();
         let files = vec![data_file(table.table(), "w0")];
 
         writes.append_files(&table, files, &tag()).await.unwrap();
@@ -708,7 +829,7 @@ async fn unknown_outcome_with_tagged_reload_commits_once() {
         );
         assert_eq!(
             requests_starting(&requests, LOAD_T).len(),
-            1,
+            2,
             "HTTP {status}"
         );
     }
@@ -750,7 +871,7 @@ async fn conflict_with_untagged_reload_commits_again() {
     })
     .await;
     let writes = static_writes(&uri).await;
-    let table = memory_write_table(20);
+    let table = memory_write_table();
     let files = vec![data_file(table.table(), "w0")];
 
     writes.append_files(&table, files, &tag()).await.unwrap();
@@ -789,7 +910,7 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
     })
     .await;
     let writes = static_writes(&uri).await;
-    let table = memory_write_table(20);
+    let table = memory_write_table();
 
     writes
         .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
@@ -800,25 +921,28 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
     let arrived = |request: &str| {
         arrivals
             .iter()
-            .find(|(line, _)| line.starts_with(request))
+            .filter(|(line, _)| line.starts_with(request))
             .map(|(_, at)| *at)
-            .unwrap()
+            .collect::<Vec<_>>()
     };
     assert!(
-        arrived(LOAD_T) - arrived(COMMIT_T) >= backoff_wait(1, 0.0),
+        arrived(LOAD_T)[1] - arrived(COMMIT_T)[0] >= Waits::DEFAULT.backoff(1, 0.0),
         "a reload before the wait goes stale when another writer commits during the wait"
     );
 }
 
 #[tokio::test]
-async fn a_commit_the_catalog_refuses_fails_at_once_without_a_reload() {
+async fn a_commit_the_catalog_refuses_fails_at_once_without_a_retry() {
     let (uri, requests) = catalog(
         PREFIX_CONFIG,
-        routes(vec![(COMMIT_T, (403, "{\"error\":\"forbidden\"}".into()))]),
+        routes(vec![
+            (COMMIT_T, (403, "{\"error\":\"forbidden\"}".into())),
+            (LOAD_T, (200, LOAD_TABLE_NO_SNAPSHOTS.into())),
+        ]),
     )
     .await;
     let writes = static_writes(&uri).await;
-    let table = memory_write_table(20);
+    let table = memory_write_table();
 
     let failed = writes
         .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
@@ -834,7 +958,7 @@ async fn a_commit_the_catalog_refuses_fails_at_once_without_a_reload() {
         )
     );
     assert_eq!(requests_starting(&requests, COMMIT_T).len(), 1);
-    assert!(requests_starting(&requests, LOAD_T).is_empty());
+    assert_eq!(requests_starting(&requests, LOAD_T).len(), 1);
 }
 
 /// Scenario: A commit retried after an unknown outcome adds its rows once
@@ -850,7 +974,7 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     })
     .await;
     let writes = static_writes(&uri).await;
-    let table = memory_write_table(20);
+    let table = memory_write_table();
 
     writes
         .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
@@ -858,11 +982,11 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
         .unwrap();
 
     assert_eq!(requests_starting(&requests, COMMIT_T).len(), 2);
-    assert_eq!(requests_starting(&requests, LOAD_T).len(), 1);
+    assert_eq!(requests_starting(&requests, LOAD_T).len(), 2);
 }
 
 #[tokio::test]
-async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the_last_outcome() {
+async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the_last_outcome() {
     for (status, unknown) in [
         (409, false),
         (429, false),
@@ -874,12 +998,15 @@ async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the
             PREFIX_CONFIG,
             routes(vec![
                 (COMMIT_T, (status, "{}".into())),
-                (LOAD_T, (200, LOAD_TABLE_NO_SNAPSHOTS.into())),
+                (
+                    LOAD_T,
+                    (200, with_short_commit_waits(&load_table_with_retries(1))),
+                ),
             ]),
         )
         .await;
         let writes = static_writes(&uri).await;
-        let table = memory_write_table(1);
+        let table = memory_write_table();
 
         let failed = writes
             .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
@@ -889,26 +1016,30 @@ async fn a_commit_that_keeps_failing_stops_after_the_table_s_retries_stating_the
         assert_eq!(failed.outcome_unknown(), unknown, "HTTP {status}");
         assert!(
             failed.to_string().contains(&format!(
-                "2 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
+                "21 attempts did not commit, the last because the catalog {uri} answered HTTP {status}"
             )),
             "{failed}"
         );
-        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 2);
+        assert_eq!(requests_starting(&requests, COMMIT_T).len(), 21);
     }
 }
 
 #[tokio::test]
 async fn a_failed_reload_after_a_lost_answer_keeps_the_outcome_unknown() {
-    let (uri, _) = catalog(
-        PREFIX_CONFIG,
-        routes(vec![
-            (COMMIT_T, (504, "{}".into())),
-            (LOAD_T, (403, "{}".into())),
-        ]),
-    )
+    let load = in_turn(vec![
+        (200, LOAD_TABLE_NO_SNAPSHOTS.into()),
+        (403, "{}".into()),
+    ]);
+    let (uri, _) = catalog(PREFIX_CONFIG, move |line| {
+        if line.starts_with(LOAD_T) {
+            load()
+        } else {
+            (504, "{}".into())
+        }
+    })
     .await;
     let writes = static_writes(&uri).await;
-    let table = memory_write_table(20);
+    let table = memory_write_table();
 
     let failed = writes
         .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
@@ -992,4 +1123,204 @@ fn a_tag_is_on_a_table_only_when_one_snapshot_carries_both_ids() {
     assert!(tag().is_on(&tagged.metadata));
     assert!(!other_writer.is_on(&tagged.metadata));
     assert!(!other_export.is_on(&tagged.metadata));
+}
+
+/// [`LOAD_TABLE_NO_SNAPSHOTS`] whose current schema and default partition spec have the IDs
+/// `schema_id` and `spec_id`.
+fn load_table_with_ids(schema_id: i32, spec_id: i32) -> String {
+    let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+    let metadata = &mut answer["metadata"];
+    let mut schema = metadata["schemas"][0].clone();
+    schema["schema-id"] = schema_id.into();
+    metadata["schemas"].as_array_mut().unwrap().push(schema);
+    let spec = serde_json::json!({"spec-id": spec_id, "fields": []});
+    metadata["partition-specs"]
+        .as_array_mut()
+        .unwrap()
+        .push(spec);
+    metadata["current-schema-id"] = schema_id.into();
+    metadata["default-spec-id"] = spec_id.into();
+    answer.to_string()
+}
+
+fn memory_write_table_with_ids(schema_id: i32, spec_id: i32) -> WriteTable {
+    WriteTable {
+        table: memory_table(&load_table_with_ids(schema_id, spec_id), &ident("ns", "t")),
+        credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
+    }
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn every_append_commit_asserts_the_schema_and_partition_spec_the_writer_checked() {
+    let commit = in_turn(vec![(409, COMMIT_CONFLICT.into()), (200, "{}".into())]);
+    let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
+        if line.starts_with(COMMIT_T) {
+            commit()
+        } else {
+            (200, load_table_with_ids(3, 2))
+        }
+    })
+    .await;
+    let writes = static_writes(&uri).await;
+    let table = memory_write_table_with_ids(3, 2);
+
+    writes
+        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .await
+        .unwrap();
+
+    let commits = requests_starting(&requests, COMMIT_T);
+    assert_eq!(commits.len(), 2);
+    for commit in &commits {
+        let requirements = json_body(commit)["requirements"].clone();
+        let pinned = [
+            serde_json::json!({"type": "assert-current-schema-id", "current-schema-id": 3}),
+            serde_json::json!({"type": "assert-default-spec-id", "default-spec-id": 2}),
+        ];
+        for requirement in pinned {
+            assert!(
+                requirements.as_array().unwrap().contains(&requirement),
+                "{requirement} is missing from {requirements}"
+            );
+        }
+    }
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn a_conflict_whose_reload_shows_another_schema_fails_without_another_commit() {
+    let load = in_turn(vec![
+        (200, LOAD_TABLE_NO_SNAPSHOTS.into()),
+        (200, load_table_with_ids(1, 0)),
+    ]);
+    let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
+        if line.starts_with(LOAD_T) {
+            load()
+        } else {
+            (409, COMMIT_CONFLICT.into())
+        }
+    })
+    .await;
+    let writes = static_writes(&uri).await;
+    let table = memory_write_table();
+
+    let failed = writes
+        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failed.to_string(),
+        "the commit of the data files to table ns.t failed: its current schema ID changed from 0 \
+         to 1 after the writer checked the table; the catalog did not apply it"
+    );
+    assert_eq!(requests_starting(&requests, COMMIT_T).len(), 1);
+}
+
+/// Scenario: A commit fails when the table changed schema or partition spec after the writer checked it
+#[tokio::test]
+async fn a_table_that_changed_before_the_first_commit_fails_without_a_commit() {
+    let (uri, requests) = catalog(
+        PREFIX_CONFIG,
+        routes(vec![
+            (COMMIT_T, (200, "{}".into())),
+            (LOAD_T, (200, load_table_with_ids(3, 2))),
+        ]),
+    )
+    .await;
+    let writes = static_writes(&uri).await;
+    let table = memory_write_table();
+
+    let failed = writes
+        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failed.to_string(),
+        "the commit of the data files to table ns.t failed: its current schema ID changed from 0 \
+         to 3 and its default partition spec ID changed from 0 to 2 after the writer checked the \
+         table; the catalog did not apply it"
+    );
+    assert!(requests_starting(&requests, COMMIT_T).is_empty());
+}
+
+#[test]
+fn a_reloaded_table_takes_the_files_only_with_the_checked_schema_and_spec() {
+    let checked = TableShape {
+        schema_id: 4,
+        spec_id: 1,
+    };
+    let cases = [
+        ("unchanged", checked, Ok(())),
+        (
+            "schema ID changed",
+            TableShape {
+                schema_id: 5,
+                ..checked
+            },
+            Err("its current schema ID changed from 4 to 5"),
+        ),
+        (
+            "spec ID changed",
+            TableShape {
+                spec_id: 0,
+                ..checked
+            },
+            Err("its default partition spec ID changed from 1 to 0"),
+        ),
+        (
+            "schema and spec IDs changed",
+            TableShape {
+                schema_id: 5,
+                spec_id: 0,
+            },
+            Err(
+                "its current schema ID changed from 4 to 5 and its default partition spec ID \
+                 changed from 1 to 0",
+            ),
+        ),
+    ];
+
+    for (case, reloaded, expected) in cases {
+        let expected =
+            expected.map_err(|change| format!("{change} after the writer checked the table"));
+        assert_eq!(refuse_changed(checked, reloaded), expected, "{case}");
+    }
+}
+
+#[test]
+fn a_reloaded_table_upgraded_to_format_version_3_takes_no_files() {
+    let reloaded = |version: u8| {
+        let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+        answer["metadata"]["format-version"] = version.into();
+        answer["metadata"]["next-row-id"] = 0.into();
+        serde_json::from_value::<LoadTableResult>(answer)
+            .unwrap()
+            .metadata
+    };
+    let checked = TableShape::of(&reloaded(2));
+
+    assert_eq!(refuse_reloaded(checked, &reloaded(2)), Ok(()));
+    assert_eq!(
+        refuse_reloaded(checked, &reloaded(3)),
+        Err("it was upgraded to format version 3 after the writer checked the table".into())
+    );
+}
+
+#[tokio::test]
+async fn a_table_exists_only_when_the_catalog_answers_its_head_request_with_success() {
+    for (status, exists) in [(204, true), (404, false)] {
+        let (uri, _) = catalog(
+            PREFIX_CONFIG,
+            routes(vec![(EXISTS_T, (status, String::new()))]),
+        )
+        .await;
+        let writes = static_writes(&uri).await;
+
+        let found = writes.table_exists(&ident("ns", "t")).await.unwrap();
+
+        assert_eq!(found, exists, "HTTP {status}");
+    }
 }

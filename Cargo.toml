@@ -62,6 +62,7 @@ thiserror  = { version = "2" }
 anyhow     = { version = "1" }
 
 chrono  = { version = "0.4" }
+chrono-tz = { version = "0.10.4" }
 futures = { version = "0.3" }
 url     = { version = "2" }
 percent-encoding = { version = "2" }

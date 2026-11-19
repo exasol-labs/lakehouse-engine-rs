@@ -49,3 +49,13 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 * *WHEN* queries apply `=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `<>`, and `LIKE` to them, including literals the column's type cannot hold exactly and constant functions Exasol folds
 * *THEN* each query SHALL return the native oracle's rows, and each format SHALL scan exactly the files its partition and statistics evaluation keeps
 * *AND* on an Exasol version with nanosecond timestamps, an Iceberg `timestamp_ns` column SHALL prune by a literal with nine fraction digits, and a microsecond column SHALL keep its file for a literal finer than its unit
+
+### Scenario: A null test keeps the files that hold empty values
+
+* *GIVEN* a table with two data files, one whose string column and variable-length binary column hold an empty value and no NULL, and one whose columns hold neither
+* *WHEN* a pruning path translates `col IS NULL` or `col IS NOT NULL` over one of those columns
+* *THEN* over the string column `col IS NULL` SHALL translate as the column is NULL or equals `''`, so the file that holds `''` is kept
+* *AND* `col IS NOT NULL` SHALL translate as the column is not NULL and differs from `''`, so `NOT (col IS NOT NULL)` keeps that file too
+* *AND* `SELECT COUNT(*) FROM t WHERE col IS NULL` SHALL count the rows that store `''`
+* *AND* over the variable-length binary column, read as hex text or under `BINARY_AS_STRING`, `col IS NULL` and `NOT (col IS NOT NULL)` SHALL keep the file that holds the empty value, and `SELECT COUNT(*) FROM t WHERE col IS NULL` SHALL count its rows
+* *AND* a null test on a column of any other type SHALL translate as the column is NULL, or for `IS NOT NULL` as the column is not NULL

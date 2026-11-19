@@ -2,9 +2,8 @@ use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::ColumnNode;
 
-use super::super::support::ColumnTypes;
+use super::super::support::{ColumnTypes, flatten_conjuncts};
 use super::attribution::JoinLegs;
-use super::rendering::flatten_conjuncts;
 
 /// Why a join the broadcast path can serve keeps the N-scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,11 +72,9 @@ fn literal_bounded_columns(
             .filter(|column| legs.leg(*column) == leg)
             .map(|column| column.ascii_upper_name())
     };
-    let mut conjuncts = Vec::new();
-    if let Some(filter) = filter {
-        flatten_conjuncts(filter, &mut conjuncts);
-    }
-    conjuncts
+    filter
+        .map(flatten_conjuncts)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|conjunct| match conjunct.get("type")?.as_str()? {
             "predicate_equal" => {

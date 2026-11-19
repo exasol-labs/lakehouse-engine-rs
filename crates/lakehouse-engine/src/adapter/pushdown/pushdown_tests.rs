@@ -888,31 +888,33 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
 }
 
 #[test]
-fn pruning_input_unchanged_when_df_render_declines() {
+fn a_split_where_keeps_each_declined_conjunct_as_exasol_sent_it() {
     // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
     // is rewritten, so the equality assertion distinguishes original from rewritten.
-    let filter = and([
-        compare("predicate_greater", col("id"), num_lit(5)),
-        declined_second_predicate(col("ts")),
-        compare(
-            "predicate_greater",
-            scalar_fn("LENGTH", [col("amount")]),
-            num_lit(5),
-        ),
+    let id_above_five = compare("predicate_greater", col("id"), num_lit(5));
+    let second = declined_second_predicate(col("ts"));
+    let length = compare(
+        "predicate_greater",
+        scalar_fn("LENGTH", [col("amount")]),
+        num_lit(5),
+    );
+    let filter = and([id_above_five.clone(), second.clone(), length.clone()]);
+    let col_types = column_types(&[
+        ("ID", ExasolType::decimal(20, 0)),
+        ("TS", ExasolType::BARE_TIMESTAMP),
+        ("AMOUNT", ExasolType::decimal(18, 2)),
     ]);
-    let col_types = vec![
-        ("ID".to_string(), ExasolType::decimal(20, 0)),
-        ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
-        ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
-    ];
-    let scan_where = scan_over(&column_types(&col_types)).split_where(Some(&filter));
+    let scan_where = scan_over(&col_types).split_where(Some(&filter));
 
     assert_eq!(
         scan_where,
-        ScanWhere::Declined(&filter),
-        "the DataFusion render must decline this filter, handing back the ORIGINAL, un-rewritten \
-         filter — the same \
-             tree the resolver prunes with"
+        ScanWhere::Split {
+            pushed: scan_filter_sql(&id_above_five, &col_types)
+                .expect("the bare id comparison renders"),
+            declined: and([second, length]),
+        },
+        "the declined half must hold the declined conjuncts as Exasol sent them, not their scan \
+         rewrites"
     );
 }
 
@@ -1847,7 +1849,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 
     assert!(
         sql.contains(&embedded_group_keys(&[
-            r#"CAST("NAME" AS VARCHAR)"#.to_string()
+            r#"CAST(nullif("NAME", '') AS VARCHAR)"#.to_string()
         ])),
         "an unprojected VARCHAR-declared group key must reach the scan unpadded: {sql}"
     );

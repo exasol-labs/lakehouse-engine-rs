@@ -45,8 +45,8 @@ pub(crate) struct RenderedJoinPushdown {
 
 /// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, a
 /// select-list item is one only Exasol computes (#196), a projected output name exceeds Exasol's
-/// identifier limit, or the WHERE filter declines through [`ScanTranslator::split_where`]: broadcast
-/// has no outer WHERE to apply a declined predicate.
+/// identifier limit, or a conjunct of the WHERE filter declines through
+/// [`ScanTranslator::split_where`]: broadcast has no outer WHERE to apply a declined predicate.
 ///
 /// Every column of the condition, filter, select list, and ORDER BY is qualified through
 /// [`JoinLegs`] with its leg's alias before anything reads it, and the column-type map is the
@@ -90,14 +90,14 @@ fn render_broadcast_join_emitting(
             .collect::<Vec<_>>(),
     )?;
     // A declined condition loses broadcast eligibility and takes the N-scan fallback (#587).
-    let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
+    let Some(condition) = scan.join_condition(&condition_tree) else {
         return Ok(None);
     };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
     let filter = match scan.split_where(filter_json) {
         ScanWhere::Absent => None,
         ScanWhere::Pushed(sql) => Some(sql),
-        ScanWhere::Declined(_) => return Ok(None),
+        ScanWhere::Split { .. } | ScanWhere::Declined(_) => return Ok(None),
     };
 
     let emitted = qualified_emission(&legs, emitted);
@@ -729,7 +729,7 @@ fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Op
 }
 
 /// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out, which emits
-/// `emitted`. `declined_filter` is the wrapper's WHERE, so `fan_out.filter` must then be `None`.
+/// `emitted`. `declined_filter` is the wrapper's WHERE.
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown: &PushdownRequest,

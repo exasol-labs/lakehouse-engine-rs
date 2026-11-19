@@ -186,6 +186,19 @@ pub(super) fn arg_column_or_expr(
     scan.expression(arg).map(|arg| (None, Some(arg.sql)))
 }
 
+/// [`arg_column_or_expr`] for an aggregate the scan computes. A string column is an expression
+/// there, because the aggregate reads its empty strings as NULL.
+fn aggregate_argument(
+    args: Option<&Vec<Json>>,
+    scan: ScanTranslator<'_>,
+) -> Option<(Option<String>, Option<String>)> {
+    let arg = args.and_then(|a| a.first())?;
+    if scan.exact_type(arg).is_some_and(|ty| ty.is_character()) {
+        return scan.operand(arg).map(|arg| (None, Some(arg.sql)));
+    }
+    arg_column_or_expr(args, scan)
+}
+
 /// `None` for any `distinct: true` item, an unsupported function, or an aggregate the scan does
 /// not compute. STDDEV/VARIANCE accept only a bare column: their (cnt, mean, m2) decomposition
 /// has no rendered-argument form, and a plan with no argument would fail inside the scan.
@@ -212,7 +225,7 @@ pub(super) fn parse_agg_item(item: &Json, scan: ScanTranslator<'_>) -> Option<Ag
                 arg_expr: None,
             },
             Some(_) => {
-                let (column, arg_expr) = arg_column_or_expr(args, scan)?;
+                let (column, arg_expr) = aggregate_argument(args, scan)?;
                 AggregatePlan {
                     kind: AggKind::CountCol,
                     column,
@@ -226,7 +239,7 @@ pub(super) fn parse_agg_item(item: &Json, scan: ScanTranslator<'_>) -> Option<Ag
         .iter()
         .find(|(name, _)| *name == fn_name)
     {
-        let (column, arg_expr) = arg_column_or_expr(args, scan)?;
+        let (column, arg_expr) = aggregate_argument(args, scan)?;
         return Some(AggregatePlan {
             kind: kind.clone(),
             column,

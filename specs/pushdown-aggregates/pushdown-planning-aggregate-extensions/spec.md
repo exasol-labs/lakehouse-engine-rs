@@ -16,7 +16,7 @@ The adapter pushes HAVING and the statistical aggregates (STDDEV and VARIANCE fa
 * *GIVEN* an aggregate or `groupBy` `pushdown` request whose WHERE filter the DataFusion-bound render declines
 * *WHEN* the adapter routes the request to the qualified single-table wrapper
 * *THEN* the wrapper SHALL render the declined predicate as its `WHERE`, positioned between the raw sharded fan-out and the aggregate select list, GROUP BY, and HAVING it renders
-* *AND* the per-shard fan-out SHALL carry no aggregate, no group keys, and no filter, so no shard aggregates unfiltered rows
+* *AND* the per-shard fan-out SHALL carry no aggregate and no group keys, and its `filter` SHALL hold only the conjuncts the DataFusion-bound render renders (`pushdown/pushdown-declined-filter-self-apply`), so no shard aggregates unfiltered rows
 * *AND* the returned aggregate value SHALL equal native Exasol evaluation of the same query, not the aggregate over the unfiltered row set the omission returned
 
 ### Scenario: HAVING predicate is pushed into the grouped scan plan

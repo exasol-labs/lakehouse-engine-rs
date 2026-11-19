@@ -13,9 +13,9 @@ fn granted(ctx: TestContext) -> TestContext {
     ctx.with_connection(CONNECTION, sentinel_connection())
 }
 
-/// The writer SELECT the hook plans before it makes any catalog call.
+/// The writer SELECT the hook plans before it makes any catalog call, as for a new table.
 fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
-    plan_export(ctx, json).map(|plan| plan.select)
+    plan_export(ctx, json).map(|plan| plan.select.render(&plan.spec.render()))
 }
 
 /// The writer plan of a group, with the context standing on its first row as in a real run.
@@ -186,6 +186,10 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
             "JSON of another shape",
             Value::String(r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","extra":1}"#.to_string()),
         ),
+        (
+            "a spec without append",
+            Value::String(spec_without("append")),
+        ),
     ];
 
     for (case, first) in cases {
@@ -242,12 +246,89 @@ fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
             "columns": ["ID", "a\"b"],
             "single_commit": false,
             "allow_http": false,
+            "append": false,
+            "partition_by": [],
         })
     );
-    let mut writer = writer_context(vec![writer_row(&first.to_string(), 1)]);
-    writer.next().unwrap();
-    let read = WriterSpec::read(&writer).expect("the writer accepts it");
-    assert_eq!(read.render(), first.to_string());
+    let mut appending = first.clone();
+    appending["append"] = true.into();
+    for spec in [first, appending] {
+        let mut writer = writer_context(vec![writer_row(&spec.to_string(), 1)]);
+        writer.next().unwrap();
+        let read = WriterSpec::read(&writer).expect("the writer accepts it");
+        assert_eq!(read.render(), spec.to_string());
+    }
+}
+
+fn export_spec_partitioned_by(partition_by: &str) -> String {
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&export_spec_with_columns(&[r#""T"."ID""#, r#""T"."D""#])).unwrap();
+    spec["parameters"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"key": "PARTITION_BY", "value": partition_by}));
+    spec.to_string()
+}
+
+#[test]
+fn the_hook_renders_partition_by_resolved_against_the_source_columns() {
+    let sql = hook(
+        &mut granted(hook_context()),
+        &export_spec_partitioned_by("day(d), bucket(4, id)"),
+    )
+    .expect("a valid PARTITION_BY");
+
+    assert_eq!(
+        rendered_writer_spec(&sql)["partition_by"],
+        serde_json::json!([
+            {"transform": "day", "column": "D", "name": "D_day"},
+            {"transform": "bucket[4]", "column": "ID", "name": "ID_bucket"},
+        ])
+    );
+}
+
+/// The hook refuses an invalid PARTITION_BY while it plans, before its first catalog call.
+#[test]
+fn the_hook_refuses_an_invalid_partition_by_before_any_catalog_call() {
+    let error = error_text(hook(
+        &mut granted(hook_context()),
+        &export_spec_partitioned_by("bucket(4, X)"),
+    ));
+
+    assert!(
+        error.contains("PARTITION_BY field 'bucket(4, X)' names column X"),
+        "{error}"
+    );
+}
+
+/// Scenario: PARTITION_BY into an existing table is refused
+#[test]
+fn partition_by_is_refused_for_a_table_that_exists() {
+    let fields = vec![partition_by::PartitionField {
+        transform: iceberg::spec::Transform::Identity,
+        column: "ID".into(),
+        name: "ID".into(),
+    }];
+    let cases = [
+        (TableMode::Create, fields.clone(), Ok(false)),
+        (TableMode::Append, vec![], Ok(true)),
+        (
+            TableMode::Append,
+            fields,
+            Err("LAKEHOUSE_EXPORT: table ns.t exists, and PARTITION_BY applies only to a table the \
+                 export creates; remove PARTITION_BY to append to the table"
+                .to_string()),
+        ),
+    ];
+
+    for (mode, partition_by, expected) in cases {
+        let mut spec: WriterSpec = serde_json::from_str(&writer_spec(false)).unwrap();
+        spec.partition_by = partition_by;
+
+        let set = spec.set_mode(mode).map(|()| spec.append);
+
+        assert_eq!(set.map_err(|error| error.to_string()), expected, "{mode:?}");
+    }
 }
 
 #[test]
@@ -301,15 +382,13 @@ mod sql {
     const WRITER_SPEC: &str = r#"{"connection":"C"}"#;
 
     fn select_for(columns: &[&str], writers: WriterLayout, node_count: usize) -> String {
-        let source_columns: Vec<String> = columns.iter().map(ToString::to_string).collect();
         WriterSelect {
-            script_schema: "LHVS",
-            writer_spec: WRITER_SPEC,
-            source_columns: &source_columns,
+            script_schema: "LHVS".to_string(),
+            source_columns: columns.iter().map(ToString::to_string).collect(),
             writers,
             node_count,
         }
-        .render()
+        .render(WRITER_SPEC)
     }
 
     fn group_key(sql: &str) -> &str {
@@ -374,15 +453,13 @@ mod sql {
 
     #[test]
     fn writer_spec_and_schema_are_quoted_for_sql() {
-        let source_columns = vec![r#""T"."A""#.to_string()];
         let sql = WriterSelect {
-            script_schema: r#"my"schema"#,
-            writer_spec: r#"{"connection":"A'B\"C"}"#,
-            source_columns: &source_columns,
+            script_schema: r#"my"schema"#.to_string(),
+            source_columns: vec![r#""T"."A""#.to_string()],
             writers: WriterLayout::PerNode(1),
             node_count: 1,
         }
-        .render();
+        .render(r#"{"connection":"A'B\"C"}"#);
 
         assert!(
             sql.starts_with(
@@ -401,8 +478,17 @@ fn writer_spec(single_commit: bool) -> String {
         "columns": ["ID"],
         "single_commit": single_commit,
         "allow_http": false,
+        "append": false,
+        "partition_by": [],
     })
     .to_string()
+}
+
+/// `writer_spec(false)` without the field `name`.
+fn spec_without(name: &str) -> String {
+    let mut spec: serde_json::Value = serde_json::from_str(&writer_spec(false)).unwrap();
+    spec.as_object_mut().unwrap().remove(name);
+    spec.to_string()
 }
 
 fn group(spec: &str, rows: usize, id_type: &str) -> TestContext {
@@ -447,13 +533,52 @@ fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
 
     assert_eq!(plan.spec.export_id, "00ff");
     assert!(plan.spec.single_commit);
-    let fields: Vec<_> = plan
-        .schema
+    let WriterTable::New { schema, .. } = plan.table else {
+        panic!("a spec that does not append creates its table");
+    };
+    let fields: Vec<_> = schema
         .fields()
         .iter()
         .map(|field| (field.name().as_str(), field.is_nullable()))
         .collect();
     assert_eq!(fields, [("ID", true)]);
+}
+
+/// Scenario: A transform that the column's type does not take fails the export before any data is written
+#[test]
+fn a_new_table_writer_checks_each_partition_field_against_its_column_type() {
+    let partitioned = |transform: &str| {
+        writer_spec(false).replace(
+            r#""partition_by":[]"#,
+            &format!(r#""partition_by":[{{"transform":"{transform}","column":"ID","name":"P"}}]"#),
+        )
+    };
+
+    let plan = writer_plan(&mut group(&partitioned("truncate[10]"), 1, "DECIMAL(18,0)"))
+        .expect("truncate takes a DECIMAL");
+    let error = writer_plan(&mut group(&partitioned("hour"), 1, "DECIMAL(18,0)"))
+        .err()
+        .expect("hour does not take a DECIMAL")
+        .to_string();
+
+    let WriterTable::New { partition_by, .. } = plan.table else {
+        panic!("a spec that does not append creates its table");
+    };
+    assert_eq!(partition_by[0].name, "P");
+    assert!(
+        error.contains("applies hour to column ID of type DECIMAL(18,0)"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_appending_writer_derives_no_table_schema_from_its_source() {
+    let appending = writer_spec(false).replace(r#""append":false"#, r#""append":true"#);
+
+    let plan = writer_plan(&mut group(&appending, 1, "TIMESTAMP(9)"))
+        .expect("the table's columns, not the source's types, decide an append");
+
+    assert!(matches!(plan.table, WriterTable::Existing));
 }
 
 #[test]

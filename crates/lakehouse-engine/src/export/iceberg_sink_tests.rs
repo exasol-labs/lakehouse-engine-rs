@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use lakehouse_catalog_write::CommitTag;
 use lakehouse_catalog_write::exported_test_support::{
-    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog,
+    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
 };
 use std::sync::{Arc, Mutex};
 
@@ -29,11 +29,7 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
 /// The outcome of a 504 commit is unknown, so the data files stay: the catalog may have applied it.
 #[tokio::test]
 async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
-    // The recorded table allows 20 commit retries; none keeps the one 504 answer decisive.
-    let table = LOAD_TABLE_NO_SNAPSHOTS.replace(
-        r#""commit.retry.num-retries": "20""#,
-        r#""commit.retry.num-retries": "0""#,
-    );
+    let table = with_short_commit_waits(LOAD_TABLE_NO_SNAPSHOTS);
     let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
         if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
             (504, "{}".into())
@@ -56,14 +52,17 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
         writer_id: "w1".into(),
     };
     let target = target(static_key_connection(&uri, true), "ns.t").unwrap();
-    let mut sink = target.open_table(&schema, &tag, false).await.unwrap();
+    let mut sink = target
+        .open_new_table(&schema, &[], &tag, false, 1 << 20)
+        .await
+        .unwrap();
     let ids: ArrayRef = Arc::new(
         Decimal128Array::from(vec![1, 2])
             .with_precision_and_scale(18, 0)
             .unwrap(),
     );
     let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
-    let batch = RecordBatch::try_new(sink.schema(), vec![ids, names]).unwrap();
+    let batch = RecordBatch::try_new(sink.columns().schema.clone(), vec![ids, names]).unwrap();
 
     sink.write(&batch).await.unwrap();
     let finished = sink.finish().await.unwrap_err().to_string();

@@ -18,8 +18,9 @@ use json_value::{Fallback, JsonValueCall, Returning};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{
-    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
-    seconds_type, timestamp_digits,
+    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, EMPTY_AS_NULL_NODE, INTEGER_ARGUMENT_NODE,
+    INTEGER_TEXT_NODE, Inferred, SECOND_NODE, empty_as_null, render_integer_argument,
+    second_fraction, seconds_type, timestamp_digits,
 };
 pub use scan_typing::{ColumnTypeLookup, ScanTyping};
 use timestamp::{TimestampLiteral, TimestampUnit};
@@ -116,14 +117,23 @@ fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
 
 /// Converting the UTC-normalized wire value into `SESSIONTIMEZONE` reproduces
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
-/// session-local (verified live).
+/// session-local (verified live). A bare TSTZ cast keeps 3 fractional digits, so a longer value
+/// names its precision; Exasol 8 never sends more than 3 and has no precision syntax.
 fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
-        Some(_) => format!(
-            "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)",
-            render_exasol_timestamp_literal(value)
-        ),
+        Some(v) => {
+            let digits = v
+                .as_str()
+                .map_or(0, |s| TimestampLiteral(s).type_precision());
+            let cast_type = ExasolType::TimestampWithLocalTimeZone {
+                precision: u8::try_from(digits.max(3)).unwrap_or(u8::MAX),
+            };
+            format!(
+                "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS {cast_type})",
+                render_exasol_timestamp_literal(value)
+            )
+        }
     }
 }
 
@@ -192,12 +202,12 @@ fn render_to_datetime(
             let source = render_conversion_source(node, source, dialect)?;
             let pattern = sql_escape(&pattern);
             Ok(Some(match target {
-                FormatTarget::Date => format!("to_date(nullif({source}, ''), '{pattern}')"),
+                FormatTarget::Date => format!("to_date({source}, '{pattern}')"),
                 FormatTarget::Timestamp => {
                     let digits = digits.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {node} carries no typed digits"))
                     })?;
-                    format!("{TO_TIMESTAMP_FN}(nullif({source}, ''), '{pattern}', {digits})")
+                    format!("{TO_TIMESTAMP_FN}({source}, '{pattern}', {digits})")
                 }
             }))
         }
@@ -483,9 +493,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             )));
         }
         "literal_timestamputc" => {
-            // Exasol's real wire name for a TSTZ literal. DataFusion keeps
-            // declining it: TSTZ coercion against a naive `timestamp_us` column is
-            // unverified (#242).
+            // Exasol's real wire name for a TSTZ literal. Its comparison depends on the
+            // session zone, so the adapter folds a compared one into a plain timestamp
+            // literal and the DataFusion dialect declines any left over.
             if dialect == Dialect::Exasol {
                 return Ok(Some(render_exasol_tstz_literal(value("value"))));
             }
@@ -695,7 +705,12 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             render_cast(args, value("dataType"), dialect)
         }
         // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE | SECOND_NODE
+        INTEGER_TEXT_NODE
+        | BOOLEAN_TEXT_NODE
+        | BOOLEAN_NUMBER_NODE
+        | SECOND_NODE
+        | INTEGER_ARGUMENT_NODE
+        | EMPTY_AS_NULL_NODE
             if dialect == Dialect::DataFusion =>
         {
             let arg = value("arguments")
@@ -707,6 +722,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(match kind {
                 INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
                 BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                EMPTY_AS_NULL_NODE => format!("nullif({inner}, '')"),
+                INTEGER_ARGUMENT_NODE => render_integer_argument(expr, &inner),
                 SECOND_NODE => {
                     let fraction = second_fraction(expr)
                         .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;
@@ -858,8 +875,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         Dialect::DataFusion => format!("({left} % {right})"),
                     }))
                 }
-                // DataFusion's `concat` never collapses an all-empty result to NULL
-                // as Exasol's `||` does.
+                // DataFusion's `concat` skips a NULL argument as Exasol's `||` does. The typed
+                // pass reads its empty result as NULL.
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
@@ -879,10 +896,30 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .collect::<Result<Vec<String>, UdfError>>()?;
                     Ok(Some(match dialect {
                         Dialect::Exasol => format!("({})", rendered.join(" || ")),
-                        Dialect::DataFusion => {
-                            format!("nullif(concat({}), '')", rendered.join(", "))
-                        }
+                        Dialect::DataFusion => format!("concat({})", rendered.join(", ")),
                     }))
+                }
+                // DataFusion dialect only. Exasol reads a NULL search text as "replace nothing"
+                // and a NULL replacement as the empty string, and sends the two-argument form
+                // with a NULL replacement. DataFusion's `replace` returns NULL for either (#203).
+                "REPLACE" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar REPLACE missing 'arguments'".into())
+                    })?;
+                    let rendered = render_args(args, dialect)?;
+                    let (subject, search, replacement) = match rendered.as_slice() {
+                        [subject, search] => (subject, search, "NULL"),
+                        [subject, search, replacement] => (subject, search, replacement.as_str()),
+                        _ => {
+                            return Err(UdfError::User(format!(
+                                "function_scalar REPLACE requires 2 or 3 arguments, got {}",
+                                rendered.len()
+                            )));
+                        }
+                    };
+                    Ok(Some(format!(
+                        "CASE WHEN {search} IS NULL THEN {subject} ELSE replace({subject}, {search}, coalesce({replacement}, '')) END"
+                    )))
                 }
                 // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
                 // strpos(s, sub), which takes no start or occurrence argument (#228).
@@ -1191,27 +1228,43 @@ fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String 
 /// A CHAR or VARCHAR CAST renders unsized, so its fragment type is the widest VARCHAR.
 impl ScanTyping<'_> {
     pub fn render_expression(self, expr: &Json) -> Result<SqlFragment, UdfError> {
-        let (typed, inferred) = self.type_scan_tree(expr)?;
-        let ty = inferred.exact().map(|ty| {
-            if ty.is_character() {
-                ExasolType::WIDEST_VARCHAR
-            } else {
-                ty
-            }
-        });
-        Ok(SqlFragment::new(render_expression(&typed)?, ty))
+        scan_fragment(self.type_scan_tree(expr)?)
     }
 
-    /// [`Self::render_expression`] for a filter. Exasol drops a `WHERE` that folds to `TRUE`, so no
-    /// filter it sends renders as `TRUE`.
+    /// [`Self::render_expression`] for an operand of a computation the caller renders around it,
+    /// such as an aggregate argument: a bare string column reads its empty strings as NULL.
+    pub fn render_operand(self, expr: &Json) -> Result<SqlFragment, UdfError> {
+        let (typed, ty) = self.type_scan_tree(expr)?;
+        scan_fragment((empty_as_null(expr, typed, ty), ty))
+    }
+
+    /// [`Self::render_expression`] for a filter or a join condition. Exasol drops a `WHERE` that
+    /// folds to `TRUE`, so no filter it sends renders as `TRUE`.
     pub fn render_filter(self, filter_expr: &Json) -> Result<String, UdfError> {
-        Ok(null_keeps_no_row(self.render_expression(filter_expr)?.sql))
+        Ok(null_keeps_no_row(self.render_filter_root(filter_expr)?))
+    }
+
+    /// A filter, a join condition, or one of their top-level conjuncts.
+    pub(crate) fn render_filter_root(self, root: &Json) -> Result<String, UdfError> {
+        let (typed, _) = self.type_scan_filter(root)?;
+        render_expression(&typed)
     }
 
     /// [`render_expression_exasol`] for an output select item, with its [`Self::exact_type`].
     pub fn exasol_fragment(self, expr: &Json) -> SqlFragment {
         SqlFragment::new(render_expression_exasol(expr), self.exact_type(expr))
     }
+}
+
+fn scan_fragment((typed, inferred): (Json, Inferred)) -> Result<SqlFragment, UdfError> {
+    let ty = inferred.exact().map(|ty| {
+        if ty.is_character() {
+            ExasolType::WIDEST_VARCHAR
+        } else {
+            ty
+        }
+    });
+    Ok(SqlFragment::new(render_expression(&typed)?, ty))
 }
 
 /// The filter [`ScanTyping::render_filter`] renders for the `AND` of conjuncts rendered one by one.

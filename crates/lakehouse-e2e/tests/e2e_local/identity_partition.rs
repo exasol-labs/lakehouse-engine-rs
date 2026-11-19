@@ -14,33 +14,19 @@ use crate::common::identity_partition_fixtures::{
     TYPES_ROW_IDS_TEXT, TYPES_TABLE,
 };
 use crate::common::raw_parquet::get_fixture_object;
-use crate::common::seed::{E2E_IDENT_PART_BYTES_TABLE, IDENT_PART_BYTES_TEXT, build_seed_catalog};
-use crate::common::stack::iceberg_catalog_url;
+use crate::common::seed::{E2E_IDENT_PART_BYTES_TABLE, IDENT_PART_BYTES_TEXT};
+use crate::common::table_state::load_table;
 use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, stack, vs_table};
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int32Type;
 use futures::TryStreamExt;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-pub(crate) fn load_table(table: &str) -> iceberg::table::Table {
-    runtime().block_on(async {
-        let catalog = build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "identity")
-            .await
-            .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog for {table}: {e:#}"));
-        let ident = TableIdent::new(NamespaceIdent::new(NAMESPACE.into()), table.into());
-        catalog
-            .load_table(&ident)
-            .await
-            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"))
-    })
-}
-
 /// `(path, footer column names)` of every data file the table's current snapshot plans.
 pub(crate) fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
-    let loaded = load_table(table);
+    let loaded = load_table(NAMESPACE, table);
     let tasks: Vec<_> = runtime().block_on(async {
         let scan = loaded
             .scan()

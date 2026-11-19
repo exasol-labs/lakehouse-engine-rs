@@ -9,13 +9,14 @@ use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT_TRAILING_SPACE, ExpectedValue,
     TYPED_TABLE_TOTAL_ROWS,
 };
+use crate::common::stack::{ExasolFlavor, exasol_flavor};
 use crate::common::timestamp_precision::{
     engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
     TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
-    echoed_pushdown_requests, events_table, lakehouse_vs, typed_table, vs_char_pad_table,
-    vs_dim_table, vs_fact_table,
+    echoed_pushdown_requests, events_table, explain_virtual_pushdown_sql, lakehouse_vs,
+    typed_table, vs_char_pad_table, vs_dim_table, vs_fact_table,
 };
 
 /// The measured worst-case divergence of the scan's float division from native Exasol is
@@ -913,35 +914,67 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     )
 }
 
+/// Scenario: Routed session-dependent projection returns the value Exasol computes natively
 #[test]
-fn e2e_now_family_projection_matches_native_session_local_value() {
+fn e2e_clock_projection_matches_native_session_local_value() {
     lakehouse_vs();
     let mut conn = exa_conn();
     let table = events_table();
-    pin_session_time_zone(&mut conn);
+    let db_timezone = conn.query_columns("SELECT DBTIMEZONE")[0][0]
+        .as_str()
+        .expect("DBTIMEZONE is text")
+        .to_string();
+    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{db_timezone}'"));
     let offset_seconds = session_utc_offset_seconds(&mut conn);
-    assert!(
-        offset_seconds != 0.0,
-        "fixture precondition: the session's UTC offset must be non-zero, or the \
-         assertion below passes whichever zone the adapter applies (#238)"
+    // A zero offset lets the assertion below pass whichever zone the adapter applies (#238), so
+    // docker-db's DBTIMEZONE is no UTC zone. Nano runs with `sysTZ=UTC` (docker-compose.nano.yml).
+    assert_eq!(
+        offset_seconds == 0.0,
+        exasol_flavor() == ExasolFlavor::Nano,
+        "fixture precondition: the session's UTC offset is zero exactly on Nano, is {offset_seconds}s"
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
-        // Measured within one statement, so no wall-clock time elapses between the two values
-        // that could mask a UTC-shift regression.
+        // CURRENT_TIMESTAMP is evaluated by Exasol in this statement; SYSTIMESTAMP comes from the
+        // adapter's clock, read when it plans the statement.
         let deviation = scalar_seconds(
             &mut conn,
             &format!("SELECT SECONDS_BETWEEN({expr}, (SELECT {expr} FROM {table} WHERE id = 1))"),
         )
         .abs();
+        let within = if expr == "CURRENT_TIMESTAMP" {
+            deviation < 1.0
+        } else {
+            deviation <= 60.0
+                && (offset_seconds == 0.0 || (deviation - offset_seconds.abs()).abs() > 60.0)
+        };
         assert!(
-            deviation < 1.0,
+            within,
             "{expr}'s deviation between the native value and the VS-projected value \
-             ({deviation}s) must be near zero — this is the sharp assertion that \
+             ({deviation}s) must be within its tolerance — this is the assertion that \
              fails if the adapter ever ships the UTC instant instead of Exasol's own \
              session-local value ({offset_seconds}s off under this session's zone, #238)"
         );
+        let pruned = format!("SELECT {expr} FROM {table} WHERE id = 999999");
+        assert_eq!(conn.query_row_count(&pruned), 0, "{pruned}");
     }
+
+    let routed = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT CURRENT_TIMESTAMP FROM {table} WHERE id = 1"),
+    );
+    assert!(
+        routed.contains(r#"AS "LHS_T0""#) && !routed.contains("_LH_PROJ_0"),
+        "CURRENT_TIMESTAMP must route to the qualified wrapper: {routed}"
+    );
+    let emitted = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT SYSTIMESTAMP FROM {table} WHERE id = 1"),
+    );
+    assert!(
+        emitted.contains("_LH_PROJ_0") && !emitted.to_uppercase().contains("SYSTIMESTAMP"),
+        "the folded SYSTIMESTAMP must be a column the scan emits: {emitted}"
+    );
 }
 
 #[test]
@@ -2233,42 +2266,6 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
 // retargeted onto `events`/`typed_distinct_probe`, each compared with an in-session
 // native oracle.
 
-/// `%.f` accepts any fractional digit count, including none.
-fn parse_exasol_timestamp(s: &str) -> chrono::NaiveDateTime {
-    let normalized = s.replacen(' ', "T", 1);
-    let fmt = "%Y-%m-%dT%H:%M:%S%.f";
-    chrono::NaiveDateTime::parse_from_str(&normalized, fmt).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse Exasol timestamp {s:?} (normalized {normalized:?}) with {fmt:?}: {e}"
-        )
-    })
-}
-
-#[test]
-fn parse_exasol_timestamp_accepts_space_and_t_separators_with_or_without_fraction() {
-    assert_eq!(
-        parse_exasol_timestamp("2026-07-28 18:56:00.581000"),
-        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
-            .unwrap()
-            .and_hms_micro_opt(18, 56, 0, 581000)
-            .unwrap()
-    );
-    assert_eq!(
-        parse_exasol_timestamp("2026-07-28T18:56:00.581"),
-        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
-            .unwrap()
-            .and_hms_milli_opt(18, 56, 0, 581)
-            .unwrap()
-    );
-    assert_eq!(
-        parse_exasol_timestamp("2024-01-01T00:00:00"),
-        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-    );
-}
-
 fn parse_int_opt(v: &serde_json::Value) -> Option<i64> {
     if v.is_null() {
         None
@@ -2589,77 +2586,10 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     );
 }
 
-#[test]
-fn e2e_now_family_matches_native_oracle() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    // A UTC DBTIMEZONE would make the offset comparison vacuous.
-    let tz_cols = conn.query_columns("SELECT DBTIMEZONE");
-    let db_timezone = tz_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("DBTIMEZONE not a string: {:?}", tz_cols[0][0]))
-        .to_string();
-    assert_ne!(
-        db_timezone.to_uppercase(),
-        "UTC",
-        "DBTIMEZONE must not be UTC, or the offset comparison below is \
-         vacuous (a whole-zone-offset regression would be invisible), got \
-         {db_timezone:?}"
-    );
-
-    let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", typed_table());
-    let vs_cols = conn.query_columns(&vs_sql);
-    let vs_values: Vec<&str> = vs_cols[0]
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .unwrap_or_else(|| panic!("SYSTIMESTAMP not a string: {v:?}"))
-        })
-        .collect();
-    assert!(
-        !vs_values.is_empty(),
-        "SELECT SYSTIMESTAMP FROM {} returned no rows",
-        typed_table()
-    );
-    let distinct_vs: std::collections::HashSet<&str> = vs_values.iter().copied().collect();
-    assert_eq!(
-        distinct_vs.len(),
-        1,
-        "SELECT SYSTIMESTAMP FROM {} must return exactly one distinct value \
-         across all rows (statement-constancy Exasol guarantees); a \
-         pushdown of now() into the scan instead returns one \
-         value PER SHARD (two over this two-file table), got {distinct_vs:?}",
-        typed_table()
-    );
-    let vs_ts = parse_exasol_timestamp(vs_values[0]);
-
-    // Loose tolerance: the statements run at different instants, and the defect is a
-    // whole-zone offset of an hour or more. CURRENT_TIMESTAMP is not the probe because its
-    // TIMESTAMP WITH LOCAL TIME ZONE type never emits a pushed projection.
-    let oracle_cols = conn.query_columns("SELECT SYSTIMESTAMP");
-    let oracle_str = oracle_cols[0][0].as_str().unwrap_or_else(|| {
-        panic!(
-            "native oracle SYSTIMESTAMP not a string: {:?}",
-            oracle_cols[0][0]
-        )
-    });
-    let oracle_ts = parse_exasol_timestamp(oracle_str);
-
-    let delta = (vs_ts - oracle_ts).num_seconds().abs();
-    assert!(
-        delta <= 60,
-        "VS SYSTIMESTAMP ({vs_ts}) must be within 60s of the native oracle \
-         SYSTIMESTAMP ({oracle_ts}); a scan computing now() \
-         UTC-naively into the scan would diverge by a whole zone offset \
-         (>= 1h) from Exasol's own {db_timezone}-zoned clock, got \
-         delta={delta}s"
-    );
-}
-
 // Declined-filter self-apply (#279): a WHERE predicate the adapter cannot push into the
 // scan must be applied in its own Exasol-dialect SQL, since Exasol never re-applies it.
 
+/// Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     lakehouse_vs();
@@ -2762,6 +2692,7 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
+/// Scenario: A declined filter does not widen the wrapper's projection
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     lakehouse_vs();
@@ -2786,6 +2717,192 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     assert_eq!(
         num_rows, 0,
         "SELECT * WHERE SECOND(c_ts, 3) > 1 must return 0 rows: {resp}"
+    );
+}
+
+/// How a case's result is compared with the native copy's.
+#[derive(Clone, Copy, Debug)]
+enum Oracle {
+    Rows,
+    /// For a select list whose values differ on every run.
+    RowCount,
+    /// Native Exasol rejects the query, and the virtual table must raise the same error class.
+    Error,
+}
+
+/// A query over `{T}` whose WHERE holds a `LIKE` over a DECIMAL column, which the scan declines,
+/// beside the conjunct `ID > 1`, which it renders.
+struct DeclinedConjunctCase {
+    query: &'static str,
+    oracle: Oracle,
+    /// Whether a clause other than the rendered conjunct names `ID`, so the fan-out emits it.
+    emits_id: bool,
+}
+
+const DECLINED_CONJUNCT_CASES: [DeclinedConjunctCase; 9] = [
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 ORDER BY ID",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT C_VARCHAR FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT COUNT(*) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT C_BOOL, COUNT(*) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 \
+                GROUP BY C_BOOL",
+        oracle: Oracle::Rows,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT COUNT(DISTINCT ID) FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1 ORDER BY ID LIMIT 1",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT RANDOM() FROM {T} WHERE C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::RowCount,
+        emits_id: false,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE (C_DECIMAL_A LIKE '1%' OR ID = 2) AND ID > 1 ORDER BY ID",
+        oracle: Oracle::Rows,
+        emits_id: true,
+    },
+    DeclinedConjunctCase {
+        query: "SELECT ID FROM {T} WHERE C_VARCHAR AND C_DECIMAL_A LIKE '1%' AND ID > 1",
+        oracle: Oracle::Error,
+        emits_id: true,
+    },
+];
+
+/// The scan spec's filter SQL in `plan`, `None` when the scan applies no WHERE conjunct.
+fn scan_spec_filter(plan: &str) -> Option<&str> {
+    let (_, rest) = plan.split_once(SCAN_FILTER)?;
+    rest.split_once(r#"",""#).map(|(filter, _)| filter)
+}
+
+/// The column list of the fan-out's `EMITS` clause in `plan`, `None` when the plan has none.
+fn fan_out_emits(plan: &str) -> Option<&str> {
+    plan.split_once("EMITS (")
+        .and_then(|(_, rest)| rest.split_once(") FROM"))
+        .map(|(emits, _)| emits)
+}
+
+/// What differs from a WHERE split between the `LHS_T0` wrapper and the scan, for `case`.
+fn where_split_mismatch(case: &DeclinedConjunctCase, plan: &str) -> Option<String> {
+    let wrapper_where = plan
+        .split_once(r#"AS "LHS_T0" WHERE "#)
+        .map(|(_, clause)| clause);
+    if !wrapper_where.is_some_and(|clause| clause.contains("LIKE")) {
+        return Some(format!(
+            "`{}`: the LHS_T0 wrapper's WHERE must apply the LIKE: {plan}",
+            case.query
+        ));
+    }
+    if !scan_spec_filter(plan)
+        .is_some_and(|filter| filter.contains("ID") && !filter.contains("LIKE"))
+    {
+        return Some(format!(
+            "`{}`: the scan filter must name ID and hold no LIKE: {plan}",
+            case.query
+        ));
+    }
+    let Some(emits) = fan_out_emits(plan) else {
+        return Some(format!(
+            "`{}`: the plan has no fan-out EMITS clause: {plan}",
+            case.query
+        ));
+    };
+    let emits_id = emits.contains(r#""ID""#);
+    (emits_id != case.emits_id).then(|| {
+        format!(
+            "`{}`: the fan-out must emit ID only when a clause beside the rendered conjunct \
+             names it ({}): {plan}",
+            case.query, case.emits_id
+        )
+    })
+}
+
+/// What differs for `case` over the virtual `table` from the native copy, or from the split.
+fn declined_conjunct_mismatch(
+    conn: &mut ExaConn,
+    table: &str,
+    case: &DeclinedConjunctCase,
+) -> Option<String> {
+    let vs_query = case.query.replace("{T}", table);
+    let outcome = match case.oracle {
+        Oracle::Rows => native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            case.query,
+            PathCheck::Wrapper,
+            Expect::Rows,
+        ),
+        Oracle::RowCount => {
+            let actual = conn.query_row_count(&vs_query);
+            let expected = conn.query_row_count(&case.query.replace("{T}", NATIVE_COPY));
+            (actual != expected)
+                .then(|| format!("`{}`: got {actual} rows, native {expected}", case.query))
+        }
+        Oracle::Error => native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            case.query,
+            PathCheck::Wrapper,
+            Expect::Error,
+        ),
+    };
+    outcome.or_else(|| where_split_mismatch(case, &isolated_pushdown_statement(conn, &vs_query)))
+}
+
+/// Scenario: A single-table WHERE filter splits at AND between the scan and the wrapper
+/// Scenario: Filter predicate is pushed into the scan spec
+/// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
+/// Scenario: A declined WHERE filter under an aggregate request is applied ahead of the aggregate
+/// Scenario: A declined filter does not widen the wrapper's projection
+#[test]
+fn e2e_declined_conjunct_keeps_the_other_conjuncts_in_the_scan() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+    assert_eq!(
+        int_column(
+            &conn.query_columns(&format!(
+                "SELECT ID FROM {NATIVE_COPY} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID"
+            ))[0]
+        ),
+        vec![1, 5, 7],
+        "fixture precondition: ID 1 must match the LIKE, so a scan that drops `ID > 1` returns \
+         a row the native copy does not"
+    );
+    let failures: Vec<String> = DECLINED_CONJUNCT_CASES
+        .iter()
+        .filter_map(|case| declined_conjunct_mismatch(&mut conn, &typed, case))
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} declined-conjunct cases failed:\n{}",
+        failures.len(),
+        DECLINED_CONJUNCT_CASES.len(),
+        failures.join("\n")
     );
 }
 
@@ -3396,6 +3513,28 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT COUNT(*) FROM {T} GROUP BY SECOND(C_DATE)",
         PathCheck::Split,
     ),
+    // A date part takes DECIMAL(4,0) for YEAR and DECIMAL(2,0) for the rest on every version.
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY YEAR(C_DATE)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY MONTH(C_TS)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY WEEK(C_DATE)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY HOUR(C_TS)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY EXTRACT(MINUTE FROM C_TS)",
+        PathCheck::Split,
+    ),
+    ("SELECT MAX(DAY(C_DATE)) + 1 FROM {T}", PathCheck::Split),
 ];
 
 /// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR, and
@@ -3449,6 +3588,7 @@ fn char_cast_cases() -> Vec<(String, Expect)> {
 /// Scenario: A group key travels with its exact type
 /// Scenario: An unprojected bare-column group key takes its column type
 /// Scenario: An unprojected group key with a derived exact type keeps the split
+/// Scenario: A date-part function takes its fixed native type
 /// Scenario: An unprojected group key without an exact type declines the split
 /// Scenario: A form whose type differs by Exasol version takes the type of the version it runs on
 /// Scenario: A CAST to CHAR returns Exasol's padded value

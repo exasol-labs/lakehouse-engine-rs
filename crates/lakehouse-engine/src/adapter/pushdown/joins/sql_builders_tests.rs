@@ -142,23 +142,26 @@ fn broadcast_join_declines_wrapped_projection() {
 
 #[test]
 fn broadcast_declines_on_a_declined_filter() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] =
-        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
-    let detected = detected_join(&request);
+    let declined = || declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
+    let beside_a_rendered_conjunct = and([string_equal("CUSTOMER", "C_NAME", "ACME"), declined()]);
+    for filter in [declined(), beside_a_rendered_conjunct] {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["filter"] = filter.clone();
+        let detected = detected_join(&request);
 
-    assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&request),
-            &detected,
-            &request_sides(&request, &detected),
-            &test_context()
-        )
-        .expect("a declined filter is a clean decline, not an error")
-        .is_none(),
-        "a declined filter must decline the broadcast plan (Ok(None)) so the \
-         request falls through to the N-scan fallback, which self-applies it"
-    );
+        assert!(
+            render_broadcast_join(
+                &parsed_pushdown(&request),
+                &detected,
+                &request_sides(&request, &detected),
+                &test_context()
+            )
+            .expect("a declined filter is a clean decline, not an error")
+            .is_none(),
+            "a declined conjunct must decline the broadcast plan (Ok(None)) so the request falls \
+             through to the N-scan fallback, which self-applies it: {filter}"
+        );
+    }
 }
 
 #[test]
@@ -2443,7 +2446,9 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
     let varchar_leg = shared_names_broadcast_sql(&like(labels_column("SCORE"), "a%"))
         .expect("LIKE on the VARCHAR leg's SCORE resolves its own leg's type and keeps the plan");
     assert!(
-        varchar_leg.contains(r#""filter":"(\"LHS_T1\".\"SCORE\" LIKE ''a%'')""#),
+        varchar_leg.contains(
+            r#""filter":"((\"LHS_T1\".\"SCORE\" LIKE ''a%'') AND (\"LHS_T1\".\"SCORE\" <> ''''))""#
+        ),
         "the filter reads LABELS' own SCORE: {varchar_leg}"
     );
     let integer_leg = shared_names_broadcast_sql(&like(events_column("SCORE"), "1%"))

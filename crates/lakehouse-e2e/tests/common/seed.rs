@@ -1089,6 +1089,91 @@ pub async fn seed_blank_label_table(catalog_url: &str, warehouse: &str) -> Resul
     Ok(())
 }
 
+pub const EMPTY_STRING_NAMESPACE: &str = "e2e_empty_string";
+pub const EMPTY_STRING_TABLE: &str = "empty_strings";
+
+type EmptyStringRow = (
+    i64,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static [u8]>,
+);
+
+/// `(id, s, k, b)` per data file of [`EMPTY_STRING_TABLE`]. The first file holds empty values
+/// and no NULL, the second NULLs and no empty value, the third neither. `b` holds UTF-8, so
+/// `BINARY_AS_STRING` reads it.
+pub const EMPTY_STRING_FILES: [&[EmptyStringRow]; 3] = [
+    &[
+        (1, Some("event-01"), Some("event-01"), Some(b"a")),
+        (2, Some(""), Some(""), Some(b"")),
+        (3, Some("TRUCK"), Some("x"), Some(b"b")),
+        (4, Some(""), Some("TRUCK"), Some(b"c")),
+    ],
+    &[
+        (5, None, None, None),
+        (6, Some("zulu"), Some("zulu"), Some(b"d")),
+        (7, Some("yankee"), None, None),
+    ],
+    &[
+        (8, Some("x-ray"), Some("x-ray"), Some(b"e")),
+        (9, Some("whiskey"), Some("U"), Some(b"f")),
+    ],
+];
+
+fn make_empty_string_batch(rows: &[EmptyStringRow]) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, true),
+        Field::new("k", DataType::Utf8, true),
+        Field::new("b", DataType::LargeBinary, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.1))),
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.2))),
+            Arc::new(LargeBinaryArray::from_iter(rows.iter().map(|row| row.3))),
+        ],
+    )
+    .expect("empty_strings RecordBatch construction is infallible")
+}
+
+/// Strings and variable-length binary values that are empty, NULL, or neither, one data file per
+/// entry of [`EMPTY_STRING_FILES`] (#203).
+pub async fn seed_empty_strings(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-empty-strings").await?;
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "s", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "k", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(4, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+        ])
+        .build()
+        .context("build empty_strings Iceberg schema")?;
+    let files = EMPTY_STRING_FILES.iter().map(|rows| {
+        (
+            EMPTY_STRING_TABLE.to_string(),
+            Struct::empty(),
+            vec![make_empty_string_batch(rows)],
+        )
+    });
+    seed_table(
+        &catalog,
+        EMPTY_STRING_NAMESPACE,
+        EMPTY_STRING_TABLE,
+        schema,
+        unpartitioned(),
+        HashMap::new(),
+        files,
+    )
+    .await
+    .context("seed empty_strings table")
+}
+
 pub const CLUSTERED_JOIN_NAMESPACE: &str = "e2e_join_clustered";
 pub const CLUSTERED_FACT_TABLE: &str = "fact_clustered";
 pub const CLUSTERED_DIM_TABLE: &str = "dim_clustered";
@@ -1097,8 +1182,14 @@ pub const CLUSTERED_ROWS_PER_KEY: i64 = 64;
 /// The dimension rows whose `C_REGION` is `hot`.
 pub const CLUSTERED_HOT_KEYS: [i64; 3] = [3, 4, 5];
 
+/// The second join-key column of key `k`, `O_SEGMENT` on the fact and `C_SEGMENT` on the
+/// dimension, so a composite key joins the clustered fixture.
+pub fn clustered_segment(key: i64) -> i64 {
+    key % 4
+}
+
 /// One fact data file whose row group `k` holds only `O_CUSTKEY = k`, and one dimension row
-/// per key, named `c{k}`.
+/// per key, named `c{k}`. Both carry the key's [`clustered_segment`].
 pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog =
         build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-clustered-join").await?;
@@ -1110,6 +1201,7 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
         .with_fields(vec![
             NestedField::required(1, "O_ORDERKEY", long()).into(),
             NestedField::required(2, "O_CUSTKEY", long()).into(),
+            NestedField::required(3, "O_SEGMENT", long()).into(),
         ])
         .build()
         .context("build fact_clustered Iceberg schema")?;
@@ -1128,11 +1220,15 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             Arc::new(ArrowSchema::new(vec![
                 Field::new("O_ORDERKEY", DataType::Int64, false),
                 Field::new("O_CUSTKEY", DataType::Int64, false),
+                Field::new("O_SEGMENT", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..rows)),
                 Arc::new(Int64Array::from_iter_values(
                     (0..rows).map(|i| i / CLUSTERED_ROWS_PER_KEY),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| clustered_segment(i / CLUSTERED_ROWS_PER_KEY)),
                 )),
             ],
         )
@@ -1159,6 +1255,7 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             NestedField::required(1, "C_CUSTKEY", long()).into(),
             NestedField::required(2, "C_NAME", string()).into(),
             NestedField::required(3, "C_REGION", string()).into(),
+            NestedField::required(4, "C_SEGMENT", long()).into(),
         ])
         .build()
         .context("build dim_clustered Iceberg schema")?;
@@ -1168,19 +1265,21 @@ pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<(
             Field::new("C_CUSTKEY", DataType::Int64, false),
             Field::new("C_NAME", DataType::Utf8, false),
             Field::new("C_REGION", DataType::Utf8, false),
+            Field::new("C_SEGMENT", DataType::Int64, false),
         ])),
         vec![
             Arc::new(Int64Array::from_iter_values(keys.clone())),
             Arc::new(StringArray::from_iter_values(
                 keys.clone().map(|k| format!("c{k}")),
             )),
-            Arc::new(StringArray::from_iter_values(keys.map(|k| {
+            Arc::new(StringArray::from_iter_values(keys.clone().map(|k| {
                 if CLUSTERED_HOT_KEYS.contains(&k) {
                     "hot"
                 } else {
                     "cold"
                 }
             }))),
+            Arc::new(Int64Array::from_iter_values(keys.map(clustered_segment))),
         ],
     )
     .expect("dim_clustered RecordBatch construction is infallible");
@@ -4111,3 +4210,119 @@ pub async fn seed_ident_part_bytes(catalog_url: &str, warehouse: &str) -> Result
 #[cfg(test)]
 #[path = "seed_tests.rs"]
 mod tests;
+
+// Clock probe: fixed rows around 2024-03-01 10:00 Berlin (09:00 UTC), where a TIMESTAMP WITH
+// LOCAL TIME ZONE comparison compared in the wrong zone changes the rows, plus one row after
+// any test run, so a clock filter keeps a strict subset. Two data files.
+
+pub const E2E_CLOCK_NAMESPACE: &str = "e2e_clock";
+pub const E2E_CLOCK_TABLE: &str = "clock_probe";
+/// The same rows again, for a statement over two tables of one virtual schema.
+pub const E2E_CLOCK_TABLE_2: &str = "clock_probe_2";
+
+/// `(id, d, ts, tz, region)`; `tz` is a `timestamptz` holding the UTC instant of its text.
+pub const CLOCK_ROWS: [(i64, &str, &str, &str, &str); 4] = [
+    (
+        1,
+        "2024-03-01",
+        "2024-03-01 08:00:00",
+        "2024-03-01 08:00:00",
+        "eu",
+    ),
+    (
+        2,
+        "2024-03-01",
+        "2024-03-01 09:30:00",
+        "2024-03-01 09:30:00",
+        "eu",
+    ),
+    (
+        3,
+        "2024-03-02",
+        "2024-03-01 10:30:00",
+        "2024-03-01 10:30:00",
+        "us",
+    ),
+    (
+        4,
+        "2099-12-31",
+        "2099-12-31 12:00:00",
+        "2099-12-31 12:00:00",
+        "us",
+    ),
+];
+
+pub async fn seed_clock_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-clock").await?;
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "d", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::required(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            NestedField::required(4, "tz", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+            NestedField::required(5, "region", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build clock_probe Iceberg schema")?;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("d", DataType::Date32, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        // "+00:00", iceberg-rust's UTC label, as for every other timestamptz fixture.
+        Field::new(
+            "tz",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        ),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let days = |text: &str| {
+        let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("fixture date");
+        i32::try_from((date - chrono::DateTime::UNIX_EPOCH.date_naive()).num_days())
+            .expect("days fit i32")
+    };
+    let micros = |text: &str| {
+        chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .expect("fixture timestamp")
+            .and_utc()
+            .timestamp_micros()
+    };
+    let batch = |rows: &[(i64, &str, &str, &str, &str)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Date32Array::from_iter_values(
+                    rows.iter().map(|r| days(r.1)),
+                )),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    rows.iter().map(|r| micros(r.2)),
+                )),
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(rows.iter().map(|r| micros(r.3)))
+                        .with_timezone("+00:00"),
+                ),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.4))),
+            ],
+        )
+        .context("build clock_probe batch")
+    };
+    let (past, future) = CLOCK_ROWS.split_at(3);
+    for table in [E2E_CLOCK_TABLE, E2E_CLOCK_TABLE_2] {
+        create_and_append_files(
+            &catalog,
+            E2E_CLOCK_NAMESPACE,
+            table,
+            iceberg_schema.clone(),
+            [[batch(past)?], [batch(future)?]],
+        )
+        .await
+        .with_context(|| format!("seed {table}"))?;
+    }
+    Ok(())
+}

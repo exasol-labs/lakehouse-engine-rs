@@ -29,6 +29,12 @@ The difference also reaches results built on the converted text:
 - `LENGTH(UPPER('ß'))` returns 2 instead of 1.
 - A filter such as `WHERE UPPER(name) = 'STRAßE'` can return different rows.
 
+## REPEAT with a negative count
+
+`REPEAT(s, n)` with a negative `n` returns NULL. Native Exasol fails the query with
+`negative numbers not allowed in function REPEAT`. A count between -0.5 and 0 rounds to 0 and
+returns NULL in both.
+
 ## Dates outside Exasol's DATE range
 
 Iceberg, Delta, and Parquet can store dates outside Exasol's DATE range (0001-01-01 to
@@ -130,3 +136,25 @@ ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'LIMIT, LIMIT_WITH_OFFSET
 A `LIKE` without `ESCAPE` uses the session's `DEFAULT_LIKE_ESCAPE_CHARACTER`, which is `\` unless `ALTER SESSION` or `ALTER SYSTEM` changes it. Exasol does not send that setting to the adapter, so the scan and file pruning always escape with `\`. After `ALTER SESSION SET DEFAULT_LIKE_ESCAPE_CHARACTER = '!'`, `WHERE name LIKE 'x!_%'` matches `x_1` natively but not through the virtual schema.
 
 **Workaround:** write the escape explicitly. `WHERE name LIKE 'x!_%' ESCAPE '!'` returns the native rows under any session default.
+
+## Clock functions and TIMESTAMP WITH LOCAL TIME ZONE literals
+
+The adapter folds `CURRENT_DATE`, `CURRENT_TIMESTAMP`, and `LOCALTIMESTAMP` in the zone of the `SESSION_TIME_ZONE` property, or in `DBTIMEZONE` when it is unset, because no adapter request carries `SESSIONTIMEZONE`. A comparison with a `TIMESTAMP WITH LOCAL TIME ZONE` literal compares in the same zone. In a session whose `SESSIONTIMEZONE` differs from that folding zone:
+
+- `CURRENT_DATE`, and on Exasol 2025 a projected `LOCALTIMESTAMP`, return the folding zone's date and time.
+- `ts < CURRENT_TIMESTAMP`, `ts > ADD_HOURS(CURRENT_TIMESTAMP, -1)`, and `ts > CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)` compare `ts` with the instant's wall-clock time in the folding zone. Native Exasol compares in the session zone.
+- A projected `CURRENT_TIMESTAMP`, a projected `TIMESTAMP WITH LOCAL TIME ZONE` literal, and on Exasol 8 a projected `LOCALTIMESTAMP` still show the session's own value.
+
+For example, with `DBTIMEZONE` `EUROPE/BERLIN`, no `SESSION_TIME_ZONE`, and `ALTER SESSION SET TIME_ZONE = 'ASIA/TOKYO'`, `SELECT CURRENT_DATE FROM t` at 15:30 UTC returns the Berlin date, one day before the Tokyo date native Exasol returns.
+
+Other differences of the folded values:
+
+- A folded value comes from the clock of the node that plans the statement, read once when the adapter plans it, not from Exasol's statement clock. It differs from a native value of the same statement by the planning time and any clock skew between the nodes.
+- Exasol itself folds an expression over a clock function, such as `CURRENT_DATE - 7`, in the session zone before the adapter sees it. In one query, `CURRENT_DATE - 7` and a bare `CURRENT_DATE` can therefore come from two zones.
+- Every clock function of a statement over one virtual schema folds from one reading. A statement over two virtual schemas can fold two readings.
+
+**Workaround:** set `SESSION_TIME_ZONE` to the zone your sessions use, `ALTER VIRTUAL SCHEMA my_vs SET SESSION_TIME_ZONE = 'ASIA/TOKYO'`. To evaluate the clock functions and the literals in each session's own zone, at the cost of file pruning, exclude them:
+
+```sql
+ALTER VIRTUAL SCHEMA my_vs SET EXCLUDED_CAPABILITIES = 'FN_CURRENT_DATE, FN_CURRENT_TIMESTAMP, FN_LOCALTIMESTAMP, LITERAL_TIMESTAMP_UTC';
+```

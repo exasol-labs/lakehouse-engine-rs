@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::requests_starting;
 use crate::test_support::{PREFIX_CONFIG, STAGED_LOCATION, assert_free_of, catalog, session};
 use lakehouse_catalog::exported_test_support::clock_reading;
 use reqsign_core::Context;
@@ -16,6 +17,12 @@ const SEED_SECRETS: [&str; 3] = ["SEED_ACCESS_KEY", "SEED_SECRET_KEY", "SEED_SES
 const SEED_EXPIRES_AT_MS: u64 = 1_700_000_000_000;
 const MINUTE_MS: u64 = 60_000;
 const OFFERING_CONFIG: &str = r#"{"defaults":{"prefix":"p"},"endpoints":["GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"]}"#;
+
+const LOAD_ADLS_CREDENTIALS: &str = include_str!("testdata/load_credentials_adls.json");
+const ADLS_LOCATION: &str = "abfss://container@account.dfs.core.windows.net/warehouse/ns/staged";
+const ADLS_SAS_KEY: &str = "adls.sas-token.account.dfs.core.windows.net";
+const SEED_SAS: &str = "sv=2022-11-02&sr=c&sp=racwdl&sig=SEED_SAS_SIGNATURE";
+const REFRESHED_SAS_SIGNATURE: &str = "REFRESHED_SAS_PLACEHOLDER";
 
 fn fixture_answer(_: &str) -> (u16, String) {
     (200, LOAD_CREDENTIALS.to_string())
@@ -169,10 +176,8 @@ async fn expired_credentials_renew_whether_or_not_the_catalog_lists_the_credenti
 
 #[tokio::test]
 async fn connection_keys_never_expire_and_are_never_renewed() {
-    let time = Arc::new(AtomicU64::new(0));
-    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"), clock_reading(&time));
+    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"));
 
-    time.store(u64::MAX / 2, Ordering::SeqCst);
     let kept = provide(&source).await.unwrap();
 
     assert_eq!(kept.access_key_id, "KEY");
@@ -306,4 +311,149 @@ async fn debug_shows_no_credential_and_secret_values_lists_only_the_credential_h
         .collect();
     expected.sort();
     assert_eq!(held, expected);
+}
+
+fn sas_seed(expires_at_ms: Option<u64>) -> VendedAdlsSas {
+    VendedAdlsSas {
+        sas: SEED_SAS.into(),
+        expires_at_ms,
+    }
+}
+
+async fn adls_source_at(uri: &str, seed: VendedAdlsSas, time: &Arc<AtomicU64>) -> AdlsCredentials {
+    AdlsCredentials::vended(
+        staged_table(uri, ADLS_LOCATION, false).await,
+        seed,
+        clock_reading(time),
+    )
+    .expect("a seeded source")
+}
+
+/// The `sig` of the SAS the source hands object_store for its next request.
+async fn signature(source: &AdlsCredentials) -> Result<String, String> {
+    let credential = source
+        .get_credential()
+        .await
+        .map_err(|error| error.to_string())?;
+    match &*credential {
+        AzureCredential::SASToken(pairs) => Ok(pairs
+            .iter()
+            .find(|(key, _)| key == "sig")
+            .map(|(_, value)| value.clone())
+            .expect("a SAS with a signature")),
+        other => panic!("expected a SAS, got {other:?}"),
+    }
+}
+
+fn credential_requests(requests: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    requests_starting(
+        requests,
+        "GET /v1/p/namespaces/ns/tables/staged/credentials",
+    )
+}
+
+/// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
+#[tokio::test]
+async fn a_vended_sas_within_five_minutes_of_expiry_is_renewed_and_signs_the_next_request() {
+    let (uri, requests) = catalog(OFFERING_CONFIG, |_| (200, LOAD_ADLS_CREDENTIALS.into())).await;
+    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS - 60 * MINUTE_MS));
+    let source = adls_source_at(&uri, sas_seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
+    time.store(SEED_EXPIRES_AT_MS - 5 * MINUTE_MS - 1, Ordering::SeqCst);
+
+    let early = signature(&source).await.unwrap();
+    time.store(SEED_EXPIRES_AT_MS - 4 * MINUTE_MS, Ordering::SeqCst);
+    let renewed = signature(&source).await.unwrap();
+    let again = signature(&source).await.unwrap();
+
+    assert_eq!(early, "SEED_SAS_SIGNATURE");
+    assert_eq!(renewed, REFRESHED_SAS_SIGNATURE);
+    assert_eq!(again, REFRESHED_SAS_SIGNATURE);
+    assert_eq!(credential_requests(&requests).len(), 1);
+    assert_eq!(
+        source.secret_values(),
+        [format!(
+            "sv=2022-11-02&sr=c&sp=racwdl&sig={REFRESHED_SAS_SIGNATURE}"
+        )]
+    );
+}
+
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
+#[tokio::test]
+async fn credentials_without_an_expiry_are_used_as_vended_and_never_renewed() {
+    let (uri, requests) = catalog(OFFERING_CONFIG, |_| (200, LOAD_ADLS_CREDENTIALS.into())).await;
+    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
+    let s3 = source_at(&uri, seed(None), &time).await;
+    let adls = adls_source_at(&uri, sas_seed(None), &time).await;
+
+    time.store(u64::MAX / 2, Ordering::SeqCst);
+    let s3_kept = provide(&s3).await.unwrap();
+    let adls_kept = signature(&adls).await.unwrap();
+
+    assert_eq!(s3_kept.access_key_id, SEED_SECRETS[0]);
+    assert_eq!(s3_kept.expires_in, None);
+    assert_eq!(adls_kept, "SEED_SAS_SIGNATURE");
+    assert_eq!(credential_requests(&requests), Vec::<String>::new());
+}
+
+/// Scenario: Vended credentials without an expiry are kept, and unreadable ones are refused
+#[tokio::test]
+async fn a_renewal_sas_answer_without_the_hosts_sas_is_refused_naming_the_key() {
+    let keyless =
+        LOAD_ADLS_CREDENTIALS.replace(ADLS_SAS_KEY, "adls.sas-token.other.dfs.core.windows.net");
+    let (uri, _) = catalog(OFFERING_CONFIG, move |_| (200, keyless.clone())).await;
+    let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
+    let source = adls_source_at(&uri, sas_seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
+
+    let refused = signature(&source).await.unwrap_err();
+
+    assert!(
+        refused.contains(&format!(
+            "could not refresh the vended storage credentials of table ns.staged through the \
+             catalog {uri}: loadCredentials of table 'ns.staged' failed: vended credentials were \
+             requested for storage host account.dfs.core.windows.net (table location \
+             {ADLS_LOCATION}), but the catalog returned none"
+        )),
+        "{refused}"
+    );
+    // The label redaction every export error passes cuts the key's host suffix.
+    assert!(refused.contains("no non-empty adls.sas-token"), "{refused}");
+    assert_free_of(&refused, &[REFRESHED_SAS_SIGNATURE, "SEED_SAS_SIGNATURE"]);
+}
+
+#[tokio::test]
+async fn the_connections_account_key_and_sas_are_never_renewed() {
+    let key = "c2VjcmV0LWtleQ==";
+    let account_key = AdlsCredentials::connection(&AdlsCred::AccountKey(key.into())).unwrap();
+    let sas = AdlsCredentials::connection(&AdlsCred::Sas(format!("?{SEED_SAS}"))).unwrap();
+
+    let signing_key = account_key.get_credential().await.unwrap();
+
+    assert!(matches!(&*signing_key, AzureCredential::AccessKey(_)));
+    assert_eq!(signature(&sas).await.unwrap(), "SEED_SAS_SIGNATURE");
+    assert_eq!(account_key.secret_values(), [key]);
+    assert_free_of(
+        &format!("{account_key:?} {sas:?}"),
+        &[key, "SEED_SAS_SIGNATURE"],
+    );
+}
+
+#[test]
+fn a_malformed_connection_account_key_or_sas_is_refused_naming_the_field_but_no_value() {
+    let cases = [
+        (
+            AdlsCred::AccountKey("NOT BASE64 SECRET".into()),
+            "account_key",
+        ),
+        (AdlsCred::Sas("sv=1&NOT_A_PAIR_SECRET".into()), "SAS token"),
+    ];
+
+    for (cred, field) in cases {
+        let refused = AdlsCredentials::connection(&cred).unwrap_err().to_string();
+
+        assert!(
+            refused.starts_with(&format!("the CONNECTION's {field}")),
+            "{refused}"
+        );
+        assert_free_of(&refused, &["SECRET"]);
+    }
 }

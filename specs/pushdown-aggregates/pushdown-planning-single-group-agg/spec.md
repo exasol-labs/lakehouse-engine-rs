@@ -83,7 +83,7 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 
 ### Scenario: A single-group request that does not decompose routes to the qualified wrapper
 
-* *GIVEN* a `pushdown` request marked `aggregationType: single_group` whose select list does not decompose, for example a constant beside an aggregate (`SELECT 'X', COUNT(*)`), `SUM` or `VARIANCE` over a text column, `STDDEV` or `VARIANCE` over an expression, no aggregate outside HAVING (`SELECT 1 ... HAVING COUNT(*) > 0`), or no aggregate at all (`SELECT COUNT(*) FROM (SELECT SUM(col) FROM t)`)
+* *GIVEN* a `pushdown` request marked `aggregationType: single_group` whose select list does not decompose, for example `SUM` or `VARIANCE` over a text column, `STDDEV` or `VARIANCE` over an expression, no aggregate outside HAVING (`SELECT 1 ... HAVING COUNT(*) > 0`), or no aggregate at all (`SELECT COUNT(*) FROM (SELECT SUM(col) FROM t)`). A constant beside an aggregate, such as `SELECT 'X', COUNT(*)` or a folded clock function (`pushdown/pushdown-planning-clock-functions`), decomposes, and the merge renders the constant
 * *WHEN* the adapter plans the request over a non-empty file list
 * *THEN* the adapter SHALL route it to the qualified single-table wrapper, whose own rendered SQL computes the select list and HAVING over the materialized sharded raw scan
 * *AND* the adapter MUST NOT return a bare row scan

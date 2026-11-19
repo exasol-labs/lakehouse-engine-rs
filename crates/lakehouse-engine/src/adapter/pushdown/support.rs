@@ -13,7 +13,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, SqlFragment, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, SqlFragment, conjoin_scan_filters,
+    walk_column_nodes,
 };
 
 use super::RefusedColumn;
@@ -118,8 +119,8 @@ pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
 }
 
 /// A matched top-N carries the same `order_by` in the per-shard blob (a DataFusion
-/// TopK) and the outer merge; both render through [`render_order_by_clause`] so they
-/// agree on direction and NULL placement.
+/// TopK) and the outer merge; both render direction and NULL placement through
+/// `render_ordered`, so they agree.
 fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &Shards<E>,
@@ -680,44 +681,132 @@ impl<'a> ScanTranslator<'a> {
             .ok()
     }
 
-    /// Where the request's WHERE applies, the scan or Exasol (`_decision/045`).
+    /// [`Self::expression`] for an operand the caller renders a computation around, such as an
+    /// aggregate argument.
+    pub(super) fn operand(self, expr: &Json) -> Option<SqlFragment> {
+        self.typing().render_operand(expr).ok()
+    }
+
+    /// `None` declines the join. A condition renders as a filter does, so its string keys stay
+    /// bare columns that the hash join reads.
+    pub(super) fn join_condition(self, condition: &Json) -> Option<String> {
+        self.typing()
+            .render_filter(&compare_binary_bytes(condition.clone(), self.columns))
+            .ok()
+    }
+
+    fn conjunct(self, conjunct: &Json) -> Option<String> {
+        self.typing()
+            .render_conjunct(&compare_binary_bytes(conjunct.clone(), self.columns))
+            .ok()
+    }
+
+    /// Where each conjunct of the request's WHERE applies, the scan or Exasol (`_decision/045`).
+    /// A filter that renders whole keeps its one rendered SQL. Otherwise each top-level conjunct
+    /// renders on its own through [`Self::screen_conjuncts`], so a declined conjunct takes only
+    /// itself out of the scan.
     pub(super) fn split_where(self, filter: Option<&Json>) -> ScanWhere<'_> {
         let Some(raw) = filter else {
             return ScanWhere::Absent;
         };
-        match self
+        if let Ok(sql) = self
             .typing()
             .render_filter(&compare_binary_bytes(raw.clone(), self.columns))
         {
-            Ok(sql) => ScanWhere::Pushed(sql),
-            Err(_) => ScanWhere::Declined(raw),
+            return ScanWhere::Pushed(sql);
         }
+        match self.screen_conjuncts(raw, Json::clone) {
+            (Some(pushed), Some(declined)) => ScanWhere::Split { pushed, declined },
+            _ => ScanWhere::Declined(raw),
+        }
+    }
+
+    /// The one per-conjunct rule: each top-level conjunct of `filter` renders on its own, nested
+    /// `AND` nodes flattened and each `OR` or `NOT` kept whole. Returns the scan filter of the
+    /// conjuncts that render and the `AND` of the raw conjuncts that decline. `scanned` maps a raw
+    /// conjunct to the tree the scan renders, so a declined conjunct keeps its original form.
+    pub(super) fn screen_conjuncts(
+        self,
+        filter: &Json,
+        scanned: impl Fn(&Json) -> Json,
+    ) -> (Option<String>, Option<Json>) {
+        let mut rendered = Vec::new();
+        let mut declined = Vec::new();
+        for conjunct in flatten_conjuncts(filter) {
+            match self.conjunct(&scanned(conjunct)) {
+                Some(sql) => rendered.push(sql),
+                None => declined.push(conjunct.clone()),
+            }
+        }
+        (conjoin_scan_filters(rendered), conjoin(declined))
     }
 }
 
-/// A request's WHERE, as [`ScanTranslator::split_where`] places it.
+/// A request's WHERE, as [`ScanTranslator::split_where`] places it. Each conjunct applies exactly
+/// once, in the scan filter or in the qualified wrapper's `WHERE`.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ScanWhere<'a> {
     Absent,
-    /// The scan applies the rendered filter.
+    /// The scan applies the whole rendered filter.
     Pushed(String),
-    /// The raw tree, which Exasol applies itself.
+    /// The scan applies the rendered conjuncts, and Exasol the raw `AND` of the declined ones.
+    Split {
+        pushed: String,
+        declined: Json,
+    },
+    /// The filter declines and no conjunct renders alone: the raw tree, which Exasol applies
+    /// itself.
     Declined(&'a Json),
 }
 
-impl<'a> ScanWhere<'a> {
+impl ScanWhere<'_> {
+    /// The filter the scan applies.
     pub(super) fn pushed(&self) -> Option<String> {
         match self {
-            Self::Pushed(sql) => Some(sql.clone()),
+            Self::Pushed(sql) | Self::Split { pushed: sql, .. } => Some(sql.clone()),
             Self::Absent | Self::Declined(_) => None,
         }
     }
 
-    pub(super) fn declined(&self) -> Option<&'a Json> {
+    /// The raw filter the qualified wrapper's `WHERE` applies.
+    pub(super) fn declined(&self) -> Option<&Json> {
         match self {
+            Self::Split { declined, .. } => Some(declined),
             Self::Declined(raw) => Some(raw),
             Self::Absent | Self::Pushed(_) => None,
         }
+    }
+}
+
+/// The top-level conjuncts of `filter`, nested `AND` nodes flattened. Each `OR` or `NOT` stays
+/// one conjunct, so an `OR` spanning legs stays withheld from every leg.
+pub(super) fn flatten_conjuncts(filter: &Json) -> Vec<&Json> {
+    let mut conjuncts = Vec::new();
+    push_conjuncts(filter, &mut conjuncts);
+    conjuncts
+}
+
+fn push_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
+    if filter.get("type").and_then(|t| t.as_str()) == Some("predicate_and")
+        && let Some(exprs) = filter.get("expressions").and_then(|e| e.as_array())
+    {
+        for expr in exprs {
+            push_conjuncts(expr, out);
+        }
+        return;
+    }
+    out.push(filter);
+}
+
+/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
+pub(super) fn conjoin(mut kept: Vec<Json>) -> Option<Json> {
+    match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => Some(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": kept,
+        })),
     }
 }
 
@@ -1007,13 +1096,22 @@ impl PushdownRequest {
     }
 
     /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
-    /// copy a broadcast join projects from, beside the types already checked for it.
-    pub fn with_json(&self, json: Json) -> Self {
+    /// copy a broadcast join projects from, beside the types already checked for it. A rewrite can
+    /// turn a sort key constant, such as a folded clock function, so the drop runs again.
+    pub fn with_json(&self, mut json: Json) -> Self {
+        drop_constant_sort_keys(&mut json);
         Self {
             json,
             select_types: self.select_types.clone(),
             output: self.output,
         }
+    }
+
+    /// This request with its WHERE replaced by `filter`, its select list and checked types kept.
+    pub(super) fn with_filter(&self, filter: Json) -> Self {
+        let mut json = self.json.clone();
+        json["filter"] = filter;
+        self.with_json(json)
     }
 }
 
