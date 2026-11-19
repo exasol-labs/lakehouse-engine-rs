@@ -25,6 +25,14 @@ pub(crate) enum TextArgs {
     Pad,
 }
 
+/// A length, count, start, or code argument, which Exasol rounds to an integer (#604).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IntegerArg {
+    pub(crate) position: usize,
+    /// Exasol returns NULL for a negative value, which DataFusion does not.
+    pub(crate) negative_is_null: bool,
+}
+
 /// How a function's result type follows from its arguments' types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResultRule {
@@ -267,6 +275,28 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         // adapter folds them into, so a missed call is refused, never computed per shard.
     ]
 };
+
+impl ScalarFunction {
+    pub(crate) fn integer_args(self) -> &'static [IntegerArg] {
+        const fn arg(position: usize, negative_is_null: bool) -> IntegerArg {
+            IntegerArg {
+                position,
+                negative_is_null,
+            }
+        }
+        const LENGTH: &[IntegerArg] = &[arg(1, true)];
+        const SUBSTR: &[IntegerArg] = &[arg(1, false), arg(2, true)];
+        const COUNT: &[IntegerArg] = &[arg(1, false)];
+        const CODE: &[IntegerArg] = &[arg(0, false)];
+        match self.name {
+            "LPAD" | "RPAD" | "LEFT" | "RIGHT" => LENGTH,
+            "SUBSTR" => SUBSTR,
+            "REPEAT" => COUNT,
+            "CHR" | "UNICODECHR" => CODE,
+            _ => &[],
+        }
+    }
+}
 
 pub(crate) fn scalar_function(name: &str) -> Option<ScalarFunction> {
     SCALAR_FUNCTIONS

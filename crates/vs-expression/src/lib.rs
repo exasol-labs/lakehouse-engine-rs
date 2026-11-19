@@ -18,8 +18,8 @@ use json_value::{Fallback, JsonValueCall, Returning};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
 use scalar_functions::{ExasolForm, scalar_function};
 use scan_typing::{
-    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE, SECOND_NODE, second_fraction,
-    seconds_type, timestamp_digits,
+    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, INTEGER_ARGUMENT_NODE, INTEGER_TEXT_NODE, SECOND_NODE,
+    render_integer_argument, second_fraction, seconds_type, timestamp_digits,
 };
 pub use scan_typing::{ColumnTypeLookup, ScanTyping};
 use timestamp::{TimestampLiteral, TimestampUnit};
@@ -704,7 +704,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             render_cast(args, value("dataType"), dialect)
         }
         // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE | BOOLEAN_NUMBER_NODE | SECOND_NODE
+        INTEGER_TEXT_NODE
+        | BOOLEAN_TEXT_NODE
+        | BOOLEAN_NUMBER_NODE
+        | SECOND_NODE
+        | INTEGER_ARGUMENT_NODE
             if dialect == Dialect::DataFusion =>
         {
             let arg = value("arguments")
@@ -716,6 +720,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(match kind {
                 INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
                 BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
+                INTEGER_ARGUMENT_NODE => render_integer_argument(expr, &inner),
                 SECOND_NODE => {
                     let fraction = second_fraction(expr)
                         .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;

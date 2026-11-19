@@ -59,6 +59,21 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *AND* an `INSTR` or `LOCATE` node with more than two arguments SHALL decline, because `strpos` takes no start position or occurrence
 * *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-functions/vs-expression-translator-concat`, not by this name-mapping table
 
+### Scenario: A string function's numeric argument converts to an integer as Exasol rounds it
+
+* *GIVEN* a `function_scalar` node named `LPAD`, `RPAD`, `REPEAT`, `LEFT`, `RIGHT`, `SUBSTR`, `CHR`, or `UNICODECHR` whose length, count, start, or code argument is not a non-negative integer literal, such as `RPAD(C_VARCHAR, 2 + MOD(ID, 2))` or `SUBSTR(C_VARCHAR, C_DOUBLE)`
+* *WHEN* the typed scan pass renders it in the DataFusion dialect, in a select list, a filter, a GROUP BY key, or an aggregate argument
+* *THEN* the translator SHALL render an integer argument as `CAST(arg AS BIGINT)`, and a DECIMAL with a fraction or a DOUBLE as `CAST(round(arg) AS BIGINT)`, so a value halfway between two integers rounds away from zero and `RPAD('ab', 3.5)` returns 4 characters as native Exasol does
+* *AND* a non-negative integer literal SHALL keep its rendering, because DataFusion reads it as `Int64`
+* *AND* an argument whose type the pass does not know, or a text argument, SHALL decline, so Exasol computes the function
+
+### Scenario: A negative length makes a string function return NULL as Exasol does
+
+* *GIVEN* a pushed `LPAD`, `RPAD`, `LEFT`, or `RIGHT` length, or a `SUBSTR` length, that is negative after rounding
+* *WHEN* the scan computes it
+* *THEN* the function SHALL return NULL, as native Exasol does
+* *AND* the translator SHALL render that length as `CASE WHEN v >= 0 THEN v END` over the converted value `v`, because DataFusion's `left` and `right` count a negative length from the end and its `substr` fails on one
+
 ### Scenario: String scalar functions render verbatim in the Exasol dialect
 
 * *GIVEN* a VS expression node of type `function_scalar` named with one of the string functions listed in the preceding scenario, `CONCAT` excepted
