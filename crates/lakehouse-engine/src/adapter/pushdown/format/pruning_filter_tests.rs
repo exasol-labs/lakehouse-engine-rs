@@ -56,13 +56,16 @@ impl StatisticsTarget for Rendered {
     }
 }
 
-/// `node` lowered over an `int` column `id`, a `long` column `amount`, and a string column `name`.
+/// `node` lowered over an `int` column `id`, a `long` column `amount`, a string column `name`, a
+/// variable-length binary column `blob`, and a fixed-length binary column `hash`.
 fn translate(node: &Json) -> Option<String> {
     let resolve = |column: &str| {
         let data_type = match column.to_uppercase().as_str() {
             "ID" => DataType::Int32,
             "AMOUNT" => DataType::Int64,
             "NAME" => DataType::Utf8,
+            "BLOB" => DataType::Binary,
+            "HASH" => DataType::FixedSizeBinary(4),
             _ => return None,
         };
         Some((column.to_lowercase(), Some(data_type)))
@@ -90,8 +93,8 @@ fn every_leaf_lowers_to_the_predicate_it_implies() {
             compare("predicate_notequal", col("ID"), num_lit(5)),
             "id != 5",
         ),
-        (is_null(col("NAME")), "name IS NULL"),
-        (is_not_null(col("NAME")), "name IS NOT NULL"),
+        (is_null(col("ID")), "id IS NULL"),
+        (is_not_null(col("ID")), "id IS NOT NULL"),
         (
             in_list(col("NAME"), [str_lit("alice"), str_lit("bob")]),
             "name IN (alice, bob)",
@@ -183,5 +186,25 @@ fn not_negates_only_an_exact_translation() {
     ];
     for (node, expected) in cases {
         assert_eq!(translate(&node).as_deref(), expected, "{node}");
+    }
+}
+
+/// Exasol reads an empty string and an empty variable-length binary value as NULL, and a file's
+/// null count leaves both out.
+#[test]
+fn a_null_test_over_a_column_that_can_hold_an_empty_value_also_tests_for_it() {
+    let cases = [
+        (is_null(col("NAME")), "(name IS NULL OR name = )"),
+        (is_not_null(col("NAME")), "(name IS NOT NULL AND name != )"),
+        (
+            not(is_not_null(col("NAME"))),
+            "NOT (name IS NOT NULL AND name != )",
+        ),
+        (is_null(col("BLOB")), "(blob IS NULL OR blob = )"),
+        (is_not_null(col("BLOB")), "(blob IS NOT NULL AND blob != )"),
+        (is_null(col("HASH")), "hash IS NULL"),
+    ];
+    for (node, expected) in cases {
+        assert_eq!(translate(&node).as_deref(), Some(expected), "{node}");
     }
 }

@@ -2446,7 +2446,9 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
     let varchar_leg = shared_names_broadcast_sql(&like(labels_column("SCORE"), "a%"))
         .expect("LIKE on the VARCHAR leg's SCORE resolves its own leg's type and keeps the plan");
     assert!(
-        varchar_leg.contains(r#""filter":"(\"LHS_T1\".\"SCORE\" LIKE ''a%'')""#),
+        varchar_leg.contains(
+            r#""filter":"((\"LHS_T1\".\"SCORE\" LIKE ''a%'') AND (\"LHS_T1\".\"SCORE\" <> ''''))""#
+        ),
         "the filter reads LABELS' own SCORE: {varchar_leg}"
     );
     let integer_leg = shared_names_broadcast_sql(&like(events_column("SCORE"), "1%"))

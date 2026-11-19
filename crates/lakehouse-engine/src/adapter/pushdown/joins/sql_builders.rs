@@ -90,7 +90,7 @@ fn render_broadcast_join_emitting(
             .collect::<Vec<_>>(),
     )?;
     // A declined condition loses broadcast eligibility and takes the N-scan fallback (#587).
-    let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
+    let Some(condition) = scan.join_condition(&condition_tree) else {
         return Ok(None);
     };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());

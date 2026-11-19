@@ -28,10 +28,10 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ### Scenario: IS NULL and IS NOT NULL predicates translate correctly
 
-* *GIVEN* a VS expression node of type `predicate_is_null` or `predicate_is_not_null` with an `expression` child
-* *WHEN* `render_expression` processes the node
-* *THEN* `predicate_is_null` SHALL return `(<inner> IS NULL)`
-* *AND* `predicate_is_not_null` SHALL return `(<inner> IS NOT NULL)`
+* *GIVEN* a `predicate_is_null` or `predicate_is_not_null` node with an `expression` child
+* *WHEN* the adapter renders the node for the scan
+* *THEN* `predicate_is_null` SHALL render `(<inner> IS NULL)`, and `predicate_is_not_null` SHALL render `(<inner> IS NOT NULL)`
+* *AND* over a bare string column, at any position, `predicate_is_null` SHALL render `(("S" IS NULL) OR ("S" = ''))` and `predicate_is_not_null` SHALL render `(("S" IS NOT NULL) AND ("S" <> ''))`, per `pushdown-types/pushdown-planning-scan-empty-string`
 
 ### Scenario: IN constant list translates to SQL IN expression
 

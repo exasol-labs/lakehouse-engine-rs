@@ -3,7 +3,9 @@ use datafusion::common::DFSchema;
 
 pub(super) use crate::exasol::quote_ident;
 use crate::scan::spec::{ColumnRef, ProjectionItem};
-use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{
+    arrow_to_exasol_type, needs_json_fallback, needs_nested_json_rendering,
+};
 
 use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
 use super::binary_text::BINARY_TEXT_UDF_NAME;
@@ -105,6 +107,23 @@ pub(super) fn render_column(column: &ColumnRef, data_type: Option<&DataType>) ->
         }
         Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
         _ => ident,
+    }
+}
+
+/// A sort key of a per-shard top-N, ranked by the value the shard emits, since that is what the
+/// Exasol-side wrapper merges and ranks; ranking anything else can cut a row the wrapper's global
+/// top-`n` needs. Exasol's VARCHAR has no empty string (`''` arrives as NULL), and `emit_batch`
+/// emits `NaN` as NULL (#246).
+pub(super) fn render_sort_target(column: &ColumnRef, data_type: Option<&DataType>) -> String {
+    let emitted = render_column(column, data_type);
+    match data_type {
+        Some(DataType::Float32 | DataType::Float64) => {
+            format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
+        }
+        Some(dt) if arrow_to_exasol_type(dt).is_character() => {
+            format!("nullif({emitted}, '')")
+        }
+        _ => emitted,
     }
 }
 

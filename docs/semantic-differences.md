@@ -29,6 +29,12 @@ The difference also reaches results built on the converted text:
 - `LENGTH(UPPER('ß'))` returns 2 instead of 1.
 - A filter such as `WHERE UPPER(name) = 'STRAßE'` can return different rows.
 
+## REPEAT with a negative count
+
+`REPEAT(s, n)` with a negative `n` returns NULL. Native Exasol fails the query with
+`negative numbers not allowed in function REPEAT`. A count between -0.5 and 0 rounds to 0 and
+returns NULL in both.
+
 ## Dates outside Exasol's DATE range
 
 Iceberg, Delta, and Parquet can store dates outside Exasol's DATE range (0001-01-01 to

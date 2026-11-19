@@ -538,6 +538,94 @@ fn text_conversions_match_native_under_session_settings() {
     assert_cases_match_native(&typed_table(), TYPED_COLUMNS, CASES, ERROR_CASES);
 }
 
+/// A string function's numeric argument as an arithmetic, DECIMAL, and DOUBLE expression, with
+/// halves and negative values, in each position the scan computes it.
+const STRING_ARGUMENT_CASES: &[Case] = &[
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, RPAD(C_VARCHAR, 2 + MOD(ID, 2)), LPAD(C_VARCHAR, ID + 1, '*') FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, REPEAT(C_VARCHAR, 1 + MOD(ID, 3)), LEFT('abcdef', MOD(ID, 4) + 1), RIGHT('abcdef', MOD(ID, 4) + 1) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, SUBSTR('abcdef', 1 + MOD(ID, 2), 1 + MOD(ID, 3)), CHR(64 + ID), UNICODECHR(64 + ID) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, RPAD(C_VARCHAR, C_DECIMAL_A - 8), REPEAT('x', CAST(ID AS DECIMAL(18,0))) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, SUBSTR('abcdefghij', C_DECIMAL_A - 9.5, C_DECIMAL_A - 9), CHR(C_DECIMAL_A + 54.5) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, RPAD(C_VARCHAR, C_DOUBLE + 1), LEFT('abcdef', C_DOUBLE), RIGHT('abcdef', C_DOUBLE) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, REPEAT('ab', C_DOUBLE), SUBSTR('abcdef', C_DOUBLE + 0.5, C_DOUBLE), UNICODECHR(C_DOUBLE + 64.5) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID, RPAD(C_VARCHAR, 2 - ID), LEFT('abcd', 2 - ID), RIGHT('abcd', 1.5 - C_DOUBLE), SUBSTR('abcd', 1, 2 - ID) FROM {T}",
+        path: Has(SCAN_ITEM),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE RPAD(C_VARCHAR, C_DOUBLE + 1, '*') LIKE '%*%'",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE SUBSTR('abcdef', C_DECIMAL_A - 9.5, 1) = 'b'",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT ID FROM {T} WHERE LENGTH(REPEAT('ab', 2 + MOD(ID, 2))) = 6",
+        path: Has(SCAN_FILTER),
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT LEFT(C_VARCHAR, C_DOUBLE), COUNT(*) FROM {T} GROUP BY LEFT(C_VARCHAR, C_DOUBLE)",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT CHR(64 + MOD(ID, 3)), COUNT(*) FROM {T} GROUP BY CHR(64 + MOD(ID, 3))",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT MAX(RPAD(C_VARCHAR, C_DOUBLE)) FROM {T}",
+        path: Split,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT C_QTY, MIN(SUBSTR('abcdef', C_DECIMAL_A - 9.5)) FROM {T} GROUP BY C_QTY",
+        path: Split,
+    },
+];
+
+/// Scenario: A string function's numeric argument converts to an integer as Exasol rounds it
+/// Scenario: A negative length makes a string function return NULL as Exasol does
+#[test]
+fn string_function_numeric_arguments_match_native() {
+    lakehouse_vs();
+    assert_cases_match_native(&typed_table(), TYPED_COLUMNS, STRING_ARGUMENT_CASES, &[]);
+}
+
 /// Native Exasol returns rows for `cases` and raises an error for `error_cases`.
 fn assert_cases_match_native(table: &str, columns: &str, cases: &[Case], error_cases: &[Case]) {
     create_native_copy(&mut exa_conn(), table, columns);
