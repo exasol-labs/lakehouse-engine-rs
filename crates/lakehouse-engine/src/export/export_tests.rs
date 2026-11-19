@@ -247,6 +247,7 @@ fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
             "single_commit": false,
             "allow_http": false,
             "append": false,
+            "partition_by": [],
         })
     );
     let mut appending = first.clone();
@@ -256,6 +257,77 @@ fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
         writer.next().unwrap();
         let read = WriterSpec::read(&writer).expect("the writer accepts it");
         assert_eq!(read.render(), spec.to_string());
+    }
+}
+
+fn export_spec_partitioned_by(partition_by: &str) -> String {
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&export_spec_with_columns(&[r#""T"."ID""#, r#""T"."D""#])).unwrap();
+    spec["parameters"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"key": "PARTITION_BY", "value": partition_by}));
+    spec.to_string()
+}
+
+#[test]
+fn the_hook_renders_partition_by_resolved_against_the_source_columns() {
+    let sql = hook(
+        &mut granted(hook_context()),
+        &export_spec_partitioned_by("day(d), bucket(4, id)"),
+    )
+    .expect("a valid PARTITION_BY");
+
+    assert_eq!(
+        rendered_writer_spec(&sql)["partition_by"],
+        serde_json::json!([
+            {"transform": "day", "column": "D", "name": "D_day"},
+            {"transform": "bucket[4]", "column": "ID", "name": "ID_bucket"},
+        ])
+    );
+}
+
+/// The hook refuses an invalid PARTITION_BY while it plans, before its first catalog call.
+#[test]
+fn the_hook_refuses_an_invalid_partition_by_before_any_catalog_call() {
+    let error = error_text(hook(
+        &mut granted(hook_context()),
+        &export_spec_partitioned_by("bucket(4, X)"),
+    ));
+
+    assert!(
+        error.contains("PARTITION_BY field 'bucket(4, X)' names column X"),
+        "{error}"
+    );
+}
+
+/// Scenario: PARTITION_BY into an existing table is refused
+#[test]
+fn partition_by_is_refused_for_a_table_that_exists() {
+    let fields = vec![partition_by::PartitionField {
+        transform: iceberg::spec::Transform::Identity,
+        column: "ID".into(),
+        name: "ID".into(),
+    }];
+    let cases = [
+        (TableMode::Create, fields.clone(), Ok(false)),
+        (TableMode::Append, vec![], Ok(true)),
+        (
+            TableMode::Append,
+            fields,
+            Err("LAKEHOUSE_EXPORT: table ns.t exists, and PARTITION_BY applies only to a table the \
+                 export creates; remove PARTITION_BY to append to the table"
+                .to_string()),
+        ),
+    ];
+
+    for (mode, partition_by, expected) in cases {
+        let mut spec: WriterSpec = serde_json::from_str(&writer_spec(false)).unwrap();
+        spec.partition_by = partition_by;
+
+        let set = spec.set_mode(mode).map(|()| spec.append);
+
+        assert_eq!(set.map_err(|error| error.to_string()), expected, "{mode:?}");
     }
 }
 
@@ -407,6 +479,7 @@ fn writer_spec(single_commit: bool) -> String {
         "single_commit": single_commit,
         "allow_http": false,
         "append": false,
+        "partition_by": [],
     })
     .to_string()
 }
@@ -469,6 +542,33 @@ fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
         .map(|field| (field.name().as_str(), field.is_nullable()))
         .collect();
     assert_eq!(fields, [("ID", true)]);
+}
+
+/// Scenario: A transform that the column's type does not take fails the export before any data is written
+#[test]
+fn a_new_table_writer_checks_each_partition_field_against_its_column_type() {
+    let partitioned = |transform: &str| {
+        writer_spec(false).replace(
+            r#""partition_by":[]"#,
+            &format!(r#""partition_by":[{{"transform":"{transform}","column":"ID","name":"P"}}]"#),
+        )
+    };
+
+    let plan = writer_plan(&mut group(&partitioned("truncate[10]"), 1, "DECIMAL(18,0)"))
+        .expect("truncate takes a DECIMAL");
+    let error = writer_plan(&mut group(&partitioned("hour"), 1, "DECIMAL(18,0)"))
+        .err()
+        .expect("hour does not take a DECIMAL")
+        .to_string();
+
+    let WriterTable::New { partition_by, .. } = plan.table else {
+        panic!("a spec that does not append creates its table");
+    };
+    assert_eq!(partition_by[0].name, "P");
+    assert!(
+        error.contains("applies hour to column ID of type DECIMAL(18,0)"),
+        "{error}"
+    );
 }
 
 #[test]

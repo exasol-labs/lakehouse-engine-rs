@@ -1,16 +1,17 @@
-//! The Iceberg sink: Arrow batches become Parquet data files under the table location, and one
+//! The Iceberg sink: Arrow batches become Parquet data files under their partition's path, and one
 //! commit tagged with the writer adds them to the table.
 
 use super::batch::TableColumns;
+use super::fanout::{Partition, PartitionBuffer};
 use super::target::ExportSink;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, Schema, SchemaRef};
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, Schema};
 use iceberg::table::Table;
-use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
@@ -21,8 +22,6 @@ use lakehouse_catalog::{error_chain, redact_error_text};
 use lakehouse_catalog_write::{CommitTag, StagedTable, TableWriteSession, WriteTable};
 use parquet::file::properties::WriterProperties;
 use std::sync::{Arc, Mutex, PoisonError};
-
-const TARGET_FILE_SIZE: usize = 128 * 1024 * 1024;
 
 /// The table a writer's files go into: one the catalog lists, created or loaded, or one staged for
 /// `SINGLE_COMMIT`.
@@ -47,14 +46,18 @@ impl OpenedTable {
     }
 }
 
-type DataWriter = DataFileWriter<ParquetWriterBuilder, RecordedLocations, DefaultFileNameGenerator>;
+type DataWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, RecordedLocations, DefaultFileNameGenerator>;
 
 pub(super) struct IcebergSink {
     session: TableWriteSession,
     opened: OpenedTable,
     tag: CommitTag,
     columns: TableColumns,
-    writer: DataWriter,
+    buffer: PartitionBuffer,
+    writers: DataWriterBuilder,
+    /// The data files written so far, which the commit adds.
+    files: Vec<DataFile>,
     locations: RecordedLocations,
     /// Set after a commit whose outcome is unknown, when the table may hold the files.
     files_may_be_committed: bool,
@@ -62,11 +65,13 @@ pub(super) struct IcebergSink {
 
 impl IcebergSink {
     /// The table's current schema carries its field IDs, which the Parquet writer matches columns
-    /// by, and every data file carries the table's default partition spec.
+    /// by, and every data file carries the table's default partition spec. The rows buffered per
+    /// partition stay within `budget` bytes of Arrow memory.
     pub(super) async fn open(
         session: TableWriteSession,
         opened: OpenedTable,
         tag: CommitTag,
+        budget: usize,
     ) -> Result<Self, UdfError> {
         let table = opened.table();
         let unwritable = |error: iceberg::Error| {
@@ -79,7 +84,12 @@ impl IcebergSink {
         let metadata = table.metadata();
         let iceberg_schema = metadata.current_schema().clone();
         let columns = table_columns(table.identifier(), &iceberg_schema).map_err(unwritable)?;
-        let partition = partition_key(metadata.default_partition_spec(), iceberg_schema.clone());
+        let buffer = PartitionBuffer::new(
+            iceberg_schema.clone(),
+            metadata.default_partition_spec(),
+            budget,
+        )
+        .map_err(unwritable)?;
         let locations = RecordedLocations {
             inner: DefaultLocationGenerator::new(table.metadata()).map_err(unwritable)?,
             recorded: Arc::default(),
@@ -89,23 +99,23 @@ impl IcebergSink {
             None,
             DataFileFormat::Parquet,
         );
+        // A write-out is at most the budget, so it rolls over to a second file only when Parquet
+        // encodes the rows larger than Arrow holds them.
         let files = RollingFileWriterBuilder::new(
             ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone()),
-            TARGET_FILE_SIZE,
+            budget,
             table.file_io().clone(),
             locations.clone(),
             names,
         );
-        let writer = DataFileWriterBuilder::new(files)
-            .build(Some(partition))
-            .await
-            .map_err(unwritable)?;
         Ok(Self {
             session,
             opened,
             tag,
             columns,
-            writer,
+            buffer,
+            writers: DataFileWriterBuilder::new(files),
+            files: Vec::new(),
             locations,
             files_may_be_committed: false,
         })
@@ -117,6 +127,16 @@ impl IcebergSink {
             self.opened.table().identifier(),
             error_chain(&error)
         ))
+    }
+
+    /// Writes each of `partitions` into its own data file, one file open at a time.
+    async fn write_out(&mut self, partitions: Vec<Partition>) -> Result<(), UdfError> {
+        for (key, batches) in partitions {
+            let written = write_partition(&self.writers, key, batches).await;
+            self.files
+                .extend(written.map_err(|error| self.storage_error(error))?);
+        }
+        Ok(())
     }
 
     /// `message` without any storage credential the sink's table signs with.
@@ -152,13 +172,20 @@ impl ExportSink for IcebergSink {
     }
 
     async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError> {
-        let written = self.writer.write(batch.clone()).await;
-        written.map_err(|error| self.storage_error(error))
+        let full = self.buffer.push(batch).map_err(|error| {
+            UdfError::User(format!(
+                "could not compute the partition values of table {}: {}",
+                self.opened.table().identifier(),
+                error_chain(&error)
+            ))
+        })?;
+        self.write_out(full).await
     }
 
     async fn finish(&mut self) -> Result<usize, UdfError> {
-        let closed = self.writer.close().await;
-        let files = closed.map_err(|error| self.storage_error(error))?;
+        let rest = self.buffer.drain();
+        self.write_out(rest).await?;
+        let files = std::mem::take(&mut self.files);
         let count = files.len();
         self.commit(files).await?;
         Ok(count)
@@ -192,14 +219,21 @@ pub(super) fn table_columns(table: &TableIdent, schema: &Schema) -> iceberg::Res
     })
 }
 
-/// The partition of every data file: `spec` with a null value per field. The target refuses a
-/// spec with a field other than `void`, whose value is always null.
-fn partition_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
-    let nulls = spec.fields().iter().map(|_| None).collect();
-    PartitionKey::new(spec.clone(), schema, nulls)
+/// One data file of `key`'s rows, or several when Parquet encodes them past the rolling size.
+async fn write_partition(
+    writers: &DataWriterBuilder,
+    key: PartitionKey,
+    batches: Vec<RecordBatch>,
+) -> iceberg::Result<Vec<DataFile>> {
+    let mut writer = writers.build(Some(key)).await?;
+    for batch in batches {
+        writer.write(batch).await?;
+    }
+    writer.close().await
 }
 
-/// The table's default data file locations, each recorded so that `abort` can delete it.
+/// The table's default data file locations under each file's partition path, each recorded so
+/// that `abort` can delete it.
 #[derive(Clone)]
 struct RecordedLocations {
     inner: DefaultLocationGenerator,
@@ -216,9 +250,8 @@ impl RecordedLocations {
 }
 
 impl LocationGenerator for RecordedLocations {
-    /// Every file lies directly under the data location: no data file has a partition value.
-    fn generate_location(&self, _: Option<&PartitionKey>, file_name: &str) -> String {
-        let location = self.inner.generate_location(None, file_name);
+    fn generate_location(&self, partition: Option<&PartitionKey>, file_name: &str) -> String {
+        let location = self.inner.generate_location(partition, file_name);
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
