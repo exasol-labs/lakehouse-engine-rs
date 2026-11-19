@@ -19,7 +19,8 @@ WITH CATALOG_CONNECTION = '<connection>'
      TABLE_NAME = '<namespace>.<table>'
      [WRITERS_PER_NODE = '<n>']
      [SINGLE_COMMIT = '<true|false>']
-     [ALLOW_HTTP = '<true|false>'];
+     [ALLOW_HTTP = '<true|false>']
+     [PARTITION_BY = '<field>, ...'];
 ```
 
 The source is a table, a table with a column list, or a parenthesized query:
@@ -39,6 +40,7 @@ The statement fails before it reads any source row when any of these holds:
 - It carries `TRUNCATE`, `REPLACE`, or `CREATED BY`. The export never truncates or replaces a table.
 - An option is missing, unknown, or outside its accepted form. The error names the option and its accepted form, and for an unknown option lists the accepted ones.
 - It sets `WRITERS_PER_NODE` together with `SINGLE_COMMIT = 'true'`.
+- Its `PARTITION_BY` is not a valid field list for the source (see [Partitioned tables](#partitioned-tables)), or it sets `PARTITION_BY` for a table that exists. The error names `PARTITION_BY` and the field, or the table.
 - Two source columns have the same name, which Exasol refuses with `duplicate column name`, or a column has the name of an Iceberg metadata column, such as `_file` or `_pos`.
 - The CONNECTION is one the export cannot write through (see [The CONNECTION](#the-connection)), or it names a plain HTTP address without `ALLOW_HTTP = 'true'`.
 - The catalog is unreachable or refuses the CONNECTION's credentials. The error names the catalog.
@@ -52,6 +54,7 @@ The statement fails before it reads any source row when any of these holds:
 | `WRITERS_PER_NODE` | no | An integer of at least 1. | `1` |
 | `SINGLE_COMMIT` | no | `true` or `false`, in any letter case. | `false` |
 | `ALLOW_HTTP` | no | `true` or `false`, in any letter case. | `false` |
+| `PARTITION_BY` | no | The partition fields of a table the export creates (see [Partitioned tables](#partitioned-tables)). Refused for a table that exists. | unpartitioned |
 
 Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to the catalog address, the OAuth2 server, the AWS STS endpoint, the CONNECTION's storage endpoint, or a storage endpoint that the catalog vends. Without it, an `http://` address fails the statement with an error that names the CONNECTION field and `ALLOW_HTTP`. A vended `abfs://` table location also needs `ALLOW_HTTP = 'true'`, as it does for a virtual schema, although the export writes it over HTTPS. Without it, the writer fails with an error that names the table and `ALLOW_HTTP`.
 
@@ -59,7 +62,7 @@ Only `ALLOW_HTTP = 'true'` lets the export send a request over plain HTTP: to th
 
 ### A new table
 
-The export creates a format-version 2 Iceberg table at the location the catalog chooses. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. The writers write Parquet data files and each commits its files once, as one snapshot. Every snapshot's summary carries `lakehouse.export-id`, which identifies the statement, and `lakehouse.export-writer`, which identifies the writer.
+The export creates a format-version 2 Iceberg table at the location the catalog chooses, unpartitioned unless `PARTITION_BY` is set. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. The writers write Parquet data files and each commits its files once, as one snapshot. Every snapshot's summary carries `lakehouse.export-id`, which identifies the statement, and `lakehouse.export-writer`, which identifies the writer.
 
 ### Type mapping
 
@@ -99,9 +102,39 @@ Exasol `INTEGER` (`DECIMAL(18,0)`) and `BIGINT` (`DECIMAL(36,0)`) fill an `int` 
 
 A source that lacks a table column, even an optional one, has a column the table lacks, has a column whose type the table column does not accept, or has a name that matches several columns only by letter case fails the export. One error names the table and lists every mismatch, with the Exasol type of each source column and the Iceberg type of each table column. A NULL for a required table column fails the export with an error that names the table and the column.
 
-The export refuses a partitioned table, whose current partition spec has a field with a transform other than `void`, and a table of format version 3 or later. The error names the table and its partition fields or its format version. A table whose partition fields were all dropped is not partitioned.
+The export appends to a partitioned table under its current partition spec (see [Partitioned tables](#partitioned-tables)). It refuses a table of format version 3 or later, with an error that names the table and its format version.
 
 The export also refuses a table that keeps a dropped partition field under the name of a column. Apache Spark leaves this shape when it drops an identity partition field of a format version 1 table, such as `PARTITIONED BY (day)` followed by `DROP PARTITION FIELD day`. The commit library the export uses cannot commit to such a table, so the error names the table and the field before any write.
+
+### Partitioned tables
+
+The export writes each row into the partition that the table's current partition spec assigns to it, both when it appends to a partitioned table and when `PARTITION_BY` makes the table it creates partitioned. Each data file holds the rows of one partition and lies under the partition's path, such as `data/D_day=2024-01-15/`, so a virtual schema prunes the exported files by partition. A row whose partition column is NULL lands in the partition whose value is null, such as `data/D_day=null/`.
+
+`PARTITION_BY` lists the partition fields of a new table in order:
+
+```sql
+EXPORT sales.orders
+INTO SCRIPT LHVS.LAKEHOUSE_EXPORT
+WITH CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
+     TABLE_NAME = 'sales.orders_by_day'
+     PARTITION_BY = 'day(ORDERED_AT), bucket(16, CUSTOMER_ID)';
+```
+
+A field is `<column>` (identity), `bucket(<n>, <column>)`, `truncate(<w>, <column>)`, `year(<column>)`, `month(<column>)`, `day(<column>)`, or `hour(<column>)`. Transform names may be in any letter case, `<n>` and `<w>` are integers of at least 1, and blanks around a name, a number, or a separator are ignored. A column is a name without blanks, `,`, `(`, `)`, or `"`, or a name in double quotes with `""` for a quote. It matches the source column of the same name, or else the one source column whose name differs from it only in letter case. A field is named after its source column: `<column>` for identity, else `<column>_bucket`, `_trunc`, `_year`, `_month`, `_day`, or `_hour`.
+
+Each transform takes these source types:
+
+| Transform | Exasol source types |
+|-----------|---------------------|
+| identity | every type the export writes |
+| `bucket` | `DECIMAL`, `VARCHAR`, `CHAR`, `DATE`, `TIMESTAMP` |
+| `truncate` | `DECIMAL`, `VARCHAR`, `CHAR` |
+| `year`, `month`, `day` | `DATE`, `TIMESTAMP` |
+| `hour` | `TIMESTAMP` |
+
+The statement fails before it reads any source row when `PARTITION_BY` is empty or not a field list, names an unknown transform, has a width below 1, names a column the source lacks or a name that matches several source columns only by letter case, gives two fields the same name, gives a field the name of another source column, or puts two of `year`, `month`, `day`, and `hour` on one column. A transform that does not take its column's type fails the export at the writer, before it creates the table, with an error that names the field, the column, and the column's type. `PARTITION_BY` applies only to a table the export creates: with a table that exists, the statement fails before it reads any row, naming the table.
+
+A writer buffers the rows of each partition in memory, within a budget of half the per-instance memory limit after 200 MB of overhead, at least 64 MiB and at most 512 MiB, or 512 MiB when the limit is unknown. When the buffered rows exceed the budget, the writer writes the partition that buffers the most bytes into a data file. A writer whose rows exceed the budget therefore gives a partition several data files, and a source whose consecutive rows fall into many different partitions gives more and smaller files. Rows reach the writers in turn, not by partition, so every writer can write a file for every partition. Fewer writers, such as `SINGLE_COMMIT = 'true'`, give fewer files.
 
 ## How an export runs
 
@@ -133,6 +166,7 @@ Iceberg REST makes a new table appear with its data through staged table creatio
 - A rerun of a failed export without `SINGLE_COMMIT` appends every row again on top of the commits that stayed. Before a rerun, find the committed snapshots by the failed statement's `lakehouse.export-id` and roll them back with another engine, or export with `SINGLE_COMMIT`.
 - A NULL for a required column and a value outside an `int` or `long` column's range show only in the rows of the writer that reads them. With `SINGLE_COMMIT` the export then leaves the table unchanged. Without it, writers that committed first keep their commits.
 - Parallel writers that append to one table retry conflicting commits up to the table's `commit.retry.num-retries`, and at least 20 times, as often as on a table the export creates. Many writers on one table can still exhaust it: lower `WRITERS_PER_NODE`, or raise the property above 20.
+- Between two attempts of one commit a writer waits the table's `commit.retry.min-wait-ms` (default 100 ms), doubled after each retry up to its `commit.retry.max-wait-ms` (default 60 s), plus up to a tenth more at random.
 - Each writer commits into the schema and partition spec it checked (see [How an export runs](#how-an-export-runs)). Each commit reloads the table first and fails if it was upgraded to format version 3. An upgrade that lands between that reload and the commit, and changes neither the snapshot, the schema, nor the partition spec, is not detected.
 - A failed writer deletes the data files it wrote and did not commit, best effort. The files of a writer that crashed, was killed, or could not delete them remain. When the table exists they lie under the table location, where Iceberg orphan-file removal finds them. After a failed `SINGLE_COMMIT` export into a new table no table exists, so they need a cleanup in storage, under the location the catalog chose for the table.
 - A writer whose commit outcome is unknown keeps its data files, because the table may hold them.

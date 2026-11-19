@@ -12,8 +12,8 @@ use crate::common::e2e_harness::{
 use crate::common::export_append_fixtures::{
     APPENDABLE_COLUMNS, APPENDABLE_ROWS, APPENDABLE_TEXT, APPENDABLE_V1, APPENDABLE_V1_SPEC,
     APPENDABLE_V1_SPEC_ID, APPENDABLE_V2, APPENDABLE_V2_SPEC, APPENDABLE_V2_SPEC_ID, NAMESPACE,
-    ODD_TYPES, ODD_TYPES_COLUMNS, PARTITIONED, PARTITIONED_COLUMNS, PARTITIONED_SPEC,
-    V1_VOID_COLUMN, V1_VOID_COLUMN_COLUMNS, V1_VOID_COLUMN_SPEC, V3, V3_COLUMNS,
+    ODD_TYPES, ODD_TYPES_COLUMNS, V1_VOID_COLUMN, V1_VOID_COLUMN_COLUMNS, V1_VOID_COLUMN_SPEC, V3,
+    V3_COLUMNS,
 };
 use crate::common::table_state::{
     WAREHOUSE_BUCKET, assert_one_new_export, iceberg_columns, local_table_metadata, objects_under,
@@ -232,7 +232,7 @@ fn export_appends_into_spark_tables() {
 }
 
 /// Scenario: Every column mismatch fails the export in one error before any data is written
-/// Scenario: A partitioned or format-version 3 table is refused before any data is written
+/// Scenario: A format-version 3 table is refused before any data is written
 /// Scenario: A void partition field named like a column is refused before any data is written
 #[test]
 fn export_refuses_appends_the_table_cannot_take() {
@@ -275,17 +275,6 @@ fn export_refuses_appends_the_table_cannot_take() {
                 "export column RATIO (DOUBLE) cannot fill table column ratio (float)",
             ),
             Some((2, &[][..], &ODD_TYPES_COLUMNS[..])),
-        ),
-        (
-            "a partitioned table",
-            (NAMESPACE, PARTITIONED),
-            "(SELECT CAST(2 AS DECIMAL(18,0)) AS ID, DATE '2024-01-16' AS \"DAY\" FROM DUAL)",
-            format!(
-                "table {} is partitioned by day (identity); the export appends only to \
-                 unpartitioned tables",
-                qualified(PARTITIONED)
-            ),
-            Some((2, PARTITIONED_SPEC, &PARTITIONED_COLUMNS[..])),
         ),
         (
             "a format version 3 table",

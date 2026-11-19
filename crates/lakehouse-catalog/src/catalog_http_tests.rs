@@ -232,14 +232,35 @@ async fn close_after_request(mut stream: TcpStream) {
     read_request(&mut stream).await;
 }
 
-/// A listener whose full accept queue makes Linux and macOS drop every further SYN; the returned
-/// values hold it full. Backlog 1, because macOS reads 0 as `kern.ipc.somaxconn` (128).
-async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
+/// A loopback address whose connects never complete while the returned value lives. macOS drops a
+/// SYN to a bound port that does not listen but resets one to a full accept queue; Linux refuses
+/// the first and drops the second.
+async fn silent_address() -> (SocketAddr, Box<dyn std::any::Any>) {
+    let unlistened = bound_loopback_socket();
+    let address = unlistened.local_addr().expect("local_addr");
+    match tokio::time::timeout(ms(100), TcpStream::connect(address)).await {
+        Err(_) => return (address, Box::new(unlistened)),
+        Ok(Ok(_)) => panic!("a connect to a bound port that does not listen completed"),
+        Ok(Err(_refused)) => {}
+    }
+    let (address, listener, queued) = spawn_full_backlog_listener().await;
+    (address, Box::new((listener, queued)))
+}
+
+fn bound_loopback_socket() -> tokio::net::TcpSocket {
     let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
     socket
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("bind a loopback port");
-    let listener = socket.listen(1).expect("listen with a backlog of 1");
+    socket
+}
+
+/// A listener whose full accept queue makes Linux drop every further SYN; the returned values hold
+/// it full.
+async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
+    let listener = bound_loopback_socket()
+        .listen(1)
+        .expect("listen with a backlog of 1");
     let address = listener.local_addr().expect("local_addr");
     let mut queued = Vec::new();
     while queued.len() < 64 {
@@ -616,7 +637,7 @@ async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
 /// Scenario: A catalog that stays silent fails the request within 30 seconds
 #[tokio::test]
 async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
-    let (address, _listener, _queued) = spawn_full_backlog_listener().await;
+    let (address, _silent) = silent_address().await;
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
 

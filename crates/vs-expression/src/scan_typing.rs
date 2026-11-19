@@ -13,7 +13,7 @@ use crate::exasol_type::{
 };
 use crate::json_value::{JsonValueCall, returning_type};
 use crate::scalar_functions::{
-    DateResult, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
+    DateResult, IntegerArg, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
 use crate::timestamp::{TimestampLiteral, TimestampUnit};
 use crate::version::ExasolVersion;
@@ -207,9 +207,18 @@ pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
 /// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
 /// (apache/datafusion#16797).
 pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
+/// Synthetic node: a string function's numeric argument as the `Int64` DataFusion requires,
+/// rounded as Exasol rounds it.
+pub(crate) const INTEGER_ARGUMENT_NODE: &str = "scan_integer_argument";
+const ROUND: &str = "scanRound";
+const NEGATIVE_IS_NULL: &str = "scanNegativeIsNull";
 /// Synthetic node: the seconds of its argument with `fraction` fractional digits, which only this
 /// pass knows.
 pub(crate) const SECOND_NODE: &str = "scan_second";
+
+/// Synthetic node: its text argument with an empty string read as NULL, because Exasol has no
+/// empty string and DataFusion keeps one as a value (#203).
+pub(crate) const EMPTY_AS_NULL_NODE: &str = "scan_empty_as_null";
 
 /// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
 pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
@@ -325,6 +334,53 @@ fn to_text(node: Json, ty: Inferred) -> Result<Json, UdfError> {
             "converting {} to text depends on the session's NLS settings",
             short(&node)
         )))
+    }
+}
+
+/// `node` at an [`IntegerArg`] position. A non-negative integer literal is already `Int64`.
+fn to_integer_argument(
+    node: Json,
+    ty: Inferred,
+    arg: IntegerArg,
+    function: &str,
+) -> Result<Json, UdfError> {
+    let literal = kind(&node) == "literal_exactnumeric"
+        && match &node["value"] {
+            Json::Number(n) => n.is_u64(),
+            Json::String(s) => s.parse::<i64>().is_ok_and(|v| v >= 0),
+            _ => false,
+        };
+    if literal {
+        return Ok(node);
+    }
+    let round = if ty.is_integer() {
+        false
+    } else if ty.is_numeric() {
+        true
+    } else {
+        return Err(decline(format!(
+            "{function} needs a number of known type for {}",
+            short(&node)
+        )));
+    };
+    let mut out = wrap(INTEGER_ARGUMENT_NODE, node);
+    out[ROUND] = round.into();
+    out[NEGATIVE_IS_NULL] = arg.negative_is_null.into();
+    Ok(out)
+}
+
+/// The DataFusion SQL of an [`INTEGER_ARGUMENT_NODE`] over its rendered argument.
+pub(crate) fn render_integer_argument(node: &Json, inner: &str) -> String {
+    let flag = |field: &str| node.get(field).and_then(Json::as_bool).unwrap_or(false);
+    let value = if flag(ROUND) {
+        format!("CAST(round({inner}) AS BIGINT)")
+    } else {
+        format!("CAST({inner} AS BIGINT)")
+    };
+    if flag(NEGATIVE_IS_NULL) {
+        format!("(CASE WHEN {value} >= 0 THEN {value} END)")
+    } else {
+        value
     }
 }
 
@@ -494,7 +550,7 @@ impl<'a> ScanTyping<'a> {
     /// which refuses a text operand that Exasol rejects and DataFusion cannot combine.
     pub fn render_conjunct(self, conjunct: &Json) -> Result<String, UdfError> {
         refuse_implicit_text(conjunct, &[self.infer_type(conjunct)])?;
-        Ok(self.render_expression(conjunct)?.sql)
+        self.render_filter_root(conjunct)
     }
 
     /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent
@@ -512,12 +568,29 @@ impl<'a> ScanTyping<'a> {
     /// Rewrites `node` for the DataFusion dialect and derives its type, post-order. Text passes only
     /// where Exasol takes text; elsewhere Exasol converts it by the session's NLS settings.
     pub(crate) fn type_scan_tree(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+        self.type_at(node, Position::Value)
+    }
+
+    /// [`Self::type_scan_tree`] for the root of a filter or of a join condition.
+    pub(crate) fn type_scan_filter(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+        self.type_at(node, Position::Filter)
+    }
+
+    fn type_at(self, node: &Json, position: Position) -> Result<(Json, Inferred), UdfError> {
         if let Some(ty) = leaf_type(node, self.columns) {
             return Ok((node.clone(), ty));
         }
         let mut out = node.clone();
+        let bare = self.bare_form(node, position);
+        let child_position = match kind(node) {
+            "predicate_and" | "predicate_or" => position,
+            _ => Position::Value,
+        };
         let children = ChildTypes::collect(node, |field, index, child| {
-            let (rewritten, ty) = self.type_scan_tree(child)?;
+            let (mut rewritten, ty) = self.type_at(child, child_position)?;
+            if bare.is_none() {
+                rewritten = empty_as_null(child, rewritten, ty);
+            }
             match index {
                 Some(i) => out[field][i] = rewritten,
                 None => out[field] = rewritten,
@@ -526,7 +599,68 @@ impl<'a> ScanTyping<'a> {
         })?;
         let ty = self.node_type(node, &children);
         self.rewrite_for_scan(node, &mut out, &children, ty)?;
+        if let Some(bare) = bare {
+            bare.apply(&mut out);
+        }
         Ok((out, ty))
+    }
+
+    /// The form of `node` that keeps its string columns bare, so statistics still prune it.
+    fn bare_form(self, node: &Json, position: Position) -> Option<BareForm> {
+        let text_column = |operand: &Json| {
+            kind(operand) == "column"
+                && leaf_type(operand, self.columns).is_some_and(Inferred::is_text)
+        };
+        let literal = |operand: &Json| matches!(kind(operand), "literal_string" | "literal_null");
+        let subject = || {
+            node.get("expression")
+                .filter(|subject| text_column(subject))
+        };
+        let op = kind(node);
+        match op {
+            "predicate_is_null" => return subject().cloned().map(BareForm::OrEmpty),
+            "predicate_is_not_null" => return subject().cloned().map(BareForm::Guarded),
+            _ if position == Position::Value => return None,
+            _ => {}
+        }
+        match op {
+            "predicate_in_constlist" => {
+                let values = node.get("arguments")?.as_array()?;
+                (subject().is_some() && values.iter().all(literal)).then_some(BareForm::Unguarded)
+            }
+            "predicate_between" => {
+                (subject().is_some() && literal(node.get("left")?) && literal(node.get("right")?))
+                    .then_some(BareForm::Unguarded)
+            }
+            "predicate_like" => subject()
+                .filter(|_| node.get("pattern").is_some_and(literal))
+                .map(|column| BareForm::Guarded(column.clone())),
+            "predicate_equal"
+            | "predicate_notequal"
+            | "predicate_less"
+            | "predicate_lessequal"
+            | "predicate_greater"
+            | "predicate_greaterequal" => {
+                let (left, right) = (node.get("left")?, node.get("right")?);
+                let (column, op) = if text_column(left) && literal(right) {
+                    (left, op)
+                } else if literal(left) && text_column(right) {
+                    (right, mirrored(op))
+                } else if op == "predicate_equal" && text_column(left) && text_column(right) {
+                    // Equal columns are both empty or neither, so one guard covers both.
+                    return Some(BareForm::Guarded(left.clone()));
+                } else {
+                    return None;
+                };
+                Some(match op {
+                    "predicate_notequal" | "predicate_less" | "predicate_lessequal" => {
+                        BareForm::Guarded(column.clone())
+                    }
+                    _ => BareForm::Unguarded,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Exasol's type of a non-column `node` whose children are typed.
@@ -656,6 +790,52 @@ impl<'a> ScanTyping<'a> {
     }
 }
 
+/// Where a node sits. Under the root of a filter or of a join condition, reached through `AND` and
+/// `OR` only, a FALSE result drops a row exactly as a NULL one does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+    Filter,
+    Value,
+}
+
+/// `typed`, the rewrite of the operand `node`, with a string column's empty strings read as NULL.
+pub(crate) fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
+    if kind(node) == "column" && ty.is_text() {
+        wrap(EMPTY_AS_NULL_NODE, typed)
+    } else {
+        typed
+    }
+}
+
+/// A predicate over bare string columns that reads an empty string as NULL without wrapping the
+/// column, which statistics pruning could not read through.
+enum BareForm {
+    /// A predicate that is never TRUE for an empty string.
+    Unguarded,
+    /// A predicate that could be TRUE for an empty string, so it adds that the column is not one.
+    Guarded(Json),
+    /// `IS NULL`, which also holds for an empty string.
+    OrEmpty(Json),
+}
+
+impl BareForm {
+    fn apply(self, out: &mut Json) {
+        let (junction, comparison, column) = match self {
+            Self::Unguarded => return,
+            Self::Guarded(column) => ("predicate_and", "predicate_notequal", column),
+            Self::OrEmpty(column) => ("predicate_or", "predicate_equal", column),
+        };
+        *out = serde_json::json!({
+            "type": junction,
+            "expressions": [out.take(), {
+                "type": comparison,
+                "left": column,
+                "right": {"type": "literal_string", "value": ""},
+            }],
+        });
+    }
+}
+
 fn leaf_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<Inferred> {
     if !node.is_object() {
         Some(Inferred::Unknown)
@@ -782,6 +962,17 @@ fn rewrite_scalar_function(
     for &i in &text_positions {
         out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
     }
+    let integer_positions: Vec<usize> = function
+        .integer_args()
+        .iter()
+        .filter(|arg| arg.position < args.len())
+        .map(|&arg| {
+            let i = arg.position;
+            out["arguments"][i] =
+                to_integer_argument(out["arguments"][i].take(), args[i], arg, function.name)?;
+            Ok(i)
+        })
+        .collect::<Result<_, UdfError>>()?;
     if function.result == ResultRule::Unified {
         return unify_branches(node, out, "arguments", args, ty);
     }
@@ -797,7 +988,11 @@ fn rewrite_scalar_function(
         let converted: Vec<Inferred> = args
             .iter()
             .enumerate()
-            .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
+            .filter(|(i, _)| {
+                !text_positions.contains(i)
+                    && !integer_positions.contains(i)
+                    && !function.parameters.contains(i)
+            })
             .map(|(_, ty)| *ty)
             .collect();
         refuse_implicit_text(node, &converted)?;
@@ -814,6 +1009,7 @@ fn rewrite_scalar_function(
         ResultRule::Truncated if args.get(1) == Some(&DATE) => {
             *out = cast_node(ExasolType::Date, out.take());
         }
+        ResultRule::Text => *out = wrap(EMPTY_AS_NULL_NODE, out.take()),
         _ => {}
     }
     Ok(())

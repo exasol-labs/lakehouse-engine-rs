@@ -475,14 +475,16 @@ fn write_binary_parquet(dir: &std::path::Path) -> String {
         .to_string()
 }
 
-fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
+/// A scan of `ID` under `filter` over one local file whose columns are `fields`, as
+/// (name, Arrow type tag) pairs.
+fn id_scan_spec(file_url: &str, filter: &str, fields: &[(&str, &str)]) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    let field = |name: &str, arrow_type: &str| LogicalField {
+    let field = |(name, arrow_type): &(&str, &str)| LogicalField {
         field_id: None,
-        name: name.into(),
-        arrow_type: arrow_type.into(),
+        name: (*name).into(),
+        arrow_type: (*arrow_type).into(),
         nullable: true,
         initial_default: None,
         nested: None,
@@ -491,17 +493,26 @@ fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
     CommonScanSpec {
         projection: vec![ProjectionItem::Column("ID".into())],
         filter: Some(filter.into()),
-        logical_schema: vec![
-            field("id", "int64"),
-            field("b", "binary"),
-            field("f", "fixed_size_binary(2)"),
-        ],
+        logical_schema: fields.iter().map(field).collect(),
         ..Default::default()
     }
     .with_files(vec![FileEntry::new(file_url.to_string(), size)])
 }
 
-async fn run_binary_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) {
+fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
+    id_scan_spec(
+        file_url,
+        filter,
+        &[
+            ("id", "int64"),
+            ("b", "binary"),
+            ("f", "fixed_size_binary(2)"),
+        ],
+    )
+}
+
+/// The sorted `ID`s a scan returns, with its executed plan.
+async fn run_id_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) {
     let ctx = scan_session_context(session_config_for_spec(spec), Arc::default());
     ctx.runtime_env().register_object_store(
         &url::Url::parse("file://").expect("file scheme"),
@@ -514,13 +525,13 @@ async fn run_binary_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) 
         &scan_fixture::resolved_storage(spec),
     )
     .await
-    .expect("register the binary table");
+    .expect("register the table");
     let plan = build_raw_scan_physical_plan(&ctx, spec)
         .await
         .expect("build physical plan");
     let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
         .await
-        .expect("collect the binary scan");
+        .expect("collect the scan");
     let mut ids: Vec<i64> = batches
         .iter()
         .flat_map(|batch| {
@@ -554,12 +565,84 @@ async fn a_hex_literal_comparison_on_a_binary_column_prunes_row_groups_by_statis
         ),
     ];
     for (filter, expected) in cases {
-        let (ids, plan) = run_binary_scan(&binary_spec(&file_url, filter)).await;
+        let (ids, plan) = run_id_scan(&binary_spec(&file_url, filter)).await;
         assert_eq!(ids, expected, "{filter} must select exactly its rows");
         assert_eq!(
             sum_pruned(plan.as_ref(), "row_groups_pruned_statistics"),
             Some(3),
             "{filter} must prune the three row groups whose byte statistics exclude it"
+        );
+    }
+}
+
+/// Each row group holds 100 ids whose `s` values share the group's letter, so the string
+/// statistics of the row groups do not overlap. Only the first row group holds an empty string
+/// (id 0) and a NULL (id 1).
+fn write_string_parquet(dir: &std::path::Path) -> String {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, true),
+    ]));
+    let path = dir.join("string.parquet");
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(100))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
+    let ids: Vec<i64> = (0..400).collect();
+    let values: Vec<Option<String>> = ids
+        .iter()
+        .map(|id| match id {
+            0 => Some(String::new()),
+            1 => None,
+            id => Some(format!(
+                "{}{:03}",
+                ["a", "b", "c", "d"][(id / 100) as usize],
+                id % 100
+            )),
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(values)),
+        ],
+    )
+    .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("file path must be absolute")
+        .to_string()
+}
+
+/// The filters are the text the adapter renders over a bare string column
+/// (`pushdown-types/pushdown-planning-scan-empty-string`).
+/// Scenario: A guarded string filter still skips row groups
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_string_filter_skips_row_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file_url = write_string_parquet(tmp.path());
+
+    let cases: [(&str, Vec<i64>); 5] = [
+        (r#"("S" = 'c050')"#, vec![250]),
+        (r#"("S" IN ('b007', 'b008'))"#, vec![107, 108]),
+        (r#"(("S" < 'a004') AND ("S" <> ''))"#, vec![2, 3]),
+        (
+            r#"(("S" LIKE 'd09%') AND ("S" <> ''))"#,
+            (390..400).collect(),
+        ),
+        (r#"(("S" IS NULL) OR ("S" = ''))"#, vec![0, 1]),
+    ];
+    for (filter, expected) in cases {
+        let spec = id_scan_spec(&file_url, filter, &[("id", "int64"), ("s", "utf8")]);
+        let (ids, plan) = run_id_scan(&spec).await;
+        assert_eq!(ids, expected, "{filter} must select exactly its rows");
+        assert_eq!(
+            sum_pruned(plan.as_ref(), "row_groups_pruned_statistics"),
+            Some(3),
+            "{filter} must prune the three row groups whose string statistics exclude it"
         );
     }
 }

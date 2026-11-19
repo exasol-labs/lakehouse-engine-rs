@@ -4,13 +4,14 @@
 
 use crate::adls_storage::adls_file_io;
 use crate::retry::{
-    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, append_retries, commit_retries,
+    DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, Waits, append_retries,
+    commit_retries,
 };
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
 use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata};
+use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -259,16 +260,18 @@ impl TableWriteSession {
         self.open(table, answer)
     }
 
-    /// Creates the table as format version 2, tagged with the export's ID. When another writer of
-    /// the same export created it first, also after an unknown outcome of this request, the
-    /// writer gets that table; a table of anything else is refused.
+    /// Creates the table as format version 2 with `partition_spec`, tagged with the export's ID.
+    /// When another writer of the same export created it first, also after an unknown outcome of
+    /// this request, the writer gets that table; a table of anything else is refused.
     pub async fn create_table(
         &self,
         table: &TableIdent,
         schema: Schema,
+        partition_spec: Option<UnboundPartitionSpec>,
         export_id: &str,
     ) -> Result<WriteTable, UdfError> {
-        let body = encoded(table, &creation_request(table, schema, export_id))?;
+        let request = creation_request(table, schema, partition_spec, export_id);
+        let body = encoded(table, &request)?;
         let mut retries = Retries::new(DEFAULT_RETRIES);
         loop {
             let cause = match self
@@ -302,9 +305,10 @@ impl TableWriteSession {
         &self,
         table: &TableIdent,
         schema: Schema,
+        partition_spec: Option<UnboundPartitionSpec>,
         export_id: &str,
     ) -> Result<StagedTable, UdfError> {
-        let mut request = creation_request(table, schema, export_id);
+        let mut request = creation_request(table, schema, partition_spec, export_id);
         request.stage_create = Some(true);
         let body = encoded(table, &request)?;
         let answer = match self
@@ -385,7 +389,10 @@ impl TableWriteSession {
         // The rebuilt table keeps `written`'s FileIO, so the reload's own credentials sign nothing.
         let mut base = rebuilt(&written.table, reloaded)
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(append_retries(base.metadata().properties()));
+        let mut retries = Retries::with_waits(
+            append_retries(base.metadata().properties()),
+            Waits::of_table(base.metadata().properties()),
+        );
         let mut last_outcome_unknown = false;
         loop {
             let captured = capture_fast_append(&base, files.clone(), tag.summary())
@@ -436,7 +443,10 @@ impl TableWriteSession {
         let body = staged_commit(table, files, tag)
             .await
             .map_err(|error| CommitError::new(ident, error, false))?;
-        let mut retries = Retries::new(commit_retries(table.metadata().properties()));
+        let mut retries = Retries::with_waits(
+            commit_retries(table.metadata().properties()),
+            Waits::of_table(table.metadata().properties()),
+        );
         loop {
             let failure = match self.send_commit(ident, &body).await? {
                 CommitAttempt::Committed => return Ok(()),
@@ -800,7 +810,12 @@ fn classify(status: u16) -> Outcome {
     }
 }
 
-fn creation_request(table: &TableIdent, schema: Schema, export_id: &str) -> CreateTableRequest {
+fn creation_request(
+    table: &TableIdent,
+    schema: Schema,
+    partition_spec: Option<UnboundPartitionSpec>,
+    export_id: &str,
+) -> CreateTableRequest {
     let properties = HashMap::from([
         ("format-version".to_string(), "2".to_string()),
         (NUM_RETRIES_PROPERTY.to_string(), EXPORT_RETRIES.to_string()),
@@ -810,7 +825,7 @@ fn creation_request(table: &TableIdent, schema: Schema, export_id: &str) -> Crea
         name: table.name.clone(),
         location: None,
         schema,
-        partition_spec: None,
+        partition_spec,
         write_order: None,
         stage_create: None,
         properties,

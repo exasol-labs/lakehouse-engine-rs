@@ -2,9 +2,11 @@
 //! calls the same script as the writer. No log event, script output, or CONNECTION value.
 
 mod batch;
+mod fanout;
 mod iceberg_rest;
 mod iceberg_sink;
 mod options;
+mod partition_by;
 mod target;
 
 use crate::exasol::{group_count, quote_ident, sql_string_literal};
@@ -17,6 +19,7 @@ use exasol_udf_sdk::value::ColumnInfo;
 use iceberg::metadata_columns::is_metadata_column_name;
 use lakehouse_catalog_write::CommitTag;
 use options::{ExportOptions, WriterLayout, check_table_name};
+use partition_by::{PARTITION_BY, PartitionField};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
@@ -35,7 +38,7 @@ pub fn generate_export_sql(ctx: &mut dyn UdfContext, json: &str) -> Result<Strin
         select,
     } = plan_export(ctx, json)?;
     let target = iceberg_rest::target(connection, &spec.table)?;
-    spec.append = export_runtime()?.block_on(target.prepare())? == TableMode::Append;
+    spec.set_mode(export_runtime()?.block_on(target.prepare())?)?;
     Ok(select.render(&spec.render()))
 }
 
@@ -54,7 +57,8 @@ pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
         export_id: plan.spec.export_id.clone(),
         writer_id: new_writer_id(),
     };
-    let mut sink = runtime.block_on(plan.table.open(target.as_ref(), &tag))?;
+    let budget = fanout::buffer_budget(ctx.memory_limit());
+    let mut sink = runtime.block_on(plan.table.open(target.as_ref(), &tag, budget))?;
     write_rows(ctx, &runtime, sink.as_mut(), &plan.source)
 }
 
@@ -70,6 +74,10 @@ fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfEr
     let spec = ExportSpec::from_json(json)?;
     let options = ExportOptions::from_spec(&spec)?;
     let columns = column_names(&spec.source_column_names)?;
+    let partition_by = match &options.partition_by {
+        Some(value) => partition_by::parse(value, &columns)?,
+        None => Vec::new(),
+    };
     let connection = read_connection(ctx, &options.connection_name, options.allow_http)?;
     let writer_spec = WriterSpec {
         connection: options.connection_name,
@@ -79,6 +87,7 @@ fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfEr
         single_commit: options.writers == WriterLayout::SingleCommit,
         allow_http: options.allow_http,
         append: false,
+        partition_by,
     };
     let select = WriterSelect {
         script_schema: ctx.script_schema(),
@@ -102,9 +111,14 @@ struct WriterPlan {
     table: WriterTable,
 }
 
-/// The table a writer opens: a new one of the source's schema, or the one the hook found.
+/// The table a writer opens: a new one of the source's schema and partition fields, or the one
+/// the hook found.
 enum WriterTable {
-    New { schema: Schema, single_commit: bool },
+    New {
+        schema: Schema,
+        partition_by: Vec<PartitionField>,
+        single_commit: bool,
+    },
     Existing,
 }
 
@@ -113,13 +127,19 @@ impl WriterTable {
         &self,
         target: &dyn ExportTarget,
         tag: &CommitTag,
+        budget: usize,
     ) -> Result<Box<dyn ExportSink>, UdfError> {
         match self {
             Self::New {
                 schema,
+                partition_by,
                 single_commit,
-            } => target.open_new_table(schema, tag, *single_commit).await,
-            Self::Existing => target.open_existing_table(tag).await,
+            } => {
+                target
+                    .open_new_table(schema, partition_by, tag, *single_commit, budget)
+                    .await
+            }
+            Self::Existing => target.open_existing_table(tag, budget).await,
         }
     }
 }
@@ -135,8 +155,11 @@ fn plan_writer(ctx: &dyn UdfContext) -> Result<WriterPlan, UdfError> {
     let table = if spec.append {
         WriterTable::Existing
     } else {
+        let schema = arrow_schema(&source.names, &source.columns)?;
+        partition_by::check_types(&spec.partition_by, &source)?;
         WriterTable::New {
-            schema: arrow_schema(&source.names, &source.columns)?,
+            schema,
+            partition_by: spec.partition_by.clone(),
             single_commit: spec.single_commit,
         }
     };
@@ -163,6 +186,8 @@ struct WriterSpec {
     allow_http: bool,
     /// Whether the table existed when the hook checked it, so the writers append to it.
     append: bool,
+    /// The partition fields of a table the writers create, empty for an unpartitioned one.
+    partition_by: Vec<PartitionField>,
 }
 
 impl WriterSpec {
@@ -175,8 +200,22 @@ impl WriterSpec {
             "single_commit": self.single_commit,
             "allow_http": self.allow_http,
             "append": self.append,
+            "partition_by": self.partition_by,
         })
         .to_string()
+    }
+
+    /// Records whether the writers append, refusing `PARTITION_BY` for a table that exists.
+    fn set_mode(&mut self, mode: TableMode) -> Result<(), UdfError> {
+        self.append = mode == TableMode::Append;
+        if self.append && !self.partition_by.is_empty() {
+            return Err(refusal(format_args!(
+                "table {} exists, and {PARTITION_BY} applies only to a table the export creates; \
+                 remove {PARTITION_BY} to append to the table",
+                self.table
+            )));
+        }
+        Ok(())
     }
 
     fn read(ctx: &dyn UdfContext) -> Result<Self, UdfError> {

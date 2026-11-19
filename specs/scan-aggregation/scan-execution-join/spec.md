@@ -11,11 +11,6 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * Statistics pruning ignores an IN-list longer than the table's Parquet `max_in_list_size`, which DataFusion defaults to 20. Every scan table sets it to the hash join's IN-list pushdown limit, so the whole pushed key set prunes.
 * Storage keys and secrets never appear in an error message.
 * Each side reads its files through its own storage credential, because a catalog can downscope a vended credential to the table it loaded. The fact side's storage value is the whole-spec `storage`. The dimension side's is in the join block. Each is a reference or a sealed envelope (`storage-access/scan-spec-credential-reference`), and both sides share one virtual schema and one CONNECTION.
-* DataFusion keys its object-store registry on `scheme://host[:port]` and cannot see a path, so one bucket holds one registered store. A routing `ObjectStore` decorator is registered once per bucket and holds one inner store per side. It selects the side that owns a requested `object_store::Path`, and it is used on every spec with a join block, including when both credentials are identical.
-* Routing matches a side's own data-file and delete-file paths first and its table root by longest prefix second, because the Iceberg spec allows a table's files outside its `location` (Appendix E, Version 4: "Absolute paths must be used for files that do not share a common prefix with the table location"). The Iceberg REST `StorageCredential.prefix` follows the same longest-prefix rule.
-* Every path the scan requests for a side is one that side's spec names, or a prefix under its table root. That covers range reads of Parquet footers, positional-delete files, and Iceberg deletion-vector blobs inside their Puffin files, and one `head` plus a prefixed `list` on the schema-inference branch. A Delta deletion-vector sidecar's path is not in the spec, so only the side's table root routes it, and a sidecar stored by absolute path outside that root matches neither rule.
-* A side whose files span more than one bucket is refused with a clear error. The Iceberg spec permits such a layout, so this is a scoped exception (#304).
-* An ADLS store is container-scoped and its `Path` is container-relative, so path routing cannot separate two containers of one storage account. The scan-time check that both sides share one store is the only guard for that case (`storage-access/pushdown-planning-cloud-credentials-vended-storage`).
 * The post-join bounds live in the join block as `post_join_limit` and `post_join_order_by`. The shard-invariant `limit` and `order_by` mean a pre-join bound on single-table legs, and a spec without a join block carries no post-join field. Both join-block fields are additive and defaulted.
 * The limit applies after the join and WHERE in the rendered SQL, and DataFusion's `push_down_limit` does not push a fetch into the inputs of a non-cross inner join. A pre-join cap would discard fact rows that match the dimension side, so the scan carries no input-side limit.
 * A per-shard top-N must rank each key by the value the shard emits, which is what the Exasol wrapper ranks. A column emitted through the JSON rendering or the `CAST(... AS VARCHAR)` fallback arrives as text. An empty string arrives as NULL, because Exasol's VARCHAR has no empty string. A `NaN` in a `Float32` or `Float64` column arrives as NULL. String comparison is assumed to agree between DataFusion and Exasol, as on the single-table top-N path.
@@ -46,37 +41,6 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * *AND* the UDF SHALL execute an inner equi-join of the two registered tables on the rendered join condition
 * *AND* the UDF MUST NOT resolve or discover any file beyond the two file lists carried in the spec
 * *AND* the UDF SHALL register a side whose spec a Delta reader produced by the SAME path it registers an Iceberg-produced one, reading only the neutral logical schema and file list carried in the spec
-
-### Scenario: Each join side reads its files through its own storage credential
-
-* *GIVEN* a join scan spec whose fact-side and dimension-side storage backends hold DIFFERENT credentials, and whose two sides' files resolve to the SAME object-store bucket
-* *WHEN* the scan UDF builds its DataFusion session context and reads both sides' files
-* *THEN* the UDF SHALL register, under that bucket's single store key, ONE routing object store holding one inner store per side, each inner store configured from that side's OWN storage backend
-* *AND* the UDF SHALL route every object-store operation carrying a path, including each `get`, ranged read, `head`, and listing call, to the inner store of the side that owns the requested path, so no request for one side's file is ever issued with the other side's credential
-* *AND* the UDF SHALL select the owning side by matching the requested path against that side's OWN data-file, positional-delete-file, and Puffin deletion-vector-file paths FIRST, and only then against the sides' table roots by longest-prefix match, so a file that the Iceberg spec permits to sit outside its table root is still routed to its own side
-* *AND* a listing operation carrying a path prefix SHALL route by that SAME two-step rule rather than by a rule of its own, because the schema-inference branch issues a prefixed listing whose prefix is either the first data file's own exact path or a directory under that side's table root
-* *AND* when the two sides' file paths and roots leave more than one side eligible for a path, the UDF SHALL resolve the tie deterministically in favour of the fact side, so one spec never routes the same path two ways across invocations
-* *AND* the UDF SHALL apply this routing on EVERY spec carrying a non-empty join block, including one whose two backends are byte-identical, so the common same-warehouse case takes the identical code path
-* *AND* the joined rows SHALL be identical to those the same query produced when both sides shared one credential that could read both prefixes, so this routing narrows which credential is used and never which rows are returned
-* *AND* no credential value from EITHER side SHALL appear in any error the UDF surfaces while building or using the routing store
-
-### Scenario: Two join sides in different buckets register two separate stores
-
-* *GIVEN* a join scan spec whose fact side's files resolve to one bucket and whose dimension side's files resolve to a DIFFERENT bucket of the same object-storage backend
-* *WHEN* the scan UDF builds its DataFusion session context
-* *THEN* the UDF SHALL register one store per bucket, each configured from the storage backend of the side whose files resolve to that bucket
-* *AND* neither registration SHALL overwrite the other, because the two buckets yield different DataFusion registry keys
-* *AND* each side's reads SHALL be issued with that side's own credential exactly as in the shared-bucket case, so the different-bucket case needs no separate code path in the caller
-* *AND* the same SHALL hold when the two sides resolve to different BACKENDS, an `s3://` fact side and an `abfss://` dimension side, because store construction dispatches on each side's OWN backend and the two schemes yield different registry keys; the UDF MUST NOT address one side's files through the other side's backend arm, and no plan-time check refuses such a join (`storage-access/pushdown-planning-cloud-credentials-vended-storage`)
-
-### Scenario: A requested path owned by no join side is a clear error
-
-* *GIVEN* a join scan spec whose two sides' file lists and table roots are known
-* *WHEN* the routing object store receives an operation for a path that matches no side's data-file or delete-file path and lies under no side's table root
-* *THEN* the routing store SHALL return an error rather than choose a side, because choosing one would issue the request with a credential of unknown scope for that path
-* *AND* the error SHALL name the unroutable path and the table roots that were tried, so the defect is attributable to the plan that produced the spec
-* *AND* the error MUST NOT contain any storage access key, secret key, session token, or SAS token from any side's backend
-* *AND* a bucket-wide listing operation carrying NO path prefix SHALL be treated as unroutable by the same rule, because it cannot be attributed to one side
 
 ### Scenario: A post-join ordering and cap bound each join shard to its own top-N over the joined output
 
@@ -123,8 +87,9 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * *WHEN* the scan UDF runs
 * *THEN* the fact scan SHALL receive the dimension side's join-key bounds as a filter once the hash table is built, plus its key set when the dimension side holds at most 150 distinct join keys (DataFusion's IN-list pushdown limit)
 * *AND* the fact scan SHALL skip, on Parquet statistics, every row group whose key range lies outside those bounds
-* *AND* when the key set reaches the fact scan, the fact scan SHALL also skip every row group whose key range holds none of those keys, at any key count up to that limit
-* *AND* the joined rows SHALL be exactly the inner join's rows, including when the filtered dimension side is empty, no key matches, a join key is NULL, every fact key matches, or the filter constrains the join key
+* *AND* for a join on one plain-column key, when the key set reaches the fact scan, the fact scan SHALL also skip every row group whose key range holds none of those keys, at any key count up to that limit
+* *AND* for a join on several keys, the fact scan SHALL skip every row group that lies outside the bounds of any one key column, and MAY read a row group whose key ranges each hold some dimension key although no dimension key tuple matches, because DataFusion delivers that key set as one `struct(...) IN (...)` filter, which Parquet statistics cannot evaluate
+* *AND* the joined rows SHALL be exactly the inner join's rows, including when the filtered dimension side is empty, no key matches, a join key is NULL, every fact key matches, the filter constrains the join key, the join has several keys, or a key compares an expression
 
 ### Scenario: Scan reports a clear error when an assigned join file is unreadable
 

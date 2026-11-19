@@ -25,7 +25,7 @@ The names come from the Exasol
 | `FILTER_EXPRESSIONS` | ✓ | Some forms run in Exasol SQL. |
 | `JOIN` | ✓ |  |
 | `JOIN_CONDITION_ALL` |  | Only inner equi-joins push down. |
-| `JOIN_CONDITION_EQUI` | ✓ |  |
+| `JOIN_CONDITION_EQUI` | ✓ | Composite and expression keys; `ON` filters act as `WHERE`. |
 | `JOIN_TYPE_FULL_OUTER` |  | Only inner equi-joins push down. |
 | `JOIN_TYPE_INNER` | ✓ | Broadcast join when one side is small. |
 | `JOIN_TYPE_LEFT_OUTER` |  | Only inner equi-joins push down. |

@@ -17,12 +17,13 @@ fn microsecond_ts() -> TypedColumns {
     typed_columns(&[("ts", ExasolType::timestamp(6))])
 }
 
-/// The DataFusion dialect of `expr` over a TIMESTAMP(6) `ts` and a VARCHAR `s`, through the typed
-/// pass, which alone knows SECOND's fraction and TO_TIMESTAMP's digits.
+/// The DataFusion dialect of `expr` over a TIMESTAMP(6) `ts`, a VARCHAR `s`, and an integer `n`,
+/// through the typed pass, which alone knows SECOND's fraction and TO_TIMESTAMP's digits.
 fn typed_scan(expr: &Json) -> Result<String, UdfError> {
     let columns = typed_columns(&[
         ("ts", ExasolType::timestamp(6)),
         ("s", ExasolType::WIDEST_VARCHAR),
+        ("n", ExasolType::decimal(18, 0)),
     ]);
     ScanTyping::new(&columns, ExasolVersion::Exasol2025)
         .render_expression(expr)
@@ -908,53 +909,62 @@ fn renders_mod_as_function_call_in_exasol_dialect() {
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
 }
 
+/// Scenario: String scalar functions translate to DataFusion string calls
 #[test]
 fn renders_string_scalar_functions() {
-    let cases_lower = [
+    let text_results = [
         "LOWER",
         "UPPER",
         "TRIM",
         "LTRIM",
         "RTRIM",
-        "REPLACE",
         "REPEAT",
         "REVERSE",
         "LPAD",
         "RPAD",
-        "ASCII",
-        "CHR",
         "INITCAP",
         "LEFT",
         "RIGHT",
         "TRANSLATE",
     ];
-    for name in cases_lower {
+    for name in text_results {
         let expr = scalar_fn(name, [col("s")]);
-        let sql = render_expression(&expr).unwrap();
         assert_eq!(
-            sql,
-            format!(r#"{}("S")"#, name.to_lowercase()),
+            typed_scan(&expr).unwrap(),
+            format!(r#"nullif({}(nullif("S", '')), '')"#, name.to_lowercase()),
             "failed for {name}"
         );
     }
 
-    let expr = scalar_fn("LENGTH", [col("s")]);
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"character_length("S")"#
-    );
+    let integer_results = [
+        ("ASCII", "ascii"),
+        ("LENGTH", "character_length"),
+        ("OCTET_LENGTH", "octet_length"),
+        ("UNICODE", "ascii"),
+    ];
+    for (name, call) in integer_results {
+        let expr = scalar_fn(name, [col("s")]);
+        assert_eq!(
+            typed_scan(&expr).unwrap(),
+            format!(r#"{call}(nullif("S", ''))"#),
+            "failed for {name}"
+        );
+    }
 
-    let expr = scalar_fn("OCTET_LENGTH", [col("s")]);
-    assert_eq!(render_expression(&expr).unwrap(), r#"octet_length("S")"#);
-
-    let expr = scalar_fn("UNICODE", [col("s")]);
-    assert_eq!(render_expression(&expr).unwrap(), r#"ascii("S")"#);
-
-    let expr = scalar_fn("UNICODECHR", [col("n")]);
-    assert_eq!(render_expression(&expr).unwrap(), r#"chr("N")"#);
+    for name in ["CHR", "UNICODECHR"] {
+        let expr = scalar_fn(name, [col("n")]);
+        assert_eq!(
+            typed_scan(&expr).unwrap(),
+            r#"nullif(chr(CAST("N" AS BIGINT)), '')"#,
+            "failed for {name}"
+        );
+    }
 
     let expr = scalar_fn("SUBSTR", [col("s"), num_lit(1), num_lit(3)]);
-    assert_eq!(render_expression(&expr).unwrap(), r#"substr("S", 1, 3)"#);
+    assert_eq!(
+        typed_scan(&expr).unwrap(),
+        r#"nullif(substr(nullif("S", ''), 1, 3), '')"#
+    );
 
     let expr = scalar_fn("INSTR", [str_lit("hello"), str_lit("ll")]);
     assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
@@ -967,14 +977,14 @@ fn renders_string_scalar_functions() {
 fn renders_concat_as_nullif_wrapped_concat_call() {
     let expr = scalar_fn("CONCAT", [col("s"), str_lit("")]);
     assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat("S", ''), '')"#
+        typed_scan(&expr).unwrap(),
+        r#"nullif(concat(nullif("S", ''), ''), '')"#
     );
 
-    let expr = scalar_fn("CONCAT", [col("a"), col("b"), col("c")]);
+    let expr = scalar_fn("CONCAT", [col("s"), str_lit("b"), str_lit("c")]);
     assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat("A", "B", "C"), '')"#
+        typed_scan(&expr).unwrap(),
+        r#"nullif(concat(nullif("S", ''), 'b', 'c'), '')"#
     );
 }
 
@@ -1000,21 +1010,24 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
 fn renders_nested_concat_wrapper_per_level() {
     let expr = scalar_fn(
         "CONCAT",
-        [scalar_fn("CONCAT", [col("a"), col("b")]), col("c")],
+        [
+            scalar_fn("CONCAT", [str_lit("a"), str_lit("b")]),
+            str_lit("c"),
+        ],
     );
     assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat(nullif(concat("A", "B"), ''), "C"), '')"#
+        typed_scan(&expr).unwrap(),
+        r#"nullif(concat(nullif(concat('a', 'b'), ''), 'c'), '')"#
     );
-    assert_eq!(render_expression_exasol(&expr), r#"(("A" || "B") || "C")"#);
+    assert_eq!(render_expression_exasol(&expr), r#"(('a' || 'b') || 'c')"#);
 }
 
 #[test]
 fn renders_concat_single_argument() {
     let expr = scalar_fn("CONCAT", [col("s")]);
     assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat("S"), '')"#
+        typed_scan(&expr).unwrap(),
+        r#"nullif(concat(nullif("S", '')), '')"#
     );
     assert_eq!(render_expression_exasol(&expr), r#"("S")"#);
 }
@@ -1302,7 +1315,7 @@ fn renders_to_date_to_timestamp() {
 
     let expr2 = scalar_fn("TO_DATE", [col("s"), str_lit("YYYY-MM-DD")]);
     assert_eq!(
-        render_expression(&expr2).unwrap(),
+        typed_scan(&expr2).unwrap(),
         r#"to_date(nullif("S", ''), '%Y-%m-%d')"#
     );
 
@@ -1745,7 +1758,6 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
         ("TRIM", "trim"),
         ("LTRIM", "ltrim"),
         ("RTRIM", "rtrim"),
-        ("REPLACE", "replace"),
         ("REPEAT", "repeat"),
         ("REVERSE", "reverse"),
         ("LPAD", "lpad"),
@@ -1774,6 +1786,13 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
             "the DataFusion dialect must stay unchanged for {exasol_name}"
         );
     }
+
+    let replace = scalar_fn("REPLACE", [col("s"), str_lit("U")]);
+    assert_eq!(render_expression_exasol(&replace), r#"REPLACE("S", 'U')"#);
+    assert_eq!(
+        render_expression(&replace).unwrap(),
+        r#"CASE WHEN 'U' IS NULL THEN "S" ELSE replace("S", 'U', coalesce(NULL, '')) END"#
+    );
 
     let substr = scalar_fn("SUBSTR", [col("s"), num_lit(1), num_lit(3)]);
     assert_eq!(render_expression_exasol(&substr), r#"SUBSTR("S", 1, 3)"#);

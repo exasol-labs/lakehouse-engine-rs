@@ -6,7 +6,6 @@ pub const NAMESPACE: &str = "e2e_export_append";
 pub const APPENDABLE_V2: &str = "appendable_v2";
 pub const APPENDABLE_V1: &str = "appendable_v1";
 pub const ODD_TYPES: &str = "odd_types";
-pub const PARTITIONED: &str = "partitioned";
 pub const V3: &str = "v3";
 pub const V1_VOID_COLUMN: &str = "v1_void_column";
 
@@ -83,11 +82,6 @@ pub const ODD_TYPES_COLUMNS: [(&str, &str, bool); 3] = [
     ("ratio", "float", false),
     ("note", "string", false),
 ];
-
-/// `partitioned`: identity on `day`.
-pub const PARTITIONED_COLUMNS: [(&str, &str, bool); 2] =
-    [("id", "long", false), ("day", "date", false)];
-pub const PARTITIONED_SPEC: &[&str] = &["identity"];
 
 /// `v3`: format version 3.
 pub const V3_COLUMNS: [(&str, &str, bool); 1] = [("id", "long", false)];

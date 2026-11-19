@@ -1,5 +1,6 @@
 //! The WITH options and clauses of an export statement.
 
+use super::partition_by::PARTITION_BY;
 use super::refusal;
 use crate::exasol::{
     CATALOG_CONNECTION, catalog_connection_name, parse_boolean, parse_whole_number,
@@ -31,6 +32,8 @@ pub(super) struct ExportOptions {
     pub(super) writers: WriterLayout,
     /// The user's consent to plain-HTTP requests, `false` unless `ALLOW_HTTP = 'true'`.
     pub(super) allow_http: bool,
+    /// The `PARTITION_BY` value, which the hook resolves against the source columns.
+    pub(super) partition_by: Option<String>,
 }
 
 impl ExportOptions {
@@ -53,6 +56,7 @@ impl ExportOptions {
             table_name,
             writers,
             allow_http,
+            partition_by: with_options.partition_by.map(str::to_string),
         })
     }
 }
@@ -88,6 +92,7 @@ struct WithOptions<'a> {
     writers_per_node: Option<&'a str>,
     single_commit: Option<&'a str>,
     allow_http: Option<&'a str>,
+    partition_by: Option<&'a str>,
 }
 
 impl<'a> WithOptions<'a> {
@@ -98,6 +103,7 @@ impl<'a> WithOptions<'a> {
             writers_per_node: None,
             single_commit: None,
             allow_http: None,
+            partition_by: None,
         };
         for parameter in parameters {
             let slot = match parameter.key.as_str() {
@@ -106,9 +112,10 @@ impl<'a> WithOptions<'a> {
                 WRITERS_PER_NODE => &mut options.writers_per_node,
                 SINGLE_COMMIT => &mut options.single_commit,
                 ALLOW_HTTP => &mut options.allow_http,
+                PARTITION_BY => &mut options.partition_by,
                 unknown => {
                     return Err(refusal(format_args!(
-                        "unknown option {unknown}; the accepted options are {CATALOG_CONNECTION}, {TABLE_NAME}, {WRITERS_PER_NODE}, {SINGLE_COMMIT}, and {ALLOW_HTTP}"
+                        "unknown option {unknown}; the accepted options are {CATALOG_CONNECTION}, {TABLE_NAME}, {WRITERS_PER_NODE}, {SINGLE_COMMIT}, {ALLOW_HTTP}, and {PARTITION_BY}"
                     )));
                 }
             };

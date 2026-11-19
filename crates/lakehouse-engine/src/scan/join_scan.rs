@@ -9,13 +9,12 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::diagnostics;
 use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
-use crate::types::mapping::arrow_to_exasol_type;
 
 use super::raw_scan::{
     delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
 };
 use super::sql_support::{
-    aliased_select, append_where, quote_ident, render_column, render_projection,
+    aliased_select, append_where, quote_ident, render_projection, render_sort_target,
 };
 
 const JOIN_FACT_TABLE: &str = "fact_scan";
@@ -154,7 +153,10 @@ async fn build_join_sql(
         let elements: Vec<String> = join
             .post_join_order_by
             .iter()
-            .map(|key| key.render_ordered(&render_join_sort_target(&key.column, &combined)))
+            .map(|key| {
+                let data_type = combined_type(&key.column, &combined);
+                key.render_ordered(&render_sort_target(&key.column, data_type))
+            })
             .collect();
         sql.push_str(" ORDER BY ");
         sql.push_str(&elements.join(", "));
@@ -212,28 +214,6 @@ fn combined_upper_fields(
     let mut fields = relation_fields(dim_alias, dim_schema);
     fields.extend(relation_fields(fact_alias, fact_schema));
     fields
-}
-
-/// Ranks by the value the shard emits, since that is what the Exasol-side wrapper merges and
-/// ranks; ranking anything else can cut a row the wrapper's global top-`n` needs. Exasol's
-/// VARCHAR has no empty string (`''` arrives as NULL), and `emit_batch` emits `NaN` as NULL (#246).
-fn render_join_sort_target(
-    column: &ColumnRef,
-    combined: &[(ColumnRef, arrow::datatypes::DataType)],
-) -> String {
-    use arrow::datatypes::DataType;
-
-    let data_type = combined_type(column, combined);
-    let emitted = render_column(column, data_type);
-    match data_type {
-        Some(DataType::Float32 | DataType::Float64) => {
-            format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
-        }
-        Some(dt) if arrow_to_exasol_type(dt).is_character() => {
-            format!("nullif({emitted}, '')")
-        }
-        _ => emitted,
-    }
 }
 
 fn combined_type<'a>(

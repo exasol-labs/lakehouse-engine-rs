@@ -119,8 +119,8 @@ pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
 }
 
 /// A matched top-N carries the same `order_by` in the per-shard blob (a DataFusion
-/// TopK) and the outer merge; both render through [`render_order_by_clause`] so they
-/// agree on direction and NULL placement.
+/// TopK) and the outer merge; both render direction and NULL placement through
+/// `render_ordered`, so they agree.
 fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &Shards<E>,
@@ -678,6 +678,20 @@ impl<'a> ScanTranslator<'a> {
     pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
         self.typing()
             .render_expression(&compare_binary_bytes(expr.clone(), self.columns))
+            .ok()
+    }
+
+    /// [`Self::expression`] for an operand the caller renders a computation around, such as an
+    /// aggregate argument.
+    pub(super) fn operand(self, expr: &Json) -> Option<SqlFragment> {
+        self.typing().render_operand(expr).ok()
+    }
+
+    /// `None` declines the join. A condition renders as a filter does, so its string keys stay
+    /// bare columns that the hash join reads.
+    pub(super) fn join_condition(self, condition: &Json) -> Option<String> {
+        self.typing()
+            .render_filter(&compare_binary_bytes(condition.clone(), self.columns))
             .ok()
     }
 
