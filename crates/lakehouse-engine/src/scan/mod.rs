@@ -57,9 +57,11 @@ use storage_ref::resolve_scan_storage;
 
 mod store_router;
 
+mod delete_source;
 mod deletion_vectors;
 mod row_deletes;
 mod scan_table;
+mod shared_files;
 
 mod partition_values;
 pub(crate) use partition_values::{hex_scalar, non_null_partition_value, partition_scalar};
@@ -167,7 +169,9 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .set_bool(
             "datafusion.execution.parquet.pushdown_filters",
             !raw_scan::scan_renders_nested_json(spec),
-        );
+        )
+        // The scan provider builds its own file groups, so DataFusion must not cut them again.
+        .set_bool("datafusion.optimizer.repartition_file_scans", false);
 
     if spec.common.join.is_some() {
         // `HashJoinExec` builds from the left child, where the dimension sits. The scan provider
@@ -248,10 +252,6 @@ async fn run_scan_dispatch(
 ) -> Result<(), UdfError> {
     let mut timers = diagnostics::PhaseTimers::start();
 
-    // A pooled UDF process serves many invocations in sequence; without this reset a later
-    // invocation would report an earlier one's recorded paths.
-    diagnostics::reset_access_plan_cached_footers();
-
     let result = if spec.common.join.is_some() {
         // The VS never combines a join with aggregates.
         run_join_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await
@@ -262,16 +262,6 @@ async fn run_scan_dispatch(
         run_raw_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await
     };
 
-    if result.is_ok() {
-        // A pushed LIMIT or a join with an empty build side can leave a cached footer at
-        // `hits == 0` without any re-fetch; only this site knows the shape.
-        let coverage = if spec.common.limit.is_none() && spec.common.join.is_none() {
-            diagnostics::OpenerCoverage::EveryAssignedFile
-        } else {
-            diagnostics::OpenerCoverage::MayStopEarly
-        };
-        emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
-    }
     result.map_err(|e| emit::reframe_raised_failure(session_ctx, e, &storage.all_secret_values()))
 }
 
@@ -283,33 +273,6 @@ fn emit_phase_telemetry(ctx: &dyn UdfContext, timers: &diagnostics::PhaseTimers)
     let record = diagnostics::telemetry_record(timers);
     udf_log!(ctx, debug, "{}", record);
     diagnostics::write_telemetry_file(&record);
-}
-
-/// Logs only the count, never a path, so no credential in a URI can leak. The
-/// [`diagnostics::telemetry_enabled`] gate runs first, so a production scan pays no
-/// `list_entries()` traversal.
-fn emit_footer_refetch_diagnostic(
-    ctx: &dyn UdfContext,
-    session_ctx: &SessionContext,
-    coverage: diagnostics::OpenerCoverage,
-) {
-    if !diagnostics::telemetry_enabled(ctx.debug_level()) {
-        return;
-    }
-    let entries = session_ctx
-        .runtime_env()
-        .cache_manager
-        .get_file_metadata_cache()
-        .list_entries();
-    let count = diagnostics::footer_refetch_count(&entries, coverage);
-    if count > 0 {
-        udf_log!(
-            ctx,
-            debug,
-            "positional-delete footer re-fetch: {count} footer(s) cached during access-plan \
-             construction were not retained by the metadata cache before the opener read them"
-        );
-    }
 }
 
 #[cfg(test)]
