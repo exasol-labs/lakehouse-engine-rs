@@ -24,7 +24,7 @@ A query runs well when:
 This page lists the rules that follow from this. Each rule shows a form to use and a form to
 avoid. [Capabilities](capabilities.md) has the technical details. The rules describe the current
 release: when the engine learns to run more, a rule gets relaxed and this page is updated. Last
-verified against lakehouse-engine 0.59.1 on Exasol 2026.2.
+verified against lakehouse-engine 0.60.0 on Exasol 2026.2.
 
 ## Quick reference
 
@@ -32,8 +32,7 @@ verified against lakehouse-engine 0.59.1 on Exasol 2026.2.
 |---|---|---|
 | `d >= DATE '2024-01-01' AND d < DATE '2025-01-01'` | `YEAR(d) = 2024` | A function around a column can't skip files. |
 | `d = DATE '2024-01-02'` | `d = '2024-01-02'` | Comparing a date with text runs in Exasol. |
-| Join filters in `WHERE` | Join filters in `ON` | A filter in `ON` makes the join slower, and the whole table is read. |
-| Two tables joined on one column | A join on two columns, or of three or more tables | Only this kind of join runs in the engine. |
+| A join of two tables | A join of three or more tables | Only joins of two tables run in the engine. |
 | `FROM a JOIN b ON ... JOIN c ON ...` | `FROM a, c, b` where `c` doesn't join `a` | Exasol then sends each table to the engine on its own. |
 | Filters on the optional side of a `LEFT JOIN` in a `WITH` clause | The same filters in `ON` | A filter in `ON` on that side doesn't reach the engine. |
 | `JOIN` on a unique key | `IN (SELECT ...)`, `EXISTS` | The engine can't run these. |
@@ -147,39 +146,36 @@ the engine skip parts of the larger table that can't match. A join is a broadcas
 of these are true:
 
 - It is an inner join (`JOIN`) of exactly two tables, or of a table with itself.
-- It joins on one column: `a.k = b.k`.
+- It joins on one or more columns, or on calculations over them: `a.k = b.k`,
+  `a.k1 = b.k1 AND a.k2 = b.k2`, `a.k = b.k + 1`.
 - The smaller table's files are at most `JOIN_BROADCAST_MAX_BYTES` ([Tuning](tuning.md)),
   128 MiB by default.
-- The filters are in `WHERE`, and the engine can run them.
+- The engine can run the filters.
 - With an aggregate, `GROUP BY`, or `HAVING`: every column the aggregation uses from the smaller
-  table is a number, date, timestamp, or boolean, or a text column that `WHERE` limits to fixed
+  table is a number, date, timestamp, or boolean, or a text column that a filter limits to fixed
   values (`col = 'x'`, `col IN ('x', 'y')`).
 
+In an inner join, a filter in `ON` works the same as in `WHERE`: it skips files and keeps the join
+a broadcast join. This includes comparisons of the two tables, such as `a.x > b.y`.
+
 Other inner joins still go to the engine as one request, but the engine reads each table on its
-own, with that table's `WHERE` filters, and Exasol joins the rows. Outer joins, `IN`, and
-`EXISTS` go to the engine one table at a time.
+own, with that table's filters, and Exasol joins the rows. Outer joins, `IN`, and `EXISTS` go to
+the engine one table at a time.
 
-### Put join filters in `WHERE`
+### Join on plain columns
 
-In an inner join, a filter in `ON` and the same filter in `WHERE` return the same rows. But
-Exasol sends a filter in `ON` as part of the join condition. The join is then no longer a
-broadcast join, and the whole table is read.
+A join on one plain column lets the engine skip the most of the larger table. With two or more
+join columns, or a calculation on the larger table's join column, it skips less, but the join is
+still a broadcast join. Put a calculation on the smaller table's side.
 
 | Use | Avoid |
 |---|---|
-| `FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.country = 'DE'` | `FROM orders o JOIN customers c ON o.customer_id = c.customer_id AND c.country = 'DE'` |
-
-### Join on one column
-
-A join on two or more columns, such as `ps.partkey = l.partkey AND ps.suppkey = l.suppkey`, is
-not a broadcast join. Moving one of the conditions to `WHERE` doesn't help, because Exasol moves
-it back into the join condition. The same applies to a join with an extra comparison, such as
-`a.k = b.k AND a.x > b.y`.
+| `ON o.customer_id = c.customer_id + 1` | `ON o.customer_id - 1 = c.customer_id` |
 
 ### Only joins of two tables are broadcast joins
 
 In a join of three or more tables, the engine reads each table on its own and Exasol joins them.
-The filters on each table still skip files of that table.
+The filters on each table, in `WHERE` or in `ON`, still skip files of that table.
 
 ### List comma-separated tables in join order
 
@@ -246,7 +242,7 @@ keys, such as `GROUP BY qty * 2`, need a `CAST` to a fixed type. See
 
 If the aggregation uses a text column of the smaller table, such as a name or a description, the
 join is not a broadcast join, because that text would be copied to every joined row. Group by a
-number column instead, or limit the text column to fixed values in `WHERE`.
+number column instead, or limit the text column to fixed values with a filter.
 
 | Use | Avoid |
 |---|---|
