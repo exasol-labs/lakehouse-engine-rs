@@ -952,6 +952,10 @@ impl StsAndCatalog {
                     }
                     head.extend_from_slice(&chunk[..read]);
                 }
+                // A join leg that `try_join_all` cancels can connect and close before it writes.
+                if !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    continue;
+                }
                 let head = String::from_utf8_lossy(&head).into_owned();
                 let (status, body) = if is_assume_role(&head) {
                     sts
