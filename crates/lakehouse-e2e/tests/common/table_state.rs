@@ -1,5 +1,6 @@
 //! An Iceberg table's state for the export tests: columns, snapshots, and snapshot summary values
-//! from its metadata JSON, the warehouse objects under a prefix, and a local REST catalog table.
+//! from its metadata JSON, the warehouse objects under a prefix, the Parquet footers of its data
+//! files, and a local REST catalog table.
 
 use std::collections::BTreeSet;
 
@@ -8,9 +9,13 @@ use iceberg::spec::DataContentType;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use parquet::basic::Compression;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value;
 
 use crate::common::e2e_harness::{local_stack_s3_store, runtime};
+use crate::common::raw_parquet::get_fixture_object;
 use crate::common::seed::build_seed_catalog;
 use crate::common::stack::iceberg_catalog_url;
 
@@ -159,29 +164,121 @@ pub fn reset_to_unexported_snapshot(namespace: &str, table: &str) {
         .filter(|snapshot| snapshot["summary"][EXPORT_ID].is_null())
         .max_by_key(|snapshot| snapshot["timestamp-ms"].as_i64())
         .unwrap_or_else(|| panic!("{namespace}.{table} has no snapshot that no export wrote"));
-    let url = format!(
-        "{}/v1/namespaces/{namespace}/tables/{table}",
-        iceberg_catalog_url()
-    );
-    let commit = serde_json::json!({
-        "requirements": [],
-        "updates": [{
+    commit_updates(
+        namespace,
+        table,
+        serde_json::json!([{
             "action": "set-snapshot-ref",
             "ref-name": "main",
             "type": "branch",
             "snapshot-id": snapshot["snapshot-id"],
-        }],
-    });
+        }]),
+    );
+}
+
+/// Sets `properties` on local `namespace.table`, as another catalog client would.
+pub fn set_table_properties(namespace: &str, table: &str, properties: &[(&str, &str)]) {
+    let updates: serde_json::Map<String, Value> = properties
+        .iter()
+        .map(|(key, value)| (key.to_string(), Value::from(*value)))
+        .collect();
+    commit_updates(
+        namespace,
+        table,
+        serde_json::json!([{"action": "set-properties", "updates": updates}]),
+    );
+}
+
+/// Commits `updates` to local `namespace.table` without requirements.
+fn commit_updates(namespace: &str, table: &str, updates: Value) {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        iceberg_catalog_url()
+    );
+    let commit = serde_json::json!({"requirements": [], "updates": updates});
     let status = reqwest::blocking::Client::new()
         .post(&url)
         .json(&commit)
         .send()
-        .unwrap_or_else(|e| panic!("reset {namespace}.{table}: POST {url} failed to send: {e}"))
+        .unwrap_or_else(|e| panic!("update {namespace}.{table}: POST {url} failed to send: {e}"))
         .status();
     assert!(
         status.is_success(),
-        "reset {namespace}.{table}: POST {url} returned {status}"
+        "update {namespace}.{table}: POST {url} returned {status}"
     );
+}
+
+/// The `data/` prefix of the table `metadata` describes, within the warehouse bucket.
+pub fn data_prefix(metadata: &Value) -> String {
+    let location = metadata["location"].as_str().unwrap();
+    let key = location
+        .strip_prefix(&format!("s3://{WAREHOUSE_BUCKET}/"))
+        .unwrap_or_else(|| panic!("{location} lies outside the warehouse bucket"));
+    format!("{key}/data/")
+}
+
+/// One Parquet data file in the warehouse: its object path, size in bytes, and footer.
+pub struct DataFileFooter {
+    pub path: String,
+    pub size: u64,
+    pub footer: ParquetMetaData,
+}
+
+/// Every Parquet object under the `data/` prefix of the table `metadata` describes.
+pub fn data_file_footers(metadata: &Value) -> Vec<DataFileFooter> {
+    let store = local_stack_s3_store(WAREHOUSE_BUCKET);
+    let prefix = ObjectStorePath::from(data_prefix(metadata));
+    let objects: Vec<_> = runtime()
+        .block_on(store.list(Some(&prefix)).try_collect())
+        .unwrap_or_else(|e| panic!("list {WAREHOUSE_BUCKET}/{prefix}: {e}"));
+    objects
+        .into_iter()
+        .filter(|object| object.location.as_ref().ends_with(".parquet"))
+        .map(|object| {
+            let uri = format!("s3://{WAREHOUSE_BUCKET}/{}", object.location);
+            let footer = SerializedFileReader::new(get_fixture_object(&uri))
+                .unwrap_or_else(|e| panic!("open the Parquet footer of {uri}: {e}"))
+                .metadata()
+                .clone();
+            DataFileFooter {
+                path: object.location.to_string(),
+                size: object.size,
+                footer,
+            }
+        })
+        .collect()
+}
+
+/// Asserts that every column chunk of `files` uses `codec`, at any level, and that no row group
+/// compresses to more than a tenth above `row_group_bytes`, which parquet-rs only estimates.
+#[track_caller]
+pub fn assert_data_files(
+    case: &str,
+    files: &[DataFileFooter],
+    codec: Compression,
+    row_group_bytes: i64,
+) {
+    assert!(!files.is_empty(), "{case}: no data file");
+    for file in files {
+        for (index, group) in file.footer.row_groups().iter().enumerate() {
+            assert!(
+                group.compressed_size() <= row_group_bytes + row_group_bytes / 10,
+                "{case}: row group {index} of {} compresses to {} bytes",
+                file.path,
+                group.compressed_size()
+            );
+            for column in group.columns() {
+                assert_eq!(
+                    std::mem::discriminant(&column.compression()),
+                    std::mem::discriminant(&codec),
+                    "{case}: {} of {} is {:?}",
+                    column.column_path(),
+                    file.path,
+                    column.compression()
+                );
+            }
+        }
+    }
 }
 
 /// One live data file of an Iceberg table, read through iceberg-rust in the test process.

@@ -11,7 +11,9 @@ use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_upda
 use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, FormatVersion, Schema, TableMetadata, UnboundPartitionSpec};
+use iceberg::spec::{
+    DataFile, FormatVersion, Schema, TableMetadata, TableProperties, UnboundPartitionSpec,
+};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
@@ -810,6 +812,8 @@ fn classify(status: u16) -> Outcome {
     }
 }
 
+const MIB: usize = 1024 * 1024;
+
 fn creation_request(
     table: &TableIdent,
     schema: Schema,
@@ -820,6 +824,19 @@ fn creation_request(
         ("format-version".to_string(), "2".to_string()),
         (NUM_RETRIES_PROPERTY.to_string(), EXPORT_RETRIES.to_string()),
         (EXPORT_ID_PROPERTY.to_string(), export_id.to_string()),
+        (
+            TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC.to_string(),
+            "zstd".to_string(),
+        ),
+        (
+            TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_string(),
+            (128 * MIB).to_string(),
+        ),
+        // Half Iceberg's default, because a virtual schema shards a scan by data file.
+        (
+            TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
+            (256 * MIB).to_string(),
+        ),
     ]);
     CreateTableRequest {
         name: table.name.clone(),

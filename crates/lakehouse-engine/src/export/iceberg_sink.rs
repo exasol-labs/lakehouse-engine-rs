@@ -2,14 +2,15 @@
 //! commit tagged with the writer adds them to the table.
 
 use super::batch::TableColumns;
-use super::fanout::{Partition, PartitionBuffer};
+use super::fanout::{Partition, PartitionBuffer, null_key};
 use super::target::ExportSink;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, Schema};
+use iceberg::compression::CompressionCodec;
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, Schema, SchemaRef, TableProperties};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -20,7 +21,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use lakehouse_catalog::{error_chain, redact_error_text};
 use lakehouse_catalog_write::{CommitTag, StagedTable, TableWriteSession, WriteTable};
-use parquet::file::properties::WriterProperties;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The table a writer's files go into: one the catalog lists, created or loaded, or one staged for
@@ -48,13 +49,25 @@ impl OpenedTable {
 
 type DataWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, RecordedLocations, DefaultFileNameGenerator>;
+type DataWriter = <DataWriterBuilder as IcebergWriterBuilder>::R;
+
+/// Where a writer's rows wait before they reach a data file.
+enum Rows {
+    /// Per partition, within the budget.
+    Buffered(Box<PartitionBuffer>),
+    /// An unpartitioned table has one partition, so its rows go straight into one rolling file.
+    Streamed {
+        key: PartitionKey,
+        writer: Option<Box<DataWriter>>,
+    },
+}
 
 pub(super) struct IcebergSink {
     session: TableWriteSession,
     opened: OpenedTable,
     tag: CommitTag,
     columns: TableColumns,
-    buffer: PartitionBuffer,
+    rows: Rows,
     writers: DataWriterBuilder,
     /// The data files written so far, which the commit adds.
     files: Vec<DataFile>,
@@ -66,7 +79,7 @@ pub(super) struct IcebergSink {
 impl IcebergSink {
     /// The table's current schema carries its field IDs, which the Parquet writer matches columns
     /// by, and every data file carries the table's default partition spec. The rows buffered per
-    /// partition stay within `budget` bytes of Arrow memory.
+    /// partition of a partitioned table stay within `budget` bytes of Arrow memory.
     pub(super) async fn open(
         session: TableWriteSession,
         opened: OpenedTable,
@@ -84,12 +97,24 @@ impl IcebergSink {
         let metadata = table.metadata();
         let iceberg_schema = metadata.current_schema().clone();
         let columns = table_columns(table.identifier(), &iceberg_schema).map_err(unwritable)?;
-        let buffer = PartitionBuffer::new(
-            iceberg_schema.clone(),
-            metadata.default_partition_spec(),
-            budget,
-        )
-        .map_err(unwritable)?;
+        let spec = metadata.default_partition_spec();
+        let rows = if spec.is_unpartitioned() {
+            Rows::Streamed {
+                key: null_key(spec, iceberg_schema.clone()),
+                writer: None,
+            }
+        } else {
+            Rows::Buffered(Box::new(
+                PartitionBuffer::new(iceberg_schema.clone(), spec, budget).map_err(unwritable)?,
+            ))
+        };
+        let (parquet, target_file_size) =
+            data_file_settings(metadata.properties(), iceberg_schema.clone()).map_err(|error| {
+                UdfError::User(format!(
+                    "could not prepare the data files of table {}: {error}",
+                    table.identifier()
+                ))
+            })?;
         let locations = RecordedLocations {
             inner: DefaultLocationGenerator::new(table.metadata()).map_err(unwritable)?,
             recorded: Arc::default(),
@@ -99,11 +124,9 @@ impl IcebergSink {
             None,
             DataFileFormat::Parquet,
         );
-        // A write-out is at most the budget, so it rolls over to a second file only when Parquet
-        // encodes the rows larger than Arrow holds them.
         let files = RollingFileWriterBuilder::new(
-            ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema.clone()),
-            budget,
+            parquet,
+            target_file_size,
             table.file_io().clone(),
             locations.clone(),
             names,
@@ -113,7 +136,7 @@ impl IcebergSink {
             opened,
             tag,
             columns,
-            buffer,
+            rows,
             writers: DataFileWriterBuilder::new(files),
             files: Vec::new(),
             locations,
@@ -172,7 +195,20 @@ impl ExportSink for IcebergSink {
     }
 
     async fn write(&mut self, batch: &RecordBatch) -> Result<(), UdfError> {
-        let full = self.buffer.push(batch).map_err(|error| {
+        let buffer = match &mut self.rows {
+            Rows::Buffered(buffer) => buffer,
+            Rows::Streamed { key, writer } => {
+                let written = match writer {
+                    Some(open) => open.write(batch.clone()).await,
+                    None => match self.writers.build(Some(key.clone())).await {
+                        Ok(open) => writer.insert(Box::new(open)).write(batch.clone()).await,
+                        Err(error) => Err(error),
+                    },
+                };
+                return written.map_err(|error| self.storage_error(error));
+            }
+        };
+        let full = buffer.push(batch).map_err(|error| {
             UdfError::User(format!(
                 "could not compute the partition values of table {}: {}",
                 self.opened.table().identifier(),
@@ -183,8 +219,19 @@ impl ExportSink for IcebergSink {
     }
 
     async fn finish(&mut self) -> Result<usize, UdfError> {
-        let rest = self.buffer.drain();
-        self.write_out(rest).await?;
+        match &mut self.rows {
+            Rows::Buffered(buffer) => {
+                let rest = buffer.drain();
+                self.write_out(rest).await?;
+            }
+            Rows::Streamed { writer, .. } => {
+                if let Some(mut open) = writer.take() {
+                    let written = open.close().await;
+                    self.files
+                        .extend(written.map_err(|error| self.storage_error(error))?);
+                }
+            }
+        }
         let files = std::mem::take(&mut self.files);
         let count = files.len();
         self.commit(files).await?;
@@ -230,6 +277,154 @@ async fn write_partition(
         writer.write(batch).await?;
     }
     writer.close().await
+}
+
+/// A key of the table's write properties, and the reading of it that fails on an unusable value.
+type WriteProperty = (
+    &'static str,
+    fn(&TableProperties<'_>) -> iceberg::Result<()>,
+);
+
+/// Every property that `ParquetWriterBuilder::from_table_properties` reads, other than the
+/// compression level, which the codec's reading parses too, and the target file size.
+const WRITE_PROPERTIES: [WriteProperty; 6] = [
+    (TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC, |t| {
+        t.parquet_compression_codec().map(drop)
+    }),
+    (
+        TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+        |t| t.parquet_row_group_size_bytes().map(drop),
+    ),
+    (TableProperties::PROPERTY_PARQUET_PAGE_SIZE_BYTES, |t| {
+        t.parquet_page_size_bytes().map(drop)
+    }),
+    (TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT, |t| {
+        t.parquet_page_row_limit().map(drop)
+    }),
+    (TableProperties::PROPERTY_PARQUET_DICT_SIZE_BYTES, |t| {
+        t.parquet_dict_size_bytes().map(drop)
+    }),
+    (
+        TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES,
+        |t| t.write_target_file_size_bytes().map(drop),
+    ),
+];
+
+/// The content-defined chunking properties, read only when chunking is enabled.
+const CHUNKING_PROPERTIES: [WriteProperty; 3] = [
+    (TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE, |t| {
+        t.cdc_min_chunk_size().map(drop)
+    }),
+    (TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE, |t| {
+        t.cdc_max_chunk_size().map(drop)
+    }),
+    (TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL, |t| {
+        t.cdc_norm_level().map(drop)
+    }),
+];
+
+/// The Parquet writer and the data file size that a table's write properties set, or an error
+/// that names the first unusable property and its value.
+pub(super) fn data_file_settings(
+    properties: &HashMap<String, String>,
+    schema: SchemaRef,
+) -> Result<(ParquetWriterBuilder, usize), String> {
+    let table = TableProperties::new(properties);
+    let named = |key: &str, cause: &dyn std::fmt::Display| {
+        let value = properties.get(key).map_or("", String::as_str);
+        format!("invalid write property {key} = '{value}': {cause}")
+    };
+    if let Some((key, cause)) = unreadable(&table).or_else(|| refused(&table)) {
+        return Err(named(key, &cause));
+    }
+    let settings = ParquetWriterBuilder::from_table_properties(&table, schema)
+        .and_then(|writer| Ok((writer, table.write_target_file_size_bytes()?)));
+    // Every property reads, so only the codec's refusal of its compression level remains.
+    settings.map_err(|error| {
+        named(
+            TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL,
+            &error_chain(&error),
+        )
+    })
+}
+
+/// The first property whose value does not read, with iceberg-rust's error.
+fn unreadable(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
+    let chunking = match table.cdc_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            return Some((
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED,
+                error_chain(&error),
+            ));
+        }
+    };
+    let chunked = if chunking {
+        &CHUNKING_PROPERTIES[..]
+    } else {
+        &[]
+    };
+    WRITE_PROPERTIES
+        .iter()
+        .chain(chunked)
+        .find_map(|(key, read)| {
+            let error = read(table).err()?;
+            let cause = error_chain(&error);
+            // The codec's reading also parses the compression level.
+            let key = if *key == TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC
+                && cause.contains(TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL)
+            {
+                TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL
+            } else {
+                key
+            };
+            Some((key, cause))
+        })
+}
+
+/// A value that iceberg-rust reads but parquet-rs panics on or refuses only at the first write.
+fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
+    let refusal = |key, cause: &str| Some((key, cause.to_string()));
+    if table.parquet_compression_codec().ok() == Some(CompressionCodec::Lzo) {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC,
+            "the export cannot write lzo",
+        );
+    }
+    if table.parquet_row_group_size_bytes().ok() == Some(0) {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+            "a row group needs at least 1 byte",
+        );
+    }
+    if table.cdc_enabled().ok() != Some(true) {
+        return None;
+    }
+    let min = table.cdc_min_chunk_size().ok()?;
+    let max = table.cdc_max_chunk_size().ok()?;
+    let norm = table.cdc_norm_level().ok()?;
+    if min == 0 {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,
+            "the minimum chunk size must be at least 1",
+        );
+    }
+    if max <= min {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE,
+            "the maximum chunk size must exceed the minimum",
+        );
+    }
+    // parquet-rs's chunking mask: floor(log2(((min + max) / 2 - min) / 8)) - norm, within 1..=63.
+    let target = ((min + max) / 2 - min) / 8;
+    let bits = target.checked_ilog2().map_or(0, |bits| bits as i64) - i64::from(norm);
+    if !(1..=63).contains(&bits) {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL,
+            "the chunk sizes and the normalization level leave no valid chunking mask",
+        );
+    }
+    None
 }
 
 /// The table's default data file locations under each file's partition path, each recorded so

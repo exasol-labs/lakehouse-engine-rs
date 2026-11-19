@@ -3,6 +3,7 @@
 
 use std::sync::OnceLock;
 
+use parquet::basic::Compression;
 use serde_json::Value;
 
 use crate::common::e2e_harness::{
@@ -16,8 +17,9 @@ use crate::common::export_append_fixtures::{
     V3_COLUMNS,
 };
 use crate::common::table_state::{
-    WAREHOUSE_BUCKET, assert_one_new_export, iceberg_columns, local_table_metadata, objects_under,
-    reset_to_unexported_snapshot, snapshot_ids,
+    DataFileFooter, assert_data_files, assert_one_new_export, data_file_footers, data_prefix,
+    iceberg_columns, local_table_metadata, objects_under, reset_to_unexported_snapshot,
+    set_table_properties, snapshot_ids,
 };
 use crate::fixtures::{
     EXPORT_DIRECT, EXPORT_PROXIED, lakehouse_vs, proxy_virtual_schemas, stack, vs_table,
@@ -28,6 +30,9 @@ const SOURCE_SCHEMA: &str = "EXPORT_APPEND_E2E";
 const SOURCE_ROWS: &str = "EXPORT_APPEND_E2E.SOURCE_ROWS";
 const LEVELS_20K: &str = "EXPORT_APPEND_E2E.LEVELS_20K";
 const ROWS_1K: &str = "EXPORT_APPEND_E2E.ROWS_1K";
+/// 200,000 rows of 128 hex characters, about 25 MB that Parquet barely compresses.
+const WIDE_ROWS: &str = "EXPORT_APPEND_E2E.WIDE_ROWS";
+const MIB: i64 = 1024 * 1024;
 const READ_VS: &str = "EXPORT_APPEND_READ";
 const READ_CONN: &str = "EXPORT_APPEND_READ_CREDS";
 
@@ -97,6 +102,11 @@ fn setup() {
             "CREATE OR REPLACE TABLE {ROWS_1K} AS SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID, \
              CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL FROM DUAL CONNECT BY LEVEL <= 1000"
         ));
+        sys.execute(&format!(
+            "CREATE OR REPLACE TABLE {WIDE_ROWS} AS SELECT CAST(LEVEL AS DECIMAL(18,0)) AS ID, \
+             HASH_SHA256(LEVEL) || HASH_SHA256(-LEVEL) AS PAYLOAD \
+             FROM DUAL CONNECT BY LEVEL <= 200000"
+        ));
         create_virtual_schema(
             &mut sys,
             &VsProps::new(READ_VS, NAMESPACE).with_catalog_conn_name(READ_CONN),
@@ -153,15 +163,6 @@ fn shape(metadata: &Value) -> Shape<'_> {
         transforms,
         iceberg_columns(metadata),
     )
-}
-
-/// The `data/` prefix of the table `metadata` describes, within the warehouse bucket.
-fn data_prefix(metadata: &Value) -> String {
-    let location = metadata["location"].as_str().unwrap();
-    let key = location
-        .strip_prefix(&format!("s3://{WAREHOUSE_BUCKET}/"))
-        .unwrap_or_else(|| panic!("{location} lies outside the warehouse bucket"));
-    format!("{key}/data/")
 }
 
 /// Scenario: Unquoted Exasol names append to a table that another engine created
@@ -394,4 +395,83 @@ fn export_single_commit_appends_one_snapshot_without_staged_creation() {
     let after = local_table_metadata(namespace, table);
     let added = assert_one_new_export("SINGLE_COMMIT", &before, &after, 1);
     assert_eq!(added[0]["summary"]["added-records"], "1000");
+}
+
+/// A new table of `WIDE_ROWS`' columns, created by an export of its first 10 rows, with
+/// `properties` set afterwards as another catalog client would.
+fn wide_table(name: &str, properties: &[(&str, &str)]) -> (String, String) {
+    let namespace = run_namespace("write_properties");
+    let source = format!("(SELECT * FROM {WIDE_ROWS} WHERE ID <= 10)");
+    let table = format!("{namespace}.{name}");
+    exported_rows(&mut exa_conn(), &EXPORT_DIRECT.export(&source, &table, ""));
+    set_table_properties(&namespace, name, properties);
+    (namespace, table)
+}
+
+/// Scenario: An append writes data files by the table's write properties
+/// Scenario: An export into an unpartitioned table rolls its data files at the target file size
+#[test]
+fn export_append_follows_the_table_write_properties() {
+    stack();
+    setup();
+    let (namespace, table) = wide_table(
+        "snappy",
+        &[
+            ("write.parquet.compression-codec", "snappy"),
+            ("write.parquet.row-group-size-bytes", "1048576"),
+            ("write.target-file-size-bytes", "4194304"),
+        ],
+    );
+    let before = local_table_metadata(&namespace, "snappy");
+    let earlier: Vec<String> = data_file_footers(&before)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+
+    let sql = EXPORT_DIRECT.export(WIDE_ROWS, &table, "SINGLE_COMMIT = 'true'");
+    assert_eq!(exported_rows(&mut exa_conn(), &sql), 200_000);
+
+    let after = local_table_metadata(&namespace, "snappy");
+    let added: Vec<DataFileFooter> = data_file_footers(&after)
+        .into_iter()
+        .filter(|file| !earlier.contains(&file.path))
+        .collect();
+    assert_data_files("snappy append", &added, Compression::SNAPPY, MIB);
+    let sizes: Vec<u64> = added.iter().map(|file| file.size).collect();
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|size| *size <= 5 * MIB as u64),
+        "several data files of at most 4 MiB plus one row group: {sizes:?}"
+    );
+    assert_eq!(after["properties"], before["properties"]);
+}
+
+/// Scenario: An unusable write property fails the export before any data is written
+#[test]
+fn export_refuses_unusable_write_properties() {
+    stack();
+    setup();
+    let cases = [
+        ("lzo", "write.parquet.compression-codec", "lzo"),
+        ("no_row_group", "write.parquet.row-group-size-bytes", "0"),
+        ("big", "write.target-file-size-bytes", "big"),
+    ];
+
+    for (name, key, value) in cases {
+        let (namespace, table) = wide_table(name, &[(key, value)]);
+        let before = local_table_metadata(&namespace, name);
+        let data = data_prefix(&before);
+        let files = objects_under(&data);
+
+        let sql = EXPORT_DIRECT.export(WIDE_ROWS, &table, "");
+        let error = export_error(&mut exa_conn(), &sql, NO_SECRETS);
+
+        let named = format!("of table {table}: invalid write property {key} = '{value}'");
+        assert!(error.contains(&named), "{name}: {error}");
+        let after = local_table_metadata(&namespace, name);
+        assert_eq!(
+            (snapshot_ids(&after), objects_under(&data)),
+            (snapshot_ids(&before), files),
+            "{name}: the table keeps its snapshots, and the export leaves no data file"
+        );
+    }
 }
