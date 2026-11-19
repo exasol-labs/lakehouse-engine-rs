@@ -19,22 +19,21 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
 * The Iceberg equality-delete variant is refused. The plan-time adapter gate refuses it first
   (`file-planning/pushdown-file-pruning`), and the read-time backstop below is cheap defense in depth
   behind that gate.
-* The pipeline runs in two phases.
-  * Phase A reads every unique delete payload once and merges the positions into one map from
-    data-file path to deleted row positions.
-  * Phase B looks up that map per data file. For each delete-carrying data file it fetches the
-    Parquet footer for the per-row-group row counts, builds a per-row-group `RowSelection`, and
-    attaches it as the file's base `ParquetAccessPlan`.
-* Every read, decode, and access-plan build is its own Tokio task on the scan runtime
-  (`scan-runtime/scan-execution-threading`). A multi-thread runtime therefore spreads the delete
-  path's CPU work across its workers, and a current-thread runtime keeps it on one core.
-* Phase A and Phase B share one size-N connection-budget limiter per scan invocation, including both
-  sides of a broadcast join. `scan-runtime/scan-execution-connection-concurrency` owns the budget
-  knob (`s3_max_connections`).
-* Phase B's footer fetches run concurrently (#165), and two properties keep that safe. Each fetch
-  targets a distinct data-file path, so no two concurrent fetches contend for one session
-  `FileMetadataCache` key. The fan-out also keeps the spec's file order in the `PartitionedFile`
-  list it returns, so the shard's single `FileGroup` matches a serial build.
+* Planning groups the shard's delete payloads and issues no request. A positional-delete file, a
+  Delta sidecar, and a merged Puffin request are one payload each.
+* A data file's deletes load when DataFusion opens the file. Its footer and its payloads load
+  together, the positions become the file's base `ParquetAccessPlan`, and DataFusion then opens the
+  file as it opens a delete-free one.
+* A payload loads once. The first data file that needs it starts the load, later data files wait
+  for it, and each takes its own positions. A data file's access plan is built once and shared by
+  its byte ranges.
+* A wrapper around the Parquet file source attaches the access plan. The scan's reader refuses a
+  delete-carrying file that reaches it without one.
+* The row groups of a positional-delete file decode as Tokio tasks on the scan runtime
+  (`scan-runtime/scan-execution-threading`). Every other delete read runs on the stream that opens
+  the data file.
+* Every delete read takes one permit of the size-N limiter of the scan invocation.
+  `scan-runtime/scan-execution-connection-concurrency` owns the budget knob (`s3_max_connections`).
 * The Parquet opener reads the base access plan and intersects predicate, bloom-filter, row-group,
   and page pruning on top of it, so deletes compose with pushdown instead of disabling it.
 * Deletes are applied at the scan layer. The rows that the DataFusion filter, LIMIT, top-N, and
@@ -53,14 +52,14 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
 * *AND* the UDF MUST NOT silently emit pre-delete rows for that file
 * *AND* the error message MUST NOT contain any storage access key, secret key, or session token
 
-### Scenario: All delete mechanisms converge on one position map and one access-plan pipeline
+### Scenario: All delete mechanisms converge on one access-plan pipeline
 
 * *GIVEN* a shard whose assigned data files mix Iceberg data files carrying Parquet positional-delete files or deletion vectors with Delta data files carrying deletion vectors
 * *WHEN* the scan UDF builds the shard's per-data-file access plans
-* *THEN* Phase A SHALL accumulate EVERY mechanism into ONE map from data-file path to deleted row positions, and Phase B SHALL consume that map WITHOUT knowing which mechanism produced an entry
+* *THEN* EVERY mechanism SHALL yield deleted row positions per data file, and the access-plan builder SHALL consume them WITHOUT knowing which mechanism produced them
 * *AND* the row-selection builder and the access-plan builder SHALL be the same for every mechanism, because a decoded deletion vector and an accumulated positional-delete set are both a bitmap of 0-based row positions in one data file
-* *AND* every mechanism SHALL share the ONE size-N connection limiter that bounds delete-payload reads and data-file footer fetches, so a mixed shard's total in-flight object-store reads MUST NOT exceed N
-* *AND* the read-time backstop SHALL run BEFORE any I/O, so an unapplicable delete anywhere in the shard fails loud before a single delete-file body, deletion-vector payload, or data-file footer is fetched
+* *AND* every mechanism SHALL share the ONE size-N connection limiter that bounds delete-payload reads, so a mixed shard's in-flight delete reads MUST NOT exceed N
+* *AND* the read-time backstop SHALL run BEFORE any I/O, so an unapplicable delete anywhere in the shard fails loud before anything is fetched
 * *AND* the post-delete row set for every data file MUST be identical to applying that file's own mechanism alone
 
 ### Scenario: A delete-free data file scans through the same provider unchanged
@@ -72,11 +71,11 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
 
 ### Scenario: Delete preparation spreads across the scan runtime's workers
 
-* *GIVEN* a scan runtime with more than one worker thread and a shard whose data files carry row-position deletes
-* *WHEN* the scan UDF reads and decodes those deletes and builds the access plans
-* *THEN* each read and decode, and each data file's access-plan build, SHALL run as its own task on the runtime's workers, so the CPU work uses more than one core
+* *GIVEN* a scan runtime with more than one worker thread and a shard whose data files carry positional-delete files
+* *WHEN* the scan UDF reads and decodes those delete files
+* *THEN* each row group of a delete file SHALL decode as its own task on the runtime's workers, so the CPU work uses more than one core
 * *AND* the UDF MUST NOT run that work on threads beyond the runtime's workers, so the instance stays within its thread budget
-* *AND* the first failing task SHALL abort the remaining tasks and fail the scan before any row is emitted
+* *AND* the first failing task SHALL abort the delete file's remaining tasks and fail the scan
 
 ### Scenario: Access-plan construction cost does not grow with the row-group count
 
@@ -85,20 +84,30 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
 * *THEN* the UDF SHALL build every row group's selection in one pass over the file's deleted positions, so the cost grows with the deletes and not with deletes times row groups
 * *AND* a row group with no deleted row SHALL be scanned without a selection, and a row group whose every row is deleted SHALL be skipped
 
-### Scenario: Concurrent data-file footer fetches stay within the connection budget
+### Scenario: A delete payload is read once for the data files that share it
 
-* *GIVEN* a shard whose assigned data files include MORE delete-carrying data files than the resolved `s3_max_connections` budget N
-* *WHEN* the scan UDF builds those files' base `ParquetAccessPlan`s, each of which needs its data file's per-row-group row counts from that file's Parquet footer
-* *THEN* the UDF SHALL fetch those footers CONCURRENTLY rather than awaiting one before starting the next
-* *AND* the number of concurrently in-flight footer fetches MUST NOT exceed N at any instant, counted across every fan-out active in the scan invocation: a single table, or both sides of a broadcast join sharing the ONE size-N limiter that also bounds the delete-payload reads
-* *AND* the returned `PartitionedFile` list SHALL preserve the per-shard spec's assigned-file order, so each file occupies the same position in the shard's single `FileGroup` as it would under a serial build
-* *AND* the post-delete row set SHALL be identical to a strictly serial footer fetch, because a data file's per-row-group row counts and its delete set are both independent of fetch order
-* *AND* a footer fetch that fails SHALL surface as a credential-redacted user error naming the failure, with the remaining fetches abandoned, no partial access plan attached, and no row emitted for the shard
+* *GIVEN* a shard whose data files share a positional-delete file, a Delta sidecar, or a merged Puffin request
+* *WHEN* the scan's streams open those data files, at the same time or one after another
+* *THEN* the UDF SHALL read the shared payload once and apply to each data file its own positions
+* *AND* a scan that a LIMIT stops early MUST NOT read a payload that only unopened data files need
 
-### Scenario: A delete-free data file still costs no footer fetch of its own
+### Scenario: A data file cut into byte ranges applies its deletes once
 
-* *GIVEN* a shard mixing delete-carrying data files with data files that carry no delete mechanism
-* *WHEN* the scan UDF builds the shard's `PartitionedFile` list
-* *THEN* the UDF SHALL fetch a Parquet footer ONLY for the delete-carrying data files, because only those need a base `ParquetAccessPlan`
-* *AND* a delete-free data file MUST NOT acquire a permit from the shared fan-out limiter, so delete-free files in a mixed shard neither consume nor wait on the connection budget
-* *AND* each delete-free data file SHALL still appear in the returned `PartitionedFile` list, in its spec order, with no access plan attached
+* *GIVEN* a delete-carrying data file that the scan cut into several byte ranges
+* *WHEN* the scan's streams open those ranges
+* *THEN* the UDF SHALL load the file's deletes and build its access plan once, and every range SHALL apply the part of the plan that covers its row groups
+* *AND* the emitted rows SHALL be the file's rows without the deleted ones, each exactly once
+
+### Scenario: Row-position deletes apply to files opened by concurrent streams
+
+* *GIVEN* a shard of delete-carrying data files read by more streams than it has files
+* *WHEN* the scan runs a full read, a top-N, a LIMIT, or a join of two delete-carrying tables
+* *THEN* the result SHALL hold no deleted row and every other row
+* *AND* a delete read or a reservation that fails after other files emitted rows SHALL fail the scan
+
+### Scenario: A delete-carrying data file is never read without its access plan
+
+* *GIVEN* a delete-carrying data file that reaches the scan's reader without a base `ParquetAccessPlan`, as a plan rewrite that dropped the file-source wrapper would cause
+* *WHEN* DataFusion opens the file
+* *THEN* the UDF SHALL fail the scan with an error naming the data file
+* *AND* the UDF MUST NOT emit a row of that file

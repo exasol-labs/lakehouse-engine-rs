@@ -13,12 +13,15 @@ use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStor
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use datafusion::common::config::ConfigOptions;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
+use object_store::{GetRange, ObjectMeta, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Drives `invoke_with_args` as DataFusion does for one batch of `rows` rows.
 pub(super) fn invoke_scalar_udf(
@@ -272,5 +275,127 @@ impl exasol_udf_sdk::context::UdfContext for SinkCtx {
         _: *mut core::ffi::c_void,
     ) -> Result<(), exasol_udf_sdk::error::UdfError> {
         Ok(())
+    }
+}
+
+/// Records every forwarded data read, with its range, so a test can count storage trips per
+/// object. Each read yields once while in flight, so concurrent reads overlap observably.
+#[derive(Debug)]
+pub(super) struct CountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    reads: std::sync::Mutex<Vec<(String, Option<GetRange>)>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl CountingObjectStore {
+    pub(super) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            reads: std::sync::Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn reads_of(&self, name: &str) -> usize {
+        self.ranges_of(name).len()
+    }
+
+    pub(super) fn ranges_of(&self, name: &str) -> Vec<Option<GetRange>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(location, _)| location.ends_with(name))
+            .map(|(_, range)| range.clone())
+            .collect()
+    }
+
+    pub(super) fn total_reads(&self) -> usize {
+        self.reads.lock().unwrap().len()
+    }
+
+    pub(super) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if options.head {
+            return self.inner.get_opts(location, options).await;
+        }
+        self.reads
+            .lock()
+            .unwrap()
+            .push((location.to_string(), options.range.clone()));
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        let result = self.inner.get_opts(location, options).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
 }
