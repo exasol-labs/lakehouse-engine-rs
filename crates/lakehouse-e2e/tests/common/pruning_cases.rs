@@ -528,10 +528,16 @@ pub fn assert_clock_cases_hold(conn: &mut ExaConn, format: Format) {
     assert_listed_cases_hold(conn, format, CLOCK_CASES);
 }
 
-/// [`assert_cases_hold`] over the instant-column cases, in a `PACIFIC/KIRITIMATI` session.
+/// [`assert_cases_hold`] over the instant-column cases, in a `PACIFIC/KIRITIMATI` session; the
+/// caller's session zone is restored afterwards.
 pub fn assert_instant_clock_cases_hold(conn: &mut ExaConn, format: Format) {
+    let session_zone = conn.query_columns("SELECT SESSIONTIMEZONE")[0][0]
+        .as_str()
+        .expect("SESSIONTIMEZONE is text")
+        .to_string();
     conn.execute("ALTER SESSION SET TIME_ZONE = 'PACIFIC/KIRITIMATI'");
     assert_listed_cases_hold(conn, format, INSTANT_CLOCK_CASES);
+    conn.execute(&format!("ALTER SESSION SET TIME_ZONE = '{session_zone}'"));
 }
 
 fn assert_listed_cases_hold(conn: &mut ExaConn, format: Format, cases: &[Case]) {

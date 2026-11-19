@@ -234,11 +234,6 @@ pub fn arrow_type_to_tag(dt: &DataType) -> String {
     }
 }
 
-/// A zoned timestamp tag holds UTC instants: the read normalizes every zone to UTC.
-pub fn tag_holds_utc_instants(tag: &str) -> bool {
-    matches!(arrow_type_from_tag(tag), DataType::Timestamp(_, Some(_)))
-}
-
 /// Returns `DataType::Utf8` for any unrecognised tag. The `decimal128(p,s)` tag requires both
 /// arguments.
 pub fn arrow_type_from_tag(tag: &str) -> DataType {

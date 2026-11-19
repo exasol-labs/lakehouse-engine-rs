@@ -201,6 +201,34 @@ fn folded_timestamps(sql: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Asserts that `query`'s pushed SQL holds one folded timestamp literal within the tolerance of
+/// `expected`, an Exasol timestamp expression evaluated now.
+#[track_caller]
+fn assert_folds_near(conn: &mut ExaConn, query: &str, expected: &str) {
+    let pushed = explain_virtual_pushdown_sql(conn, query);
+    let folded: Vec<String> = folded_timestamps(&pushed).into_iter().collect();
+    let [folded] = folded.as_slice() else {
+        panic!("{query} must fold to one timestamp literal: {pushed}");
+    };
+    let off = parse_numeric(
+        &conn.query_columns(&format!(
+            "SELECT ABS(SECONDS_BETWEEN(TIMESTAMP '{folded}', {expected}))"
+        ))[0][0],
+    );
+    assert!(
+        off <= TOLERANCE_SECONDS,
+        "{query} must fold to {expected}, {folded} is {off}s off"
+    );
+}
+
+/// The session's `CURRENT_DATE` as `YYYY-MM-DD`.
+fn session_today(conn: &mut ExaConn) -> String {
+    conn.query_columns("SELECT TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')")[0][0]
+        .as_str()
+        .expect("a date text")
+        .to_string()
+}
+
 #[track_caller]
 fn assert_names_no_clock_function(pushed: &str, context: &str) {
     let upper = pushed.to_uppercase();
@@ -291,10 +319,7 @@ fn each_clock_function_reaches_the_pushed_sql_as_a_literal() {
                 "{predicate}: the scan filter must hold one millisecond timestamp literal: {pushed}"
             );
         } else {
-            let today = conn.query_columns("SELECT TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')")[0][0]
-                .as_str()
-                .expect("a date text")
-                .to_string();
+            let today = session_today(&mut conn);
             // The scan spec is an SQL string literal, which doubles each quote.
             assert!(
                 pushed.contains(&format!("DATE ''{today}''")),
@@ -415,21 +440,10 @@ fn a_tstz_value_compared_with_an_instant_column_compares_the_instants() {
         clocks.push("LOCALTIMESTAMP");
     }
     for function in clocks {
-        let query = format!("SELECT ID FROM {} WHERE TZ < {function}", table(INSTANT_VS));
-        let pushed = explain_virtual_pushdown_sql(&mut conn, &query);
-        let folded: Vec<String> = folded_timestamps(&pushed).into_iter().collect();
-        let [folded] = folded.as_slice() else {
-            panic!("{query} must fold to one timestamp literal: {pushed}");
-        };
-        let off = parse_numeric(
-            &conn.query_columns(&format!(
-                "SELECT ABS(SECONDS_BETWEEN(TIMESTAMP '{folded}', \
-                 CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, 'UTC')))"
-            ))[0][0],
-        );
-        assert!(
-            off <= TOLERANCE_SECONDS,
-            "{query} must fold to the UTC date and time of now, {folded} is {off}s off"
+        assert_folds_near(
+            &mut conn,
+            &format!("SELECT ID FROM {} WHERE TZ < {function}", table(INSTANT_VS)),
+            "CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, 'UTC')",
         );
     }
 
@@ -468,17 +482,31 @@ fn a_plain_value_compared_with_an_instant_column_compares_its_utc_date_and_time(
         [3, 4],
         "{boundary}: a session-local reading of TZ would keep row 2 too"
     );
-    let mut predicates = vec![
-        "TZ >= DATE '2024-03-01'",
-        "TZ <= SYSTIMESTAMP",
-        "TZ >= CURRENT_DATE",
-    ];
+    assert_native_rows(&mut conn, PLAIN_VS, "TZ >= DATE '2024-03-01'");
+
+    // The fixture's rows lie far from now, so only the pushed literal shows the clock's fold.
+    let berlin_now = format!("CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, '{BERLIN}')");
+    let mut clocks = vec![("TZ <= SYSTIMESTAMP", "SYSTIMESTAMP")];
     if !local_is_tstz {
-        predicates.push("TZ <= LOCALTIMESTAMP");
+        clocks.push(("TZ <= LOCALTIMESTAMP", berlin_now.as_str()));
     }
-    for predicate in predicates {
+    for (predicate, expected) in clocks {
+        let query = format!("SELECT ID FROM {} WHERE {predicate}", table(PLAIN_VS));
+        assert_folds_near(&mut conn, &query, expected);
         assert_native_rows(&mut conn, PLAIN_VS, predicate);
     }
+    let today = "TZ >= CURRENT_DATE";
+    let pushed = explain_virtual_pushdown_sql(
+        &mut conn,
+        &format!("SELECT ID FROM {} WHERE {today}", table(PLAIN_VS)),
+    );
+    // The scan spec is an SQL string literal, which doubles each quote.
+    let folded = format!("DATE ''{}''", session_today(&mut conn));
+    assert!(
+        pushed.contains(&folded),
+        "{today}: the scan filter must hold the folding zone's date {folded}: {pushed}"
+    );
+    assert_native_rows(&mut conn, PLAIN_VS, today);
 }
 
 /// Scenario: The clock functions fold in the zone that Exasol uses when the session zone matches

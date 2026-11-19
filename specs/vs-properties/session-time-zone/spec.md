@@ -1,6 +1,6 @@
 # Feature: Session Time Zone
 
-The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in for the session time zone when the adapter folds a clock function or a compared `TIMESTAMP WITH LOCAL TIME ZONE` literal (`pushdown/pushdown-planning-clock-functions`). `SYSDATE` and `SYSTIMESTAMP` fold in the zone of the adapter VM's `TZ` variable. A `TIMESTAMP WITH LOCAL TIME ZONE` value compared with an instant column folds in no zone.
+The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in for the session time zone when the adapter folds a clock function or a compared `TIMESTAMP WITH LOCAL TIME ZONE` literal (`pushdown/pushdown-planning-clock-functions`). `SYSDATE` and `SYSTIMESTAMP` fold in the zone of the adapter VM's `TZ` variable.
 
 ## Background
 
