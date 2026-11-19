@@ -2021,3 +2021,58 @@ fn a_string_column_operand_reads_empty_as_null() {
         assert_eq!(operand.unwrap().sql, expected, "{expr}");
     }
 }
+
+/// Exasol rounds a length, count, start, or code to an integer; DataFusion takes only `Int64`.
+#[test]
+fn string_function_numeric_arguments_convert_to_int64() {
+    let length = |sql: &str| format!("(CASE WHEN {sql} >= 0 THEN {sql} END)");
+    let s = r#"nullif("S", '')"#;
+    let cases = [
+        (
+            "integer literal",
+            scalar_fn("RPAD", [col("S"), num_lit(3)]),
+            format!("rpad({s}, 3)"),
+        ),
+        (
+            "integer arithmetic",
+            scalar_fn("RPAD", [col("S"), scalar_fn("ADD", [col("I"), num_lit(1)])]),
+            format!("rpad({s}, {})", length(r#"CAST(("I" + 1) AS BIGINT)"#)),
+        ),
+        (
+            "DECIMAL(9,2)",
+            scalar_fn("LEFT", [col("S"), col("N")]),
+            format!("left({s}, {})", length(r#"CAST(round("N") AS BIGINT)"#)),
+        ),
+        (
+            "negative literal",
+            scalar_fn("RIGHT", [col("S"), num_lit(-1)]),
+            format!("right({s}, {})", length("CAST(-1 AS BIGINT)")),
+        ),
+        (
+            "DOUBLE start, integer length",
+            scalar_fn("SUBSTR", [col("S"), col("F"), col("I")]),
+            format!(
+                r#"substr({s}, CAST(round("F") AS BIGINT), {})"#,
+                length(r#"CAST("I" AS BIGINT)"#)
+            ),
+        ),
+        (
+            "REPEAT count",
+            scalar_fn("REPEAT", [col("S"), col("I18")]),
+            format!(r#"repeat({s}, CAST("I18" AS BIGINT))"#),
+        ),
+        (
+            "fractional literal",
+            scalar_fn("CHR", [num_lit("65.5")]),
+            "chr(CAST(round(65.5) AS BIGINT))".to_owned(),
+        ),
+    ];
+    for (label, expr, sql) in cases {
+        assert_eq!(
+            render(&expr).unwrap(),
+            format!("nullif({sql}, '')"),
+            "{label}"
+        );
+    }
+    assert!(render(&scalar_fn("LPAD", [col("S"), col("UNKNOWN")])).is_err());
+}

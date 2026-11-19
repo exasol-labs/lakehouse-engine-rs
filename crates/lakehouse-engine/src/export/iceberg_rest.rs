@@ -2,6 +2,7 @@
 //! catalog, or an existing one it appends to.
 
 use super::iceberg_sink::{IcebergSink, OpenedTable};
+use super::partition_by::{PartitionField, unbound_spec};
 use super::refusal;
 use super::target::{ExportConnection, ExportSink, ExportTarget, TableMode};
 use arrow::datatypes::Schema;
@@ -65,30 +66,40 @@ impl ExportTarget for IcebergRestTarget {
     async fn open_new_table(
         &self,
         schema: &Schema,
+        partition_by: &[PartitionField],
         tag: &CommitTag,
         single_commit: bool,
+        budget: usize,
     ) -> Result<Box<dyn ExportSink>, UdfError> {
-        let session = self.session().await?;
         let schema = iceberg_schema(schema)?;
+        let spec = match partition_by {
+            [] => None,
+            fields => Some(unbound_spec(fields, &schema)?),
+        };
+        let session = self.session().await?;
         let opened = if single_commit {
             OpenedTable::Staged(
                 session
-                    .stage_table(&self.ident, schema, &tag.export_id)
+                    .stage_table(&self.ident, schema, spec, &tag.export_id)
                     .await?,
             )
         } else {
             OpenedTable::Listed(
                 session
-                    .create_table(&self.ident, schema, &tag.export_id)
+                    .create_table(&self.ident, schema, spec, &tag.export_id)
                     .await?,
             )
         };
         Ok(Box::new(
-            IcebergSink::open(session, opened, tag.clone()).await?,
+            IcebergSink::open(session, opened, tag.clone(), budget).await?,
         ))
     }
 
-    async fn open_existing_table(&self, tag: &CommitTag) -> Result<Box<dyn ExportSink>, UdfError> {
+    async fn open_existing_table(
+        &self,
+        tag: &CommitTag,
+        budget: usize,
+    ) -> Result<Box<dyn ExportSink>, UdfError> {
         let session = self.session().await?;
         let table = session.load_table(&self.ident).await?;
         let metadata = table.table().metadata();
@@ -100,14 +111,14 @@ impl ExportTarget for IcebergRestTarget {
         )?;
         let opened = OpenedTable::Listed(table);
         Ok(Box::new(
-            IcebergSink::open(session, opened, tag.clone()).await?,
+            IcebergSink::open(session, opened, tag.clone(), budget).await?,
         ))
     }
 }
 
 /// Refuses format version 3 or later, whose row lineage and encryption keys the export does not
-/// maintain, a partition field other than `void`, whose values it does not compute, and a `void`
-/// field named like a column, which iceberg-rust cannot commit to.
+/// maintain, and a partition field named like a column unless it is that column's identity, which
+/// iceberg-rust cannot commit to.
 fn refuse_unappendable(
     table: &TableIdent,
     version: FormatVersion,
@@ -121,24 +132,16 @@ fn refuse_unappendable(
             version as u8
         )));
     }
-    let partitioned: Vec<String> = spec
-        .fields()
-        .iter()
-        .filter(|field| field.transform != Transform::Void)
-        .map(|field| format!("{} ({})", field.name, field.transform))
-        .collect();
-    if !partitioned.is_empty() {
-        return Err(refusal(format_args!(
-            "table {table} is partitioned by {}; the export appends only to unpartitioned tables",
-            partitioned.join(", ")
-        )));
-    }
-    // iceberg-rust's commit rebinds the default spec and refuses a non-identity field named like a
-    // column, which Spark leaves when it drops a version 1 identity field.
+    // iceberg-rust's commit rebinds the default spec and refuses a field named like a column unless
+    // it is that column's identity, which Spark breaks when it drops a version 1 identity field.
     let named_like_columns: Vec<String> = spec
         .fields()
         .iter()
-        .filter(|field| schema.field_by_name(&field.name).is_some())
+        .filter(|field| {
+            schema.field_by_name(&field.name).is_some_and(|column| {
+                field.transform != Transform::Identity || column.id != field.source_id
+            })
+        })
         .map(|field| format!("{} ({})", field.name, field.transform))
         .collect();
     if !named_like_columns.is_empty() {

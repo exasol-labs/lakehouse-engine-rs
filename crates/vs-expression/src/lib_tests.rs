@@ -955,7 +955,7 @@ fn renders_string_scalar_functions() {
         let expr = scalar_fn(name, [col("n")]);
         assert_eq!(
             typed_scan(&expr).unwrap(),
-            r#"nullif(chr("N"), '')"#,
+            r#"nullif(chr(CAST("N" AS BIGINT)), '')"#,
             "failed for {name}"
         );
     }

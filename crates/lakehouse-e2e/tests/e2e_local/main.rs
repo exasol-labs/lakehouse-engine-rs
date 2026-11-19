@@ -17,6 +17,7 @@ mod emit_declaration;
 mod empty_string;
 mod export;
 mod export_append;
+mod export_partition;
 mod harness_row_cap;
 mod identity_partition;
 mod int96_timestamp;
