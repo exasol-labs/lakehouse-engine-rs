@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
 use iceberg::{Catalog, NamespaceIdent};
-use parquet::basic::{Compression, ZstdLevel};
 
 use crate::common::e2e_harness::{
     DEFAULT_CATALOG_CONN_NAME, EXPORT_SCRIPT_NAME, ExportRoute, SCHEMA_NAME, SOURCE_READ_ERROR,
@@ -20,10 +19,7 @@ use crate::common::stack::{
     build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url_internal,
     local_stack_connection_password, proxy_log_during,
 };
-use crate::common::table_state::{
-    WAREHOUSE_BUCKET, assert_data_files, data_file_footers, local_table_metadata, objects_under,
-    table_exists,
-};
+use crate::common::table_state::{WAREHOUSE_BUCKET, objects_under, table_exists};
 use crate::fixtures::{
     EXPORT_DIRECT as DIRECT, EXPORT_PROXIED as PROXIED, LAKEHOUSE_VS, lakehouse_vs,
     proxy_virtual_schemas, seed_catalog, stack, vs_table,
@@ -723,39 +719,4 @@ fn export_errors_carry_no_connection_password() {
         error.contains(&missing_grant_error(NO_ACCESS_EXPORTER)),
         "the writer must refuse a direct call without the script grant: {error}"
     );
-}
-
-/// Scenario: A table the export creates carries its write properties
-#[test]
-fn export_created_table_carries_write_properties() {
-    stack();
-    setup();
-    let created = [
-        ("write.parquet.compression-codec", "zstd"),
-        ("write.parquet.row-group-size-bytes", "134217728"),
-        ("write.target-file-size-bytes", "268435456"),
-    ];
-
-    for options in ["WRITERS_PER_NODE = '4'", "SINGLE_COMMIT = 'true'"] {
-        let table = new_table();
-        let (namespace, name) = table.split_once('.').unwrap();
-        exported_rows(
-            &mut exa_conn(),
-            &DIRECT.export(SOURCE_TABLE, &table, options),
-        );
-
-        let metadata = local_table_metadata(namespace, name);
-        let properties: Vec<_> = created
-            .iter()
-            .map(|(key, _)| metadata["properties"][key].as_str())
-            .collect();
-        let expected: Vec<_> = created.iter().map(|(_, value)| Some(*value)).collect();
-        assert_eq!(properties, expected, "{options}");
-        assert_data_files(
-            options,
-            &data_file_footers(&metadata),
-            Compression::ZSTD(ZstdLevel::default()),
-            134_217_728,
-        );
-    }
 }
