@@ -1821,12 +1821,12 @@ fn selectlist_predicate_node_projects_as_expr() {
         (
             "predicate_is_null",
             is_null(col("name")),
-            r#"("NAME" IS NULL OR "NAME" = '')"#,
+            r#"(("NAME" IS NULL) OR ("NAME" = ''))"#,
         ),
         (
             "predicate_is_not_null",
             is_not_null(col("name")),
-            r#"("NAME" IS NOT NULL AND "NAME" <> '')"#,
+            r#"(("NAME" IS NOT NULL) AND ("NAME" <> ''))"#,
         ),
         (
             "predicate_notequal",

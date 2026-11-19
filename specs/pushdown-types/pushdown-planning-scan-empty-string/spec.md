@@ -40,7 +40,7 @@ The scan reads an empty string as NULL wherever it computes with it, so a pushed
 * *AND* `s <> 'x'`, `s < 'x'`, `s <= 'x'`, and `s LIKE 'x%'` SHALL render over the bare column joined by `AND` with `"S" <> ''`
 * *AND* each filter SHALL return the rows the native oracle returns, so `s <> 'x'` and `s < 'x'` SHALL NOT return a row that stores `''`
 * *AND* the same comparison under a `NOT`, in a `CASE` condition, or in the select list SHALL read the column as `nullif("S", '')`, so `NOT (s = 'x')` SHALL NOT return a row that stores `''`
-* *AND* `s IS NULL` SHALL render as `("S" IS NULL OR "S" = '')` and `s IS NOT NULL` as `("S" IS NOT NULL AND "S" <> '')` at any position, also under a `NOT`, and SHALL return the native oracle's rows
+* *AND* `s IS NULL` SHALL render as `(("S" IS NULL) OR ("S" = ''))` and `s IS NOT NULL` as `(("S" IS NOT NULL) AND ("S" <> ''))` at any position, also under a `NOT`, and SHALL return the native oracle's rows
 
 ### Scenario: A guarded string filter still skips row groups
 

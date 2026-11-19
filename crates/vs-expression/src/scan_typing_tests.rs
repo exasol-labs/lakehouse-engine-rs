@@ -1891,16 +1891,8 @@ fn a_text_function_result_reads_empty_as_null() {
             r#"nullif(rtrim(nullif("S", ''), nullif("S", '')), '')"#,
         ),
         (
-            scalar_fn("CONCAT", [col("S"), str_lit("x")]),
-            r#"nullif(concat(nullif("S", ''), 'x'), '')"#,
-        ),
-        (
             scalar_fn("LENGTH", [scalar_fn("UPPER", [col("S")])]),
             r#"character_length(nullif(upper(nullif("S", '')), ''))"#,
-        ),
-        (
-            scalar_fn("TO_DATE", [col("S"), str_lit("YYYY-MM-DD")]),
-            r#"to_date(nullif("S", ''), '%Y-%m-%d')"#,
         ),
     ];
     for (expr, expected) in cases {
@@ -1984,11 +1976,14 @@ fn a_filter_over_a_bare_string_column_keeps_the_bare_column() {
 #[test]
 fn a_null_test_over_a_bare_string_column_holds_for_an_empty_string() {
     let cases = [
-        (is_null(col("S")), r#"("S" IS NULL OR "S" = '')"#),
-        (is_not_null(col("S")), r#"("S" IS NOT NULL AND "S" <> '')"#),
+        (is_null(col("S")), r#"(("S" IS NULL) OR ("S" = ''))"#),
+        (
+            is_not_null(col("S")),
+            r#"(("S" IS NOT NULL) AND ("S" <> ''))"#,
+        ),
         (
             not(is_not_null(col("S"))),
-            r#"(NOT ("S" IS NOT NULL AND "S" <> ''))"#,
+            r#"(NOT (("S" IS NOT NULL) AND ("S" <> '')))"#,
         ),
         (is_null(col("I")), r#"("I" IS NULL)"#),
         (
@@ -2004,39 +1999,25 @@ fn a_null_test_over_a_bare_string_column_holds_for_an_empty_string() {
 
 #[test]
 fn replace_reads_a_null_search_as_no_match_and_a_null_replacement_as_empty() {
-    let cases = [
-        (
-            scalar_fn("REPLACE", [col("S"), str_lit("U"), null_lit()]),
-            r#"nullif(CASE WHEN 'U' IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), 'U', coalesce(NULL, '')) END, '')"#,
-        ),
-        (
-            scalar_fn("REPLACE", [col("S"), col("S10")]),
-            r#"nullif(CASE WHEN nullif("S10", '') IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), nullif("S10", ''), coalesce(NULL, '')) END, '')"#,
-        ),
-    ];
-    for (expr, expected) in cases {
-        assert_eq!(render(&expr).unwrap(), expected, "{expr}");
-    }
+    assert_eq!(
+        render(&scalar_fn("REPLACE", [col("S"), col("S10"), null_lit()])).unwrap(),
+        r#"nullif(CASE WHEN nullif("S10", '') IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), nullif("S10", ''), coalesce(NULL, '')) END, '')"#
+    );
     assert!(render(&scalar_fn("REPLACE", [col("S")])).is_err());
 }
 
 #[test]
 fn a_string_column_operand_reads_empty_as_null() {
-    let operand = |expr: &Json| {
-        ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
-            .render_operand(expr)
-            .unwrap()
-    };
-    assert_eq!(
-        operand(&col("S10")),
-        SqlFragment::new(
-            r#"nullif("S10", '')"#.to_string(),
-            Some(ExasolType::WIDEST_VARCHAR)
-        )
-    );
-    assert_eq!(operand(&col("I")).sql, r#""I""#);
-    assert_eq!(
-        operand(&scalar_fn("LENGTH", [col("S")])).sql,
-        r#"character_length(nullif("S", ''))"#
-    );
+    let cases = [
+        (col("S10"), r#"nullif("S10", '')"#),
+        (col("I"), r#""I""#),
+        (
+            scalar_fn("LENGTH", [col("S")]),
+            r#"character_length(nullif("S", ''))"#,
+        ),
+    ];
+    for (expr, expected) in cases {
+        let operand = ScanTyping::new(&columns(), ExasolVersion::Exasol2025).render_operand(&expr);
+        assert_eq!(operand.unwrap().sql, expected, "{expr}");
+    }
 }

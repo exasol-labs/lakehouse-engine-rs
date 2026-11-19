@@ -79,28 +79,23 @@ impl<C: Clone> PruningFilter<C> {
             "predicate_is_null" | "predicate_is_not_null" => {
                 let (column, data_type) = resolve(subject_column(node)?)?;
                 let is_null = kind == "predicate_is_null";
-                let empty = |comparison| {
-                    let literal = data_type.as_ref().and_then(empty_value)?;
-                    Some(Self::Compare {
+                let empty = data_type.as_ref().and_then(empty_value).map(|literal| {
+                    let comparison = if is_null {
+                        Comparison::Equal
+                    } else {
+                        Comparison::NotEqual
+                    };
+                    Self::Compare {
                         column: column.clone(),
                         comparison,
                         literal,
-                    })
-                };
-                let null_test = Self::NullTest {
-                    column: column.clone(),
-                    is_null,
-                };
-                if is_null {
-                    match empty(Comparison::Equal) {
-                        Some(is_empty) => Self::Or(vec![null_test, is_empty]),
-                        None => null_test,
                     }
-                } else {
-                    match empty(Comparison::NotEqual) {
-                        Some(not_empty) => Self::And(vec![null_test, not_empty]),
-                        None => null_test,
-                    }
+                });
+                let null_test = Self::NullTest { column, is_null };
+                match empty {
+                    None => null_test,
+                    Some(empty) if is_null => Self::Or(vec![null_test, empty]),
+                    Some(empty) => Self::And(vec![null_test, empty]),
                 }
             }
             "predicate_in_constlist" => {

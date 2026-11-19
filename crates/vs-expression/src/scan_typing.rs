@@ -196,10 +196,6 @@ pub(crate) const SECOND_NODE: &str = "scan_second";
 /// Synthetic node: its text argument with an empty string read as NULL, because Exasol has no
 /// empty string and DataFusion keeps one as a value (#203).
 pub(crate) const EMPTY_AS_NULL_NODE: &str = "scan_empty_as_null";
-/// Synthetic node: `IS NULL` of a bare string column, which also holds for an empty string.
-pub(crate) const TEXT_IS_NULL_NODE: &str = "scan_text_is_null";
-/// Synthetic node: `IS NOT NULL` of a bare string column, which fails for an empty string.
-pub(crate) const TEXT_IS_NOT_NULL_NODE: &str = "scan_text_is_not_null";
 
 /// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
 pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
@@ -502,13 +498,6 @@ impl<'a> ScanTyping<'a> {
         self.type_at(node, Position::Filter)
     }
 
-    /// [`Self::type_scan_tree`] for an operand of a computation the caller renders around it, such
-    /// as an aggregate argument.
-    pub(crate) fn type_scan_operand(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
-        let (typed, ty) = self.type_at(node, Position::Value)?;
-        Ok((empty_as_null(node, typed, ty), ty))
-    }
-
     fn type_at(self, node: &Json, position: Position) -> Result<(Json, Inferred), UdfError> {
         if let Some(ty) = leaf_type(node, self.columns) {
             return Ok((node.clone(), ty));
@@ -551,8 +540,8 @@ impl<'a> ScanTyping<'a> {
         };
         let op = kind(node);
         match op {
-            "predicate_is_null" => return subject().map(|_| BareForm::IsNull),
-            "predicate_is_not_null" => return subject().map(|_| BareForm::IsNotNull),
+            "predicate_is_null" => return subject().cloned().map(BareForm::OrEmpty),
+            "predicate_is_not_null" => return subject().cloned().map(BareForm::Guarded),
             _ if position == Position::Value => return None,
             _ => {}
         }
@@ -732,7 +721,7 @@ enum Position {
 }
 
 /// `typed`, the rewrite of the operand `node`, with a string column's empty strings read as NULL.
-fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
+pub(crate) fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
     if kind(node) == "column" && ty.is_text() {
         wrap(EMPTY_AS_NULL_NODE, typed)
     } else {
@@ -743,32 +732,29 @@ fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
 /// A predicate over bare string columns that reads an empty string as NULL without wrapping the
 /// column, which statistics pruning could not read through.
 enum BareForm {
-    IsNull,
-    IsNotNull,
-    /// A comparison that is never TRUE for an empty string.
+    /// A predicate that is never TRUE for an empty string.
     Unguarded,
-    /// A comparison that could be TRUE for an empty string, so it adds that the column is not one.
+    /// A predicate that could be TRUE for an empty string, so it adds that the column is not one.
     Guarded(Json),
+    /// `IS NULL`, which also holds for an empty string.
+    OrEmpty(Json),
 }
 
 impl BareForm {
     fn apply(self, out: &mut Json) {
-        match self {
-            Self::IsNull => *out = wrap(TEXT_IS_NULL_NODE, out["expression"].take()),
-            Self::IsNotNull => *out = wrap(TEXT_IS_NOT_NULL_NODE, out["expression"].take()),
-            Self::Unguarded => {}
-            Self::Guarded(column) => {
-                let not_empty = serde_json::json!({
-                    "type": "predicate_notequal",
-                    "left": column,
-                    "right": {"type": "literal_string", "value": ""},
-                });
-                *out = serde_json::json!({
-                    "type": "predicate_and",
-                    "expressions": [out.take(), not_empty],
-                });
-            }
-        }
+        let (junction, comparison, column) = match self {
+            Self::Unguarded => return,
+            Self::Guarded(column) => ("predicate_and", "predicate_notequal", column),
+            Self::OrEmpty(column) => ("predicate_or", "predicate_equal", column),
+        };
+        *out = serde_json::json!({
+            "type": junction,
+            "expressions": [out.take(), {
+                "type": comparison,
+                "left": column,
+                "right": {"type": "literal_string", "value": ""},
+            }],
+        });
     }
 }
 

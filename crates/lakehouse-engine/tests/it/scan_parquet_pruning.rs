@@ -633,7 +633,7 @@ async fn guarded_string_filter_skips_row_groups() {
             r#"(("S" LIKE 'd09%') AND ("S" <> ''))"#,
             (390..400).collect(),
         ),
-        (r#"("S" IS NULL OR "S" = '')"#, vec![0, 1]),
+        (r#"(("S" IS NULL) OR ("S" = ''))"#, vec![0, 1]),
     ];
     for (filter, expected) in cases {
         let spec = id_scan_spec(&file_url, filter, &[("id", "int64"), ("s", "utf8")]);
