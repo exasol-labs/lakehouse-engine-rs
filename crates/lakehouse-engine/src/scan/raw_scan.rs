@@ -77,9 +77,9 @@ pub(super) async fn physical_plan(df: DataFrame) -> Result<Arc<dyn ExecutionPlan
         .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
-/// Bounds every object-store read the delete path issues for one invocation (delete-file bodies
-/// and data-file footers alike), shared across all its providers. Sized per call, never at
-/// process scope. Clamped to 1 because `Semaphore::new(0)` would deadlock every read.
+/// Bounds every object-store read the delete path issues for one invocation, shared across all
+/// its providers. Sized per call, never at process scope. Clamped to 1 because
+/// `Semaphore::new(0)` would deadlock every read.
 pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1)))
 }

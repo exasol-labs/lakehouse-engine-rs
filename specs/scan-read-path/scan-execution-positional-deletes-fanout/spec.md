@@ -4,7 +4,7 @@ Governs the object-store I/O shape of reading Iceberg Parquet positional-delete 
 
 ## Background
 
-* These reads are Phase A of the pipeline every row-position delete mechanism shares. `scan-read-path/scan-execution-row-position-deletes` owns Phase B, including the concurrent data-file footer fetches, and the size-N limiter that both phases share.
+* A delete file is one payload of the pipeline every row-position delete mechanism shares. `scan-read-path/scan-execution-row-position-deletes` owns when a payload loads and the size-N limiter its reads share.
 * Both deletion-vector mechanisms read under the same limiter with their own read-once discipline: see `scan-read-path/scan-execution-delta-deletion-vectors` and `scan-read-path/scan-execution-iceberg-deletion-vectors`.
 * `scan-runtime/scan-execution-connection-concurrency` owns the budget knob `s3_max_connections`. This feature governs how positional-delete file reads spend the budget.
 
@@ -22,7 +22,7 @@ Governs the object-store I/O shape of reading Iceberg Parquet positional-delete 
 ### Scenario: Concurrent delete-file reads stay within the connection budget
 
 * *GIVEN* a shard whose assigned data files reference more unique positional-delete files than the resolved `s3_max_connections` budget N
-* *WHEN* the scan UDF reads those delete files to build its per-data-file delete sets
+* *WHEN* the scan UDF reads those delete files at the same time, because one data file references them or several streams open their data files
 * *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing one size-N limiter
 * *AND* the UDF SHALL read delete files concurrently up to N in flight rather than strictly one at a time
 * *AND* the resulting per-data-file delete sets SHALL be identical to a strictly serial read, because unioning delete positions is order-independent
@@ -31,7 +31,7 @@ Governs the object-store I/O shape of reading Iceberg Parquet positional-delete 
 
 * *GIVEN* a positional-delete file with several row groups that can hold an assigned data file's deletes
 * *WHEN* the scan UDF reads that delete file
-* *THEN* the UDF SHALL read the footer first, as ONE ranged GET of the file's last metadata-size-hint bytes, with a second GET only when the footer and metadata do not fit the hint
+* *THEN* the UDF SHALL read the footer first, as ONE ranged GET of the file's last metadata-size-hint bytes, with a second GET, for the missing leading part only, when the footer does not fit the hint
 * *AND* the UDF SHALL decode a row group whose `file_path` and `pos` column chunks lie inside those footer bytes from memory, issuing no request and taking no permit, so a delete file that fits the hint costs ONE GET in total
 * *AND* the UDF SHALL read every other such row group as its own request under its own permit of the shared limiter, so those row groups are read concurrently up to N in flight
 * *AND* the UDF SHALL decode those row groups in the footer read's own task, after releasing its permit, and SHALL drop the footer bytes before that task ends, so the bytes never wait on another file's read and never hold memory-pool room that the deleted-position sets need

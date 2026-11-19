@@ -10,7 +10,7 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 * The SDK calls the scan `run()` once per input row, so the runtime is built per call; see `datafusion-scan/scan-execution`.
 * The `DATAFUSION_THREADING_MODE` VS/connection property takes `AUTO` or `FIXED`. The adapter resolves it at each pushdown. Only the resulting integer fields reach the scan UDF, which does not know the mode.
 * `nr_of_cores` comes from `std::thread::available_parallelism()` on the adapter's executing node, resolved once per request and defaulting to `1` when the platform cannot report it (`vs-properties/tuning-resolution`).
-* In AUTO mode, `df_threads_per_udf = nr_of_cores` and `df_target_partitions = 2 × nr_of_cores`, independent of the parallelism factor. DataFusion splits the scan's file group into byte ranges up to `target_partitions`, so partitions beyond threads overlap object-store reads with decoding.
+* In AUTO mode, `df_threads_per_udf = nr_of_cores` and `df_target_partitions = 2 × nr_of_cores`, independent of the parallelism factor. The scan table builds up to `target_partitions` file groups per file scan (`datafusion-scan/scan-execution-plan-shape`), so partitions beyond threads overlap object-store reads with decoding.
 * In FIXED mode the adapter uses the supplied `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` values as given, each falling back to its AUTO value when absent.
 
 ## Scenarios

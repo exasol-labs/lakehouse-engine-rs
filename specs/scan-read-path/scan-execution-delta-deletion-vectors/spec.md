@@ -107,7 +107,7 @@ The engine carries the descriptor unresolved in the Delta deletion-vector varian
   scan-driving kernel object inside the scan, because DataFusion is this engine's only execution
   engine and a second one would compete for the UDF's bounded memory pool
 
-### Scenario: A deletion vector the scan cannot trust fails loud before any row is emitted
+### Scenario: A deletion vector the scan cannot trust fails loud before any row of its data file is emitted
 
 * *GIVEN* a scan invocation whose assigned Delta data file carries a deletion vector that the decoder
   rejects, a container whose leading version byte is not `1`, a stored size that disagrees with the

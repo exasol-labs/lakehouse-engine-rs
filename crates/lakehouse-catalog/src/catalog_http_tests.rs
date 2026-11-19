@@ -280,6 +280,13 @@ async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStrea
     panic!("the accept queue of a listen(1) socket never filled");
 }
 
+/// reqwest's connect timeout also covers the TLS handshake, which needs the fake server's task, so a
+/// loaded host can overrun [`SHORT_POLICY`]'s 100 ms and turn a final TLS failure into a retried one.
+const TLS_HANDSHAKE_POLICY: RetryPolicy = RetryPolicy {
+    connect_timeout: CATALOG_POLICY.connect_timeout,
+    ..SHORT_POLICY
+};
+
 fn get(http: &CatalogHttp, url: &str) -> Request {
     http.get(url)
         .bearer_auth(BEARER_TOK)
@@ -1002,7 +1009,7 @@ async fn an_http2_connection_closed_cleanly_is_transient() {
 #[tokio::test]
 async fn a_tls_client_against_a_plain_http_listener_connects_once() {
     let (address, accepted) = spawn_listener(|stream, _| answer_in_plain_http(stream)).await;
-    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let http = CatalogHttp::with_policy(TLS_HANDSHAKE_POLICY);
 
     let error = http
         .send(
@@ -1057,8 +1064,8 @@ async fn an_unresolvable_host_fails_at_the_first_attempt() {
 #[tokio::test]
 async fn transport_failures_are_classified_by_their_typed_cause() {
     let client = reqwest::Client::builder()
-        .connect_timeout(SHORT_POLICY.connect_timeout)
-        .read_timeout(SHORT_POLICY.read_timeout)
+        .connect_timeout(TLS_HANDSHAKE_POLICY.connect_timeout)
+        .read_timeout(TLS_HANDSHAKE_POLICY.read_timeout)
         .build()
         .unwrap();
     let failure = |url: String| {
