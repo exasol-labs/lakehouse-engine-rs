@@ -7,12 +7,17 @@ use crate::common::e2e_harness::{
     has_broadcast_join_block, int_column, isolated_pushdown_statement, join_query,
     pushdown_statements, runtime, text_column,
 };
+use crate::common::pos_delete_fixtures::{
+    PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
+};
+use crate::common::raw_parquet::{encode_parquet_with, put_fixture_object};
 use crate::common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS,
 };
 use crate::common::stack::{
-    ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, count_proxy_requests,
-    iceberg_catalog_url_internal, local_stack_connection_password, proxy_log_during, request_count,
+    CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY,
+    count_proxy_requests, iceberg_catalog_url_internal, local_stack_connection_password,
+    proxy_log_during, request_count,
 };
 use crate::fixtures::{
     PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, append_file, count, drop_table_if_exists,
@@ -20,7 +25,13 @@ use crate::fixtures::{
     role_password_via_proxy, seed_catalog, vs_table,
 };
 
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::record_batch::RecordBatch;
 use iceberg::NamespaceIdent;
+use parquet::file::properties::WriterProperties;
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 const LATER_NAMESPACE: &str = "e2e_statement_reuse_later";
 const LATER_TABLE: &str = "later";
@@ -30,6 +41,9 @@ const MANIFESTS_TABLE: &str = "manifests";
 const MANIFESTS_VS: &str = "REUSE_MANIFESTS_VS";
 /// One append per row, and each append commits one manifest.
 const MANIFESTS: i64 = 8;
+const READS_BASE: &str = "s3://warehouse/proxy_reads/";
+const READS_ROWS: usize = 150_000;
+const READS_ROW_GROUPS: usize = 5;
 
 fn config_get() -> String {
     format!("GET {ICEBERG_REST_VIA_PROXY}/v1/config")
@@ -408,4 +422,155 @@ fn planning_keeps_at_most_the_configured_manifest_reads_in_flight() {
             "{concurrency}: {peak} manifest GETs in flight at once, expected {peaks:?}"
         );
     }
+}
+
+/// The object keys of the `.parquet` GETs in `log`, with how often each was requested.
+fn parquet_gets(log: &str) -> HashMap<String, usize> {
+    let prefix = format!("GET {SEAWEEDFS_VIA_PROXY}/");
+    let mut gets = HashMap::new();
+    for line in log.lines() {
+        let Some((_, rest)) = line.split_once(prefix.as_str()) else {
+            continue;
+        };
+        let key = rest.split([' ', '?']).next().unwrap_or_default();
+        if key.ends_with(".parquet") {
+            *gets.entry(key.to_string()).or_default() += 1;
+        }
+    }
+    gets
+}
+
+/// `id` counts the rows and seven pseudo-random columns keep the file from compressing.
+fn reads_batch(rows: usize) -> RecordBatch {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut columns: Vec<(String, ArrayRef)> = vec![(
+        "id".to_string(),
+        Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+    )];
+    for column in 1..8 {
+        let values = (0..rows).map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 1) as i64
+        });
+        columns.push((
+            format!("c{column}"),
+            Arc::new(Int64Array::from_iter_values(values)),
+        ));
+    }
+    RecordBatch::try_from_iter(columns).expect("build the reads fixture batch")
+}
+
+/// Scenario: A data file's footer is fetched once for all its byte ranges
+/// Scenario: A data file within the metadata size hint is read in one request
+#[test]
+fn storage_requests_do_not_grow_with_the_stream_count() {
+    proxy_virtual_schemas();
+    let large = encode_parquet_with(
+        &reads_batch(READS_ROWS),
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(READS_ROWS / READS_ROW_GROUPS))
+            .build(),
+    );
+    assert!(
+        large.len() > 8 * 1024 * 1024,
+        "the large fixture must be large enough for 16 streams to cut it: {}",
+        large.len()
+    );
+    put_fixture_object(&format!("{READS_BASE}large/f.parquet"), large);
+    for file in 0..4 {
+        put_fixture_object(
+            &format!("{READS_BASE}small/f{file}.parquet"),
+            encode_parquet_with(&reads_batch(100), WriterProperties::default()),
+        );
+    }
+
+    let mut conn = exa_conn();
+    let mut large_gets = Vec::new();
+    for (streams, vs, creds) in [
+        (
+            "1",
+            "PROXY_READS_ONE_STREAM_VS",
+            "PROXY_READS_ONE_STREAM_CREDS",
+        ),
+        ("16", "PROXY_READS_STREAMS_VS", "PROXY_READS_STREAMS_CREDS"),
+    ] {
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(vs, "")
+                .proxied(creds)
+                .with_catalog_kind("DIRECT_STORAGE")
+                .with_parallelism_factor(1)
+                .with_property("DATAFUSION_THREADING_MODE", "FIXED")
+                .with_property("DATAFUSION_TARGET_PARTITIONS", streams),
+            READS_BASE,
+            &CatalogConnectionPassword {
+                warehouse: String::new(),
+                ..local_stack_connection_password().via_proxy()
+            },
+        );
+
+        let mut sum = 0;
+        let log = proxy_log_during(|| {
+            sum = conn.query_scalar_i64(&format!("SELECT SUM(id) FROM {}", vs_table(vs, "large")));
+        });
+        assert_eq!(
+            sum,
+            (READS_ROWS * (READS_ROWS - 1) / 2) as i64,
+            "{streams} streams"
+        );
+        large_gets.push(parquet_gets(&log)["warehouse/proxy_reads/large/f.parquet"]);
+
+        let mut rows = 0;
+        let log = proxy_log_during(|| {
+            rows = count(&format!("SELECT COUNT(*) FROM {}", vs_table(vs, "small")))
+        });
+        assert_eq!(rows, 400, "{streams} streams");
+        let small = parquet_gets(&log);
+        assert_eq!(small.len(), 4, "{streams} streams: {small:?}");
+        assert!(
+            small.values().all(|gets| *gets == 1),
+            "{streams} streams: a small file costs one request: {small:?}"
+        );
+    }
+
+    assert_eq!(
+        large_gets,
+        [1 + READS_ROW_GROUPS; 2],
+        "one footer request and one column request per row group, at 1 and at 16 streams"
+    );
+}
+
+/// Scenario: A data file within the metadata size hint is read in one request
+/// Scenario: A delete payload is read once for the data files that share it
+#[test]
+fn a_scan_with_deletes_requests_each_file_once() {
+    proxy_virtual_schemas();
+    // One shard, because every shard reads a delete file its data files share.
+    let vs = "PROXY_DELETES_ONE_SHARD_VS";
+    create_virtual_schema_with_password(
+        &mut exa_conn(),
+        &VsProps::new(vs, E2E_NAMESPACE)
+            .proxied("PROXY_DELETES_ONE_SHARD_CREDS")
+            .with_parallelism_factor(1),
+        ICEBERG_REST_VIA_PROXY,
+        &local_stack_connection_password().via_proxy(),
+    );
+    let table = vs_table(vs, PARTITION_GRANULARITY_TABLE);
+
+    let mut rows = 0;
+    let log = proxy_log_during(|| rows = count(&format!("SELECT COUNT(*) FROM {table}")));
+
+    assert_eq!(rows, PARTITION_GRANULARITY_REMAINING_ROWS as i64);
+    let gets = parquet_gets(&log);
+    assert_eq!(
+        gets.len(),
+        6,
+        "four data files and one delete file per partition: {gets:?}"
+    );
+    assert!(
+        gets.values().all(|gets| *gets == 1),
+        "every data file and every delete file costs one request: {gets:?}"
+    );
 }

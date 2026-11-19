@@ -46,7 +46,7 @@ The adapter qualifies its calls to these scripts from its own running-script sch
 
 **Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the per-instance limit is reported as 0 (unknown), a conservative default budget applies instead.
 
-**Tables with deletes:** A scan of a table with positional deletes or deletion vectors holds its deleted row positions in this pool until the row selections are built, and the row selections until the scan finishes. That memory cannot spill. When a shard's delete state does not fit, the query fails with `the row-position delete state does not fit the memory pool`. Raise `PARALLELISM_FACTOR` so each shard holds fewer data files, or raise `MEMORY_POOL_FRACTION`. Reading and decoding the deletes runs on the scan's worker threads, so the thread budget set by `DATAFUSION_THREADING_MODE` also speeds up the delete preparation.
+**Tables with deletes:** A scan of a table with positional deletes or deletion vectors holds a data file's deleted row positions in this pool until its row selection is built, and the row selection while the file is read. That memory cannot spill. When a shard's delete state does not fit, the query fails with `the row-position delete state does not fit the memory pool`. Raise `PARALLELISM_FACTOR` so each shard holds fewer data files, or raise `MEMORY_POOL_FRACTION`. Reading and decoding the deletes runs on the scan's worker threads, so the thread budget set by `DATAFUSION_THREADING_MODE` also speeds up the delete preparation.
 
 **Quick recommendation:** Keep the defaults. On scan-only queries, `DATAFUSION_TARGET_PARTITIONS` at 4 × cores (`FIXED` mode) can be faster, but it slows joins. Raise `PARALLELISM_FACTOR` to 2 only when file sizes are very uneven, so one node does not become the long pole.
 
@@ -56,7 +56,7 @@ This property sizes the HTTP client connection pool of the object store for the 
 
 The property has no hard cap on in-flight request concurrency. It only bounds how many established connections stay open for reuse. Without reuse, the client tears down a connection and negotiates a new one. The property therefore improves connection reuse on a best-effort basis. It is not a guaranteed ceiling on concurrent data-file fetches.
 
-One read path does have a hard cap. When a scan instance reads a table with deletes, it first fetches the positional-delete files, the deletion vectors, and the Parquet footers of the data files they apply to. The instance keeps at most this many of those reads in flight at once, across both sides of a join.
+One read path does have a hard cap. When a scan instance opens a data file with deletes, it fetches the positional-delete files and the deletion vectors that apply to it. The instance keeps at most this many of those reads in flight at once.
 
 The property says nothing about how many shards run (`PARALLELISM_FACTOR`). It also says nothing about how many CPU threads decode them (`DATAFUSION_THREADING_MODE`). Those two axes stay separate and orthogonal.
 

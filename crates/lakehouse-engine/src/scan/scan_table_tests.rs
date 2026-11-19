@@ -28,7 +28,6 @@ fn scan_table_over(files: Vec<FileEntry>) -> ParquetScanTable {
         table_root: "memory:///db/t".to_string(),
         secrets: Arc::from([]),
         delete_path_read_limiter: Arc::new(Semaphore::new(1)),
-        delete_state_reservations: Default::default(),
     }
 }
 
@@ -59,16 +58,6 @@ fn entry_in_partition(path: &str, part: Option<&str>) -> FileEntry {
         1,
         std::collections::BTreeMap::from([("part".to_string(), part.map(str::to_string))]),
     )
-}
-
-fn memory_session() -> datafusion::execution::session_state::SessionState {
-    use datafusion::prelude::SessionContext;
-    let ctx = SessionContext::new();
-    ctx.register_object_store(
-        &url::Url::parse("memory://").unwrap(),
-        Arc::new(object_store::memory::InMemory::new()),
-    );
-    ctx.state()
 }
 
 #[test]
@@ -114,10 +103,9 @@ fn each_partitioned_file_carries_its_own_logged_partition_values() {
         &["part".to_string()],
     );
 
-    let rt = current_thread_runtime();
-    let files = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
-        .expect("no delete needs reading");
+    let files = table
+        .partitioned_files()
+        .expect("every partition value converts");
 
     let values: Vec<&datafusion::scalar::ScalarValue> = files
         .iter()
@@ -148,10 +136,9 @@ fn an_unpartitioned_scan_attaches_no_partition_values() {
         Vec::new(),
     )]);
 
-    let rt = current_thread_runtime();
-    let files = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
-        .expect("no delete needs reading");
+    let files = table
+        .partitioned_files()
+        .expect("every partition value converts");
 
     assert!(files[0].partition_values.is_empty());
 }
@@ -164,15 +151,94 @@ fn an_unrepresentable_partition_value_fails_the_scan() {
         &["part".to_string()],
     );
 
-    let rt = current_thread_runtime();
-    let error = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
+    let error = table
+        .partitioned_files()
         .expect_err("an unrepresentable partition value must never reach the query");
 
     let message = error.to_string();
     assert!(message.contains("part"), "{message}");
     assert!(message.contains("Int32"), "{message}");
     assert!(message.contains("not-a-number"), "{message}");
+}
+
+/// A grouped file as `(name, byte range)`.
+type Piece = (String, Option<(i64, i64)>);
+
+fn grouped(sizes: &[(&str, u64)], target: usize) -> Vec<Vec<Piece>> {
+    let files = sizes
+        .iter()
+        .map(|(name, size)| PartitionedFile::new(*name, *size))
+        .collect();
+    file_groups(files, target)
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|file| {
+                    (
+                        file.object_meta.location.to_string(),
+                        file.range.as_ref().map(|range| (range.start, range.end)),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Scenario: A data file larger than an even share of the scan is cut into byte ranges
+#[test]
+fn files_within_an_even_share_stay_whole_and_fill_every_group() {
+    let names: Vec<String> = (0..12).map(|i| format!("f{i}")).collect();
+    let sizes: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 1_500_000)).collect();
+
+    let groups = grouped(&sizes, 4);
+
+    assert_eq!(
+        groups.iter().map(Vec::len).collect::<Vec<_>>(),
+        [3, 3, 3, 3]
+    );
+    assert!(groups.iter().flatten().all(|(_, range)| range.is_none()));
+}
+
+/// Scenario: A file scan has one stream per file, up to the target
+#[test]
+fn tiny_files_get_one_group_each_up_to_the_target() {
+    let tiny = [("a", 1_000), ("b", 1_000), ("c", 1_000)];
+
+    assert_eq!(grouped(&tiny, 4).len(), 3);
+    assert_eq!(grouped(&tiny, 2).len(), 2);
+    assert_eq!(
+        grouped(&[], 4),
+        [vec![]],
+        "an empty scan keeps one empty group"
+    );
+}
+
+/// Scenario: A data file larger than an even share of the scan is cut into byte ranges
+#[test]
+fn a_large_file_is_cut_into_ranges_that_cover_it_once() {
+    const LARGE: u64 = 30_000_001;
+
+    let groups = grouped(&[("large", LARGE), ("small", 8_000_000)], 4);
+
+    assert_eq!(groups.len(), 4);
+    let mut ranges: Vec<(i64, i64)> = groups
+        .iter()
+        .flatten()
+        .filter(|(name, _)| name == "large")
+        .map(|(_, range)| range.expect("a large file carries a range"))
+        .collect();
+    ranges.sort_unstable();
+    assert_eq!(ranges.len(), 4);
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[3].1, LARGE as i64);
+    assert!(ranges.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    let small: Vec<_> = groups
+        .iter()
+        .flatten()
+        .filter(|(name, _)| name == "small")
+        .collect();
+    assert_eq!(small, [&("small".to_string(), None)]);
 }
 
 /// A 1000-row data file in ten row groups whose every other row is deleted, in a session whose
@@ -228,42 +294,54 @@ fn session_with_deleted_rows(pool_bytes: usize) -> (ParquetScanTable, SessionSta
         .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
         .build_arc()
         .unwrap();
-    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    // Several batches per file, so the file is still open after the first one.
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_batch_size(10), runtime);
     ctx.register_object_store(&url::Url::parse("memory://").unwrap(), Arc::new(store));
     (table, ctx.state())
 }
 
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
-fn delete_state_is_reserved_in_the_memory_pool_while_the_provider_lives() {
+fn delete_state_is_reserved_in_the_memory_pool_while_its_file_is_read() {
+    use futures::StreamExt;
     let (table, state) = session_with_deleted_rows(1024 * 1024);
-    let rt = current_thread_runtime();
+    let pool = Arc::clone(&state.runtime_env().memory_pool);
 
-    rt.block_on(table.partitioned_files(&state)).unwrap();
-    let pool = &state.runtime_env().memory_pool;
-    assert!(
-        pool.reserved() >= 1000 * size_of::<parquet::arrow::arrow_reader::RowSelector>(),
-        "the access plans' selectors are reserved: {} bytes",
-        pool.reserved()
-    );
+    current_thread_runtime().block_on(async {
+        let plan = table.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(pool.reserved(), 0, "planning loads no delete state");
 
-    drop(table);
-    assert_eq!(
-        pool.reserved(),
-        0,
-        "dropping the provider releases the reservation"
-    );
+        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        stream.next().await.unwrap().unwrap();
+        assert!(
+            pool.reserved() >= 1000 * size_of::<parquet::arrow::arrow_reader::RowSelector>(),
+            "the access plan's selectors are reserved: {} bytes",
+            pool.reserved()
+        );
+
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        assert_eq!(pool.reserved(), 0, "the end of the file's read releases it");
+    });
 }
 
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
 fn delete_state_beyond_the_memory_pool_fails_the_scan_cleanly() {
+    use futures::StreamExt;
     let (table, state) = session_with_deleted_rows(4096);
-    let rt = current_thread_runtime();
 
-    let error = rt
-        .block_on(table.partitioned_files(&state))
-        .expect_err("the delete state outgrows a 4 KiB pool");
+    let error = current_thread_runtime().block_on(async {
+        let plan = table.scan(&state, None, &[], None).await.unwrap();
+        let mut stream = plan.execute(0, state.task_ctx()).unwrap();
+        stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("the delete state outgrows a 4 KiB pool")
+    });
 
     assert!(
         error.to_string().contains("does not fit the memory pool"),

@@ -7,11 +7,10 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 * Each per-shard file entry carries the file's byte size. A data-file or delete-file size from the spec entry is authoritative.
 * An entry that contains a `://` scheme is absolute and passes through unchanged. A relative entry is joined onto the common spec's table root, normalizing the trailing `/`. Delete-file paths follow the same rule.
 * An empty table root is unreachable from the current adapter. The rule stays defined for it (every entry is absolute) so path resolution is a total function over the wire format.
-* Building a data file's base `ParquetAccessPlan` needs only its per-row-group row counts, read from the Parquet footer.
-* A footer read without a size hint costs two object-store round-trips: the last 8 bytes, then the metadata range. A `metadata_size_hint` of N fetches the last N bytes first, so a footer that fits in N costs one request.
-* DataFusion already carries the hint as `datafusion.execution.parquet.metadata_size_hint` (default `Some(512 * 1024)`) on the `ParquetFormat` the provider owns, and `ParquetFormat::create_physical_plan` copies it to the `ParquetSource` the opener uses.
-* A footer larger than the hint is re-requested in full. The result is still correct.
-* With an empty `logical_schema`, the scan's file registration runs `ParquetFormat::infer_schema`, which fetches and caches the footer before access-plan construction. Only a non-empty `logical_schema`, as the adapter supplies in production, measures the access-plan fetch.
+* One shared reader per scan table reads its data files. A file's footer, the bytes fetched with it, and its page index each load once, however many byte ranges read the file. The first range that needs a load starts it, and the others wait for it.
+* The footer read is one GET of the file's last `metadata_size_hint` bytes (`datafusion.execution.parquet.metadata_size_hint`, default 512 KiB, on the `ParquetFormat` the provider owns). That GET fetches a file no larger than the hint whole.
+* The fetched bytes stay in memory while the file is read and serve every read that falls inside them. `scan-runtime/scan-execution-memory-and-credentials` owns their reservation.
+* With an empty `logical_schema`, registration runs `ParquetFormat::infer_schema`, which reads the first file's footer on its own. A request count is therefore only meaningful with a non-empty `logical_schema`, as the adapter supplies in production.
 
 ## Scenarios
 
@@ -40,16 +39,41 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 * *AND* the UDF MUST NOT issue a per-file object-store metadata (HEAD) request for a delete file to discover its size, because the size is authoritative from the spec
 * *AND* the emitted rows SHALL be identical to those produced when a delete file's size is instead discovered from object storage
 
-### Scenario: Data-file Parquet footer is read via a range GET, not a HEAD, and not twice
+### Scenario: Planning a scan reads nothing
 
-* *GIVEN* a data file that carries positional deletes, whose per-row-group row counts are needed to build the base `ParquetAccessPlan`
-* *WHEN* the scan UDF constructs the access plan for that data file
-* *THEN* the UDF SHALL obtain the per-row-group row counts by reading the Parquet footer via an object-store range GET (the file size is already known from the spec), and MUST NOT issue a HEAD request
-* *AND* the UDF SHALL supply that read with a metadata size hint, so a data file whose Parquet footer and metadata fit within the hint costs EXACTLY ONE object-store range GET rather than a suffix probe followed by a second GET, and that hint SHALL be the SAME value the Parquet opener uses for its own footer reads, read back from the one `ParquetFormat` the provider both builds access plans against and hands to the physical-plan builder, so the two sites cannot drift and no separate constant and no operator-facing knob is introduced
-* *AND* the UDF SHALL request only the metadata the access plan consumes, the per-row-group row counts, and MUST NOT additionally request the Parquet page index, which access-plan construction never reads
-* *AND* the UDF SHOULD parse each data file's footer at most once per scan, reusing the parsed metadata for both access-plan construction and the Parquet opener (via a shared reader factory / cached metadata) rather than reading the footer twice
-* *AND* attaching positional deletes to a data file MUST NOT increase the number of object-store requests issued against THAT data file, compared with the same scan of the same file with no deletes attached, measured with a non-empty `logical_schema`, the production configuration in which no `ParquetFormat::infer_schema` pass pre-populates the metadata cache, since measuring it under the legacy inference fallback proves nothing about the access-plan fetch
-* *AND* the emitted rows SHALL be identical regardless of how many times the footer is physically fetched
+* *GIVEN* a scan invocation with a non-empty `logical_schema`, whose data files may carry row-position deletes
+* *WHEN* the scan UDF registers its files and builds the physical plan
+* *THEN* the UDF MUST NOT issue an object-store request
+* *AND* the UDF SHALL read a data file's footer and its deletes when DataFusion opens the file
+
+### Scenario: A data file's footer is fetched once for all its byte ranges
+
+* *GIVEN* a data file that the scan cut into several byte ranges
+* *WHEN* the scan's streams open those ranges, at the same time or one after another
+* *THEN* the UDF SHALL fetch and parse the file's footer once, with one range GET of the file's last `metadata_size_hint` bytes and no HEAD
+* *AND* a range that holds none of the file's row groups MUST NOT issue a request
+* *AND* the number of requests against the file MUST NOT depend on the number of streams
+
+### Scenario: A footer larger than the size hint costs one more request
+
+* *GIVEN* a data file or a positional-delete file whose footer is larger than the metadata size hint
+* *WHEN* the UDF reads its footer
+* *THEN* the UDF SHALL issue one second GET, for the leading part of the footer that the first GET did not fetch
+
+### Scenario: A data file's page index is fetched once for all its byte ranges
+
+* *GIVEN* a data file whose page index lies outside the bytes fetched with its footer, and a predicate that needs page pruning
+* *WHEN* several byte ranges of the file load the page index
+* *THEN* the UDF SHALL fetch the page index once for the file
+* *AND* a page index inside the bytes fetched with the footer MUST NOT cost a request
+
+### Scenario: A data file within the metadata size hint is read in one request
+
+* *GIVEN* a data file no larger than the metadata size hint, with or without row-position deletes
+* *WHEN* a scan reads it
+* *THEN* the UDF SHALL issue exactly one GET against the file, for the whole file, and serve the footer, the page index, and every column read from those bytes
+* *AND* a positional-delete file within the metadata size hint SHALL also cost one GET
+* *AND* when the file's bytes do not fit the memory pool, the UDF SHALL read its columns from the store
 
 ### Scenario: Delete-file relative and absolute paths resolve like data-file paths
 
