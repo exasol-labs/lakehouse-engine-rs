@@ -132,6 +132,10 @@ fn an_unusable_write_property_is_named_with_its_value() {
             "write.parquet.row-group-size-bytes = '0'",
         ),
         (
+            vec![("write.parquet.page-row-limit", "0")],
+            "write.parquet.page-row-limit = '0'",
+        ),
+        (
             vec![("write.parquet.page-size-bytes", "-1")],
             "write.parquet.page-size-bytes = '-1'",
         ),

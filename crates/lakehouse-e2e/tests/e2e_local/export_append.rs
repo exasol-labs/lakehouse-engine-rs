@@ -453,6 +453,7 @@ fn export_refuses_unusable_write_properties() {
     let cases = [
         ("lzo", "write.parquet.compression-codec", "lzo"),
         ("no_row_group", "write.parquet.row-group-size-bytes", "0"),
+        ("no_page_rows", "write.parquet.page-row-limit", "0"),
         ("big", "write.target-file-size-bytes", "big"),
     ];
 

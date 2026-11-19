@@ -382,7 +382,8 @@ fn unreadable(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
         })
 }
 
-/// A value that iceberg-rust reads but parquet-rs panics on or refuses only at the first write.
+/// A value that iceberg-rust reads but parquet-rs panics or hangs on, or refuses only at the first
+/// write.
 fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
     let refusal = |key, cause: &str| Some((key, cause.to_string()));
     if table.parquet_compression_codec().ok() == Some(CompressionCodec::Lzo) {
@@ -395,6 +396,13 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
         return refusal(
             TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
             "a row group needs at least 1 byte",
+        );
+    }
+    // parquet-rs writes a column in steps of this many rows, so 0 never advances.
+    if table.parquet_page_row_limit().ok() == Some(0) {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT,
+            "a page needs at least 1 row",
         );
     }
     if table.cdc_enabled().ok() != Some(true) {

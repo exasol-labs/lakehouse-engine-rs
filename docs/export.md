@@ -114,16 +114,18 @@ The writers write Parquet data files, also into a table whose `write.format.defa
 |----------|------|-------------------|
 | `write.parquet.compression-codec` | The codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `lz4_raw`, or `uncompressed` | `zstd` |
 | `write.parquet.compression-level` | The level of `zstd`, `gzip`, or `brotli` | The codec's own |
-| `write.parquet.row-group-size-bytes` | The approximate size at which a row group ends | 128 MiB |
+| `write.parquet.row-group-size-bytes` | The approximate size, before compression, at which a row group ends | 128 MiB |
 | `write.parquet.page-size-bytes`, `write.parquet.page-row-limit`, `write.parquet.dict-size-bytes` | Page and dictionary sizes | 1 MiB, 20,000 rows, 2 MiB |
 | `write.parquet.content-defined-chunking.*` | Content-defined chunking of pages, off unless `enabled` is `true` | Off |
 | `write.target-file-size-bytes` | The size at which a writer starts a new data file | 512 MiB |
 
 The writer estimates how many rows fit in a row group, so a row group can end a few percent above that size. A row group also ends at 1,048,576 rows. A writer holds the row group in progress in memory, so a larger row group size costs writer memory.
 
+Apache Spark reads every codec except `brotli` without extra libraries: a `brotli` file needs Hadoop's Brotli codec on Spark's classpath.
+
 A table the export creates carries `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728` (128 MiB), and `write.target-file-size-bytes = 268435456` (256 MiB), so every later writer of the table uses the same settings. Files are half Iceberg's default size because a virtual schema shards a scan by data file, so smaller files keep reads of small exports parallel. To change these settings, set the properties on the table with another engine: every later append follows them.
 
-An append follows the properties of the table it appends to and never changes them. A property the export cannot use fails the export before any data is written, with an error that names the table, the property, and its value, for example `invalid write property write.parquet.compression-codec = 'lzo'`. This covers the `lzo` codec, which the export cannot write, a row group size of 0, and a value that is not a number where one is expected.
+An append follows the properties of the table it appends to and never changes them. A property the export cannot use fails the export before any data is written, with an error that names the table, the property, and its value, for example `invalid write property write.parquet.compression-codec = 'lzo'`. This covers the `lzo` codec, which the export cannot write, a row group size or page row limit of 0, and a value that is not a number where one is expected.
 
 An export into an unpartitioned table writes each writer's rows into its open data file as they arrive, so a writer holds no rows beyond the row group in progress.
 
