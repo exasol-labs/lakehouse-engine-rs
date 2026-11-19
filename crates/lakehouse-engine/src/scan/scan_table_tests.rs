@@ -185,9 +185,9 @@ fn grouped(sizes: &[(&str, u64)], target: usize) -> Vec<Vec<Piece>> {
         .collect()
 }
 
-/// Scenario: A small data file is never cut into byte ranges
+/// Scenario: A data file larger than an even share of the scan is cut into byte ranges
 #[test]
-fn small_files_stay_whole_and_spread_over_the_streams() {
+fn files_within_an_even_share_stay_whole_and_fill_every_group() {
     let names: Vec<String> = (0..12).map(|i| format!("f{i}")).collect();
     let sizes: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 1_500_000)).collect();
 
@@ -200,7 +200,7 @@ fn small_files_stay_whole_and_spread_over_the_streams() {
     assert!(groups.iter().flatten().all(|(_, range)| range.is_none()));
 }
 
-/// Scenario: A shard of tiny files is read by several streams
+/// Scenario: A file scan has one stream per file, up to the target
 #[test]
 fn tiny_files_get_one_group_each_up_to_the_target() {
     let tiny = [("a", 1_000), ("b", 1_000), ("c", 1_000)];
@@ -214,12 +214,12 @@ fn tiny_files_get_one_group_each_up_to_the_target() {
     );
 }
 
-/// Scenario: A large data file is cut into byte ranges
+/// Scenario: A data file larger than an even share of the scan is cut into byte ranges
 #[test]
 fn a_large_file_is_cut_into_ranges_that_cover_it_once() {
     const LARGE: u64 = 30_000_001;
 
-    let groups = grouped(&[("large", LARGE), ("small", SMALL_FILE_BYTES)], 4);
+    let groups = grouped(&[("large", LARGE), ("small", 8_000_000)], 4);
 
     assert_eq!(groups.len(), 4);
     let mut ranges: Vec<(i64, i64)> = groups

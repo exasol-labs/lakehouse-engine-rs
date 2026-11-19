@@ -23,10 +23,6 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
-/// A file up to this size is never cut into byte ranges, and is fetched whole with its footer
-/// when the scan projects enough of its columns.
-pub(super) const SMALL_FILE_BYTES: u64 = 8 * 1024 * 1024;
-
 /// A contiguous part of a file held in memory.
 #[derive(Debug)]
 pub(super) struct HeldBytes {
@@ -44,30 +40,14 @@ impl HeldBytes {
     }
 }
 
-/// Bytes reserved in the memory pool until dropped.
-#[derive(Debug)]
-pub(super) struct Reserved {
-    reservation: Arc<MemoryReservation>,
+/// `bytes` of `reservation`'s consumer, reserved in the memory pool until the result drops.
+pub(super) fn reserved(
+    reservation: &MemoryReservation,
     bytes: usize,
-}
-
-impl Reserved {
-    pub(super) fn try_new(
-        reservation: &Arc<MemoryReservation>,
-        bytes: usize,
-    ) -> datafusion::error::Result<Self> {
-        reservation.try_grow(bytes)?;
-        Ok(Self {
-            reservation: Arc::clone(reservation),
-            bytes,
-        })
-    }
-}
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        self.reservation.shrink(self.bytes);
-    }
+) -> datafusion::error::Result<MemoryReservation> {
+    let reserved = reservation.new_empty();
+    reserved.try_grow(bytes)?;
+    Ok(reserved)
 }
 
 fn external(e: object_store::Error) -> ParquetError {
@@ -134,7 +114,7 @@ fn page_index_range(metadata: &ParquetMetaData) -> Option<Range<u64>> {
 #[derive(Debug)]
 struct Footer {
     metadata: Arc<ParquetMetaData>,
-    held: Option<(HeldBytes, Reserved)>,
+    held: Option<(HeldBytes, MemoryReservation)>,
     /// `None` when the held bytes already cover it.
     page_index: Option<Range<u64>>,
 }
@@ -143,8 +123,8 @@ struct Footer {
 #[derive(Debug, Default)]
 struct FileLoads {
     footer: OnceCell<Footer>,
-    page_index: OnceCell<Option<(HeldBytes, Reserved)>>,
-    access_plan: OnceCell<(ParquetAccessPlan, Reserved)>,
+    page_index: OnceCell<Option<(HeldBytes, MemoryReservation)>>,
+    access_plan: OnceCell<(ParquetAccessPlan, MemoryReservation)>,
 }
 
 #[derive(Debug, Default)]
@@ -199,9 +179,7 @@ impl SharedFile {
 pub(super) struct ScanFiles {
     store: Arc<dyn ObjectStore>,
     metadata_size_hint: u64,
-    /// False when the scan reads too few columns for a whole-file fetch to pay off.
-    whole_small_files: bool,
-    held_bytes: Arc<MemoryReservation>,
+    held_bytes: MemoryReservation,
     files: HashMap<Path, SharedFile>,
     deletes: Option<DeleteLoads>,
 }
@@ -219,7 +197,6 @@ impl ScanFiles {
     pub(super) fn new(
         store: Arc<dyn ObjectStore>,
         metadata_size_hint: Option<usize>,
-        whole_small_files: bool,
         pool: &Arc<dyn MemoryPool>,
         files: impl IntoIterator<Item = (Path, u64, Option<String>)>,
         deletes: Option<DeleteLoads>,
@@ -227,8 +204,7 @@ impl ScanFiles {
         Self {
             store,
             metadata_size_hint: metadata_size_hint.unwrap_or(0) as u64,
-            whole_small_files,
-            held_bytes: Arc::new(MemoryConsumer::new("scan file bytes").register(pool)),
+            held_bytes: MemoryConsumer::new("scan file bytes").register(pool),
             files: files
                 .into_iter()
                 .map(|(location, size, delete_key)| {
@@ -261,26 +237,22 @@ impl ScanFiles {
         })
     }
 
-    /// A small file is fetched whole when the scan wants whole files and its bytes fit the pool,
-    /// any other file by its last `metadata_size_hint` bytes. Bytes that do not fit the pool are parsed and dropped.
+    /// One GET of the file's last `metadata_size_hint` bytes, which stay held while they fit the
+    /// pool. Bytes that do not fit are parsed and dropped.
     async fn footer<'a>(&self, file: &SharedFile, loads: &'a FileLoads) -> Result<&'a Footer> {
         loads
             .footer
             .get_or_try_init(|| async {
-                let whole = (self.whole_small_files && file.size <= SMALL_FILE_BYTES)
-                    .then(|| Reserved::try_new(&self.held_bytes, file.size as usize).ok())
-                    .flatten();
-                let want = if whole.is_some() {
-                    file.size
-                } else {
-                    self.metadata_size_hint
-                };
-                let (tail, metadata) =
-                    read_footer(self.store.as_ref(), &file.location, file.size, want).await?;
+                let (tail, metadata) = read_footer(
+                    self.store.as_ref(),
+                    &file.location,
+                    file.size,
+                    self.metadata_size_hint,
+                )
+                .await?;
                 let page_index =
                     page_index_range(&metadata).filter(|range| tail.slice(range).is_none());
-                let reserved =
-                    whole.or_else(|| Reserved::try_new(&self.held_bytes, tail.bytes.len()).ok());
+                let reserved = reserved(&self.held_bytes, tail.bytes.len()).ok();
                 Ok(Footer {
                     metadata: Arc::new(metadata),
                     held: reserved.map(|reserved| (tail, reserved)),
@@ -314,7 +286,7 @@ impl ScanFiles {
             .page_index
             .get_or_try_init(|| async {
                 let length = (index.end - index.start) as usize;
-                let Ok(reserved) = Reserved::try_new(&self.held_bytes, length) else {
+                let Ok(reserved) = reserved(&self.held_bytes, length) else {
                     return Ok(None);
                 };
                 let bytes = self
@@ -346,13 +318,13 @@ impl ScanFiles {
         let (plan, _) = loads
             .access_plan
             .get_or_try_init(|| async {
-                let (footer, ()) = futures::future::try_join(
+                let (footer, loaded) = futures::future::try_join(
                     async { Ok(self.footer(file, &loads).await?) },
                     async { deletes.load(key).await.map_err(external_df) },
                 )
                 .await?;
                 deletes
-                    .access_plan(key, footer.metadata.row_groups())
+                    .access_plan(key, &loaded, footer.metadata.row_groups())
                     .map_err(external_df)
             })
             .await?;

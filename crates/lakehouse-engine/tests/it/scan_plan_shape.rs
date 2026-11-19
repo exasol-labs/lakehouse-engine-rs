@@ -335,7 +335,7 @@ fn leaf_file_groups(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(usize, bool)>)
     }
 }
 
-/// Scenario: Every pushed plan shape keeps the scan's file groups
+/// Scenario: Every pushed plan shape keeps the scan's streams
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_plan_shape_keeps_the_file_groups_the_scan_built() {
     const TARGET: usize = 4;

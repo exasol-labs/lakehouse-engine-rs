@@ -811,10 +811,12 @@ async fn collect_positions_within(
         .filter(|entry| !entry.deletes.is_empty())
         .map(|entry| reconstruct_abs_uri(&entry.path, table_root))
         .collect();
-    futures::future::try_join_all(data_files.iter().map(|data_file| loads.load(data_file))).await?;
+    let loaded =
+        futures::future::try_join_all(data_files.iter().map(|data_file| loads.load(data_file)))
+            .await?;
     let mut positions = HashMap::new();
-    for data_file in data_files {
-        let taken = loads.take(&data_file)?;
+    for (data_file, loaded) in data_files.into_iter().zip(loaded) {
+        let taken = loads.take(&data_file, &loaded)?;
         if !taken.is_empty() {
             positions.insert(data_file, taken);
         }

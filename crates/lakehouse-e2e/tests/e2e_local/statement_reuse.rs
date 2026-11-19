@@ -463,7 +463,7 @@ fn reads_batch(rows: usize) -> RecordBatch {
 }
 
 /// Scenario: A data file's footer is fetched once for all its byte ranges
-/// Scenario: A small data file is read in one request
+/// Scenario: A data file within the metadata size hint is read in one request
 #[test]
 fn storage_requests_do_not_grow_with_the_stream_count() {
     proxy_virtual_schemas();
@@ -475,7 +475,7 @@ fn storage_requests_do_not_grow_with_the_stream_count() {
     );
     assert!(
         large.len() > 8 * 1024 * 1024,
-        "the large fixture must exceed the small-file threshold, so many streams cut it: {}",
+        "the large fixture must be large enough for 16 streams to cut it: {}",
         large.len()
     );
     put_fixture_object(&format!("{READS_BASE}large/f.parquet"), large);
@@ -542,7 +542,7 @@ fn storage_requests_do_not_grow_with_the_stream_count() {
     );
 }
 
-/// Scenario: A small data file is read in one request
+/// Scenario: A data file within the metadata size hint is read in one request
 /// Scenario: A delete payload is read once for the data files that share it
 #[test]
 fn a_scan_with_deletes_requests_each_file_once() {

@@ -42,7 +42,7 @@ DataFusion cut one file group into `target_partitions` byte ranges after `scan()
 
 ### Decision
 
-The scan table builds its own file groups and turns DataFusion's file-scan repartitioning off. A file of at most 8 MiB stays whole, and is fetched in one GET when the scan projects at least half of the table's columns. A larger file is cut into byte ranges whose readers share one footer load, the bytes fetched with it, and one page-index load. Held bytes are reserved in the memory pool, and bytes that do not fit are not held.
+The scan table builds its own file groups and turns DataFusion's file-scan repartitioning off. A file larger than an even share of the scan's bytes is cut into byte ranges. The readers of one file share one footer load, the bytes fetched with it, and one page-index load, so a file within the metadata size hint is read in one GET. Held bytes are reserved in the memory pool, and bytes that do not fit are not held.
 
 ### Options Considered
 
@@ -50,9 +50,11 @@ The scan table builds its own file groups and turns DataFusion's file-scan repar
 |--------|---------|
 | Keep DataFusion's split and only share the footer | Rejected: a cut small file still costs a request per range, and a tiny shard stays serial |
 | Rely on the session `FileMetadataCache` | Rejected: concurrent ranges all miss it before one fills it, and it holds neither bytes nor the page index |
+| Fetch every file of at most 8 MiB whole in one GET | Not in this change: it was about twice as slow on 8 MiB files of 40 columns read for two, so it needs a rule on the projected columns. With that rule, 1.9 MB files were faster at 4 and 8 streams and slower at 16 |
 
 ### Consequences
 
 - Storage requests no longer grow with `DATAFUSION_TARGET_PARTITIONS`.
-- Below half of the columns a small file is read by ranges, because a whole-file fetch was twice as slow on 8 MiB files of 40 columns read for two. At or above half it moves its unprojected columns too, in exchange for one request.
+- A file larger than the metadata size hint costs its footer GET and the column GETs of the row groups it reads.
+- The file groups set the stream count only. DataFusion's file streams take their files from one queue per file scan (`enable_file_stream_work_stealing`, on by default), so which stream reads a file is decided at run time. With that option off, a stream reads only its own group, and the groups are even by file count, not by bytes.
 - Shared state is released once a file's finished ranges cover it. A file reopened after that is fetched again, which changes no row.

@@ -12,7 +12,7 @@ use crate::scan::deletion_vectors::{
     DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
 };
 use crate::scan::parquet_reader::{SizedParquetReader, object_meta_for};
-use crate::scan::shared_files::{HeldBytes, Reserved, read_footer};
+use crate::scan::shared_files::{HeldBytes, read_footer, reserved};
 use crate::scan::spec::{DeleteMechanism, FileEntry};
 use crate::scan::{ObjectLocation, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
@@ -453,7 +453,7 @@ pub(super) struct ShardDeletes<'a> {
     /// Shared by every provider of one invocation (both join sides included), so the whole
     /// instance stays within one N-permit budget.
     pub(super) limiter: Arc<Semaphore>,
-    /// Holds the serialized size of every decoded set, then the size of every built access plan.
+    /// Holds the serialized size of every decoded set until its access plan is built.
     pub(super) reservation: Arc<MemoryReservation>,
     pub(super) metadata_size_hint: Option<usize>,
 }
@@ -535,8 +535,9 @@ impl ShardDeletes<'_> {
 
 /// One delete payload's positions per data file, loaded by the first data file that awaits it.
 /// A positional-delete file, a Delta sidecar, and a merged Puffin request are one payload each.
-type Payload =
-    Shared<BoxFuture<'static, Result<Arc<Mutex<HashMap<String, Vec<RoaringTreemap>>>>, String>>>;
+type Payload = Shared<BoxFuture<'static, Result<LoadedPayload, String>>>;
+
+pub(super) type LoadedPayload = Arc<Mutex<HashMap<String, Vec<RoaringTreemap>>>>;
 
 fn shared_payload(read: Read<Positions>) -> Payload {
     async move {
@@ -571,7 +572,7 @@ impl DeleteLoads {
     }
 
     /// Loads every payload that can hold deletes of `data_file`.
-    pub(super) async fn load(&self, data_file: &str) -> Result<(), UdfError> {
+    pub(super) async fn load(&self, data_file: &str) -> Result<Vec<LoadedPayload>, UdfError> {
         let payloads = self
             .pending()
             .get(data_file)
@@ -579,25 +580,18 @@ impl DeleteLoads {
             .ok_or_else(|| Self::already_applied(data_file))?;
         futures::future::try_join_all(payloads.into_iter().map(|idx| self.payloads[idx].clone()))
             .await
-            .map_err(UdfError::User)?;
-        Ok(())
+            .map_err(UdfError::User)
     }
 
-    /// Takes the loaded positions of `data_file`, so a second call fails instead of applying no
-    /// deletes. The reservation keeps the union's size.
-    fn take(&self, data_file: &str) -> Result<RoaringTreemap, UdfError> {
-        let payloads = self
-            .pending()
+    /// Takes the positions of `data_file` out of its `loaded` payloads, so a second call fails
+    /// instead of applying no deletes. The reservation keeps the union's size.
+    fn take(&self, data_file: &str, loaded: &[LoadedPayload]) -> Result<RoaringTreemap, UdfError> {
+        self.pending()
             .remove(data_file)
             .ok_or_else(|| Self::already_applied(data_file))?;
         let mut positions = RoaringTreemap::new();
         let mut reserved = 0;
-        for idx in payloads {
-            let Some(Ok(sets)) = self.payloads[idx].peek() else {
-                return Err(UdfError::User(format!(
-                    "data file '{data_file}': its row-position deletes are not loaded"
-                )));
-            };
+        for sets in loaded {
             let sets = sets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -617,15 +611,16 @@ impl DeleteLoads {
     }
 
     /// Replaces the reserved positions of `data_file` by its plan, which stays reserved until
-    /// the returned guard drops.
+    /// the returned reservation drops.
     pub(super) fn access_plan(
         &self,
         data_file: &str,
+        loaded: &[LoadedPayload],
         row_groups: &[RowGroupMetaData],
-    ) -> Result<(ParquetAccessPlan, Reserved), UdfError> {
-        let positions = self.take(data_file)?;
+    ) -> Result<(ParquetAccessPlan, MemoryReservation), UdfError> {
+        let positions = self.take(data_file, loaded)?;
         let plan = build_access_plan(row_groups, &positions);
-        let reserved = Reserved::try_new(&self.reservation, access_plan_bytes(&plan))
+        let reserved = reserved(&self.reservation, access_plan_bytes(&plan))
             .map_err(|e| does_not_fit(e, &self.secrets))?;
         self.reservation.shrink(positions.serialized_size());
         Ok((plan, reserved))

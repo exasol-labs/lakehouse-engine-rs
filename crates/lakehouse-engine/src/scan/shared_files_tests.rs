@@ -29,14 +29,13 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pool: Arc<dyn MemoryPool>, metadata_size_hint: usize) -> Self {
-        Self::with(pool, metadata_size_hint, None, true).await
+        Self::with(pool, metadata_size_hint, None).await
     }
 
     async fn with(
         pool: Arc<dyn MemoryPool>,
         metadata_size_hint: usize,
         delete_key: Option<String>,
-        whole_small_files: bool,
     ) -> Self {
         let bytes = data_file();
         let store = Arc::new(CountingObjectStore::new(Arc::new(InMemory::new())));
@@ -47,7 +46,6 @@ impl Fixture {
         let files = Arc::new(ScanFiles::new(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             Some(metadata_size_hint),
-            whole_small_files,
             &pool,
             [(Path::from(NAME), bytes.len() as u64, delete_key)],
             None,
@@ -94,11 +92,6 @@ fn unbounded() -> Arc<dyn MemoryPool> {
     Arc::new(UnboundedMemoryPool::default())
 }
 
-/// Room for a footer suffix and the page index, but not for the whole file.
-fn pool_below_the_file() -> Arc<dyn MemoryPool> {
-    Arc::new(GreedyMemoryPool::new(64 * 1024))
-}
-
 fn column_chunks(metadata: &ParquetMetaData) -> Vec<Range<u64>> {
     metadata
         .row_groups()
@@ -115,7 +108,7 @@ fn column_chunks(metadata: &ParquetMetaData) -> Vec<Range<u64>> {
 #[tokio::test]
 async fn the_ranges_of_one_file_share_one_footer_request() {
     const HINT: u64 = 16 * 1024;
-    let fixture = Fixture::new(pool_below_the_file(), HINT as usize).await;
+    let fixture = Fixture::new(unbounded(), HINT as usize).await;
     let size = fixture.size();
     let step = size.div_ceil(16);
     let mut readers: Vec<_> = (0..16)
@@ -137,30 +130,28 @@ async fn the_ranges_of_one_file_share_one_footer_request() {
     assert!(footers.iter().all(|f| Arc::ptr_eq(f, &footers[0])));
 }
 
-/// Scenario: A small data file is read in one request
+/// Scenario: A data file within the metadata size hint is read in one request
 #[tokio::test]
-async fn a_small_file_costs_one_request_under_and_above_the_size_hint() {
-    for hint in [512 * 1024, 1024] {
-        let fixture = Fixture::new(unbounded(), hint).await;
-        let mut reader = fixture.reader(None);
+async fn a_file_within_the_size_hint_costs_one_request() {
+    let fixture = Fixture::new(unbounded(), 512 * 1024).await;
+    let mut reader = fixture.reader(None);
 
-        let metadata = reader.get_metadata(None).await.unwrap();
-        let chunks = column_chunks(&metadata);
-        let read = reader.get_byte_ranges(chunks.clone()).await.unwrap();
+    let metadata = reader.get_metadata(None).await.unwrap();
+    let chunks = column_chunks(&metadata);
+    let read = reader.get_byte_ranges(chunks.clone()).await.unwrap();
 
-        let whole = Range {
-            start: 0,
-            end: fixture.size(),
-        };
-        assert_eq!(fixture.requests(), [whole], "hint {hint}");
-        for (range, bytes) in chunks.iter().zip(read) {
-            assert_eq!(
-                bytes,
-                fixture
-                    .bytes
-                    .slice(range.start as usize..range.end as usize)
-            );
-        }
+    let whole = Range {
+        start: 0,
+        end: fixture.size(),
+    };
+    assert_eq!(fixture.requests(), [whole]);
+    for (range, bytes) in chunks.iter().zip(read) {
+        assert_eq!(
+            bytes,
+            fixture
+                .bytes
+                .slice(range.start as usize..range.end as usize)
+        );
     }
 }
 
@@ -183,7 +174,7 @@ async fn a_footer_larger_than_the_hint_fetches_only_the_missing_prefix() {
 #[tokio::test]
 async fn the_page_index_is_fetched_once_for_all_ranges() {
     // An 8-byte hint holds the footer alone, so the page index lies outside the held bytes.
-    let fixture = Fixture::new(pool_below_the_file(), 8).await;
+    let fixture = Fixture::new(unbounded(), 8).await;
     let half = fixture.size() / 2;
     let mut readers = [
         fixture.reader(Some(0..half)),
@@ -268,7 +259,7 @@ async fn bytes_beyond_the_pool_are_not_held_and_are_read_from_the_store() {
 #[tokio::test]
 async fn a_read_mixes_held_and_fetched_ranges_in_request_order() {
     const HINT: u64 = 16 * 1024;
-    let fixture = Fixture::new(pool_below_the_file(), HINT as usize).await;
+    let fixture = Fixture::new(unbounded(), HINT as usize).await;
     let size = fixture.size();
     let mut reader = fixture.reader(None);
     reader.get_metadata(None).await.unwrap();
@@ -294,13 +285,7 @@ async fn a_read_mixes_held_and_fetched_ranges_in_request_order() {
 /// Scenario: A delete-carrying data file is never read without its access plan
 #[tokio::test]
 async fn a_delete_carrying_file_without_its_access_plan_is_refused() {
-    let fixture = Fixture::with(
-        unbounded(),
-        0,
-        Some("memory:///data/a.parquet".into()),
-        true,
-    )
-    .await;
+    let fixture = Fixture::with(unbounded(), 0, Some("memory:///data/a.parquet".into())).await;
     let factory = SharedReaderFactory(Arc::clone(&fixture.files));
     let metrics = ExecutionPlanMetricsSet::new();
 
@@ -315,21 +300,4 @@ async fn a_delete_carrying_file_without_its_access_plan_is_refused() {
     let mut planned = fixture.part(None);
     planned.extensions.insert(ParquetAccessPlan::new_all(10));
     assert!(factory.create_reader(0, planned, None, &metrics).is_ok());
-}
-
-/// Scenario: A small data file read for few columns is read by ranges
-#[tokio::test]
-async fn a_small_file_read_for_few_columns_fetches_its_footer_and_the_columns_it_reads() {
-    let fixture = Fixture::with(unbounded(), 16 * 1024, None, false).await;
-    let mut reader = fixture.reader(None);
-    let chunks = column_chunks(&reader.get_metadata(None).await.unwrap());
-
-    reader.get_bytes(chunks[0].clone()).await.unwrap();
-    assert_eq!(
-        fixture.requests(),
-        [
-            fixture.size() - 16 * 1024..fixture.size(),
-            chunks[0].clone()
-        ]
-    );
 }

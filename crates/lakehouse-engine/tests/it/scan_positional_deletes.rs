@@ -1460,7 +1460,7 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
 }
 
 /// Scenario: Planning a scan reads nothing
-/// Scenario: A small data file is read in one request
+/// Scenario: A data file within the metadata size hint is read in one request
 #[test]
 fn scan_planning_reads_nothing_and_execution_reads_each_small_file_once() {
     let tmp = tempfile::tempdir().unwrap();

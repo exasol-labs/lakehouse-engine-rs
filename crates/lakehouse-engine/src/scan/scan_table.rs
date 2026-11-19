@@ -6,7 +6,7 @@ use crate::scan::parquet_reader::object_meta_for;
 use crate::scan::partition_values::PartitionedScanGroups;
 use crate::scan::raw_scan::scan_table_parquet_format;
 use crate::scan::row_deletes::{ShardDeletes, redact};
-use crate::scan::shared_files::{SMALL_FILE_BYTES, ScanFiles, SharedReaderFactory};
+use crate::scan::shared_files::{ScanFiles, SharedReaderFactory};
 use crate::scan::spec::{FileEntry, StorageBackend};
 use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
 use arrow::datatypes::SchemaRef;
@@ -49,8 +49,8 @@ pub(crate) struct ParquetScanTable {
     delete_path_read_limiter: Arc<Semaphore>,
 }
 
-/// At most `target` groups, one per stream. A file up to [`SMALL_FILE_BYTES`] stays whole, and a
-/// larger file is cut into byte ranges of about an even share of the scan's bytes.
+/// At most `target` groups, which set the stream count only: DataFusion's streams share one
+/// queue of all groups. A file larger than an even share of the scan's bytes is cut into ranges.
 fn file_groups(files: Vec<PartitionedFile>, target: usize) -> Vec<FileGroup> {
     let target = target.max(1) as u64;
     let total: u64 = files.iter().map(|file| file.object_meta.size).sum();
@@ -58,11 +58,11 @@ fn file_groups(files: Vec<PartitionedFile>, target: usize) -> Vec<FileGroup> {
     let mut pieces = Vec::new();
     for file in files {
         let size = file.object_meta.size;
-        if size <= SMALL_FILE_BYTES {
+        let ranges = size.div_ceil(range_bytes).min(target);
+        if ranges <= 1 {
             pieces.push(file);
             continue;
         }
-        let ranges = size.div_ceil(range_bytes).min(target);
         let step = size.div_ceil(ranges);
         for start in (0..size).step_by(step as usize) {
             let end = (start + step).min(size);
@@ -133,7 +133,6 @@ impl ParquetScanTable {
         &self,
         state: &dyn Session,
         files: &[PartitionedFile],
-        projection: Option<&Vec<usize>>,
     ) -> Result<ScanFiles, UdfError> {
         let runtime = state.runtime_env();
         let store = runtime.object_store(&self.object_store_url).map_err(|e| {
@@ -163,14 +162,9 @@ impl ParquetScanTable {
                 delete_key,
             )
         });
-        // Below half of the columns, a whole-file fetch moves more unread bytes than the
-        // requests it saves are worth.
-        let columns = self.schema.declared_schema().fields().len();
-        let whole_small_files = projection.is_none_or(|p| p.len() * 2 >= columns);
         Ok(ScanFiles::new(
             store,
             metadata_size_hint,
-            whole_small_files,
             &runtime.memory_pool,
             shared,
             deletes,
@@ -198,10 +192,7 @@ impl TableProvider for ParquetScanTable {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let external = |e: UdfError| DataFusionError::External(Box::new(e));
         let files = self.partitioned_files().map_err(external)?;
-        let scan_files = Arc::new(
-            self.scan_files(state, &files, projection)
-                .map_err(external)?,
-        );
+        let scan_files = Arc::new(self.scan_files(state, &files).map_err(external)?);
 
         let mut files_by_group = vec![Vec::new(); self.schema.groups().len()];
         for (index, file) in files.into_iter().enumerate() {

@@ -170,7 +170,7 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
             "datafusion.execution.parquet.pushdown_filters",
             !raw_scan::scan_renders_nested_json(spec),
         )
-        // The scan provider builds its own file groups, so that no small file is cut.
+        // The scan provider builds its own file groups, so DataFusion must not cut them again.
         .set_bool("datafusion.optimizer.repartition_file_scans", false);
 
     if spec.common.join.is_some() {
