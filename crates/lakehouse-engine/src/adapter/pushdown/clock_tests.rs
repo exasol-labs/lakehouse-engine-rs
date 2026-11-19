@@ -272,15 +272,18 @@ fn with_tz_source(
 type Shape = (&'static str, fn(Json) -> Json, &'static [&'static str]);
 
 #[test]
-fn tstz_values_compared_with_an_instant_column_fold_to_utc() {
+fn clock_values_compared_with_an_instant_column_fold_to_utc() {
     let literal = tstz_lit("2024-03-01 09:00:00.000");
     let utc_literal = timestamp_lit("2024-03-01 09:00:00.000");
     let tokyo_literal = timestamp_lit("2024-03-01 18:00:00.000");
     let utc_now = timestamp_lit("2024-01-15 23:30:45.123");
     let tokyo_now = timestamp_lit("2024-01-16 08:30:45.123");
     let new_york_now = timestamp_lit("2024-01-15 18:30:45.123");
+    let utc_today = date_lit("2024-01-15");
+    let tokyo_today = date_lit("2024-01-16");
     let (exasol8, exasol2025) = (ExasolVersion::Exasol8, ExasolVersion::Exasol2025);
-    // (value, version, folded against an instant column, folded against any other column)
+    // (value, version, folded against an instant column with no readable zone, folded against
+    // any other column)
     let values = [
         (literal, exasol2025, &utc_literal, &tokyo_literal),
         (
@@ -298,15 +301,22 @@ fn tstz_values_compared_with_an_instant_column_fold_to_utc() {
         (
             scalar_fn("LOCALTIMESTAMP", []),
             exasol2025,
-            &tokyo_now,
+            &utc_now,
             &tokyo_now,
         ),
         (
             scalar_fn("SYSTIMESTAMP", []),
             exasol2025,
-            &new_york_now,
+            &utc_now,
             &new_york_now,
         ),
+        (
+            scalar_fn("CURRENT_DATE", []),
+            exasol2025,
+            &utc_today,
+            &tokyo_today,
+        ),
+        (scalar_fn("SYSDATE", []), exasol2025, &utc_today, &utc_today),
     ];
     let shapes: [Shape; 6] = [
         (
@@ -351,7 +361,12 @@ fn tstz_values_compared_with_an_instant_column_fold_to_utc() {
             let expected = if instant { against_instant } else { otherwise };
             for (shape, filter, pointers) in &shapes {
                 let request = with_tz_source(tag, |b| b.filter(filter(value.clone())));
-                let json = folded_on(*version, &tokyo_clock(), &request)
+                let clock = if instant {
+                    clock(None, None)
+                } else {
+                    tokyo_clock()
+                };
+                let json = folded_on(*version, &clock, &request)
                     .unwrap_or_else(|e| panic!("{tag} {shape} {value} must fold: {e:?}"));
                 for pointer in *pointers {
                     assert_eq!(
@@ -365,10 +380,10 @@ fn tstz_values_compared_with_an_instant_column_fold_to_utc() {
     }
 }
 
-/// A TSTZ value folds to UTC beside an operand that reads an instant column and that native
-/// Exasol types TSTZ, in every clause; any other one keeps the folding-zone rule.
+/// A clock value folds to UTC anywhere in the operands of a predicate or call that has a date or
+/// time operand reading an instant column, except in a nested predicate, which decides for itself.
 #[test]
-fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
+fn a_clock_value_beside_an_instant_expression_folds_to_utc() {
     let tstz = ExasolType::TimestampWithLocalTimeZone { precision: 3 };
     let now = || scalar_fn("CURRENT_TIMESTAMP", []);
     let at_nine = || tstz_lit("2024-03-01 09:00:00.000");
@@ -402,7 +417,17 @@ fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
             less(at_nine(), cast_to(ExasolType::timestamp(3), tz())),
             less(at_nine(), case_when([less(at_nine(), tz())], [ts(), ts()])),
             less(at_nine(), case_when([is_not_null(tz())], [tz(), now()])),
-            less(at_nine(), scalar_fn("GREATEST", [tz(), at_nine()])),
+            less(tz(), case_when([is_not_null(ts())], [at_nine(), now()])),
+            compare(
+                "predicate_equal",
+                cast_to(ExasolType::Date, tz()),
+                scalar_fn("CURRENT_DATE", []),
+            ),
+            less(tz(), case_when([less(ts(), now())], [at_nine(), at_nine()])),
+            less(
+                scalar_fn("HOURS_BETWEEN", [now(), ts()]),
+                scalar_fn("HOUR", [tz()]),
+            ),
         ]))
         .field("having", less(at_nine(), agg_item_expr("MIN", tz(), false)))
     });
@@ -412,6 +437,8 @@ fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
     let utc_nine = timestamp_lit("2024-03-01 09:00:00.000");
     let tokyo_nine = timestamp_lit("2024-03-01 18:00:00.000");
     let utc_now = timestamp_lit("2024-01-15 23:30:45.123");
+    let tokyo_now = timestamp_lit("2024-01-16 08:30:45.123");
+    let utc_today = date_lit("2024-01-15");
     let expected = [
         (
             "HOURS_BETWEEN(now, TZ)",
@@ -449,14 +476,14 @@ fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
             &tokyo_nine,
         ),
         (
-            "ADD_DAYS(TS, DAY(TZ)) > v",
+            "ADD_DAYS(TS, DAY(TZ)) > v: a mixed operand counts as instant",
             "/filter/expressions/3/left",
-            &tokyo_nine,
+            &utc_nine,
         ),
         (
             "CAST(TZ AS TIMESTAMP) > v",
             "/filter/expressions/4/left",
-            &tokyo_nine,
+            &utc_nine,
         ),
         (
             "CASE WHEN TZ > v",
@@ -474,9 +501,34 @@ fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
             &utc_nine,
         ),
         (
-            "GREATEST(TZ, v) > v",
-            "/filter/expressions/7/left",
+            "TZ < CASE ... THEN v",
+            "/filter/expressions/7/right/results/0",
             &utc_nine,
+        ),
+        (
+            "TZ < CASE ... ELSE now",
+            "/filter/expressions/7/right/results/1",
+            &utc_now,
+        ),
+        (
+            "CAST(TZ AS DATE) = CURRENT_DATE",
+            "/filter/expressions/8/right",
+            &utc_today,
+        ),
+        (
+            "TZ < CASE WHEN TS < now: the nested predicate keeps its zone",
+            "/filter/expressions/9/right/arguments/0/right",
+            &tokyo_now,
+        ),
+        (
+            "TZ < CASE WHEN ... THEN v",
+            "/filter/expressions/9/right/results/0",
+            &utc_nine,
+        ),
+        (
+            "HOURS_BETWEEN(now, TS) < HOUR(TZ): a number is no instant operand",
+            "/filter/expressions/10/left/arguments/0",
+            &tokyo_now,
         ),
         ("MIN(TZ) > v", "/having/left", &utc_nine),
     ];
@@ -487,22 +539,5 @@ fn a_tstz_value_beside_an_instant_expression_folds_to_utc() {
         json["selectList"][3],
         tstz_lit("2024-01-15 23:30:45.123"),
         "a TSTZ item beside no instant column keeps the instant"
-    );
-}
-
-#[test]
-fn a_tstz_value_compared_with_an_instant_column_never_reads_tz() {
-    let unreadable = clock(None, None);
-    let request = with_tz_source("timestamptz_us", |b| {
-        b.filter(compare(
-            "predicate_less",
-            tz(),
-            scalar_fn("CURRENT_TIMESTAMP", []),
-        ))
-    });
-    let json = folded(&unreadable, &request).expect("an instant comparison folds without TZ");
-    assert_eq!(
-        json["filter"]["right"],
-        timestamp_lit("2024-01-15 23:30:45.123")
     );
 }

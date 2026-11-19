@@ -2744,7 +2744,7 @@ fn unity_parquet_partition_pruning_keeps_every_file_with_a_matching_row() {
     assert_cases_hold(&mut exa_conn(), Format::UnityParquet);
 }
 
-/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value beside an instant operand compares the instants
 #[test]
 fn delta_and_unity_parquet_instant_columns_compare_with_a_tstz_value_as_instants() {
     setup();

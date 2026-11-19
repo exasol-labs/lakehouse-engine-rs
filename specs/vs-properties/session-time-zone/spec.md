@@ -5,7 +5,7 @@ The `SESSION_TIME_ZONE` virtual schema property names the zone that stands in fo
 ## Background
 
 * No adapter or UDF request carries `SESSIONTIMEZONE`. Exasol sets the `TZ` environment variable of the adapter VM to `DBTIMEZONE`, as a zone name or, for a numeric zone, expectedly as a POSIX `UTC±N` string with the sign inverted. A `%env TZ=<zone>;` line in the adapter script source overrides it.
-* The folding zone is the `SESSION_TIME_ZONE` zone when the property is set, and the `TZ` zone otherwise. It applies to `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, and every compared `TIMESTAMP WITH LOCAL TIME ZONE` literal, except a `TIMESTAMP WITH LOCAL TIME ZONE` value beside an instant operand (`pushdown/pushdown-planning-clock-functions`), which folds to its UTC date and time.
+* The folding zone is the `SESSION_TIME_ZONE` zone when the property is set, and the `TZ` zone otherwise. It applies to `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, and every compared `TIMESTAMP WITH LOCAL TIME ZONE` literal, except beside an instant operand (`pushdown/pushdown-planning-clock-functions`), where every clock function and such a literal folds to its UTC date or date and time.
 * Exasol parses `ALTER VIRTUAL SCHEMA ... SET TIME_ZONE` as its own syntax and refuses a quoted property name, so the property is not named `TIME_ZONE`.
 * `docs/semantic-differences.md` lists where the folded values differ from native Exasol.
 

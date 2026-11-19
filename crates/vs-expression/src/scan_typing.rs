@@ -105,13 +105,6 @@ impl Inferred {
         }
     }
 
-    fn is_local_time_zone(self) -> bool {
-        matches!(
-            self,
-            Self::Exact(ExasolType::TimestampWithLocalTimeZone { .. })
-        )
-    }
-
     fn is_timestamp(self) -> bool {
         self == Self::Partial(Partial::Timestamp) || self.timestamp_precision().is_some()
     }
@@ -179,17 +172,6 @@ fn unified_type(a: ExasolType, b: ExasolType) -> Option<ExasolType> {
         (ExasolType::Timestamp { precision: p }, ExasolType::Timestamp { precision: q }) => {
             Some(ExasolType::timestamp(p.max(q)))
         }
-        (
-            ExasolType::TimestampWithLocalTimeZone { precision: p },
-            ExasolType::TimestampWithLocalTimeZone { precision: q }
-            | ExasolType::Timestamp { precision: q },
-        )
-        | (
-            ExasolType::Timestamp { precision: p },
-            ExasolType::TimestampWithLocalTimeZone { precision: q },
-        ) => Some(ExasolType::TimestampWithLocalTimeZone {
-            precision: p.max(q),
-        }),
         _ => None,
     }
 }
@@ -430,19 +412,11 @@ impl ScalarFunction {
                     DateResult::Date => DATE,
                     DateResult::Timestamp => derived_timestamp(0, version),
                 },
-                Some(&first)
-                    if first.timestamp_precision().is_some() || first.is_local_time_zone() =>
-                {
-                    first
-                }
+                Some(&first) if first.timestamp_precision().is_some() => first,
                 _ => Inferred::Unknown,
             },
             ResultRule::Truncated => match args.get(1) {
-                Some(&source)
-                    if source == DATE || source.is_timestamp() || source.is_local_time_zone() =>
-                {
-                    source
-                }
+                Some(&source) if source == DATE || source.is_timestamp() => source,
                 _ => Inferred::Unknown,
             },
             ResultRule::Date => DATE,

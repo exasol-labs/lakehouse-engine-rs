@@ -8,7 +8,7 @@ use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::{Value as Json, json};
 use vs_expression::timestamp::TimestampLiteral;
-use vs_expression::{ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, walk_column_nodes};
+use vs_expression::{ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping};
 
 use crate::adapter::column_notes::declares_utc_instants;
 use crate::adapter::time_zone::TimeZone;
@@ -21,6 +21,13 @@ use super::support::involved_columns;
 const DEFAULT_DIGITS: usize = 3;
 const MAX_DIGITS: usize = 9;
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const CLOCK_FUNCTIONS: [&str; 5] = [
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIMESTAMP",
+    "SYSDATE",
+    "SYSTIMESTAMP",
+];
 
 /// Read once per adapter VM. Exasol runs one adapter VM per statement (#583), so every pushdown
 /// request and virtual schema the VM serves folds the same instant.
@@ -37,12 +44,10 @@ pub(crate) struct StatementClock {
     session_time_zone: Option<TimeZone>,
 }
 
-/// The `(table, column)` names and types of a request's involved columns, typed as native Exasol
-/// types them over a table whose instant columns are TSTZ. Exasol declares an instant column a
-/// plain `TIMESTAMP` holding each instant's UTC date and time, and no virtual column TSTZ.
-struct NativeColumns(Vec<(String, String, ExasolType)>);
+/// A request's involved columns: table, name, declared type, and whether it is an instant column.
+struct InvolvedColumns(Vec<(String, String, ExasolType, bool)>);
 
-impl NativeColumns {
+impl InvolvedColumns {
     /// A column without a readable note counts as no instant column; planning refuses it later.
     fn of(request: &Json) -> Result<Self, UdfError> {
         let table_count = request
@@ -54,51 +59,64 @@ impl NativeColumns {
             let involved = involved_columns(request, |tables| tables.get(index))?;
             let declared = involved.types.iter().zip(&involved.notes.columns);
             for ((_, exa_type), (name, note)) in declared {
-                let native = match *exa_type {
-                    ExasolType::Timestamp { precision }
-                        if note.is_some_and(declares_utc_instants) =>
-                    {
-                        ExasolType::TimestampWithLocalTimeZone { precision }
-                    }
-                    other => other,
-                };
-                columns.push((involved.notes.table.to_string(), name.to_string(), native));
+                columns.push((
+                    involved.notes.table.to_string(),
+                    name.to_string(),
+                    *exa_type,
+                    note.is_some_and(declares_utc_instants),
+                ));
             }
         }
         Ok(Self(columns))
     }
 
-    /// Whether `operand` reads an instant column and native Exasol types it TSTZ. An explicit
-    /// TSTZ cast of a plain column reads no instant: Exasol evaluates it in the session zone.
+    /// Whether `operand` is a date or time that reads an instant column. An explicit TSTZ cast of
+    /// a plain column reads no instant: Exasol evaluates it in the session zone.
     fn is_instant(&self, operand: &Json, version: ExasolVersion) -> bool {
-        let mut reads_instant = false;
-        walk_column_nodes(operand, &mut |column| {
-            reads_instant |= self.column(&column).is_some_and(is_tstz);
-        });
-        // The typed pass gives a TSTZ value no type, and NULL leaves the instant's type to unify.
-        reads_instant
+        // The typed pass gives a clock value no type, and NULL leaves the other operands' type.
+        self.reads_instant(operand)
             && ScanTyping::new(self, version)
-                .exact_type(&without_tstz_values(operand, version))
-                .is_some_and(is_tstz)
+                .exact_type(&without_clock_values(operand))
+                .is_some_and(is_date_or_time)
     }
 
-    fn column(&self, column: &ColumnNode) -> Option<ExasolType> {
+    /// A nested predicate, such as a `CASE` condition, gives the operand none of its value.
+    fn reads_instant(&self, node: &Json) -> bool {
+        if is_predicate(node) {
+            return false;
+        }
+        if let Some(column) = ColumnNode::parse(node) {
+            return self.column(&column).is_some_and(|(_, instant)| instant);
+        }
+        match node {
+            Json::Array(items) => items.iter().any(|item| self.reads_instant(item)),
+            Json::Object(fields) => fields.values().any(|value| self.reads_instant(value)),
+            _ => false,
+        }
+    }
+
+    fn column(&self, column: &ColumnNode) -> Option<(ExasolType, bool)> {
         let table = column.table_name.unwrap_or_default();
         self.0
             .iter()
-            .find(|(column_table, name, _)| column_table == table && name == column.name)
-            .map(|(_, _, ty)| *ty)
+            .find(|(column_table, name, ..)| column_table == table && name == column.name)
+            .map(|(_, _, ty, instant)| (*ty, *instant))
     }
 }
 
-impl ColumnTypeLookup for NativeColumns {
+impl ColumnTypeLookup for InvolvedColumns {
     fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        self.column(&ColumnNode::parse(column)?)
+        self.column(&ColumnNode::parse(column)?).map(|(ty, _)| ty)
     }
 }
 
-fn is_tstz(ty: ExasolType) -> bool {
-    matches!(ty, ExasolType::TimestampWithLocalTimeZone { .. })
+fn is_date_or_time(ty: ExasolType) -> bool {
+    matches!(
+        ty,
+        ExasolType::Date
+            | ExasolType::Timestamp { .. }
+            | ExasolType::TimestampWithLocalTimeZone { .. }
+    )
 }
 
 /// A `TIMESTAMP WITH LOCAL TIME ZONE` value: its UTC wall clock and its fractional digits.
@@ -108,10 +126,10 @@ struct Tstz {
     digits: usize,
 }
 
-/// How one walk folds: the columns that tell an instant operand, beside which a TSTZ value folds
+/// How one walk folds: the columns that tell an instant operand, beside which a clock value folds
 /// to UTC, and the literal a TSTZ value becomes anywhere else.
 struct Fold<'a> {
-    columns: &'a NativeColumns,
+    columns: &'a InvolvedColumns,
     version: ExasolVersion,
     tstz: &'a dyn Fn(Tstz) -> Result<Json, UdfError>,
 }
@@ -130,7 +148,7 @@ impl StatementClock {
         }
     }
 
-    /// A TSTZ value beside an instant operand folds to its UTC date and time. Elsewhere a TSTZ
+    /// A clock value beside an instant operand folds to its UTC date or time. Elsewhere a TSTZ
     /// select-list item keeps the instant for Exasol to show, and other values fold to wall clock.
     pub(super) fn fold(
         &self,
@@ -138,7 +156,7 @@ impl StatementClock {
         pushdown: PushdownRequest,
         version: ExasolVersion,
     ) -> Result<PushdownRequest, UdfError> {
-        let columns = NativeColumns::of(request)?;
+        let columns = InvolvedColumns::of(request)?;
         let compared = Fold {
             columns: &columns,
             version,
@@ -175,10 +193,8 @@ impl StatementClock {
             *node = folded;
             return Ok(());
         }
-        for operand in beside_an_instant(node, fold) {
-            if let Some(tstz) = self.tstz_value(operand, fold.version)? {
-                *operand = timestamp_literal(tstz.utc, tstz.digits);
-            }
+        if has_an_instant_operand(node, fold) {
+            return self.walk_in_utc(node, fold);
         }
         match node {
             Json::Array(items) => items.iter_mut().try_for_each(|item| self.walk(item, fold)),
@@ -189,16 +205,36 @@ impl StatementClock {
         }
     }
 
-    /// The value of a node Exasol types TSTZ: a TSTZ literal, `CURRENT_TIMESTAMP`, or, on
-    /// Exasol 8 only, `LOCALTIMESTAMP`. `None` for any other node.
-    fn tstz_value(&self, node: &Json, version: ExasolVersion) -> Result<Option<Tstz>, UdfError> {
-        if let Some(literal) = tstz_literal_value(node)? {
-            return Ok(Some(literal));
+    /// Folds each clock value under `node` to UTC. A nested predicate decides for its operands.
+    fn walk_in_utc(&self, node: &mut Json, fold: &Fold) -> Result<(), UdfError> {
+        let children: Vec<&mut Json> = match node {
+            Json::Array(items) => items.iter_mut().collect(),
+            Json::Object(fields) => fields.values_mut().collect(),
+            _ => return Ok(()),
+        };
+        for child in children {
+            if let Some(utc) = self.utc_value(child)? {
+                *child = utc;
+            } else if is_predicate(child) {
+                self.walk(child, fold)?;
+            } else {
+                self.walk_in_utc(child, fold)?;
+            }
         }
-        if is_tstz_call(node, version) {
-            return self.now(node).map(Some);
+        Ok(())
+    }
+
+    /// The literal of a clock value's UTC date or time, `None` for any other node.
+    fn utc_value(&self, node: &Json) -> Result<Option<Json>, UdfError> {
+        if let Some(tstz) = tstz_literal_value(node)? {
+            return Ok(Some(timestamp_literal(tstz.utc, tstz.digits)));
         }
-        Ok(None)
+        let utc = self.instant.naive_utc();
+        Ok(match clock_call(node).as_deref() {
+            Some("CURRENT_DATE" | "SYSDATE") => Some(date_literal(utc)),
+            Some(_) => Some(timestamp_literal(utc, precision(node)?)),
+            None => None,
+        })
     }
 
     fn now(&self, call: &Json) -> Result<Tstz, UdfError> {
@@ -217,11 +253,7 @@ impl StatementClock {
         if let Some(literal) = tstz_literal_value(node)? {
             return tstz(literal).map(Some);
         }
-        let field = |key| node.get(key).and_then(Json::as_str);
-        if field("type") != Some("function_scalar") {
-            return Ok(None);
-        }
-        let Some(name) = field("name").map(str::to_ascii_uppercase) else {
+        let Some(name) = clock_call(node) else {
             return Ok(None);
         };
         Ok(Some(match name.as_str() {
@@ -230,8 +262,7 @@ impl StatementClock {
             "SYSTIMESTAMP" => {
                 timestamp_literal(self.tz_zone()?.wall_clock(self.instant), precision(node)?)
             }
-            "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" => tstz(self.now(node)?)?,
-            _ => return Ok(None),
+            _ => tstz(self.now(node)?)?,
         }))
     }
 
@@ -249,61 +280,52 @@ impl StatementClock {
     }
 }
 
-/// Every operand of a predicate or function call that has an instant operand, none otherwise.
-/// Typing reads the operands before the walk folds them.
-fn beside_an_instant<'n>(node: &'n mut Json, fold: &Fold) -> Vec<&'n mut Json> {
+/// Whether `node` is a predicate or function call with an instant operand.
+fn has_an_instant_operand(node: &Json, fold: &Fold) -> bool {
     let kind = node.get("type").and_then(Json::as_str).unwrap_or_default();
     if !(kind.starts_with("predicate_") || kind.starts_with("function_")) {
-        return Vec::new();
+        return false;
     }
     let Json::Object(fields) = node else {
-        return Vec::new();
+        return false;
     };
-    let operands: Vec<&mut Json> = fields
-        .values_mut()
+    fields
+        .values()
         .flat_map(|value| match value {
-            Json::Array(items) => items.iter_mut().collect(),
+            Json::Array(items) => items.iter().collect(),
             value => vec![value],
         })
-        .filter(|operand| operand.is_object())
-        .collect();
-    if operands
-        .iter()
-        .any(|operand| fold.columns.is_instant(operand, fold.version))
-    {
-        operands
-    } else {
-        Vec::new()
-    }
+        .any(|operand| operand.is_object() && fold.columns.is_instant(operand, fold.version))
 }
 
-/// `CURRENT_TIMESTAMP`, or `LOCALTIMESTAMP` on Exasol 8 only: the clock calls Exasol types TSTZ.
-fn is_tstz_call(node: &Json, version: ExasolVersion) -> bool {
+fn is_predicate(node: &Json) -> bool {
+    node.get("type")
+        .and_then(Json::as_str)
+        .is_some_and(|kind| kind.starts_with("predicate_"))
+}
+
+/// The upper-case name of a clock function call, `None` for any other node.
+fn clock_call(node: &Json) -> Option<String> {
     let field = |key| node.get(key).and_then(Json::as_str);
-    field("type") == Some("function_scalar")
-        && field("name")
-            .map(str::to_ascii_uppercase)
-            .is_some_and(|name| {
-                name == "CURRENT_TIMESTAMP"
-                    || (name == "LOCALTIMESTAMP" && version == ExasolVersion::Exasol8)
-            })
+    if field("type") != Some("function_scalar") {
+        return None;
+    }
+    field("name")
+        .map(str::to_ascii_uppercase)
+        .filter(|name| CLOCK_FUNCTIONS.contains(&name.as_str()))
 }
 
-/// `node` with a NULL literal in place of each TSTZ literal and TSTZ clock call.
-fn without_tstz_values(node: &Json, version: ExasolVersion) -> Json {
-    let is_tstz_literal = matches!(tstz_literal_value(node), Ok(Some(_)));
-    if is_tstz_literal || is_tstz_call(node, version) {
+/// `node` with a NULL literal in place of each TSTZ literal and clock call.
+fn without_clock_values(node: &Json) -> Json {
+    if matches!(tstz_literal_value(node), Ok(Some(_))) || clock_call(node).is_some() {
         return json!({"type": "literal_null"});
     }
     match node {
-        Json::Array(items) => items
-            .iter()
-            .map(|item| without_tstz_values(item, version))
-            .collect(),
+        Json::Array(items) => items.iter().map(without_clock_values).collect(),
         Json::Object(fields) => Json::Object(
             fields
                 .iter()
-                .map(|(key, value)| (key.clone(), without_tstz_values(value, version)))
+                .map(|(key, value)| (key.clone(), without_clock_values(value)))
                 .collect(),
         ),
         other => other.clone(),

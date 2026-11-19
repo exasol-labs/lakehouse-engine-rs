@@ -4253,7 +4253,7 @@ fn a_connection_without_credentials_reads_a_public_bucket_unsigned() {
     );
 }
 
-/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value compared with an instant column compares the instants
+/// Scenario: A TIMESTAMP WITH LOCAL TIME ZONE value beside an instant operand compares the instants
 #[test]
 fn an_int96_column_compares_with_a_tstz_value_as_an_instant() {
     const ORACLE: &str = "DIRECT_INT96_ORACLE.INT96_TS";

@@ -405,6 +405,7 @@ fn a_tstz_value_beside_an_instant_operand_compares_the_instants() {
         format!("TZ <= {ROW_2_IN_KIRITIMATI}"),
         format!("ADD_HOURS(TZ, 1) > {ROW_2_IN_KIRITIMATI}"),
         format!("COALESCE(TZ, TIMESTAMP '2000-01-01 00:00:00') >= {ROW_2_IN_KIRITIMATI}"),
+        format!("TZ >= CASE WHEN ID > 0 THEN {ROW_2_IN_KIRITIMATI} ELSE CURRENT_TIMESTAMP END"),
     ];
     if local_is_tstz {
         predicates.push("TZ < LOCALTIMESTAMP".to_string());
@@ -500,9 +501,9 @@ fn a_tstz_value_beside_an_instant_operand_compares_the_instants() {
     }
 }
 
-/// Scenario: A plain value compared with an instant column compares with its UTC date and time
+/// Scenario: A plain value or clock function beside an instant column uses its UTC date and time
 #[test]
-fn a_plain_value_compared_with_an_instant_column_compares_its_utc_date_and_time() {
+fn a_plain_value_or_clock_function_beside_an_instant_column_uses_utc() {
     const PLAIN_VS: &str = "CLOCK_VS_PLAIN_VALUES";
     let mut conn = setup();
     let local_is_tstz = localtimestamp_is_tstz(&mut conn);
@@ -518,16 +519,28 @@ fn a_plain_value_compared_with_an_instant_column_compares_its_utc_date_and_time(
         "{boundary}: a session-local reading of TZ would keep row 2 too"
     );
     assert_native_rows(&mut conn, PLAIN_VS, "TZ >= DATE '2024-03-01'");
+    let cast = format!("CAST(TZ AS TIMESTAMP) > {TSTZ_BOUNDARY}");
+    assert_eq!(
+        ids(
+            &mut conn,
+            &format!("SELECT ID FROM {} WHERE {cast}", table(PLAIN_VS))
+        ),
+        ids(
+            &mut conn,
+            &format!("SELECT ID FROM {INSTANT_ORACLE} WHERE TZ > {TSTZ_BOUNDARY}")
+        ),
+        "{cast} must compare the UTC dates and times, as the instants compare"
+    );
 
     // The fixture's rows lie far from now, so only the pushed literal shows the clock's fold.
-    let berlin_now = format!("CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, '{BERLIN}')");
-    let mut clocks = vec![("TZ <= SYSTIMESTAMP", "SYSTIMESTAMP")];
+    let utc_now = "CONVERT_TZ(SYSTIMESTAMP, DBTIMEZONE, 'UTC')";
+    let mut clocks = vec!["TZ <= SYSTIMESTAMP"];
     if !local_is_tstz {
-        clocks.push(("TZ <= LOCALTIMESTAMP", berlin_now.as_str()));
+        clocks.push("TZ <= LOCALTIMESTAMP");
     }
-    for (predicate, expected) in clocks {
+    for predicate in clocks {
         let query = format!("SELECT ID FROM {} WHERE {predicate}", table(PLAIN_VS));
-        assert_folds_near(&mut conn, &query, expected);
+        assert_folds_near(&mut conn, &query, utc_now);
         assert_native_rows(&mut conn, PLAIN_VS, predicate);
     }
     let today = "TZ >= CURRENT_DATE";
@@ -535,11 +548,12 @@ fn a_plain_value_compared_with_an_instant_column_compares_its_utc_date_and_time(
         &mut conn,
         &format!("SELECT ID FROM {} WHERE {today}", table(PLAIN_VS)),
     );
+    let utc_today = &conn.query_columns(&format!("SELECT TO_CHAR({utc_now}, 'YYYY-MM-DD')"))[0][0];
     // The scan spec is an SQL string literal, which doubles each quote.
-    let folded = format!("DATE ''{}''", session_today(&mut conn));
+    let folded = format!("DATE ''{}''", utc_today.as_str().expect("a date text"));
     assert!(
         pushed.contains(&folded),
-        "{today}: the scan filter must hold the folding zone's date {folded}: {pushed}"
+        "{today}: the scan filter must hold the UTC date {folded}: {pushed}"
     );
     assert_native_rows(&mut conn, PLAIN_VS, today);
 }
