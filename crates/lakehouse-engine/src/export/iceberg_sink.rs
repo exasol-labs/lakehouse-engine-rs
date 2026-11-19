@@ -416,7 +416,8 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
         );
     }
     // parquet-rs's chunking mask: floor(log2(((min + max) / 2 - min) / 8)) - norm, within 1..=63.
-    let target = ((min + max) / 2 - min) / 8;
+    // `(max - min) / 2` equals `(min + max) / 2 - min` and cannot overflow.
+    let target = (max - min) / 2 / 8;
     let bits = target.checked_ilog2().map_or(0, |bits| bits as i64) - i64::from(norm);
     if !(1..=63).contains(&bits) {
         return refusal(
