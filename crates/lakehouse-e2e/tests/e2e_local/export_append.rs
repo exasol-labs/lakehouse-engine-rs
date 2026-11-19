@@ -18,8 +18,8 @@ use crate::common::export_append_fixtures::{
 };
 use crate::common::table_state::{
     assert_data_files, assert_one_new_export, data_file_footers, data_prefix, iceberg_columns,
-    local_table_metadata, objects_under, reset_to_unexported_snapshot, set_table_properties,
-    snapshot_ids,
+    local_table_metadata, objects_under, remove_table_properties, reset_to_unexported_snapshot,
+    set_table_properties, snapshot_ids,
 };
 use crate::fixtures::{
     EXPORT_DIRECT, EXPORT_PROXIED, lakehouse_vs, proxy_virtual_schemas, stack, vs_table,
@@ -397,12 +397,19 @@ fn export_single_commit_appends_one_snapshot_without_staged_creation() {
     assert_eq!(added[0]["summary"]["added-records"], "1000");
 }
 
+/// The first `rows` rows of `WIDE_ROWS`.
+fn wide_rows(rows: u32) -> String {
+    format!("(SELECT * FROM {WIDE_ROWS} WHERE ID <= {rows})")
+}
+
 /// A new table of `WIDE_ROWS`' columns, created by an export of its first 10 rows.
 fn wide_table(name: &str) -> (String, String) {
     let namespace = run_namespace("write_properties");
-    let source = format!("(SELECT * FROM {WIDE_ROWS} WHERE ID <= 10)");
     let table = format!("{namespace}.{name}");
-    exported_rows(&mut exa_conn(), &EXPORT_DIRECT.export(&source, &table, ""));
+    exported_rows(
+        &mut exa_conn(),
+        &EXPORT_DIRECT.export(&wide_rows(10), &table, ""),
+    );
     (namespace, table)
 }
 
@@ -458,6 +465,29 @@ fn export_append_follows_the_table_write_properties() {
         "several data files of at most 4 MiB plus one row group: {sizes:?}"
     );
     assert_eq!(after["properties"], before["properties"]);
+
+    // Without the properties, an append takes Iceberg's defaults.
+    remove_table_properties(
+        &namespace,
+        "snappy",
+        &[
+            "write.parquet.compression-codec",
+            "write.parquet.row-group-size-bytes",
+            "write.target-file-size-bytes",
+        ],
+    );
+    let sql = EXPORT_DIRECT.export(&wide_rows(5), &table, "");
+    assert_eq!(exported_rows(&mut exa_conn(), &sql), 5);
+    let defaulted: Vec<_> = data_file_footers(&local_table_metadata(&namespace, "snappy"))
+        .into_iter()
+        .filter(|file| file.footer.file_metadata().num_rows() == 5)
+        .collect();
+    assert_data_files(
+        "append without write properties",
+        &defaulted,
+        Compression::ZSTD(ZstdLevel::default()),
+        128 * MIB,
+    );
 }
 
 /// Scenario: An unusable write property fails the export before any data is written
@@ -476,7 +506,7 @@ fn export_refuses_unusable_write_properties() {
     let data = data_prefix(&before);
     let files = objects_under(&data);
 
-    let sql = EXPORT_DIRECT.export(WIDE_ROWS, &table, "");
+    let sql = EXPORT_DIRECT.export(&wide_rows(10), &table, "");
     let error = export_error(&mut exa_conn(), &sql, NO_SECRETS);
 
     let named =

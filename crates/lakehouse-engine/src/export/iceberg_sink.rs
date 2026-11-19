@@ -411,6 +411,20 @@ fn refused(table: &TableProperties<'_>) -> Option<(&'static str, String)> {
     let min = table.cdc_min_chunk_size().ok()?;
     let max = table.cdc_max_chunk_size().ok()?;
     let norm = table.cdc_norm_level().ok()?;
+    // parquet-rs casts both sizes to i64, so a larger one turns negative at the first write.
+    let too_large = "a chunk size must be at most 9223372036854775807";
+    if i64::try_from(min).is_err() {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,
+            too_large,
+        );
+    }
+    if i64::try_from(max).is_err() {
+        return refusal(
+            TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE,
+            too_large,
+        );
+    }
     if min == 0 {
         return refusal(
             TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,

@@ -189,6 +189,15 @@ pub fn set_table_properties(namespace: &str, table: &str, properties: &[(&str, &
     );
 }
 
+/// Removes `keys` from the properties of local `namespace.table`.
+pub fn remove_table_properties(namespace: &str, table: &str, keys: &[&str]) {
+    commit_updates(
+        namespace,
+        table,
+        serde_json::json!([{"action": "remove-properties", "removals": keys}]),
+    );
+}
+
 /// Commits `updates` to local `namespace.table` without requirements.
 fn commit_updates(namespace: &str, table: &str, updates: Value) {
     let url = format!(
@@ -250,7 +259,8 @@ pub fn data_file_footers(metadata: &Value) -> Vec<DataFileFooter> {
 }
 
 /// Asserts that every column chunk of `files` uses `codec`, at any level, and that no row group
-/// compresses to more than a tenth above `row_group_bytes`, which parquet-rs only estimates.
+/// compresses to more than a tenth above `row_group_bytes`. parquet-rs counts finished pages after
+/// compression, so the size before compression can exceed the limit further.
 #[track_caller]
 pub fn assert_data_files(
     case: &str,

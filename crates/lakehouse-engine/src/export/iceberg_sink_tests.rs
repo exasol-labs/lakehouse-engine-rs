@@ -187,10 +187,20 @@ fn an_unusable_write_property_is_named_with_its_value() {
                 ),
                 (
                     "write.parquet.content-defined-chunking.max-chunk-size",
-                    "9223372036854775810",
+                    "9223372036855824384",
                 ),
             ],
-            "write.parquet.content-defined-chunking.norm-level = ''",
+            "write.parquet.content-defined-chunking.min-chunk-size = '9223372036854775808'",
+        ),
+        (
+            vec![
+                ("write.parquet.content-defined-chunking.enabled", "true"),
+                (
+                    "write.parquet.content-defined-chunking.max-chunk-size",
+                    "9223372036854775808",
+                ),
+            ],
+            "write.parquet.content-defined-chunking.max-chunk-size = '9223372036854775808'",
         ),
         (
             vec![("write.parquet.content-defined-chunking.enabled", "maybe")],

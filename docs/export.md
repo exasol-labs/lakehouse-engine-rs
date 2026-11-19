@@ -114,12 +114,12 @@ The writers write Parquet data files, also into a table whose `write.format.defa
 |----------|------|-------------------|
 | `write.parquet.compression-codec` | The codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `lz4_raw`, or `uncompressed` | `zstd` |
 | `write.parquet.compression-level` | The level of `zstd`, `gzip`, or `brotli` | The codec's own |
-| `write.parquet.row-group-size-bytes` | The approximate size, before compression, at which a row group ends | 128 MiB |
+| `write.parquet.row-group-size-bytes` | The approximate size at which a row group ends | 128 MiB |
 | `write.parquet.page-size-bytes`, `write.parquet.page-row-limit`, `write.parquet.dict-size-bytes` | Page and dictionary sizes | 1 MiB, 20,000 rows, 2 MiB |
 | `write.parquet.content-defined-chunking.*` | Content-defined chunking of pages, off unless `enabled` is `true` | Off |
 | `write.target-file-size-bytes` | The size at which a writer starts a new data file | 512 MiB |
 
-The writer estimates how many rows fit in a row group, so a row group can end a few percent above that size. A row group also ends at 1,048,576 rows. A writer holds the row group in progress in memory, so a larger row group size costs writer memory.
+The writer estimates a row group's size from its pages, counting finished pages after compression and the open page before it, so a row group can end a few percent above that size on disk and hold more before compression. A row group also ends at 1,048,576 rows. A writer holds the row group in progress in memory, so a larger row group size costs writer memory.
 
 Apache Spark reads every codec except `brotli` without extra libraries: a `brotli` file needs Hadoop's Brotli codec on Spark's classpath.
 
