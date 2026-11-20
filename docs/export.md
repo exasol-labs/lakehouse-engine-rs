@@ -155,7 +155,7 @@ Each transform takes these source types:
 
 The statement fails before it reads any source row when `PARTITION_BY` is empty or not a field list, names an unknown transform, has a width below 1, names a column the source lacks or a name that matches several source columns only by letter case, gives two fields the same name, gives a field the name of another source column, or puts two of `year`, `month`, `day`, and `hour` on one column. A transform that does not take its column's type fails the export at the writer, before it creates the table, with an error that names the field, the column, and the column's type. `PARTITION_BY` applies only to a table the export creates: with a table that exists, the statement fails before it reads any row, naming the table.
 
-A writer into a partitioned table buffers the rows of each partition in memory, within a budget of half the per-instance memory limit after 200 MB of overhead, at least 64 MiB and at most 512 MiB, or 512 MiB when the limit is unknown. When the buffered rows exceed the budget, the writer writes the partition that buffers the most bytes into data files of its own, which start a new file at `write.target-file-size-bytes`. Each such write-out gets new files, so a partition's files can stay below `write.target-file-size-bytes`. A writer whose rows exceed the budget therefore gives a partition several data files, and a source whose consecutive rows fall into many different partitions gives more and smaller files. Rows reach the writers in turn, not by partition, so every writer can write a file for every partition: G writers and P partitions give G × P files when no writer exceeds its budget and no partition's rows of a writer reach `write.target-file-size-bytes`, and more otherwise. Fewer writers, such as the default of one per node or `SINGLE_COMMIT = 'true'`, give fewer files. [Choosing WRITERS_PER_NODE](#choosing-writers_per_node) shows the file counts of a daily and a monthly partitioned table.
+A writer into a partitioned table buffers the rows of each partition in memory, within a budget of half the per-instance memory limit after 200 MB of overhead, at least 64 MiB and at most 512 MiB, or 512 MiB when the limit is unknown. When the buffered rows exceed the budget, the writer writes the partition that buffers the most bytes into data files of its own, which start a new file at `write.target-file-size-bytes`. Each such write-out gets new files, so a partition's files can stay below `write.target-file-size-bytes`. A writer whose rows exceed the budget therefore gives a partition several data files, and a source whose consecutive rows fall into many different partitions gives more and smaller files. Rows reach the writers in turn, not by partition, so every writer can write a file for every partition. Fewer writers, such as `SINGLE_COMMIT = 'true'`, give fewer files.
 
 ## How an export runs
 
@@ -177,31 +177,15 @@ The export deals the source rows in turn to G writers, where G is the node count
 
 ### Choosing WRITERS_PER_NODE
 
-Keep the default of one writer per node. More writers per node do not export faster: Exasol passes rows to the writers, which run as UDFs, at a fixed rate per node, and the writers of a node share it. A Python UDF that only counts rows reads them at the same rate. The rate grows with the node count. More writers per node give more data files and more commits on the table.
+Keep the default of one writer per node. Exasol passes rows to the writers at a fixed rate per node, and the writers on a node share it. More writers per node do not make an export faster, but they write more data files and make more commits on the table. A cluster with more nodes exports faster.
 
-On a 4-node cluster with Exasol 2025.2.0 and lakehouse-engine v0.60.0, an export of 610,666 TPC-H `lineitem` rows shipped in one year, spread evenly over the nodes, into an Iceberg REST catalog on Amazon S3 gave:
-
-| Partitioning | `WRITERS_PER_NODE` | Writers | Time | Data files | Peak memory of the largest writer |
-|--------------|--------------------|---------|------|------------|-----------------------------------|
-| none | 1 | 4 | 56 s | 4 | 95 MB |
-| none | 2 | 8 | 59 s | 8 | 87 MB |
-| none | 4 | 16 | 57 s | 16 | 79 MB |
-| `month` (12 partitions) | 1 | 4 | 55 s | 48 | 92 MB |
-| `month` (12 partitions) | 4 | 16 | 60 s | 192 | 70 MB |
-| `day` (365 partitions) | 1 | 4 | 66 s | 1,460 | 117 MB |
-| `day` (365 partitions) | 4 | 16 | 75 s | 5,840 | 78 MB |
-
-- Every unpartitioned run exports 10,400 to 10,800 rows/s, 2,600 to 2,700 rows/s per node, whatever `WRITERS_PER_NODE`.
-- On the same cluster, a Python UDF that only counts rows read 1,000,000 rows over 16 groups in 92 s, about 10,900 rows/s, and the same rows on one node in 339 s, about 2,950 rows/s. The export of the same 1,000,000 rows with 16 writers took 97 s.
-- Each writer receives the same number of rows, to within one row.
-- Into a partitioned table, each writer writes one data file per partition it receives rows of, so G writers and P partitions give G × P files when no writer exceeds its buffer budget and no file reaches `write.target-file-size-bytes`. With `day` and 4 writers per node, 5,840 files of about 10 KB hold the data that the unpartitioned export writes as 16 files of about 1.2 MB. They take about three times the storage, and the export takes a third longer.
-- The peak memory of every writer stays below 3% of the 4 GiB per-instance memory limit. No writer in these runs filled its 512 MiB buffer budget (see [Partitioned tables](#partitioned-tables)).
+Into a partitioned table, each writer writes a data file for each partition it gets rows for. G writers and P partitions can give G × P files or more. For example, a 4-node cluster with one writer per node writes a year of daily partitions as 4 × 365 = 1,460 files. To get fewer files, keep one writer per node or use `SINGLE_COMMIT`.
 
 ## SINGLE_COMMIT
 
 `SINGLE_COMMIT = 'true'` makes a new table appear only together with all its rows: the new table has one snapshot and no earlier metadata version. An append adds exactly one snapshot, or none. The export runs one writer for the whole cluster, because Exasol has no step after the last writer that could commit the files of several writers at once.
 
-The one writer reads every row on one node, so `SINGLE_COMMIT` exports at the rate of one node (see [Choosing WRITERS_PER_NODE](#choosing-writers_per_node)). It also gives a partitioned table the fewest data files, because one writer writes every partition.
+The one writer reads every row on one node, so the export is slower than with one writer per node. It writes the fewest data files.
 
 Iceberg REST makes a new table appear with its data through staged table creation (`stage-create`): the writer stages the table, writes its data files, and creates the table together with its snapshot in one commit. Only `SINGLE_COMMIT` into a new table needs a catalog that accepts staged creation. An append needs none. Lakekeeper accepts it. On a catalog that refuses it, the export fails at the writer, with an error that names the catalog and states that `SINGLE_COMMIT` needs staged table creation, and creates no table. A catalog that ignores `stage-create` and creates the table at once also fails the export, with an error that names the catalog.
 
