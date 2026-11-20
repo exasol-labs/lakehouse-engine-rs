@@ -109,6 +109,9 @@ filter runs in Exasol and skips no files. Write `DATE '2024-01-02'`, `TIMESTAMP 
 `TO_DATE(s, 'YYYY-MM-DD')` with a format. See
 [Text and session settings](capabilities.md#text-and-session-settings).
 
+On an integer column, a quoted whole number such as `part_nr = '47'` skips files as `part_nr = 47`
+does. On a column with decimal places, write the number without quotes.
+
 ### Calculated values and the current date work
 
 Exasol calculates constant expressions before it sends the query, so

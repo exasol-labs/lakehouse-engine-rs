@@ -1122,6 +1122,9 @@ fn check_json_value(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {
     JsonValueCall::parse(node).map(drop)
 }
 
+/// The most digits of a text literal the scan compares with an integer as a number.
+const MAX_INTEGER_TEXT_DIGITS: u8 = 18;
+
 /// The digit count of `text` when it is digits with an optional leading minus sign.
 fn integer_digits(text: &str) -> Option<u8> {
     let digits = text.strip_prefix('-').unwrap_or(text);
@@ -1131,15 +1134,16 @@ fn integer_digits(text: &str) -> Option<u8> {
     u8::try_from(digits.len()).ok()
 }
 
-/// A literal of at most `max_digits` digits reads as the same integer in every session, so
-/// comparing it with an integer needs no session setting.
-fn is_session_free_integer_text(node: &Json, max_digits: u8) -> bool {
+/// A literal of at most `precision` digits, and at most [`MAX_INTEGER_TEXT_DIGITS`], reads as the
+/// same integer in every session, so comparing it with an integer of that precision needs no
+/// session setting. Plan-time pruning reads the same literals as numbers.
+pub fn is_session_free_integer_text(node: &Json, precision: u8) -> bool {
     kind(node) == "literal_string"
         && node
             .get("value")
             .and_then(Json::as_str)
             .and_then(integer_digits)
-            .is_some_and(|digits| digits <= max_digits)
+            .is_some_and(|digits| digits <= precision.min(MAX_INTEGER_TEXT_DIGITS))
 }
 
 /// The fields that hold a predicate's operands or a simple CASE's basis. `arguments` holds the
@@ -1182,10 +1186,12 @@ fn compare_without_session_parse(
     }
     // A multi-value IN converts the text to the integer's type, which fails natively on a literal
     // wider than its precision, so only a literal that fits reaches the scan.
-    let max_digits = non_text.iter().try_fold(18, |max, ty| {
-        ty.is_integer()
-            .then(|| ty.integer_precision().map_or(max, |p| max.min(p)))
-    });
+    let max_digits = non_text
+        .iter()
+        .try_fold(MAX_INTEGER_TEXT_DIGITS, |max, ty| {
+            ty.is_integer()
+                .then(|| ty.integer_precision().map_or(max, |p| max.min(p)))
+        });
     let integer_against_digits =
         max_digits.is_some_and(|max| text.iter().all(|n| is_session_free_integer_text(n, max)));
     if !integer_against_digits {

@@ -518,14 +518,23 @@ fn a_negative_zero_float_partition_value_compares_equal_to_zero() {
     }
 }
 
+#[test]
+fn a_digits_only_text_literal_decides_an_integer_partition() {
+    let files = two_files("year", "2024", "2025");
+    assert_eq!(
+        kept_under(&sales_equal("YEAR", "2024"), &typed_columns(), &files),
+        [true, false]
+    );
+}
+
 /// Scenario: A comparison the declared type cannot decide exactly keeps the file
 #[test]
 fn an_undecidable_comparison_keeps_the_file() {
     let declared = typed_columns();
     let cases: Vec<(&str, Json, [FileValues; 2])> = vec![
         (
-            "a string literal on an integer column",
-            sales_equal("YEAR", "2024"),
+            "a string literal on an integer column that is not digits only",
+            sales_equal("YEAR", "+2024"),
             two_files("year", "2024", "2025"),
         ),
         (
