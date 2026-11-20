@@ -4,11 +4,9 @@
 
 # Export
 
-> **In development.** `EXPORT ... INTO SCRIPT` is not ready for use. Syntax, options and permissions may change.
-
 `EXPORT ... INTO SCRIPT` writes the rows of an Exasol table, a query on virtual schema tables, or a query that joins both into a new Iceberg table or an existing one. It writes through the Iceberg REST catalog that a CONNECTION names, onto S3-compatible storage or Azure Data Lake Storage Gen2. For a new table it creates the namespace and the table, and into an existing table it appends. Exasol reports the number of written rows as the statement's row count.
 
-Export is in development and opt-in, so the installer creates `LAKEHOUSE_EXPORT` only with `--with-export`. Releases from v0.58.4 contain it. On an earlier release, the script fails with `F-UDF-CL-RUST-9001: Loader error: no entry point found`.
+Export is opt-in: the installer creates `LAKEHOUSE_EXPORT` only with `--with-export`. Use v0.60.1 or later. Earlier releases lack parts of the export, and releases before v0.58.4 fail with `F-UDF-CL-RUST-9001: Loader error: no entry point found`.
 
 ## The statement
 
@@ -175,9 +173,17 @@ The export deals the source rows in turn to G writers, where G is the node count
 | `WRITERS_PER_NODE = '<w>'` | The node count times `w`, at most 300 |
 | `SINGLE_COMMIT = 'true'` | One for the whole cluster |
 
+### Choosing WRITERS_PER_NODE
+
+Keep the default of one writer per node. Exasol passes rows to the writers at a fixed rate per node, and the writers on a node share it. More writers per node do not make an export faster, but they write more data files and make more commits on the table. A cluster with more nodes exports faster.
+
+Into a partitioned table, each writer writes a data file for each partition it gets rows for. G writers and P partitions can give G × P files or more. For example, a 4-node cluster with one writer per node writes a year of daily partitions as 4 × 365 = 1,460 files. To get fewer files, keep one writer per node or use `SINGLE_COMMIT`.
+
 ## SINGLE_COMMIT
 
 `SINGLE_COMMIT = 'true'` makes a new table appear only together with all its rows: the new table has one snapshot and no earlier metadata version. An append adds exactly one snapshot, or none. The export runs one writer for the whole cluster, because Exasol has no step after the last writer that could commit the files of several writers at once.
+
+The one writer reads every row on one node, so the export is slower than with one writer per node. It writes the fewest data files.
 
 Iceberg REST makes a new table appear with its data through staged table creation (`stage-create`): the writer stages the table, writes its data files, and creates the table together with its snapshot in one commit. Only `SINGLE_COMMIT` into a new table needs a catalog that accepts staged creation. An append needs none. Lakekeeper accepts it. On a catalog that refuses it, the export fails at the writer, with an error that names the catalog and states that `SINGLE_COMMIT` needs staged table creation, and creates no table. A catalog that ignores `stage-create` and creates the table at once also fails the export, with an error that names the catalog.
 
