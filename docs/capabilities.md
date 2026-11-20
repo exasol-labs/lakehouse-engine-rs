@@ -38,7 +38,7 @@ A filter prunes files at plan time only where it compares a bare column with a l
 
 A `LIKE` without `ESCAPE` prunes with `\` as its escape character, Exasol's default `DEFAULT_LIKE_ESCAPE_CHARACTER`, so `name LIKE 'x\_%'` prunes by the prefix `x_`. A session that sets another default gets different rows, see [Semantic differences](semantic-differences.md#like-under-a-changed-default_like_escape_character).
 
-A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32-bit `float` column, `amount = 1.555` on a `decimal(10,2)` column, and a timestamp literal finer than the column's unit prune nothing, and still return the correct rows.
+A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32-bit `float` column, `amount = 1.555` on a `decimal(10,2)` column, and a timestamp literal finer than the column's unit prune nothing, and still return the correct rows. A quoted number compared with an integer column, such as `part_nr = '47'`, prunes as `part_nr = 47` does when it is digits with an optional minus sign and has no more digits than the column's precision, at most 18.
 
 | Format | Prunes by |
 |---|---|

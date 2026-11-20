@@ -20,7 +20,15 @@ The Iceberg, Delta, and Hive partition pruning paths translate the same filter s
 * *AND* a 32-bit float column SHALL take a numeric literal only when 32 bits hold its 64-bit value exactly, and a double column SHALL take it as a 64-bit value
 * *AND* a `literal_double` SHALL convert only for a float or double column, because Exasol compares it with any other numeric column as a DOUBLE
 
-### Scenario: A text or time literal converts only for a column of its own kind
+### Scenario: A digits-only text literal converts for an integer column
+
+* *GIVEN* a column that Exasol declares as an integer (`DECIMAL(p,0)`), and a filter that compares it with a quoted number, such as `part_nr = '47'` or `k IN ('45', '060')`, which Exasol sends as `literal_string`
+* *WHEN* a pruning path converts the literal
+* *THEN* a literal of digits with an optional leading minus sign, of no more digits than p and at most 18, SHALL convert to the number it reads as, as the scan reads it, so the filter prunes as `part_nr = 47` does
+* *AND* any other text, such as `'+47'`, `' 47'`, `'4.7'`, or a literal of more digits than p, SHALL constrain nothing for its node
+* *AND* a text literal SHALL constrain nothing for a column with a scale above 0, because Exasol reads the text by the session's `NLS_NUMERIC_CHARACTERS`
+
+### Scenario: A text or time literal converts for a column of its own kind
 
 * *GIVEN* columns of string, date, timestamp, UTC-adjusted timestamp, and nanosecond timestamp type
 * *WHEN* a pruning path converts a filter literal for one of them

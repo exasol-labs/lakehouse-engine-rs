@@ -22,7 +22,7 @@ use scan_typing::{
     INTEGER_TEXT_NODE, Inferred, SECOND_NODE, empty_as_null, render_integer_argument,
     second_fraction, seconds_type, timestamp_digits,
 };
-pub use scan_typing::{ColumnTypeLookup, ScanTyping};
+pub use scan_typing::{ColumnTypeLookup, ScanTyping, is_session_free_integer_text};
 use timestamp::{TimestampLiteral, TimestampUnit};
 pub use version::ExasolVersion;
 

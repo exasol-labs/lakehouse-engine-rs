@@ -343,6 +343,9 @@ const CASES: &[Case] = &[
     Case::new("K <> 10", Scan)
         .iceberg(ALL_FILES)
         .delta(NON_NULL_STATS),
+    // Exasol sends a quoted number as `literal_string`, which prunes as the number it reads as.
+    Case::new("K = '45'", Scan).iceberg_and_delta(&["b1", "n2"]),
+    Case::new("K IN ('45', '060')", Scan).iceberg_and_delta(&["b1", "n2"]),
     Case::new("P <> 'a'", Scan)
         .iceberg(&["b1", "b2", "n1", "n2"])
         .hive(&["b1", "b2"])
