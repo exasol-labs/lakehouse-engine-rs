@@ -412,9 +412,8 @@ Both modes:
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
   --with-export             also create the LAKEHOUSE_EXPORT script and print the export grants.
-                            In development, not ready for use: export counts rows and writes
-                            nothing to the lakehouse. No release contains it yet, so the script
-                            fails with a loader error unless the engine is built from source
+                            Export writes Iceberg tables and needs v0.60.1 or later; releases
+                            before v0.58.4 fail with a loader error
   --arch <x86_64|aarch64>   target CPU architecture (default: x86_64, or the host's for a local
                             --deployment); selects unsuffixed vs -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and

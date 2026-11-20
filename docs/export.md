@@ -4,11 +4,9 @@
 
 # Export
 
-> **In development.** `EXPORT ... INTO SCRIPT` is not ready for use. Syntax, options and permissions may change.
-
 `EXPORT ... INTO SCRIPT` writes the rows of an Exasol table, a query on virtual schema tables, or a query that joins both into a new Iceberg table or an existing one. It writes through the Iceberg REST catalog that a CONNECTION names, onto S3-compatible storage or Azure Data Lake Storage Gen2. For a new table it creates the namespace and the table, and into an existing table it appends. Exasol reports the number of written rows as the statement's row count.
 
-Export is in development and opt-in, so the installer creates `LAKEHOUSE_EXPORT` only with `--with-export`. Releases from v0.58.4 contain it. On an earlier release, the script fails with `F-UDF-CL-RUST-9001: Loader error: no entry point found`.
+Export is opt-in: the installer creates `LAKEHOUSE_EXPORT` only with `--with-export`. Use v0.60.1 or later. Earlier releases lack parts of the export, and releases before v0.58.4 fail with `F-UDF-CL-RUST-9001: Loader error: no entry point found`.
 
 ## The statement
 

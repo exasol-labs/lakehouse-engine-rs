@@ -77,8 +77,6 @@ Readers still need only the reader grants, not membership in the role. Every mem
 
 ### Export grants
 
-> **In development.** Export is not ready for use. Permissions may change.
-
 A user who runs `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT` (see [Export](export.md)) holds the export role, not the engine role. The installer prints the role's statements in its next-step template only when you pass `--with-export`, and runs none of them, because it runs before any CONNECTION exists. Create the CONNECTION, run the statements as a DBA, then grant the role to each exporting user:
 
 ```sql
