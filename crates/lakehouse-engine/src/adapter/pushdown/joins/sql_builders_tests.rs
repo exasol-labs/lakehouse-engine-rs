@@ -1,7 +1,7 @@
-use super::super::plan_broadcast_join;
-use super::super::planning::{
-    JoinLeaf, JoinShape, classify_join_window, detect_join, select_broadcast_sides,
-};
+use super::super::plan::LegGroup;
+use super::super::planning::{JoinLeaf, JoinShape, classify_join_window, detect_join};
+use super::super::render_resolved_join;
+use super::super::rendering::LegNaming;
 use super::super::tests::{
     broadcast_projection, built_join, customer_orders_request, customer_orders_request_declaring,
     customer_orders_request_over, customer_orders_sides, detected_join, equi_condition,
@@ -16,7 +16,7 @@ use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
-    full_row_n_scan_sql(
+    n_scan_sql_over(
         &parsed_pushdown(request),
         &detected_join(request),
         &customer_orders_sides(request, 10, 100),
@@ -81,114 +81,208 @@ fn q1_join_request() -> Json {
     )
 }
 
+/// Scenario: A broadcast join applies a declined filter conjunct in Exasol's WHERE
 #[test]
-fn broadcast_join_declines_wrapped_projection() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request = selecting(
-        request,
+fn a_declined_conjunct_keeps_the_broadcast_and_runs_in_exasols_where() {
+    let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .column(table_col("ORDERS", "O_ORDERDATE"))
+            .filter(and([string_equal("CUSTOMER", "C_NAME", "ACME"), declined]))
+            .order_by(serde_json::json!([order_by_element(
+                table_col("CUSTOMER", "C_NAME"),
+                true,
+                true
+            )]))
+            .limit(5),
+    );
+
+    let sql = broadcast_plan(&request, 10, 100).expect("a declined conjunct keeps the broadcast");
+
+    assert!(
+        sql.starts_with(r#"SELECT "LHS_T0_C_NAME", "LHS_T1_O_ORDERDATE" FROM (SELECT SCAN("#),
+        "{sql}"
+    );
+    let (fan_out, outer) = sql
+        .rsplit_once(") WHERE (")
+        .expect("an Exasol WHERE over the fan-out");
+    assert!(
+        outer.contains(r#"SECOND("LHS_T1_O_ORDERDATE", 3)"#),
+        "{sql}"
+    );
+    assert!(
+        outer.ends_with(r#" ORDER BY "LHS_T0_C_NAME" ASC NULLS LAST LIMIT 5"#),
+        "{sql}"
+    );
+    assert!(
+        fan_out.contains(r#""filter":"(\"LHS_T0\".\"C_NAME\" = ''ACME'')""#),
+        "the scan keeps the conjunct it renders: {sql}"
+    );
+    for absent in ["SECOND", "post_join", r#""limit""#, r#""order_by""#] {
+        assert!(!fan_out.contains(absent), "{absent}: {sql}");
+    }
+}
+
+#[test]
+fn a_two_leg_join_whose_sort_key_the_select_list_lacks_keeps_the_n_scan() {
+    let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .filter(declined)
+            .order_by(serde_json::json!([order_by_element(
+                table_col("ORDERS", "O_ORDERDATE"),
+                true,
+                true
+            )]))
+            .limit(5),
+    );
+
+    assert_eq!(broadcast_plan(&request, 10, 100), None);
+}
+
+/// Scenario: A wrapped derived projection routes to a native wrapper on every path
+#[test]
+fn a_wrapped_select_list_keeps_the_broadcast_under_an_exasol_select() {
+    let mut request = selecting(
+        join_request(Json::Null, equi_condition()),
         &[(
             scalar_fn("UPPER", [table_col("CUSTOMER", "C_NAME")]),
             ExasolType::varchar(100),
         )],
     );
-    let pushdown_req = pd(&request);
-    assert!(matches!(
-        classify_join_window(&pushdown_req),
-        JoinWindowPlan::Unbounded
-    ));
-    let detected = detected_join(&request);
-
-    let mut ok_req = request.clone();
-    ok_req["pushdownRequest"]["selectListDataTypes"] =
-        serde_json::json!([exasol_type_to_json(&ExasolType::varchar(100))]);
-    let projection = broadcast_projection(&ok_req);
-    let ok_wrapped = projection == RowProjection::Wrapped;
-    assert!(!ok_wrapped, "the control fixture must NOT wrap");
-    assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&ok_req),
-            &detected,
-            &request_sides(&ok_req, &detected),
-            &test_context()
-        )
-        .expect("the control must not error")
-        .is_some(),
-        "the control must render a broadcast plan, so only the wrapping differs"
-    );
-
     request["pushdownRequest"]["selectListDataTypes"] = serde_json::json!([exasol_type_to_json(
         &ExasolType::TimestampWithLocalTimeZone { precision: 3 }
     )]);
-    let projection = broadcast_projection(&request);
-    let wrapped = projection == RowProjection::Wrapped;
-    assert!(
-        wrapped,
-        "precondition: the one-item select list must be one only Exasol computes"
+    assert_eq!(
+        broadcast_projection(&request),
+        RowProjection::Wrapped,
+        "precondition: only Exasol computes the one item"
     );
 
+    let sql = broadcast_plan(&request, 10, 100).expect("a wrapped select list keeps the broadcast");
+
     assert!(
-        render_broadcast_join(
-            &parsed_pushdown(&request),
-            &detected,
-            &request_sides(&request, &detected),
-            &test_context()
+        outer_select_list(&sql).contains(r#"UPPER("LHS_T0_C_NAME")"#),
+        "{sql}"
+    );
+    assert_eq!(
+        emits_clause(&sql),
+        r#""LHS_T0_C_NAME" VARCHAR(100)"#,
+        "{sql}"
+    );
+}
+
+/// `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM` selecting `C_CUSTKEY` and LINEITEM's `quantity` column, its
+/// legs of 10, 100, and 1000 bytes.
+fn three_leg_plan_sql(quantity: &str) -> String {
+    let decimal = ExasolType::decimal(20, 0);
+    let request = with_identifier_notes(
+        pushdown_request(
+            "CUSTOMER",
+            &[("C_CUSTKEY", decimal), ("C_NAME", ExasolType::varchar(100))],
         )
-        .expect("a wrapped projection is a clean decline, NOT an error")
-        .is_none(),
-        "a wrapped projection must decline broadcast rendering (Ok(None)) so the \
-         request falls through to the unified N-scan fallback"
+        .table("ORDERS", &[("O_ORDERKEY", decimal), ("O_CUSTKEY", decimal)])
+        .table(
+            "LINEITEM",
+            &[
+                ("L_ORDERKEY", decimal),
+                (quantity, ExasolType::decimal(15, 2)),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field(
+            "from",
+            inner_join(
+                customer_orders_join(),
+                table_ref("LINEITEM"),
+                predicate_equal(
+                    table_col("ORDERS", "O_ORDERKEY"),
+                    table_col("LINEITEM", "L_ORDERKEY"),
+                ),
+            ),
+        )
+        .column(table_col("CUSTOMER", "C_CUSTKEY"))
+        .column(table_col("LINEITEM", quantity))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
+        &[
+            ("CUSTOMER", "lh.customer"),
+            ("ORDERS", "lh.orders"),
+            ("LINEITEM", "lh.lineitem"),
+        ],
     );
-}
-
-#[test]
-fn broadcast_declines_on_a_declined_filter() {
-    let declined = || declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
-    let beside_a_rendered_conjunct = and([string_equal("CUSTOMER", "C_NAME", "ACME"), declined()]);
-    for filter in [declined(), beside_a_rendered_conjunct] {
-        let mut request = join_request(Json::Null, equi_condition());
-        request["pushdownRequest"]["filter"] = filter.clone();
-        let detected = detected_join(&request);
-
-        assert!(
-            render_broadcast_join(
-                &parsed_pushdown(&request),
-                &detected,
-                &request_sides(&request, &detected),
-                &test_context()
-            )
-            .expect("a declined filter is a clean decline, not an error")
-            .is_none(),
-            "a declined conjunct must decline the broadcast plan (Ok(None)) so the request falls \
-             through to the N-scan fallback, which self-applies it: {filter}"
-        );
-    }
-}
-
-#[test]
-fn broadcast_declines_instr_with_start_position_argument() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = compare(
-        "predicate_greater",
-        scalar_fn(
-            "INSTR",
-            [table_col("CUSTOMER", "C_NAME"), str_lit("b"), num_lit(3)],
-        ),
-        num_lit(0),
+    let sides = request_typed(
+        &request,
+        &[
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
+        ],
     );
-    let detected = detected_join(&request);
-
-    let outcome = render_broadcast_join(
+    render_resolved_join(
         &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &test_context(),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
     )
-    .expect("a type-declined filter is a clean decline, not an error");
+    .expect("a three-leg join plans without error")
+}
+
+/// Scenario: A join of three or more legs broadcasts one pair and scans the other legs
+#[test]
+fn a_three_leg_join_broadcasts_its_largest_facts_pair_and_scans_the_other_leg() {
+    let sql = three_leg_plan_sql("L_QUANTITY");
+
     assert!(
-        outcome.is_none(),
-        "INSTR with a start-position argument must decline the broadcast plan \
-         (Ok(None)) so Exasol evaluates it natively via the N-scan fallback's \
-         residual WHERE"
+        sql.starts_with(
+            r#"SELECT "LHS_T0"."C_CUSTKEY", "LHS_T2"."LHS_T2_L_QUANTITY" FROM (SELECT SCAN("#
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.ends_with(r#" AS "LHS_T2" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T2"."LHS_T1_O_CUSTKEY"))"#),
+        "the pair joins CUSTOMER where both are in scope: {sql}"
+    );
+    let blobs: Vec<Json> = sql
+        .split('\'')
+        .skip(1)
+        .step_by(4)
+        .map(|blob| serde_json::from_str(blob).expect("each fan-out's common blob is JSON"))
+        .collect();
+    assert_eq!(
+        blobs.len(),
+        2,
+        "one fan-out for CUSTOMER and one for the pair: {sql}"
+    );
+    assert!(blobs[0].get("join").is_none(), "{}", blobs[0]);
+    let join = &blobs[1]["join"];
+    assert_eq!(join["fact_alias"], "LHS_T2");
+    assert_eq!(join["dimension_alias"], "LHS_T1");
+    assert_eq!(join["table_root"], "s3://warehouse/lh/orders");
+    assert!(join.get("post_join_limit").is_none(), "{join}");
+    assert!(
+        sql.contains(
+            r#"EMITS ("LHS_T1_O_CUSTKEY" DECIMAL(20,0), "LHS_T2_L_QUANTITY" DECIMAL(15,2))"#
+        ),
+        "the pair emits the columns Exasol reads over it: {sql}"
+    );
+}
+
+/// Scenario: A pair that is not eligible is not broadcast
+#[test]
+fn a_pair_that_does_not_render_yields_to_the_next_eligible_pair() {
+    let long = format!("L_{}", "Q".repeat(124));
+    let sql = three_leg_plan_sql(&long);
+
+    let join = broadcast_common_blob(&sql)["join"].clone();
+    assert_eq!(join["fact_alias"], "LHS_T1", "{sql}");
+    assert_eq!(join["dimension_alias"], "LHS_T0", "{sql}");
+    assert!(
+        sql.contains(&format!(r#""LHS_T2"."{long}""#)),
+        "LINEITEM keeps a fan-out of its own: {sql}"
     );
 }
 
@@ -200,6 +294,7 @@ fn broadcast_absent_filter_stays_eligible() {
         &parsed_pushdown(&absent_request),
         &absent_detected,
         &request_sides(&absent_request, &absent_detected),
+        &LegGroup::pair(1, 0),
         &test_context(),
     )
     .expect("an absent filter must not error")
@@ -322,7 +417,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -343,7 +438,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
 
 /// Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
 #[test]
-fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
+fn n_scan_produces_qualified_n_scan_wrapper() {
     let request = three_table_join_request();
     let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
         JoinShape::Join(m) => m,
@@ -354,7 +449,7 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -388,7 +483,7 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
 }
 
 #[test]
-fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
+fn n_scan_for_q1_shape_supplier_nation_region() {
     let request = q1_join_request();
     let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
         JoinShape::Join(m) => m,
@@ -399,7 +494,7 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
         resolved_side("REGION", vec![("s3://w/r-0.parquet", 2)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -424,7 +519,7 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
 }
 
 #[test]
-fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
+fn n_scan_for_nq3_shape_part_partsupp_supplier_nation() {
     let request = nq3_join_request();
     let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
         JoinShape::Join(m) => m,
@@ -436,7 +531,7 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 5)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 3)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -465,7 +560,7 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
 }
 
 #[test]
-fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name() {
+fn n_scan_renders_qualified_when_three_tables_share_column_name() {
     let request = with_identifier_notes(
         pushdown_request(
             "EVENTS",
@@ -522,7 +617,7 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
         resolved_side("TAGS", vec![("s3://w/t-0.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -552,7 +647,7 @@ fn self_join_renders_each_occurrence_as_its_own_leg() {
             resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
             resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         ];
-        let sql = full_row_n_scan_sql(
+        let sql = n_scan_sql_over(
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_typed(&request, &sides),
@@ -582,7 +677,7 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f2.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -637,7 +732,7 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -676,7 +771,7 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -751,7 +846,7 @@ fn three_table_join_inner_join_on_chain() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -830,7 +925,7 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
         resolved_side("N2", vec![("s3://w/n2-0.parquet", 10)]),
         resolved_side("FACT", vec![("s3://w/f-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -888,6 +983,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
+        &LegGroup::pair(1, 0),
         &test_context(),
     )
     .expect("a VARCHAR LIKE subject must not error")
@@ -1230,7 +1326,7 @@ fn golden_broadcast_join_sql_unchanged() {
         allow_http: true,
         ..Default::default()
     });
-    let sides = broadcast_sides(fact, dimension, 1);
+    let (sides, pair) = broadcast_sides(fact, dimension, 1);
     let rendered = RenderedJoinPushdown {
         filter: Some(r#"("LHS_T0"."L_QUANTITY" > 5)"#.to_string()),
         ..rendered_join(
@@ -1247,7 +1343,7 @@ fn golden_broadcast_join_sql_unchanged() {
             ],
         )
     };
-    let actual = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
+    let actual = build_pair_fan_out_sql(&sides, &pair, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
     assert_eq!(
@@ -1276,7 +1372,7 @@ fn broadcast_carries_each_sides_own_storage() {
         allow_http: true,
         ..Default::default()
     });
-    let sides = broadcast_sides(fact.clone(), dimension.clone(), 1);
+    let (sides, pair) = broadcast_sides(fact.clone(), dimension.clone(), 1);
     let rendered = rendered_join(
         r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
         &[ProjectedColumn {
@@ -1284,8 +1380,9 @@ fn broadcast_carries_each_sides_own_storage() {
             exa_type: ExasolType::decimal(20, 0),
         }],
     );
-    let sql = build_broadcast_join_sql(
+    let sql = build_pair_fan_out_sql(
         &sides,
+        &pair,
         &rendered,
         &PushdownContext {
             connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
@@ -1343,7 +1440,7 @@ fn broadcast_sql_projecting(
     projection: &[ProjectedColumn],
     window: JoinWindowPlan,
 ) -> Option<String> {
-    let sides = broadcast_sides(
+    let (sides, pair) = broadcast_sides(
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
         1,
@@ -1355,7 +1452,7 @@ fn broadcast_sql_projecting(
             projection,
         )
     };
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
+    build_pair_fan_out_sql(&sides, &pair, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -1539,6 +1636,7 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
             &parsed_pushdown(request),
             &detected_join(request),
             &request_sides(request, &detected_join(request)),
+            &LegGroup::pair(1, 0),
             &test_context(),
         )
         .expect("renders")
@@ -2111,7 +2209,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         &pushdown_req,
         &legs,
         &[leg],
-        LegColumns::Relations,
+        &LegNaming::relations(1),
         &test_context(),
     )
     .expect("a renderable expression sort key must render, not decline");
@@ -2151,7 +2249,7 @@ fn seam_trailing(request: &Json) -> Result<String, UdfError> {
         &pushdown,
         &legs,
         &vec![events; leg_count],
-        LegColumns::Relations,
+        &LegNaming::relations(leg_count),
         &test_context(),
     )
     .map(|clauses| clauses.trailing)
@@ -2375,11 +2473,12 @@ fn shared_names_broadcast_sql_over(
         &parsed_pushdown(request),
         &detected_join(request),
         &typed,
+        &LegGroup::pair(1, 0),
         &test_context(),
     )
     .expect("a well-formed request renders without error")?;
-    let sides = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
-    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
+    let (sides, pair) = broadcast_sides(typed[0].clone(), typed[1].clone(), 1);
+    build_pair_fan_out_sql(&sides, &pair, &rendered, &two_scan_tuning())
         .expect("selecting the wire storage must succeed")
 }
 
@@ -2504,6 +2603,7 @@ fn output_name_over_identifier_limit_declines_broadcast() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            &LegGroup::pair(1, 0),
             &test_context(),
         )
         .expect("an identifier-limit decline is not an error")
@@ -2534,6 +2634,7 @@ fn self_join_renders_each_occurrence_as_its_own_relation() {
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_sides(&request, &detected_join(&request)),
+            &LegGroup::pair(1, 0),
             &test_context(),
         )
         .expect("renders")
@@ -2555,22 +2656,14 @@ fn self_join_renders_each_occurrence_as_its_own_relation() {
 #[test]
 fn join_block_names_the_dimension_legs_alias() {
     let request = join_request(Json::Null, equi_condition());
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected_join(&request),
-        &request_sides(&request, &detected_join(&request)),
-        &test_context(),
-    )
-    .expect("renders")
-    .expect("an equi-join renders");
     let aliases_with = |customer_bytes: u64, orders_bytes: u64| {
-        let [customer, orders] = customer_orders_sides(&request, customer_bytes, orders_bytes)
-            .try_into()
-            .expect("two sides");
-        let sides = select_broadcast_sides(customer, orders);
-        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning())
-            .expect("selecting the wire storage must succeed")
-            .expect("an unbounded join builds");
+        let sql = render_resolved_join(
+            &parsed_pushdown(&request),
+            &detected_join(&request),
+            &customer_orders_sides(&request, customer_bytes, orders_bytes),
+            &two_scan_tuning(),
+        )
+        .expect("an equi-join renders");
         let join = broadcast_common_blob(&sql)["join"].clone();
         (join["fact_alias"].clone(), join["dimension_alias"].clone())
     };
@@ -2586,14 +2679,11 @@ fn join_block_names_the_dimension_legs_alias() {
     );
 }
 
-/// The broadcast plan of `request` over one CUSTOMER and one ORDERS file of the given sizes.
-fn aggregating_broadcast_plan(
-    request: &Json,
-    customer_bytes: u64,
-    orders_bytes: u64,
-) -> Option<String> {
+/// The broadcast plan of `request` over one CUSTOMER and one ORDERS file of the given sizes,
+/// `None` when the request keeps the N-scan.
+fn broadcast_plan(request: &Json, customer_bytes: u64, orders_bytes: u64) -> Option<String> {
     let sides = customer_orders_sides(request, customer_bytes, orders_bytes);
-    plan_broadcast_join(
+    let sql = render_resolved_join(
         &parsed_pushdown(request),
         &detected_join(request),
         &sides,
@@ -2605,12 +2695,13 @@ fn aggregating_broadcast_plan(
             ..two_scan_tuning()
         },
     )
-    .expect("a declined broadcast is not an error")
+    .expect("a join plans without error");
+    sql.contains(r#""join":{"#).then_some(sql)
 }
 
-/// [`aggregating_broadcast_plan`] with CUSTOMER the smaller side.
-fn aggregating_broadcast_sql(request: &Json) -> String {
-    aggregating_broadcast_plan(request, 10, 100)
+/// [`broadcast_plan`] with CUSTOMER the smaller side.
+fn broadcast_plan_sql(request: &Json) -> String {
+    broadcast_plan(request, 10, 100)
         .expect("a renderable aggregating join must stay on the broadcast path")
 }
 
@@ -2632,7 +2723,7 @@ fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
             .limit(1),
     );
 
-    let sql = aggregating_broadcast_sql(&request);
+    let sql = broadcast_plan_sql(&request);
 
     assert!(
         sql.starts_with(
@@ -2666,7 +2757,7 @@ fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
                 .single_group(),
         );
 
-        let sql = aggregating_broadcast_sql(&request);
+        let sql = broadcast_plan_sql(&request);
 
         assert!(
             sql.starts_with("SELECT COUNT(*) FROM (SELECT SCAN("),
@@ -2686,7 +2777,7 @@ fn aggregating_broadcast_wrapper_selects_only_columns_the_fan_out_emits() {
             .group_by(vec![table_col("ORDERS", "O_CUSTKEY")]),
     );
 
-    let sql = aggregating_broadcast_plan(&request, 100, 10)
+    let sql = broadcast_plan(&request, 100, 10)
         .expect("ORDERS, the dimension, holds no unbounded text column");
 
     let emitted: Vec<&str> = emits_clause(&sql)
@@ -2738,12 +2829,12 @@ fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only
     );
 
     assert_eq!(
-        aggregating_broadcast_plan(&request, 10, 100),
+        broadcast_plan(&request, 10, 100),
         None,
         "CUSTOMER is the dimension"
     );
     assert!(
-        aggregating_broadcast_plan(&request, 100, 10).is_some(),
+        broadcast_plan(&request, 100, 10).is_some(),
         "CUSTOMER is the fact side"
     );
 }
@@ -2759,7 +2850,7 @@ fn aggregating_broadcast_keeps_a_column_free_aggregation_over_a_text_keyed_leadi
             .count_star(),
     );
 
-    let sql = aggregating_broadcast_plan(&request, 10, 100)
+    let sql = broadcast_plan(&request, 10, 100)
         .expect("CUSTOMER, the dimension and first leg, lends only its join key");
 
     assert_eq!(emits_clause(&sql), r#""LHS_T0_CODE" VARCHAR(100)"#, "{sql}");

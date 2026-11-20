@@ -601,16 +601,19 @@ pub(crate) fn customer_orders_join() -> Json {
     )
 }
 
-pub(crate) fn broadcast_sides(
+/// The two legs of a broadcast pair in leg order, beside the pair whose dimension is leg
+/// `dimension_leg`.
+pub(super) fn broadcast_sides(
     fact: joins::ResolvedJoinSide,
     dimension: joins::ResolvedJoinSide,
     dimension_leg: usize,
-) -> joins::JoinSides {
-    joins::JoinSides {
-        fact,
-        dimension,
-        dimension_leg,
-    }
+) -> (Vec<joins::ResolvedJoinSide>, joins::LegGroup) {
+    let fact_leg = 1 - dimension_leg;
+    let sides = match dimension_leg {
+        0 => vec![dimension, fact],
+        _ => vec![fact, dimension],
+    };
+    (sides, joins::LegGroup::pair(fact_leg, dimension_leg))
 }
 
 pub(crate) fn rendered_join(
@@ -682,18 +685,28 @@ pub(super) fn emitting_named(columns: &ColumnTypes, names: &[&str]) -> Emitted {
         .expect("the fixture names no refused column")
 }
 
-/// The N-scan wrapper over `sides`, each leg's fan-out emitting every column of its side.
-pub(super) fn full_row_n_scan_sql(
+/// The N-scan wrapper over `sides`, each leg's fan-out emitting the columns the request names.
+pub(super) fn n_scan_sql_over(
     pushdown: &PushdownRequest,
     join: &joins::DetectedJoin,
     sides: &[joins::ResolvedJoinSide],
     context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
-    let emitted: Vec<Emitted> = sides
-        .iter()
-        .map(|side| emitting(&side.column_types))
-        .collect();
-    joins::build_n_scan_join_sql(pushdown, join, sides, &emitted, context)
+    let plan = joins::JoinPlan::n_scan(sides.len());
+    joins::render_join_plan(pushdown, join, sides, &plan, context)
+        .map(|sql| sql.expect("the N-scan renders every join"))
+}
+
+/// The plan of `join` that broadcasts `pair`, `None` when its fan-out does not render.
+pub(super) fn pair_plan_sql(
+    pushdown: &PushdownRequest,
+    join: &joins::DetectedJoin,
+    sides: &[joins::ResolvedJoinSide],
+    pair: &joins::LegGroup,
+    context: &PushdownContext<'_>,
+) -> Result<Option<String>, UdfError> {
+    let plan = joins::JoinPlan::broadcasting(sides.len(), pair);
+    joins::render_join_plan(pushdown, join, sides, &plan, context)
 }
 
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that

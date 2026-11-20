@@ -14,7 +14,7 @@ use crate::common::timestamp_precision::{
     engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
+    TYPED_COLUMNS, assert_broadcast_join_wrapper, assert_single_table_wrapper,
     echoed_pushdown_requests, events_table, explain_virtual_pushdown_sql, lakehouse_vs,
     typed_table, vs_char_pad_table, vs_dim_table, vs_fact_table,
 };
@@ -3022,7 +3022,7 @@ fn non_emittable_select_items_match_native() {
     for query in single_table {
         assert_single_table_wrapper(&mut conn, &query.replace("{T}", &table));
     }
-    assert_two_scan_join_wrapper(&mut conn, &join.replace("{T}", &table));
+    assert_broadcast_join_wrapper(&mut conn, &join.replace("{T}", &table));
     let pruned_sql = pruned.replace("{T}", &table);
     assert_eq!(
         conn.query_row_count(&pruned_sql),
@@ -3049,7 +3049,7 @@ fn typed_null_select_item_keeps_its_declared_type() {
          ORDER BY a.ID"
     );
     assert_single_table_wrapper(&mut conn, &single_table);
-    assert_two_scan_join_wrapper(&mut conn, &join);
+    assert_broadcast_join_wrapper(&mut conn, &join);
 
     for sql in [single_table, join] {
         let resp = conn.execute(&sql);

@@ -2,7 +2,7 @@
 //! planning, so a filter written in `ON` is planned exactly as the same filter in `WHERE`.
 //! Three rules live here and change independently: which conjuncts stay in a condition
 //! ([`is_join_equality`]), the move ([`move_condition_filters`]), and the broadcast join-key test
-//! ([`holds_only_join_keys`]).
+//! ([`join_key_legs`]).
 
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
@@ -10,12 +10,18 @@ use std::collections::BTreeSet;
 use super::super::support::{PushdownRequest, conjoin, flatten_conjuncts};
 use super::attribution::JoinLegs;
 
-/// True when every conjunct of `condition` is a join key, the condition shape a broadcast join
-/// hands DataFusion as its hash-join keys.
-pub(super) fn holds_only_join_keys(condition: &Json, legs: &JoinLegs) -> bool {
-    flatten_conjuncts(condition)
-        .into_iter()
-        .all(|conjunct| is_join_key(conjunct, legs))
+/// The two legs `conjunct` joins, lower first, when it is a join key: an `=` whose sides each read
+/// exactly one leg, different legs, expressions included. A broadcast pair hands DataFusion its
+/// keys as hash-join keys.
+pub(super) fn join_key_legs(conjunct: &Json, legs: &JoinLegs) -> Option<(usize, usize)> {
+    let (left, right) = equality_side_legs(conjunct, legs)?;
+    match (
+        Vec::from_iter(left).as_slice(),
+        Vec::from_iter(right).as_slice(),
+    ) {
+        (&[l], &[r]) if l != r => Some((l.min(r), l.max(r))),
+        _ => None,
+    }
 }
 
 /// `pushdown` with every conjunct of an inner join's condition other than a join equality moved
@@ -80,12 +86,6 @@ fn is_join_equality(conjunct: &Json, legs: &JoinLegs) -> bool {
     equality_side_legs(conjunct, legs).is_some_and(|(left, right)| {
         !left.is_empty() && !right.is_empty() && left.is_disjoint(&right)
     })
-}
-
-/// An `=` whose sides each read exactly one leg, different legs, expressions included.
-fn is_join_key(conjunct: &Json, legs: &JoinLegs) -> bool {
-    equality_side_legs(conjunct, legs)
-        .is_some_and(|(left, right)| left.len() == 1 && right.len() == 1 && left != right)
 }
 
 fn equality_side_legs(
