@@ -46,10 +46,10 @@ A literal prunes only when the column's type holds it exactly. `f > 0.2` on a 32
 | Delta | Partition values and per-file statistics. `LIKE 'ab%'` prunes as `>= 'ab' AND < 'ac'`. |
 | Hive partitions (direct storage, Unity Catalog and Glue Parquet) | Partition values only, compared under the declared partition type. Direct storage declares every partition column a string. |
 
-`ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
-or a two-table broadcast join that leaves Exasol nothing to join or filter, no aggregation, and every
-sort key must be a bare projected column that is not JSON-fallback typed, or a constant. DataFusion runs a `TopK`, not a full sort. Each shard emits only its own local
-top-`n` rows. Exasol SQL then merges the `shard_count × n` rows with a final `ORDER BY ... LIMIT n`.
+`ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N when the query reads one table, or
+is a two-table broadcast join that leaves Exasol nothing to filter, does not aggregate, and sorts
+only by bare projected columns that are not JSON-fallback typed, or by constants. DataFusion runs a
+`TopK`, not a full sort. Each shard emits only its own local top-`n` rows. Exasol SQL then merges the `shard_count × n` rows with a final `ORDER BY ... LIMIT n`.
 The per-shard bounded top-N never carries an offset. A non-zero offset always
 declines to the row-scan wrapper. That wrapper renders the full `ORDER BY ... LIMIT n OFFSET m`
 window itself.
@@ -75,8 +75,7 @@ an `OFFSET` it orders by one `FALSE` key, because Exasol rejects `OFFSET` withou
 
 The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
 
-- a join that is not broadcast, a join of three or more tables, or a broadcast join with a
-  condition that runs in Exasol SQL
+- a join, except a two-table broadcast join that leaves Exasol nothing to filter
 - a `GROUP BY` or an aggregate
 - an unprojected sort key
 - a JSON-fallback-typed sort key
@@ -130,7 +129,7 @@ Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and re
 
 Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A BOOLEAN cast to DECIMAL or compared with a number runs in the scan as 1 or 0, except an `IN` list of numbers over a BOOLEAN, which runs in Exasol SQL. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
-Such a condition runs in Exasol SQL on its own. The scan still filters on the other conditions of the `AND`, on a single table and in a join alike, and a broadcast join stays broadcast. A join key that converts this way keeps its pair of tables off the broadcast. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
+Such a condition runs in Exasol SQL on its own: the scan still applies the other conditions of the `AND`, and a broadcast join stays broadcast. A join key that converts this way rules its pair of tables out of the broadcast. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
 
 | Runs in Exasol SQL | Runs in the scan |
 |---|---|
@@ -176,13 +175,21 @@ Exasol SQL combines these partial values into the final result.
 |---|---|---|
 | Inner equi-join | `JOIN`, `JOIN_TYPE_INNER`, `JOIN_CONDITION_EQUI` | `FROM a JOIN b ON a.id = b.id` |
 
-The adapter broadcasts one pair of the joined tables: two tables, or two occurrences of a table joined to itself, that a join key joins, each side of the key reading only one of them. The smaller table of the pair, by its files after pruning, is broadcast into every shard of the larger, and DataFusion joins them there. The join key may be composite (`ON a.k1 = b.k1 AND a.k2 = b.k2`), and each side of a key may be an expression over its own table (`ON a.k = b.k + 1`). Every other condition in an inner join's `ON` clause is planned as a `WHERE` condition, so it prunes its table's files and filters its scan. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them, but only for a key of one plain column. With a composite key, the scan skips only the row groups that lie outside the range of some key column, and with an expression on the larger side's key it may skip fewer row groups still. Either way it reads no more than scanning each table separately.
+The adapter picks one pair of the joined tables that a join key connects, and broadcasts the pair's smaller table, by file size after pruning, into every shard of the larger one. DataFusion joins them there. A table joined to itself counts as two tables. In a join of three or more tables, every other table keeps its own scan, and Exasol joins the scans in an `INNER JOIN ... ON` chain. A join with no pair to broadcast scans every table separately.
 
-A pair is broadcast only when its smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) and the scan renders its join keys. When Exasol processes the pair's rows further, because the request aggregates, groups, or carries a `HAVING`, the join has three or more tables, or a condition runs in Exasol SQL, every smaller-side column that Exasol reads over the pair must also be a `DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`, or a text column that a top-level `WHERE` limits to literals (`col = 'x'` or `col IN ('x', 'y')`). The broadcast repeats those columns on every joined row, so a long text column such as a description would send far more data than scanning each table separately. Wrapping the column in an expression such as `SUBSTR` does not help, because the scan emits only plain columns.
+- A join key may be composite (`ON a.k1 = b.k1 AND a.k2 = b.k2`) or an expression over one side (`ON a.k = b.k + 1`).
+- Every other `ON` condition of an inner join acts as a `WHERE` condition: it prunes files and filters its table's scan.
+- The larger table's scan skips row groups outside the smaller table's join-key range. For a key of one plain column with at most 150 distinct values, it also skips row groups that hold none of them. A composite or expression key skips fewer row groups, and never reads more than separate scans would.
 
-When several pairs qualify, the adapter broadcasts the one whose smaller table has a filter of its own that the scan runs, then the one with the larger fact table, then the one with the smaller dimension, then the first in `FROM` order. If the scan cannot render that pair's join keys or columns, it broadcasts the next one. In a join of three or more tables every other table keeps its own scan, and Exasol joins the pair's scan with them in an `INNER JOIN ... ON` chain.
+A pair is broadcast only when all of these hold:
 
-A filter condition that the scan cannot run, and a select-list item that only Exasol computes, run in Exasol SQL over the broadcast scan, and the join stays broadcast. A two-table broadcast join that leaves Exasol nothing to join, filter, or aggregate sorts and limits each shard itself when every sort key is a projected column or a constant. Otherwise the broadcast scan emits plain columns, and Exasol aggregates, sorts, and applies the `LIMIT` over the joined rows. A two-table join whose sort key is an expression or a column the select list lacks is not broadcast. A join with no pair to broadcast scans each table separately, and the adapter joins the scans in Exasol SQL.
+- Its smaller table is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)), and the scan can render its join keys.
+- When Exasol processes the joined rows further, because the query aggregates, groups, has a `HAVING`, joins a third table, or has a condition that runs in Exasol SQL, every smaller-table column Exasol reads is a `DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`, or text that a top-level `WHERE` limits to literals (`col = 'x'` or `col IN ('x', 'y')`). The broadcast repeats these columns on every joined row, so a long text column would send more data than separate scans. `SUBSTR` does not help, because the scan emits only plain columns.
+- In a two-table join that does not aggregate, every sort key is a projected column or a constant.
+
+When several pairs qualify, the adapter prefers, in order: a smaller table with a filter of its own that the scan runs, a larger fact table, a smaller dimension table, and `FROM` order. If the scan cannot render the chosen pair, it takes the next one.
+
+A filter or select-list item that the scan cannot compute runs in Exasol SQL over the broadcast scan, and the join stays broadcast. Exasol also aggregates, sorts, and applies the `LIMIT` over the joined rows, except in a two-table broadcast join that leaves Exasol nothing to filter or aggregate: there each shard sorts and limits its own rows.
 
 ## Handled by Exasol
 
