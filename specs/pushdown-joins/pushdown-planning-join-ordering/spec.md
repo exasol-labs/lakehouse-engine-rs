@@ -65,13 +65,13 @@ Serves a pushed `ORDER BY`, `LIMIT`, and `OFFSET` over a join. The broadcast pat
 
 ### Scenario: A fallback leg's fan-out scan spec never carries a row limit
 
-* *GIVEN* any request served by the unified unaccelerated fallback, for any N ≥ 2, carrying a `limit` with `numElements` = `n` and any combination of `orderBy`, `groupBy`, `having`, and `limit.offset`
-* *WHEN* the adapter builds each side's fan-out leg
-* *THEN* every leg's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and NO join block, so the leg emits every row the outer wrapper's join, ordering, and window still depend on
-* *AND* that guarantee SHALL be structural rather than conventional, and SHALL be delivered by the TYPE rather than by a call signature, a field visibility, or a comment: the broadcast path's per-shard post-join cap SHALL be a field of the JOIN BLOCK, so a scan spec carrying no join block has NO field on which a post-join cap could be set. A leg builder constructs no join block, so it cannot express a post-join cap at all, in-crate and out-of-crate, in debug builds and in release
-* *AND* the shard-invariant row-limit field the single-table scan paths use MUST NOT be set on any join-carrying spec, so the two meanings never share one field and no reader has to know which path a spec came from to know what a limit on it would mean
-* *AND* that structural property SHALL be pinned by a test asserting every fallback leg spec carries `limit` = absent, an EMPTY `order_by`, and NO join block, for a request that DOES carry a limit, an offset, and an `orderBy`, so the runtime consequence is checked as well as the type
-* *AND* the request's `LIMIT` and `OFFSET` SHALL be rendered ONLY on the outer wrapper SELECT, through the shared limit-and-offset seam
+* *GIVEN* a join request carrying a `limit` with `numElements` = `n` and any combination of `orderBy`, `groupBy`, `having`, and `limit.offset`
+* *AND* it is served by the unified unaccelerated fallback, for any N ≥ 2, or by a broadcast pair that leaves a join or a filter conjunct for Exasol
+* *WHEN* the adapter builds each fan-out
+* *THEN* every leg fan-out's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and NO join block, so the leg emits every row the outer wrapper's join, ordering, and window still depend on
+* *AND* the broadcast pair's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and a join block with no post-join limit and no post-join ordering, so no shard cuts or sorts rows before Exasol's join or `WHERE` has run
+* *AND* the request's `LIMIT` and `OFFSET` SHALL be rendered ONLY on the outer wrapper SELECT
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
 ### Scenario: The qualified wrapper renders a renderable expression sort key on every entry point that reaches it
 
