@@ -113,13 +113,13 @@ The writers write Parquet data files, also into a table whose `write.format.defa
 | Property | Sets | Default |
 |----------|------|-------------------|
 | `write.parquet.compression-codec` | The codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4_raw`, `uncompressed`, or `lz4`, which the [Parquet format deprecates](https://parquet.apache.org/docs/file-format/data-pages/compression/#lz4): use `lz4_raw` instead | `zstd` |
-| `write.parquet.compression-level` | The level of `zstd`, `gzip`, or `brotli` | The codec's own |
+| `write.parquet.compression-level` | The level of `zstd`, `gzip`, or `brotli`, ignored for other codecs | The codec's own |
 | `write.parquet.row-group-size-bytes` | The size at which a row group ends | 128 MiB |
 | `write.parquet.page-size-bytes`, `write.parquet.page-row-limit`, `write.parquet.dict-size-bytes` | Page and dictionary sizes | 1 MiB, 20,000 rows, 2 MiB |
 | `write.parquet.content-defined-chunking.*` | Content-defined chunking of pages, off unless `enabled` is `true` | Off |
 | `write.target-file-size-bytes` | The size at which a writer starts a new data file | 512 MiB |
 
-The row group size counts data before compression, and a row group holds at least one batch of 8,192 rows. A row group also ends at 1,048,576 rows.
+Both sizes are approximate. A row group of data that compresses well can hold several times `write.parquet.row-group-size-bytes` before compression, so a limit of a few MiB can still give one row group per file. Every row group but the last of each file holds at least one batch of 8,192 rows, so a small limit does not hold, and a row group also ends at 1,048,576 rows. A data file of data that compresses well can end well below `write.target-file-size-bytes`.
 
 A table the export creates carries `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728` (128 MiB), and `write.target-file-size-bytes = 268435456` (256 MiB), so every later writer of the table uses the same settings. To change these settings, set the properties on the table with another engine: every later append follows them.
 

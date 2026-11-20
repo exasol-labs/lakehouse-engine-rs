@@ -336,6 +336,16 @@ pub(super) fn data_file_settings(
     properties: &HashMap<String, String>,
     schema: SchemaRef,
 ) -> Result<(ParquetWriterBuilder, usize), String> {
+    let level = TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL;
+    let codec = properties.get(TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC);
+    // iceberg-rust parses the level for every codec, but only zstd, gzip, and brotli use it.
+    let takes_level = codec
+        .is_none_or(|codec| matches!(codec.to_lowercase().as_str(), "zstd" | "gzip" | "brotli"));
+    let mut properties = properties.clone();
+    if !takes_level {
+        properties.remove(level);
+    }
+    let properties = &properties;
     let table = TableProperties::new(properties);
     let named = |key: &str, cause: &dyn std::fmt::Display| {
         let value = properties.get(key).map_or("", String::as_str);
@@ -379,10 +389,21 @@ fn unreadable(
     } else {
         &[]
     };
-    WRITE_PROPERTIES
+    let (key, error) = WRITE_PROPERTIES
         .iter()
         .chain(chunked)
-        .find_map(|(key, read)| Some((*key, error_chain(&read(table).err()?))))
+        .find_map(|(key, read)| Some((*key, read(table).err()?)))?;
+    let cause = if key == TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC {
+        "the export writes zstd, snappy, gzip, brotli, lz4_raw, uncompressed, or lz4".to_string()
+    } else if properties
+        .get(key)
+        .is_some_and(|value| value.trim().starts_with('-'))
+    {
+        "the value must not be negative".to_string()
+    } else {
+        error_chain(&error)
+    };
+    Some((key, cause))
 }
 
 /// A value that iceberg-rust reads but the export cannot write with, refused before any data is

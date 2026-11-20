@@ -54,7 +54,7 @@ struct Buffered {
     bytes: usize,
 }
 
-/// One partition's buffered rows, ready to go into a data file.
+/// One partition's buffered rows, ready to go into the partition's data files.
 pub(super) type Partition = (PartitionKey, Vec<RecordBatch>);
 
 pub(super) struct PartitionBuffer {

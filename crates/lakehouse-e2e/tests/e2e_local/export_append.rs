@@ -445,9 +445,13 @@ fn new_data_files(old: &[String], metadata: &Value) -> Vec<DataFileFooter> {
 fn export_append_follows_the_table_write_properties() {
     stack();
     setup();
-    let (namespace, table) = wide_table("snappy", "");
+    let (namespace, table) = wide_table("snappy", "WRITERS_PER_NODE = '4'");
     let created = local_table_metadata(&namespace, "snappy");
     assert_created_properties("several writers", &created);
+    assert!(
+        snapshot_ids(&created).len() > 1,
+        "several writers each commit a snapshot"
+    );
     assert_data_files(
         "created table",
         &data_file_footers(&created),
@@ -491,7 +495,7 @@ fn export_append_follows_the_table_write_properties() {
     );
     let sizes: Vec<u64> = added.iter().map(|file| file.size).collect();
     assert!(
-        sizes.len() > 1 && sizes.iter().all(|size| *size <= 5 * MIB as u64),
+        sizes.len() > 1 && sizes.iter().all(|size| *size <= 6 * MIB as u64),
         "several data files of at most 4 MiB plus one row group: {sizes:?}"
     );
     assert_eq!(after["properties"], before["properties"]);

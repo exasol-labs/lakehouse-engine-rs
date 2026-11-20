@@ -121,6 +121,38 @@ fn the_target_file_size_follows_the_table_or_iceberg_default() {
 }
 
 #[test]
+fn a_codec_without_a_level_ignores_the_level_property() {
+    for codec in ["snappy", "uncompressed", "lz4_raw"] {
+        let table = properties(&[
+            ("write.parquet.compression-codec", codec),
+            ("write.parquet.compression-level", "abc"),
+        ]);
+        assert!(
+            data_file_settings(&table, date_columns(1)).is_ok(),
+            "{codec}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_codec_or_a_negative_size_gets_a_plain_reason() {
+    let cases = [
+        (
+            ("write.parquet.compression-codec", "foo"),
+            "the export writes zstd, snappy, gzip, brotli, lz4_raw, uncompressed, or lz4",
+        ),
+        (
+            ("write.parquet.page-size-bytes", "-1"),
+            "the value must not be negative",
+        ),
+    ];
+    for (pair, reason) in cases {
+        let error = data_file_settings(&properties(&[pair]), date_columns(1)).unwrap_err();
+        assert!(error.ends_with(reason), "{pair:?}: {error}");
+    }
+}
+
+#[test]
 fn an_unusable_write_property_is_named_with_its_value() {
     let cases = [
         (
