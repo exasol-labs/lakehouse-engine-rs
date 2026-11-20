@@ -1,4 +1,4 @@
-use crate::scan::spec::ProjectionItem;
+use crate::scan::spec::{ColumnRef, ProjectionItem, relation_alias};
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -8,10 +8,13 @@ use vs_expression::{
 };
 
 use super::super::context::PushdownContext;
+use super::super::scalar_over_agg::substitute_subtrees;
 use super::super::support::{
     ColumnTypes, Emitted, OutputContract, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
 };
 use super::attribution::JoinLegs;
+use super::condition_filters::join_key_legs;
+use super::plan::{JoinPlan, LegGroup};
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
 /// leg's type.
@@ -52,31 +55,75 @@ pub(super) fn render_expression_qualified(expr: &Json, legs: &JoinLegs) -> Strin
     render_expression_exasol(&legs.qualify(expr))
 }
 
-/// How an Exasol wrapper names a leg's column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LegColumns {
-    /// `"LHS_T{leg}"."COLUMN"`: each leg is a relation of the wrapper's FROM.
-    Relations,
-    /// `"LHS_T{leg}_COLUMN"`: one broadcast fan-out emits every leg's columns.
-    FanOutOutput,
+/// How an Exasol wrapper names each leg's column. A leg with a fan-out of its own is a relation of
+/// the wrapper's FROM, `"LHS_T{leg}"."COLUMN"`. A leg of a broadcast fan-out is the fan-out's
+/// output `"LHS_T{leg}_COLUMN"`, qualified with the fan-out's alias `LHS_T{sharded}` when Exasol
+/// joins it with other fan-outs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LegNaming {
+    per_leg: Vec<LegName>,
 }
 
-impl LegColumns {
-    pub(super) fn render(self, expr: &Json, legs: &JoinLegs) -> String {
-        match self {
-            Self::Relations => render_expression_qualified(expr, legs),
-            Self::FanOutOutput => render_expression_exasol(&legs.to_fan_out_output(expr)),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegName {
+    relation: Option<String>,
+    prefix: Option<String>,
+}
+
+impl LegNaming {
+    /// Every leg a relation of its own.
+    pub(super) fn relations(leg_count: usize) -> Self {
+        Self {
+            per_leg: (0..leg_count)
+                .map(|leg| LegName {
+                    relation: Some(relation_alias(leg)),
+                    prefix: None,
+                })
+                .collect(),
         }
     }
 
-    pub(super) fn column(self, legs: &JoinLegs, leg: usize, name: &str) -> String {
-        match self {
-            Self::Relations => format!(
-                "{}.{}",
-                quote_ident(&legs.leg_alias(leg)),
-                quote_ident(name)
-            ),
-            Self::FanOutOutput => quote_ident(&legs.fan_out_name(leg, name)),
+    /// The naming of `plan`'s fan-outs. A plan of one fan-out is the wrapper's unaliased FROM.
+    pub(super) fn of_plan(plan: &JoinPlan, leg_count: usize) -> Self {
+        let single = plan.fan_outs().len() == 1;
+        let mut per_leg = Self::relations(leg_count).per_leg;
+        for fan_out in plan.fan_outs().iter().filter(|fan_out| !fan_out.is_plain()) {
+            for leg in fan_out.legs() {
+                per_leg[leg] = LegName {
+                    relation: (!single).then(|| relation_alias(fan_out.sharded)),
+                    prefix: Some(relation_alias(leg)),
+                };
+            }
+        }
+        Self { per_leg }
+    }
+
+    /// `expr` in the Exasol dialect, each column named as its leg's.
+    pub(super) fn render(&self, expr: &Json, legs: &JoinLegs) -> String {
+        let named = substitute_subtrees(expr, &mut |subtree| {
+            let column = ColumnNode::parse(subtree)?;
+            let leg = &self.per_leg[legs.leg(column)];
+            let name = leg.column_name(&column.upper_name());
+            Some(ColumnNode::to_json(&name, None, leg.relation.as_deref()))
+        });
+        render_expression_exasol(&named)
+    }
+
+    pub(super) fn column(&self, leg: usize, name: &str) -> String {
+        let leg = &self.per_leg[leg];
+        let name = quote_ident(&leg.column_name(name));
+        match &leg.relation {
+            Some(relation) => format!("{}.{name}", quote_ident(relation)),
+            None => name,
+        }
+    }
+}
+
+impl LegName {
+    fn column_name(&self, name: &str) -> String {
+        match &self.prefix {
+            Some(prefix) => ColumnRef::qualified(prefix.clone(), name).output_name(),
+            None => name.to_string(),
         }
     }
 }
@@ -91,23 +138,104 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
     )
 }
 
-/// The conjuncts every column of which belongs to leg `leg` (by leg, never by table name,
-/// so self-join occurrences get only their own). Makes no renderability decision. Sound
-/// for an inner join: a single-leg conjunct is necessary for that leg's rows to survive.
-///
-/// Its consumers deliberately receive different trees:
-/// (a) manifest pruning gets it raw, so every leg-local conjunct prunes even when
-/// DataFusion cannot render it;
-/// (b) the leg's `ScanSpec.filter` gets the conjuncts [`screen_leg_filter`] renders;
-/// (c) the outer wrapper's WHERE gets the raw declined conjuncts (Exasol dialect).
-/// Cross-leg and OR-spanning conjuncts go only to the outer WHERE.
-pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
-    partition_conjuncts(filter, |c| legs.conjunct_leg(c) == Some(leg))
+/// The conjuncts that read only leg `leg`, raw, for that leg's file pruning: pruning by them is
+/// sound for an inner join, even when the scan declines one.
+pub(super) fn fan_out_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
+    partition_conjuncts(filter, |c| fan_out_holds(legs, &LegGroup::plain(leg), c))
 }
 
-/// `None` when every conjunct is leg-local. It complements [`leg_local_filter`] over the tree it is given.
-pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Option<Json> {
-    partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
+/// Whether the scan of `fan_out` can apply the WHERE conjunct `conjunct`: every leg it reads lies
+/// in the fan-out. A conjunct that reads no column holds for every row or none, so a broadcast
+/// scan applies it, as the two-leg broadcast always has, and the N-scan leaves it to Exasol.
+pub(super) fn fan_out_holds(legs: &JoinLegs, fan_out: &LegGroup, conjunct: &Json) -> bool {
+    let read = legs.legs_referenced(conjunct);
+    match read.is_empty() {
+        true => !fan_out.is_plain(),
+        false => read.iter().all(|&leg| fan_out.holds(leg)),
+    }
+}
+
+/// Where each join condition and WHERE conjunct of a join runs under a plan, before the scan
+/// screen. Every WHERE conjunct lies in exactly one fan-out's local filter or in the residual.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ConditionPlacement {
+    /// The broadcast pair's join keys, which its join block runs. `None` without a pair.
+    pub pair_keys: Option<Json>,
+    /// Per chain position, the join conditions its `ON` runs.
+    pub on: Vec<Vec<Json>>,
+    /// Per fan-out, the WHERE conjuncts whose legs all lie in it.
+    pub local: Vec<Option<Json>>,
+    /// The WHERE conjuncts no fan-out holds, which Exasol's WHERE runs.
+    pub residual: Option<Json>,
+}
+
+/// A condition that holds a pair key and something else splits, and the rest keeps its own join
+/// point. Every other condition stays whole, so the N-scan renders each as written.
+pub(super) fn place_conditions(
+    filter: Option<&Json>,
+    conditions: &[Json],
+    legs: &JoinLegs,
+    plan: &JoinPlan,
+) -> ConditionPlacement {
+    let pair = plan.fan_outs().iter().find(|fan_out| !fan_out.is_plain());
+    let is_pair_key = |conjunct: &Json| {
+        pair.is_some_and(|pair| {
+            join_key_legs(conjunct, legs).is_some_and(|(a, b)| pair.legs() == [a, b])
+        })
+    };
+    let mut pair_keys = Vec::new();
+    let mut chained = Vec::new();
+    for condition in conditions {
+        let (keys, rest): (Vec<&Json>, Vec<&Json>) = flatten_conjuncts(condition)
+            .into_iter()
+            .partition(|conjunct| is_pair_key(conjunct));
+        match (keys.is_empty(), rest.is_empty()) {
+            (true, _) => chained.push(condition.clone()),
+            (false, true) => pair_keys.push(condition.clone()),
+            (false, false) => {
+                pair_keys.extend(keys.into_iter().cloned());
+                chained.extend(conjoin(rest.into_iter().cloned().collect()));
+            }
+        }
+    }
+
+    let mut on = vec![Vec::new(); plan.fan_outs().len()];
+    let mut unattached = Vec::new();
+    for condition in chained {
+        let position = legs
+            .legs_referenced(&condition)
+            .iter()
+            .map(|&leg| plan.position(leg))
+            .max()
+            .unwrap_or_default();
+        // Only a pair can hold every leg of a condition at the first position: the WHERE runs it.
+        match position {
+            0 => unattached.push(condition),
+            _ => on[position].push(condition),
+        }
+    }
+
+    let local = plan
+        .fan_outs()
+        .iter()
+        .map(|fan_out| {
+            filter.and_then(|f| partition_conjuncts(f, |c| fan_out_holds(legs, fan_out, c)))
+        })
+        .collect();
+    let structural = filter.and_then(|f| {
+        partition_conjuncts(f, |c| {
+            !plan
+                .fan_outs()
+                .iter()
+                .any(|fan_out| fan_out_holds(legs, fan_out, c))
+        })
+    });
+    ConditionPlacement {
+        pair_keys: conjoin(pair_keys),
+        on,
+        local,
+        residual: conjoin_filters(structural, conjoin(unattached)),
+    }
 }
 
 /// Returns `(leg_filter_sql, declined)` through [`ScanTranslator::screen_conjuncts`] against the

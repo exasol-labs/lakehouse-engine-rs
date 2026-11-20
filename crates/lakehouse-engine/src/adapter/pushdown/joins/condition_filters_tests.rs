@@ -162,22 +162,24 @@ fn a_join_equality_reads_disjoint_non_empty_leg_sets() {
 #[test]
 fn a_join_key_reads_one_leg_on_each_side() {
     for (case, legs, conjunct, _, expected) in equality_cases() {
-        assert_eq!(is_join_key(&conjunct, &legs), expected, "{case}");
+        assert_eq!(
+            join_key_legs(&conjunct, &legs).is_some(),
+            expected,
+            "{case}"
+        );
     }
 }
 
 #[test]
-fn a_condition_of_join_keys_only_is_a_broadcast_condition() {
+fn a_join_key_names_its_two_legs_in_from_tree_order() {
     let legs = three_legs();
-    let composite = and([
-        ab_key(),
-        predicate_equal(table_col("B", "J"), table_col("A", "J")),
-    ]);
-    let with_filter = and([ab_key(), a_filter()]);
+    let reversed = predicate_equal(table_col("B", "J"), table_col("A", "J"));
+    let across = predicate_equal(table_col("C", "K"), table_col("A", "K"));
 
-    assert!(holds_only_join_keys(&ab_key(), &legs));
-    assert!(holds_only_join_keys(&composite, &legs));
-    assert!(!holds_only_join_keys(&with_filter, &legs));
+    assert_eq!(join_key_legs(&ab_key(), &legs), Some((0, 1)));
+    assert_eq!(join_key_legs(&reversed, &legs), Some((0, 1)));
+    assert_eq!(join_key_legs(&across, &legs), Some((0, 2)));
+    assert_eq!(join_key_legs(&a_filter(), &legs), None);
 }
 
 #[test]

@@ -1,14 +1,14 @@
 # Feature: Pushdown Planning, Broadcast Inner Equi-Join
 
-Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inner equi-join. When the smaller side of a two-leg join is below the broadcast threshold, the adapter shards the larger (fact) side across the scan fan-out and replicates the smaller (dimension) side into the shard-invariant common spec, and a node-local DataFusion join runs inside the scan UDF (`scan-aggregation/scan-execution-join`). The two legs are two tables or one table joined to itself, and they may share column names. Every other join is served by the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`).
+Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inner equi-join. The adapter broadcasts one eligible pair of join legs: it shards the pair's larger (fact) leg across the scan fan-out and replicates its smaller (dimension) leg into the shard-invariant common spec, and a node-local DataFusion join runs inside the scan UDF (`scan-aggregation/scan-execution-join`). In a two-leg join the pair is the whole join. In a join of three or more legs every other leg keeps its own fan-out, and Exasol joins the fan-outs (`pushdown-joins/pushdown-planning-join-multi-way`). The legs may be one table joined to itself, and they may share column names. A join with no eligible pair is served by the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`).
 
 ## Background
 
-* The broadcast contract: exactly two join legs, `join_type = "inner"`, a condition of one or more join keys once its filters have moved to WHERE (`pushdown-joins/pushdown-planning-join-condition-filters`), and a condition, filter, and projection that `crates/vs-expression` can render. A request that requires Exasol postprocessing also needs every dimension column its aggregation reads to be width-bounded. Any deviation takes the fallback.
-* A width-bounded column has a fixed-width type (`DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`), or is a text column that a top-level WHERE conjunct limits to string literals (`col = 'x'` or `col IN ('x', 'y')`). Every text column the adapter declares has the same declared length, so the type alone cannot tell a short code from a long description.
+* A broadcast pair is two legs of an all-inner join tree that one or more join keys join, each key reading only those two legs (`pushdown-joins/pushdown-planning-join-condition-filters`). Its smaller leg by bytes after its own pruning is the dimension, and the other is the fact.
+* A pair is eligible when its dimension is at or below `JOIN_BROADCAST_MAX_BYTES` and, when Exasol processes the pair's rows further (it aggregates them under Exasol postprocessing, joins them with other legs, or applies a filter conjunct to them), every dimension column that the select list, the other join conditions, Exasol's `WHERE`, `GROUP BY`, `HAVING`, and `ORDER BY` read is width-bounded. A request meets the broadcast contract when it is a two-leg join with an eligible pair and the scan renders every WHERE conjunct and every select-list item, so its broadcast fan-out is the whole plan.
 * Exasol postprocessing means a non-null `aggregationType`, `group_by` or `single_group`. Exasol sets it on every request that aggregates, groups, or carries a HAVING, including one whose aggregates it stripped from the select list. A pushed `LIMIT` and a pushed `ORDER BY` do not force it.
-* A join leg is one occurrence of a table in the FROM tree. `pushdown-joins/pushdown-planning-join-fallback-self-join` owns the one binding that resolves a `column` node to its leg.
-* Exasol binds the pushdown result to the select list by position, so the column names the pushdown SQL emits stay inside it.
+* A width-bounded column has a fixed-width type (`DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`), or is a text column that a top-level WHERE conjunct limits to string literals (`col = 'x'` or `col IN ('x', 'y')`). Every text column the adapter declares has the same declared length, so the type alone cannot tell a short code from a long description.
+* A join leg is one occurrence of a table in the FROM tree, and `pushdown-joins/pushdown-planning-join-fallback-self-join` states which leg a `column` node reads. Exasol binds the pushdown result to the select list by position, so the column names the pushdown SQL emits stay inside it.
 
 ## Scenarios
 
@@ -48,15 +48,15 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 
 ### Scenario: Broadcast join projection and filter are rendered per involved table
 
-* *GIVEN* a broadcast-eligible inner equi-join `pushdown` request over two legs
+* *GIVEN* a `pushdown` request over an inner join with a broadcast pair
 * *WHEN* the adapter resolves the projection and renders the WHERE filter
 * *THEN* the adapter SHALL resolve each projected column's Exasol output type from the leg it belongs to, matching the column against that leg's involved-table column metadata
 * *AND* the scan-driving SQL's declared EMITS column list SHALL match the projected join output columns in order and type
-* *AND* a WHERE filter over columns of either side SHALL be rendered via the same path used for single-table filters, the scan translator over both legs' column metadata keyed by (relation alias, column) (`pushdown-types/pushdown-planning-scan-text-conversion`), and carried in the common spec
-* *AND* a filter that is PRESENT and non-trivial but that DECLINES, because the scan translator declines it, SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
-* *AND* the adapter SHALL distinguish an ABSENT filter, which leaves the broadcast plan eligible and emits no scan-spec filter, from a DECLINED one, which forfeits the broadcast plan
-* *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because the result would carry extra rows, see `pushdown/pushdown-declined-filter-self-apply`
-* *AND* every column reference in the filter and in any select-list expression SHALL be qualified with its leg's relation alias BEFORE the scan translator renders it, replacing Exasol's native `tableAlias`, because the scan aliases each relation with the alias the join block carries for it
+* *AND* each top-level WHERE conjunct whose legs all lie in the pair and that the scan renders against each column's own leg type (`pushdown-types/pushdown-planning-scan-text-conversion`) SHALL be carried in the common spec
+* *AND* a conjunct local to a leg outside the pair SHALL be that leg's fan-out filter, as `pushdown-joins/pushdown-planning-join-fallback` states
+* *AND* every conjunct that reads legs of more than one fan-out, or that the scan declines, SHALL be applied once in Exasol's `WHERE` over the fan-outs, as `pushdown/pushdown-declined-filter-self-apply` states for a declined conjunct, and the adapter MUST NOT emit a plan that omits a conjunct
+* *AND* an ABSENT filter SHALL emit no scan-spec filter and no Exasol `WHERE`
+* *AND* every column reference in the scan spec's filter and projection SHALL be qualified with its leg's relation alias `LHS_T{leg}`, the alias the join block carries for that relation, never with Exasol's `tableAlias`
 
 ### Scenario: Join condition is rendered via the vs-expression translator
 
@@ -101,11 +101,11 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 ### Scenario: A two-leg join with filters in its condition is planned as a broadcast fan-out
 
 * *GIVEN* a two-leg inner join `pushdown` request whose condition holds its join keys and filters: a conjunct on either leg alone, a comparison across the legs such as `o.x > c.y`, or an `OR` across the legs, with or without a top-level WHERE filter
-* *AND* the request meets the rest of the broadcast contract once those filters are WHERE conjuncts
+* *AND* its pair is eligible once those filters are WHERE conjuncts
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL emit the broadcast fan-out and MUST NOT route the request to the unified unaccelerated fallback
 * *AND* the common spec's filter SHALL carry each moved conjunct, rendered as a WHERE conjunct is
 * *AND* a dimension text column that a moved conjunct limits to literals, such as `GROUP BY c.name` with `ON … AND c.name = 'v'`, SHALL count as width-bounded
 * *AND* a moved conjunct on one occurrence of a self-join SHALL prune only that occurrence's files
-* *AND* a moved conjunct that the scan translator declines SHALL take the unified unaccelerated fallback, as a declined WHERE filter does
+* *AND* a moved conjunct that the scan translator declines SHALL be applied in Exasol's `WHERE` over the broadcast fan-out, as a declined WHERE conjunct is
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query

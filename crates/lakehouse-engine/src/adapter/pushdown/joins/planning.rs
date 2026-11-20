@@ -55,7 +55,7 @@ fn collect_join_tree(
     leaves.push((name.to_string(), alias));
 }
 
-/// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
+/// No equi-condition gate here: only broadcast eligibility (in `broadcast_policy`) requires one;
 /// the N-scan fallback renders any inner condition. A leaf without a readable identifier note is
 /// the same stale-schema condition the single-table path reports, so a hard `Err`.
 pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
@@ -121,48 +121,9 @@ impl ResolvedJoinSide {
     }
 }
 
-/// Both sides stay fully resolved because the N-scan fallback scans both. The roles say nothing
-/// about whether the join is broadcast: `broadcast_policy` decides that.
-///
-/// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
-/// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
-/// a self-join's occurrences can differ in size. An empty side has 0 bytes and is always the
-/// dimension; selection does not special-case it so role assignment stays total.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JoinSides {
-    /// Larger side by bytes, sharded like the single-table scan.
-    pub fact: ResolvedJoinSide,
-    /// Smaller side by bytes, the broadcast candidate.
-    pub dimension: ResolvedJoinSide,
-    /// The dimension's leg in FROM-tree order, which names its relation alias.
-    pub dimension_leg: usize,
-}
-
-impl JoinSides {
-    /// Broadcast is two-leg only, so the fact is the leg the dimension is not.
-    pub(crate) fn fact_leg(&self) -> usize {
-        1 - self.dimension_leg
-    }
-}
-
-/// `a` is leg 0 and `b` leg 1. On an exact byte tie `a`, the first leg in FROM-tree order,
-/// becomes the dimension, so the choice of the sharded occurrence is deterministic.
-pub(super) fn select_broadcast_sides(a: ResolvedJoinSide, b: ResolvedJoinSide) -> JoinSides {
-    let (dimension, fact, dimension_leg) = if a.total_bytes <= b.total_bytes {
-        (a, b, 0)
-    } else {
-        (b, a, 1)
-    };
-    JoinSides {
-        fact,
-        dimension,
-        dimension_leg,
-    }
-}
-
 /// All sides share one per-request `resolver`, so a join costs no more catalog auth
 /// round-trips than a single scan. `filter_json` is the leg-local sub-predicate
-/// ([`super::rendering::leg_local_filter`]); pruning by it is sound for an inner join.
+/// ([`super::rendering::fan_out_filter`]); pruning by it is sound for an inner join.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,

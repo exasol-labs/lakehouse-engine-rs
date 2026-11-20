@@ -13,36 +13,37 @@ use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
     ColumnTypes, Emitted, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
-    project_columns, pushdown_response,
+    flatten_conjuncts, project_columns, pushdown_response,
 };
 
 mod attribution;
 mod broadcast_policy;
 mod condition_filters;
+mod plan;
 mod planning;
 mod rendering;
 mod sql_builders;
 
-pub(crate) use planning::{
-    DetectedJoin, JoinLeaf, JoinShape, JoinSides, ResolvedJoinSide, detect_join,
-};
-pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
+pub(crate) use planning::{DetectedJoin, JoinLeaf, JoinShape, ResolvedJoinSide, detect_join};
+pub(crate) use sql_builders::RenderedJoinPushdown;
 
 pub(super) use sql_builders::{
     EmptyRelation, n_scan_emission, qualified_single_table_fallback_pushdown, single_table_emission,
 };
-// The dispatch-golden sibling module drives the broadcast and N-scan builders directly.
+// The dispatch-golden sibling module drives the plan renderer directly.
+pub(super) use plan::{JoinPlan, LegGroup};
+pub(super) use sql_builders::render_join_plan;
 #[cfg(test)]
-pub(super) use sql_builders::{
-    build_broadcast_join_sql, build_qualified_single_table_fallback_sql,
-};
+pub(super) use sql_builders::{build_pair_fan_out_sql, build_qualified_single_table_fallback_sql};
 
-use broadcast_policy::{BroadcastFacts, n_scan_reason};
-pub(super) use planning::{JoinWindowPlan, involved_table};
-use planning::{classify_join_window, resolve_one_join_side, select_broadcast_sides};
-use rendering::{leg_local_filter, possible_side_column_names};
-pub(super) use sql_builders::build_n_scan_join_sql;
-use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emission};
+use broadcast_policy::{JoinGraph, WhereConjunct, group_legs};
+use plan::broadcast_serves_window;
+#[cfg(test)]
+pub(super) use planning::JoinWindowPlan;
+pub(super) use planning::involved_table;
+use planning::resolve_one_join_side;
+use rendering::{fan_out_filter, possible_side_column_names, wrapper_clause_values};
+use sql_builders::{qualified_emission, renders_in_scan};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
 /// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
@@ -119,10 +120,10 @@ fn empty_join_sql(
 /// empty side short-circuits to the shape-correct empty result, since an inner join is then
 /// empty.
 ///
-/// Broadcast is an optimization inside this one path, taken when [`plan_broadcast_join`] yields
-/// a plan. The legs may share column names or be one
-/// table joined to itself. Everything else takes the sole fallback,
-/// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
+/// Broadcast is an optimization inside this one path: the first eligible pair whose fan-out
+/// renders is broadcast, and every other leg keeps its own fan-out. The legs may share column
+/// names or be one table joined to itself. With no such pair every leg keeps its own fan-out,
+/// the N-scan, and Exasol joins them.
 /// A column that binds no single leg, or that its leg does not declare, fails the request
 /// before any catalog call ([`ensure_columns_declared`]).
 ///
@@ -176,7 +177,7 @@ pub(super) async fn plan_join(
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
-        .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
+        .map(|leg| filter.and_then(|f| fan_out_filter(f, &legs, leg)))
         .collect();
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> =
@@ -202,52 +203,68 @@ pub(super) async fn plan_join(
         return empty_join_sql(pushdown, join, &sides, emitted, context);
     }
 
-    if let Some(sql) = plan_broadcast_join(pushdown, join, &sides, context)? {
-        return Ok(pushdown_response(sql));
-    }
-
-    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, context)?;
+    let sql = render_resolved_join(pushdown, join, &sides, context)?;
     Ok(pushdown_response(sql))
 }
 
-/// The broadcast plan of `join`, or `None` to keep the N-scan. Three things can say no, in this
-/// order: the shape (two legs, a condition of join keys, a window the path can serve), the policy
-/// ([`n_scan_reason`]), and a render decline of the builder.
-fn plan_broadcast_join(
+/// The SQL of a join whose every leg has files: the plan that broadcasts the first eligible pair
+/// whose fan-out renders, else the N-scan.
+fn render_resolved_join(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     context: &PushdownContext<'_>,
-) -> Result<Option<String>, UdfError> {
-    let pushdown_req = pushdown.json();
+) -> Result<String, UdfError> {
+    let leg_count = sides.len();
+    for pair in broadcast_candidates(pushdown, join, sides, context)? {
+        let plan = JoinPlan::broadcasting(leg_count, &pair);
+        if let Some(sql) = render_join_plan(pushdown, join, sides, &plan, context)? {
+            return Ok(sql);
+        }
+    }
+    let n_scan = JoinPlan::n_scan(leg_count);
+    Ok(render_join_plan(pushdown, join, sides, &n_scan, context)?
+        .expect("the N-scan renders every join"))
+}
+
+/// The pairs worth broadcasting, best first ([`group_legs`]). None when a two-leg broadcast
+/// cannot serve the request's window (#675).
+fn broadcast_candidates(
+    pushdown: &PushdownRequest,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    context: &PushdownContext<'_>,
+) -> Result<Vec<LegGroup>, UdfError> {
     let legs = join.legs();
-    let keys_only = condition_filters::holds_only_join_keys(&join.conditions[0], &legs);
-    // Exasol renders an aggregating request's window over the broadcast fan-out, so only a
-    // request that does not aggregate has a window the path may be unable to serve.
-    let window_servable = aggregation_type(pushdown_req).is_some()
-        || !matches!(
-            classify_join_window(pushdown_req),
-            JoinWindowPlan::BroadcastUnservable
-        );
-    if join.tables.len() != 2 || !keys_only || !window_servable {
-        return Ok(None);
+    if !broadcast_serves_window(pushdown, &legs, sides.len()) {
+        return Ok(Vec::new());
     }
-    let candidate = select_broadcast_sides(sides[0].clone(), sides[1].clone());
-    let reads = aggregation_reads(pushdown, join, sides)?;
-    let facts = BroadcastFacts {
-        dimension_bytes: candidate.dimension.total_bytes,
-        max_bytes: context.tuning.join_broadcast_max_bytes,
+    let pushdown_req = pushdown.json();
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let trees: Vec<&Json> = filter.map(flatten_conjuncts).unwrap_or_default();
+    let conjuncts = trees
+        .into_iter()
+        .map(|tree| {
+            Ok(WhereConjunct {
+                tree,
+                renders: renders_in_scan(tree, &legs, sides, context)?,
+            })
+        })
+        .collect::<Result<Vec<_>, UdfError>>()?;
+    let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
+    let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
+    let above: Vec<&Json> = wrapper_clause_values(pushdown_req).collect();
+    Ok(group_legs(&JoinGraph {
         legs: &legs,
-        dimension_leg: candidate.dimension_leg,
-        filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
-        aggregation_reads: reads
-            .as_ref()
-            .map(|read| read[candidate.dimension_leg].columns()),
-    };
-    if n_scan_reason(&facts).is_some() {
-        return Ok(None);
-    }
-    build_broadcast_plan_sql(pushdown, join, sides, &candidate, reads, context)
+        bytes: &bytes,
+        columns: &columns,
+        conditions: &join.conditions,
+        conjuncts: &conjuncts,
+        above: &above,
+        output: pushdown.output(),
+        aggregates: aggregation_type(pushdown_req).is_some(),
+        max_bytes: context.tuning.join_broadcast_max_bytes,
+    }))
 }
 
 #[cfg(test)]

@@ -578,11 +578,12 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
             "SELECT c.C_NAME, COUNT(*) FROM {orders} AND o.O_ORDERKEY > c.C_CUSTKEY \
              WHERE {named} GROUP BY c.C_NAME"
         ),
-    ];
-    let n_scan = [format!(
-        "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE SECOND(o.O_ORDERDATE, 3) = 0 \
+        // Exasol's WHERE applies the conjunct the scan declines.
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE {SECOND_IS_ZERO} \
              AND {named} GROUP BY c.C_NAME"
-    )];
+        ),
+    ];
     let mut failures = Vec::new();
     for query in &broadcast {
         for (vs_name, path) in [
@@ -598,16 +599,6 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
                 Expect::Rows,
             ));
         }
-    }
-    for query in &n_scan {
-        failures.extend(native_copy_mismatch(
-            &mut conn,
-            VS_NAME,
-            JOIN_ORACLE,
-            query,
-            PathCheck::NScan(2),
-            Expect::Rows,
-        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
@@ -889,30 +880,21 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
     rows
 }
 
+/// Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
 #[test]
 fn e2e_three_table_join_result_correct() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let pushed = explain_virtual_sql(&mut conn, &three_table_join_query(VS_NAME));
+    let pushed = explain_virtual_sql(&mut conn, &three_table_join_query(VS_NAME_LOW));
     assert!(
-        has_n_scan_wrapper(&pushed, 3),
-        "three-table inner join must emit the N-scan wrapper with three distinct \
-         LHS_T* fan-out aliases:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a three-table join must NOT carry a broadcast common-blob join block \
-         (broadcast stays strictly two-table):\n{pushed}"
-    );
-    assert!(
-        !has_two_scan_wrapper(&pushed),
-        "a three-table join must NOT emit the two-table LHS_T0/LHS_T1 \
-         wrapper:\n{pushed}"
+        has_n_scan_wrapper(&pushed, 3) && !has_broadcast_join_block(&pushed),
+        "with no eligible pair a three-table inner join must emit the N-scan wrapper with \
+         three distinct LHS_T* fan-out aliases:\n{pushed}"
     );
 
-    let actual = fetch_three_table_join_rows(&mut conn, VS_NAME);
-    let expected = expected_three_table_join_rows(&mut conn, VS_NAME);
+    let actual = fetch_three_table_join_rows(&mut conn, VS_NAME_LOW);
+    let expected = expected_three_table_join_rows(&mut conn, VS_NAME_LOW);
 
     assert_eq!(
         actual.len(),
@@ -932,25 +914,15 @@ fn e2e_four_table_join_result_correct() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let pushed = explain_virtual_sql(&mut conn, &four_table_join_query(VS_NAME));
+    let pushed = explain_virtual_sql(&mut conn, &four_table_join_query(VS_NAME_LOW));
     assert!(
-        has_n_scan_wrapper(&pushed, 4),
-        "four-table inner join must emit the N-scan wrapper with four distinct \
-         LHS_T* fan-out aliases:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a four-table join must NOT carry a broadcast common-blob join block \
-         (broadcast stays strictly two-table):\n{pushed}"
-    );
-    assert!(
-        !has_two_scan_wrapper(&pushed),
-        "a four-table join must NOT emit the two-table LHS_T0/LHS_T1 \
-         wrapper:\n{pushed}"
+        has_n_scan_wrapper(&pushed, 4) && !has_broadcast_join_block(&pushed),
+        "with no eligible pair a four-table inner join must emit the N-scan wrapper with \
+         four distinct LHS_T* fan-out aliases:\n{pushed}"
     );
 
-    let actual = fetch_four_table_join_rows(&mut conn, VS_NAME);
-    let expected = expected_four_table_join_rows(&mut conn, VS_NAME);
+    let actual = fetch_four_table_join_rows(&mut conn, VS_NAME_LOW);
+    let expected = expected_four_table_join_rows(&mut conn, VS_NAME_LOW);
 
     assert_eq!(
         actual.len(),
@@ -1072,18 +1044,13 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let query = scalar_over_aggregate_n_table_join_query(VS_NAME);
+    let query = scalar_over_aggregate_n_table_join_query(VS_NAME_LOW);
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_n_scan_wrapper(&pushed, 3),
-        "a scalar-over-aggregate grouped join over three tables must be served \
-         by the unified N-scan wrapper (N=3), not declined:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "broadcast stays strictly two-table; a three-table join must never \
-         carry a common-blob join block:\n{pushed}"
+        has_n_scan_wrapper(&pushed, 3) && !has_broadcast_join_block(&pushed),
+        "with no eligible pair a scalar-over-aggregate grouped join over three tables must \
+         be served by the unified N-scan wrapper (N=3), not declined:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);
@@ -1103,125 +1070,68 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     );
 }
 
-// A side-local conjunct DataFusion cannot render (`SECOND(<col>, 3)`) must still be
-// applied: the broadcast plan is declined, and the N-scan wrapper applies it in the
-// outer WHERE. `O_ORDERDATE` is a DATE, so `SECOND(O_ORDERDATE, 3)` is always 0
-// (verified live).
+/// `SECOND(<date>, 3)` is always 0 (verified live), and DataFusion refuses the two-argument
+/// `SECOND`, so the scan declines both conjuncts.
+const SECOND_IS_ZERO: &str = "SECOND(o.O_ORDERDATE, 3) = 0";
+const SECOND_IS_ONE: &str = "SECOND(o.O_ORDERDATE, 3) = 1";
 
-fn broadcast_declined_filter_join_query(vs_name: &str) -> String {
-    format!(
-        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
-         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
-         WHERE SECOND(o.O_ORDERDATE, 3) = 0",
-        vs_fact_table(vs_name),
-        vs_dim_table(vs_name)
-    )
-}
-
-/// The declined filter in [`broadcast_declined_filter_join_query`] is always true, so
-/// the full join is its ground truth.
-fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    let dim_cols = conn.query_columns(&format!(
-        "SELECT C_CUSTKEY, C_NAME FROM {}",
-        vs_dim_table(vs_name)
-    ));
-    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
-    let custkey_to_name: HashMap<String, String> = dim_cols[0]
-        .iter()
-        .zip(dim_cols[1].iter())
-        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
-        .collect();
-
-    let fact_cols = conn.query_columns(&format!(
-        "SELECT O_CUSTKEY, O_ORDERDATE FROM {}",
-        vs_fact_table(vs_name)
-    ));
-    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
-
-    let mut rows: Vec<(String, String)> = fact_cols[0]
-        .iter()
-        .zip(fact_cols[1].iter())
-        .map(|(custkey, date)| {
-            let key = value_to_string(custkey);
-            let name = custkey_to_name
-                .get(&key)
-                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
-                .clone();
-            (name, value_to_string(date))
-        })
-        .collect();
-    rows.sort();
-    rows
-}
-
-/// Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
+/// Scenario: A broadcast join applies a declined filter conjunct in Exasol's WHERE
+/// Scenario: Broadcast join projection and filter are rendered per involved table
+/// Scenario: A single-table WHERE filter splits at AND between the scan and the wrapper
 #[test]
-fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
+fn e2e_broadcast_join_declined_conjunct_runs_in_exasol_where() {
     setup_e2e();
     let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let select = format!("SELECT c.C_CUSTKEY, o.O_ORDERKEY, o.O_ORDERDATE FROM {ORDERS_JOIN}");
+    let cases = [
+        format!(
+            "{select} WHERE {SECOND_IS_ZERO} AND o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"
+        ),
+        format!("{select} WHERE {SECOND_IS_ONE}"),
+        format!("{select} WHERE {SECOND_IS_ZERO} ORDER BY o.O_ORDERKEY DESC LIMIT 3"),
+        format!(
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {ORDERS_JOIN} WHERE {SECOND_IS_ZERO} \
+             GROUP BY c.C_CUSTKEY"
+        ),
+        format!("SELECT c.C_CUSTKEY, l.L_LINENUMBER FROM {CHAIN} WHERE {SECOND_IS_ZERO}"),
+    ];
+    let mut failures = Vec::new();
+    for query in &cases {
+        failures.extend(native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            query,
+            PathCheck::Has(BROADCAST_JOIN),
+            Expect::Rows,
+        ));
+        let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+        let (_, outer) = pushed.rsplit_once(") WHERE (").unwrap_or_default();
+        if !outer.contains("SECOND(") {
+            failures.push(format!(
+                "`{query}`: Exasol's WHERE must apply SECOND: {pushed}"
+            ));
+        }
+        if pushed.contains("post_join") {
+            failures.push(format!(
+                "`{query}`: no shard may cut or sort rows: {pushed}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    let query = broadcast_declined_filter_join_query(VS_NAME);
-    let pushed = explain_virtual_sql(&mut conn, &query);
+    let pushed = isolated_pushdown_statement(&mut conn, &cases[0].replace("{T}", VS_NAME));
     assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a declined side-local filter must decline the broadcast plan and fall \
-         back to the N-scan wrapper (LHS_T0/LHS_T1), not omit the predicate:\n{pushed}"
+        pushed_scan_filters(&pushed)
+            .iter()
+            .any(|filter| filter.contains("O_ORDERDATE")),
+        "the conjunct the scan renders stays in the broadcast scan: {pushed}"
     );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a declined filter must NOT ride the broadcast in-UDF join unfiltered \
-         (no common-blob join block may appear):\n{pushed}"
-    );
-    assert!(
-        pushed.contains("SECOND("),
-        "the fallback wrapper must self-apply the declined conjunct in its own \
-         outer WHERE, not just fall back and drop it:\n{pushed}"
-    );
-
-    let cols = conn.query_columns(&query);
-    let actual = columns_to_sorted_pairs(&cols);
-    let expected = expected_full_join_rows(&mut conn, VS_NAME);
-
     assert_eq!(
-        actual.len(),
-        FACT_ORDERS_ROWS,
-        "SECOND(O_ORDERDATE, 3) is always 0 for the seeded DATE column, so the \
-         declined filter must cost no rows: expected {FACT_ORDERS_ROWS}, got {}: {actual:?}",
-        actual.len()
-    );
-    assert_eq!(
-        actual, expected,
-        "the N-scan fallback result must equal the independently computed \
-         unfiltered join.\nactual:   {actual:?}\nexpected: {expected:?}"
-    );
-}
-
-#[test]
-fn e2e_broadcast_declined_filter_excludes_rows() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let query = format!(
-        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
-         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
-         WHERE SECOND(o.O_ORDERDATE, 3) = 1",
-        vs_fact_table(VS_NAME),
-        vs_dim_table(VS_NAME)
-    );
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a declined side-local filter must decline the broadcast plan and fall \
-         back to the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
-    );
-
-    let row_count = conn.query_row_count(&query);
-    assert_eq!(
-        row_count, 0,
-        "SECOND(O_ORDERDATE, 3) = 1 is false for every seeded DATE row, so a \
-         correctly self-applied declined conjunct must exclude every row \
-         (a build that silently dropped it instead would return all \
-         {FACT_ORDERS_ROWS}): got {row_count}"
+        conn.query_row_count(&cases[1].replace("{T}", VS_NAME)),
+        0,
+        "SECOND(O_ORDERDATE, 3) = 1 holds for no row, so a dropped conjunct would return rows"
     );
 }
 
@@ -1280,7 +1190,7 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let query = three_table_join_with_mixed_filters_query(VS_NAME);
+    let query = three_table_join_with_mixed_filters_query(VS_NAME_LOW);
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
         has_n_scan_wrapper(&pushed, 3),
@@ -1317,7 +1227,7 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
         cols.len()
     );
     let actual = fetch_rows_as_vecs(&cols);
-    let expected = expected_three_table_join_rows_with_orderdate_filter(&mut conn, VS_NAME);
+    let expected = expected_three_table_join_rows_with_orderdate_filter(&mut conn, VS_NAME_LOW);
 
     assert!(
         !actual.is_empty(),
@@ -1411,24 +1321,49 @@ fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
     });
 }
 
-/// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
+/// Scenario: A join filter that converts a date to text runs in Exasol, and such a join key keeps the N-scan
 #[test]
-fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
+fn e2e_join_date_to_text_filter_runs_in_exasol_and_key_keeps_the_n_scan() {
     setup_e2e();
     copy_join_tables_natively(&mut exa_conn(), VS_NAME);
+    let filtered = |filter: &str| {
+        format!("SELECT c.C_CUSTKEY, o.O_ORDERKEY, o.O_ORDERDATE FROM {ORDERS_JOIN} WHERE {filter}")
+    };
+    let text_key = "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b \
+                    ON CAST(a.O_ORDERDATE AS VARCHAR(20)) = CAST(b.O_ORDERDATE AS VARCHAR(20))";
 
     for (setting, own_format_filter) in
         [(DEFAULT_SESSION, ORDERDATE_LIKE), (DMY, ORDERDATE_LIKE_DMY)]
     {
         let mut conn = exa_session(setting);
-        assert_narrows_fact_table(&mut conn, &like_join_query("{T}", own_format_filter));
+        assert_narrows_fact_table(&mut conn, &filtered(own_format_filter));
         for filter in [ORDERDATE_LIKE, ORDERDATE_LIKE_DMY] {
-            let query = like_join_query("{T}", filter);
-            let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME, &query);
+            let query = filtered(filter);
+            if let Some(failure) = native_copy_mismatch(
+                &mut conn,
+                VS_NAME,
+                JOIN_ORACLE,
+                &query,
+                PathCheck::Has(BROADCAST_JOIN),
+                Expect::Rows,
+            ) {
+                panic!("[{setting}] {failure}");
+            }
+            let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
             assert!(
-                !pushed.contains(SCAN_FILTER) && pushed.contains(r#"."O_ORDERDATE" LIKE"#),
-                "[{setting}] the outer WHERE, not a scan, applies {filter}: {pushed}"
+                pushed.contains(r#""LHS_T0_O_ORDERDATE" LIKE '"#),
+                "[{setting}] Exasol's WHERE over the broadcast fan-out applies {filter}: {pushed}"
             );
+        }
+        if let Some(failure) = native_copy_mismatch(
+            &mut conn,
+            VS_NAME,
+            JOIN_ORACLE,
+            text_key,
+            PathCheck::NScan(2),
+            Expect::Rows,
+        ) {
+            panic!("[{setting}] {failure}");
         }
     }
 }
@@ -1458,6 +1393,41 @@ fn e2e_n_scan_leg_keeps_its_computed_conjunct_beside_a_declined_one() {
     );
 }
 
+/// Every order joined to its customer: the ground truth of a filter that holds for every row.
+fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    let dim_cols = conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    ));
+    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
+    let custkey_to_name: HashMap<String, String> = dim_cols[0]
+        .iter()
+        .zip(dim_cols[1].iter())
+        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
+        .collect();
+
+    let fact_cols = conn.query_columns(&format!(
+        "SELECT O_CUSTKEY, O_ORDERDATE FROM {}",
+        vs_fact_table(vs_name)
+    ));
+    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
+
+    let mut rows: Vec<(String, String)> = fact_cols[0]
+        .iter()
+        .zip(fact_cols[1].iter())
+        .map(|(custkey, date)| {
+            let key = value_to_string(custkey);
+            let name = custkey_to_name
+                .get(&key)
+                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
+                .clone();
+            (name, value_to_string(date))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 #[test]
 fn e2e_join_instr_with_start_position_returns_native_result() {
     setup_e2e();
@@ -1467,14 +1437,13 @@ fn e2e_join_instr_with_start_position_returns_native_result() {
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
          JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
          WHERE INSTR(c.C_NAME, 'c', 3) = 0",
-        vs_fact_table(VS_NAME),
-        vs_dim_table(VS_NAME)
+        vs_fact_table(VS_NAME_LOW),
+        vs_dim_table(VS_NAME_LOW)
     );
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
         has_two_scan_wrapper(&pushed),
-        "the 3-argument INSTR must decline the broadcast plan and fall through \
-         to the N-scan wrapper:\n{pushed}"
+        "with no eligible pair the join takes the N-scan wrapper:\n{pushed}"
     );
     // `'c'` occurs only at position 1, so native `INSTR(C_NAME, 'c', 3)` is 0 for every row;
     // a `strpos` rewrite dropping the start position would answer 1 and return no rows.
@@ -1489,7 +1458,7 @@ fn e2e_join_instr_with_start_position_returns_native_result() {
          which would drop the start-position argument:\n{pushed}"
     );
     let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
-    let expected = expected_full_join_rows(&mut conn, VS_NAME);
+    let expected = expected_full_join_rows(&mut conn, VS_NAME_LOW);
 
     assert_eq!(
         actual.len(),
@@ -2121,7 +2090,7 @@ fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
 fn e2e_three_leg_self_join_matches_single_node() {
     setup_e2e();
     let mut conn = exa_conn();
-    let fact = vs_fact_table(VS_NAME);
+    let fact = vs_fact_table(VS_NAME_LOW);
 
     let query = format!(
         "SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM {fact} a \
@@ -2499,7 +2468,7 @@ fn e2e_three_table_join_on_filters_reach_their_leg_scans() {
 
     if let Some(failure) = native_copy_mismatch(
         &mut conn,
-        VS_NAME,
+        VS_NAME_LOW,
         JOIN_ORACLE,
         query,
         PathCheck::NScan(3),
@@ -2512,7 +2481,7 @@ fn e2e_three_table_join_on_filters_reach_their_leg_scans() {
         "the filtered join must return rows, or the comparison proves nothing"
     );
 
-    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME_LOW));
     let where_query = "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {T}.DIM_CUSTOMER c \
                        JOIN {T}.FACT_ORDERS o ON c.C_CUSTKEY = o.O_CUSTKEY \
                        JOIN {T}.FACT_LINEITEM l ON o.O_ORDERKEY = l.L_ORDERKEY \
@@ -2521,7 +2490,7 @@ fn e2e_three_table_join_on_filters_reach_their_leg_scans() {
         shard_order_free(&pushed),
         shard_order_free(&isolated_pushdown_statement(
             &mut conn,
-            &where_query.replace("{T}", VS_NAME)
+            &where_query.replace("{T}", VS_NAME_LOW)
         )),
         "the three-leg ON filters must plan, and prune, as the same WHERE filters"
     );
@@ -2549,7 +2518,7 @@ fn e2e_three_table_join_equality_over_two_legs_stays_in_on() {
 
     if let Some(failure) = native_copy_mismatch(
         &mut conn,
-        VS_NAME,
+        VS_NAME_LOW,
         JOIN_ORACLE,
         query,
         PathCheck::NScan(3),
@@ -2562,7 +2531,7 @@ fn e2e_three_table_join_equality_over_two_legs_stays_in_on() {
         "the join must return rows, or the comparison proves nothing"
     );
 
-    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME_LOW));
     let (_, chain) = pushed
         .rsplit_once(r#"AS "LHS_T2""#)
         .unwrap_or_else(|| panic!("the N-scan must alias the third leg LHS_T2:\n{pushed}"));
@@ -2678,17 +2647,19 @@ fn e2e_join_with_on_filters_takes_the_broadcast_path_and_matches_native() {
         .iter()
         .flat_map(|query| broadcast_mismatches(&mut conn, query))
         .collect();
-    // DataFusion refuses the two-argument SECOND, as it does in WHERE.
-    failures.extend(native_copy_mismatch(
-        &mut conn,
-        VS_NAME,
-        JOIN_ORACLE,
-        &format!(
-            "SELECT c.C_NAME, o.O_ORDERDATE FROM {ORDERS_JOIN} AND SECOND(o.O_ORDERDATE, 3) = 0"
-        ),
-        PathCheck::NScan(2),
-        Expect::Rows,
-    ));
+    // The scan declines the two-argument SECOND, as it does in WHERE, so Exasol's WHERE applies it.
+    let declined =
+        format!("SELECT o.O_ORDERKEY, c.C_CUSTKEY FROM {ORDERS_JOIN} AND {SECOND_IS_ZERO}");
+    failures.extend(broadcast_mismatches(&mut conn, &declined));
+    let pushed = isolated_pushdown_statement(&mut conn, &declined.replace("{T}", VS_NAME));
+    if !pushed
+        .rsplit_once(") WHERE (")
+        .is_some_and(|(_, outer)| outer.contains("SECOND("))
+    {
+        failures.push(format!(
+            "Exasol's WHERE must apply the declined ON conjunct: {pushed}"
+        ));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     let pushed = isolated_pushdown_statement(&mut conn, &dimension_filter.replace("{T}", VS_NAME));
@@ -2697,4 +2668,279 @@ fn e2e_join_with_on_filters_takes_the_broadcast_path_and_matches_native() {
         filters.iter().any(|filter| filter.contains("C_NAME")),
         "the common spec's filter must carry the moved C_NAME conjunct: {filters:?}\n{pushed}"
     );
+}
+
+/// CUSTOMER, ORDERS, and LINEITEM in a chain. ORDERS is broadcast into LINEITEM's shards.
+const CHAIN: &str = "{T}.DIM_CUSTOMER c JOIN {T}.FACT_ORDERS o ON c.C_CUSTKEY = o.O_CUSTKEY \
+                     JOIN {T}.FACT_LINEITEM l ON o.O_ORDERKEY = l.L_ORDERKEY";
+/// LINEITEM joined to ORDERS and to SUPPLIER on keys of its own.
+const STAR: &str = "{T}.FACT_LINEITEM l JOIN {T}.FACT_ORDERS o ON l.L_ORDERKEY = o.O_ORDERKEY \
+                    JOIN {T}.DIM_SUPPLIER s ON l.L_SUPPKEY = s.S_SUPPKEY";
+
+/// What differs when `query`, a join of `legs` legs that names its schema `{T}`, broadcasts a pair
+/// on [`VS_NAME`] and takes the N-scan on [`VS_NAME_LOW`], and returns its native rows on both.
+fn multi_way_mismatches(conn: &mut ExaConn, legs: usize, query: &str) -> Vec<String> {
+    [
+        (VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
+        (VS_NAME_LOW, PathCheck::NScan(legs)),
+    ]
+    .into_iter()
+    .filter_map(|(vs_name, path)| {
+        native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, path, Expect::Rows)
+    })
+    .collect()
+}
+
+/// The fan-out of `pushed` that carries the join block, as a statement of its own.
+fn pair_fan_out(pushed: &str) -> &str {
+    let block = pushed
+        .find(BROADCAST_JOIN)
+        .unwrap_or_else(|| panic!("no broadcast pair:\n{pushed}"));
+    let start = pushed[..block]
+        .rfind("(SELECT ")
+        .unwrap_or_else(|| panic!("the pair's fan-out must be a subquery:\n{pushed}"));
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (offset, ch) in pushed[start..].char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return &pushed[start + 1..start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the pair's fan-out must close:\n{pushed}");
+}
+
+/// The rows the broadcast pair's fan-out of `query` emits, `query` over [`VS_NAME`].
+fn pair_fan_out_rows(conn: &mut ExaConn, query: &str) -> i64 {
+    let pushed = isolated_pushdown_statement(conn, &query.replace("{T}", VS_NAME));
+    conn.query_row_count(pair_fan_out(&pushed))
+}
+
+/// Scenario: A join of three or more legs broadcasts one pair and scans the other legs
+#[test]
+fn e2e_multi_way_join_broadcasts_one_pair_and_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let cases = [
+        (
+            3,
+            format!("SELECT l.L_LINENUMBER, l.L_QUANTITY, o.O_ORDERDATE, s.S_SUPPKEY FROM {STAR}"),
+        ),
+        (
+            3,
+            format!("SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {CHAIN}"),
+        ),
+        (
+            4,
+            format!(
+                "SELECT c.C_NAME, l.L_LINENUMBER, s.S_NAME FROM {CHAIN} \
+                 JOIN {{T}}.DIM_SUPPLIER s ON l.L_SUPPKEY = s.S_SUPPKEY"
+            ),
+        ),
+        (
+            3,
+            "SELECT a.O_ORDERKEY, b.O_ORDERKEY, c.O_ORDERKEY FROM {T}.FACT_ORDERS a \
+             JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY \
+             JOIN {T}.FACT_ORDERS c ON b.O_ORDERKEY = c.O_ORDERKEY"
+                .to_string(),
+        ),
+        (
+            3,
+            "SELECT e.ID, l.ID, f.SCORE FROM {T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID \
+             JOIN {T}.EVENTS f ON l.ID = f.ID"
+                .to_string(),
+        ),
+        // ORDERS ranks first by its own filter and holds each O_CUSTKEY twice.
+        (
+            3,
+            format!(
+                "SELECT l.L_LINENUMBER, o.O_ORDERKEY, s.S_SUPPKEY FROM {{T}}.FACT_LINEITEM l \
+                 JOIN {{T}}.FACT_ORDERS o ON l.L_SUPPKEY = o.O_CUSTKEY \
+                 JOIN {{T}}.DIM_SUPPLIER s ON l.L_SUPPKEY = s.S_SUPPKEY \
+                 WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"
+            ),
+        ),
+        (
+            3,
+            "SELECT c.C_CUSTKEY, o.O_ORDERKEY, l.L_LINENUMBER FROM {T}.DIM_CUSTOMER c \
+             JOIN {T}.FACT_ORDERS o ON c.C_CUSTKEY = o.O_CUSTKEY \
+             JOIN {T}.FACT_LINEITEM l ON c.C_CUSTKEY + o.O_ORDERKEY = l.L_ORDERKEY"
+                .to_string(),
+        ),
+        (
+            3,
+            format!(
+                "SELECT c.C_NAME, l.L_LINENUMBER FROM {CHAIN} WHERE c.C_CUSTKEY < l.L_QUANTITY"
+            ),
+        ),
+        (
+            3,
+            format!(
+                "SELECT c.C_NAME, SUM(l.L_QUANTITY) FROM {CHAIN} \
+                 GROUP BY c.C_NAME HAVING SUM(l.L_QUANTITY) > 5"
+            ),
+        ),
+        (
+            3,
+            format!(
+                "SELECT o.O_ORDERKEY, l.L_LINENUMBER, c.C_NAME FROM {CHAIN} \
+                 ORDER BY o.O_ORDERKEY DESC, l.L_LINENUMBER LIMIT 5 OFFSET 2"
+            ),
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (legs, query) in &cases {
+        if conn.query_row_count(&query.replace("{T}", JOIN_ORACLE)) == 0 {
+            failures.push(format!("`{query}` must return rows natively"));
+        }
+        failures.extend(multi_way_mismatches(&mut conn, *legs, query));
+    }
+    // Every ORDERS file is pruned, so the join is empty before any plan.
+    failures.extend(native_copy_mismatch(
+        &mut conn,
+        VS_NAME,
+        JOIN_ORACLE,
+        &format!(
+            "SELECT c.C_NAME, l.L_LINENUMBER FROM {CHAIN} WHERE o.O_ORDERDATE < DATE '1900-01-01'"
+        ),
+        PathCheck::Unchecked,
+        Expect::Rows,
+    ));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    assert_eq!(
+        pair_fan_out_rows(&mut conn, &cases[1].1),
+        LINEITEM_ROWS as i64,
+        "the pair emits each line item that matches an order, once"
+    );
+}
+
+/// Scenario: The broadcast pair is the eligible pair whose dimension has a filter of its own
+#[test]
+fn e2e_multi_way_join_broadcasts_the_filtered_dimension_pair() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let query = format!(
+        "SELECT l.L_LINENUMBER, o.O_ORDERDATE, s.S_NAME FROM {STAR} WHERE s.S_NAME = 'supplier-02'"
+    );
+
+    let failures = multi_way_mismatches(&mut conn, 3, &query);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+    let fan_out = pair_fan_out(&pushed);
+    let (fact, join) = fan_out
+        .split_once(BROADCAST_JOIN)
+        .expect("the pair carries a join block");
+    assert!(
+        fact.contains(E2E_LINEITEM_TABLE) && join.contains(E2E_SUPPLIER_TABLE),
+        "SUPPLIER, filtered, is broadcast into LINEITEM's shards, and ORDERS keeps its own \
+         fan-out:\n{pushed}"
+    );
+    let matching = conn.query_row_count(&format!(
+        "SELECT * FROM {JOIN_ORACLE}.FACT_LINEITEM l JOIN {JOIN_ORACLE}.DIM_SUPPLIER s \
+         ON l.L_SUPPKEY = s.S_SUPPKEY WHERE s.S_NAME = 'supplier-02'"
+    ));
+    assert!(matching > 0 && matching < LINEITEM_ROWS as i64);
+    assert_eq!(
+        pair_fan_out_rows(&mut conn, &query),
+        matching,
+        "the pair emits only the line items of the filtered supplier"
+    );
+}
+
+/// Scenario: A pair that is not eligible is not broadcast
+#[test]
+fn e2e_multi_way_join_without_eligible_pair_keeps_the_n_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let chain = format!("SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {CHAIN}");
+    // Every dimension would carry an unbounded text column into Exasol's join.
+    let wide = "SELECT e.NAME, l.LABEL, f.NAME FROM {T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID \
+                JOIN {T}.EVENTS f ON l.ID = f.ID";
+    let failures: Vec<String> = [(VS_NAME_LOW, chain.as_str()), (VS_NAME, wide)]
+        .into_iter()
+        .filter_map(|(vs_name, query)| {
+            native_copy_mismatch(
+                &mut conn,
+                vs_name,
+                JOIN_ORACLE,
+                query,
+                PathCheck::NScan(3),
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scenario: A fallback leg's fan-out scan spec never carries a row limit
+#[test]
+fn e2e_multi_way_join_with_limit_cuts_no_shard() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let query = format!(
+        "SELECT o.O_ORDERKEY, l.L_LINENUMBER, c.C_NAME FROM {CHAIN} \
+         ORDER BY o.O_ORDERKEY DESC, l.L_LINENUMBER LIMIT 3"
+    );
+
+    let failures = multi_way_mismatches(&mut conn, 3, &query);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+    for marker in [
+        r#""limit""#,
+        r#""order_by""#,
+        "post_join_limit",
+        "post_join_order_by",
+    ] {
+        assert!(
+            !pushed.contains(marker),
+            "no fan-out carries {marker}:\n{pushed}"
+        );
+    }
+    assert!(pushed.ends_with(" LIMIT 3"), "{pushed}");
+}
+
+/// Scenario: A wrapped derived projection routes to a native wrapper on every path
+#[test]
+fn e2e_broadcast_join_with_a_declined_select_item_keeps_the_broadcast() {
+    setup_e2e();
+    copy_join_tables_natively(&mut exa_conn(), VS_NAME);
+    let queries = [
+        format!("SELECT o.O_ORDERKEY, CAST(o.O_ORDERDATE AS VARCHAR(20)) FROM {ORDERS_JOIN}"),
+        format!("SELECT c.C_NAME, CAST(o.O_ORDERDATE AS VARCHAR(20)), l.L_LINENUMBER FROM {CHAIN}"),
+    ];
+    for setting in [DEFAULT_SESSION, DMY] {
+        let mut conn = exa_session(setting);
+        for query in &queries {
+            if let Some(failure) = native_copy_mismatch(
+                &mut conn,
+                VS_NAME,
+                JOIN_ORACLE,
+                query,
+                PathCheck::Has(BROADCAST_JOIN),
+                Expect::Rows,
+            ) {
+                panic!("[{setting}] {failure}");
+            }
+            let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
+            let select = pushed.split(" FROM (").next().unwrap_or_default();
+            assert!(
+                select.contains("CAST("),
+                "[{setting}] Exasol computes the item over the fan-out: {pushed}"
+            );
+        }
+    }
 }

@@ -9,7 +9,7 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_JSON_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, EMPTY_STRING_FILES,
+    E2E_NAMESPACE, E2E_SUPPLIER_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, EMPTY_STRING_FILES,
     EMPTY_STRING_NAMESPACE, build_seed_catalog, seed_all_types, seed_complex_types_probe,
     seed_distinct_probe, seed_empty_strings, seed_events, seed_high_card_probe,
     seed_ident_part_bytes, seed_json_docs, seed_typed_distinct_probe,
@@ -201,11 +201,11 @@ pub fn vs_lineitem_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_LINEITEM_TABLE)
 }
 
-/// Holds native copies of the fact, dimension, lineitem, events, and labels tables under their
-/// virtual names, so a join query that names its schema `{T}` runs over either.
+/// Holds native copies of the fact, dimension, lineitem, supplier, events, and labels tables
+/// under their virtual names, so a join query that names its schema `{T}` runs over either.
 pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
 
-/// Copies the fact, dimension, lineitem, events, and labels tables of `source_vs` into
+/// Copies the fact, dimension, lineitem, supplier, events, and labels tables of `source_vs` into
 /// [`JOIN_ORACLE`].
 pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
@@ -213,6 +213,7 @@ pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
         E2E_FACT_TABLE,
         E2E_DIM_TABLE,
         E2E_LINEITEM_TABLE,
+        E2E_SUPPLIER_TABLE,
         E2E_TABLE,
         E2E_TABLE_2,
     ] {
@@ -277,6 +278,16 @@ pub fn assert_single_table_wrapper(conn: &mut ExaConn, sql: &str) -> String {
         "{sql} must run in the qualified single-table wrapper over the scan: {pushed}"
     );
     pushed
+}
+
+/// `sql` keeps its broadcast pair, and an outer Exasol SELECT computes its select list over the
+/// pair's fan-out.
+pub fn assert_broadcast_join_wrapper(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        has_broadcast_join_block(&pushed) && pushed.contains(" FROM (SELECT "),
+        "{sql} must keep the broadcast join under an Exasol SELECT: {pushed}"
+    );
 }
 
 /// Exasol computes the join in the N-scan wrapper, not in a broadcast scan.
