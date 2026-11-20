@@ -3,7 +3,9 @@ use datafusion::scalar::ScalarValue;
 use serde_json::Value as Json;
 
 use crate::adapter::pushdown::literal_binary_bytes;
-use crate::types::mapping::timestamp_unit;
+use crate::types::exasol_type::ExasolType;
+use crate::types::mapping::{arrow_to_exasol_type, timestamp_unit};
+use vs_expression::is_session_free_integer_text;
 use vs_expression::timestamp::TimestampLiteral;
 
 use super::filter_json::non_empty_str;
@@ -35,6 +37,9 @@ pub(super) fn exact_literal(literal: &Json, column: &DataType) -> Option<ScalarV
         | ("literal_date", DataType::Date32 | DataType::Date64) => {
             non_empty_str(value)?.to_string()
         }
+        ("literal_string", integer) if is_integer_text(literal, integer) => {
+            non_empty_str(value)?.to_string()
+        }
         ("literal_timestamp", DataType::Timestamp(unit, _)) => exact_timestamp(value, *unit)?,
         ("literal_binary", DataType::Binary) => {
             return literal_binary_bytes(literal).map(|bytes| ScalarValue::Binary(Some(bytes)));
@@ -49,6 +54,17 @@ pub(super) fn exact_literal(literal: &Json, column: &DataType) -> Option<ScalarV
     ScalarValue::try_from_string(text, column)
         .ok()
         .filter(|scalar| !scalar.is_null())
+}
+
+/// Exasol compares a digits-only text literal with an integer column as that number, and the scan
+/// converts it by `is_session_free_integer_text`, so pruning converts it by the same rule.
+fn is_integer_text(literal: &Json, column: &DataType) -> bool {
+    match arrow_to_exasol_type(column) {
+        ExasolType::Decimal(decimal) if decimal.scale() == 0 => {
+            is_session_free_integer_text(literal, decimal.precision())
+        }
+        _ => false,
+    }
 }
 
 fn double(value: &Json) -> Option<f64> {

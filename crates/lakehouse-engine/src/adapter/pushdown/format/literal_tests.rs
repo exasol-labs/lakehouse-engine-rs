@@ -32,12 +32,53 @@ fn an_integer_column_takes_an_integral_numeral_only() {
         (num_lit("300"), DataType::Int8),
         (num_lit("1e2"), DataType::Int64),
         (double_lit("4.7e+01"), DataType::Int64),
-        (str_lit("47"), DataType::Int64),
     ] {
         assert_eq!(
             exact_literal(&literal, &column),
             None,
             "{literal} on {column}"
+        );
+    }
+}
+
+/// Scenario: A digits-only text literal converts for an integer column
+#[test]
+fn an_integer_column_takes_a_digits_only_text_literal_as_its_number() {
+    let part_nr = DataType::Decimal128(3, 0);
+    let decimal = |value| Some(ScalarValue::Decimal128(Some(value), 3, 0));
+    assert_eq!(exact_literal(&str_lit("47"), &part_nr), decimal(47));
+    assert_eq!(exact_literal(&str_lit("047"), &part_nr), decimal(47));
+    assert_eq!(exact_literal(&str_lit("-5"), &part_nr), decimal(-5));
+    assert_eq!(exact_literal(&str_lit("999"), &part_nr), decimal(999));
+    assert_eq!(
+        exact_literal(&str_lit("47"), &DataType::Int32),
+        Some(ScalarValue::Int32(Some(47)))
+    );
+    assert_eq!(
+        exact_literal(&str_lit("123456789012345678"), &DataType::Int64),
+        Some(ScalarValue::Int64(Some(123_456_789_012_345_678))),
+        "18 digits is the widest text the scan reads as a number"
+    );
+}
+
+/// Scenario: A digits-only text literal converts for an integer column
+#[test]
+fn a_text_literal_that_is_not_digits_only_within_the_precision_converts_for_no_number() {
+    let part_nr = DataType::Decimal128(3, 0);
+    for text in ["1000", "+47", " 47", "47 ", "4.7", "1e2", "-", "--5", "0x1"] {
+        assert_eq!(exact_literal(&str_lit(text), &part_nr), None, "{text:?}");
+    }
+    for (text, column) in [
+        ("1234567890123456789", DataType::Int64),
+        ("2147483648", DataType::Int32),
+        ("47", DataType::Decimal128(10, 2)),
+        ("47", DataType::Float64),
+        ("1", DataType::Boolean),
+    ] {
+        assert_eq!(
+            exact_literal(&str_lit(text), &column),
+            None,
+            "{text:?} on {column}"
         );
     }
 }
@@ -82,7 +123,7 @@ fn a_float_column_takes_only_a_value_it_holds_exactly() {
     );
 }
 
-/// Scenario: A text or time literal converts only for a column of its own kind
+/// Scenario: A text or time literal converts for a column of its own kind
 #[test]
 fn a_string_or_date_literal_must_not_be_empty() {
     assert_eq!(
@@ -97,7 +138,7 @@ fn a_string_or_date_literal_must_not_be_empty() {
     assert_eq!(exact_literal(&date_lit(""), &DataType::Date32), None);
 }
 
-/// Scenario: A text or time literal converts only for a column of its own kind
+/// Scenario: A text or time literal converts for a column of its own kind
 #[test]
 fn a_timestamp_literal_converts_only_at_or_above_the_column_precision() {
     let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
@@ -122,7 +163,7 @@ fn a_timestamp_literal_converts_only_at_or_above_the_column_precision() {
     );
 }
 
-/// Scenario: A text or time literal converts only for a column of its own kind
+/// Scenario: A text or time literal converts for a column of its own kind
 #[test]
 fn a_utc_adjusted_column_reads_a_timestamp_literal_as_utc() {
     assert_eq!(
@@ -147,7 +188,7 @@ fn a_utc_adjusted_column_reads_a_timestamp_literal_as_utc() {
     );
 }
 
-/// Scenario: A text or time literal converts only for a column of its own kind
+/// Scenario: A text or time literal converts for a column of its own kind
 #[test]
 fn a_literal_of_another_kind_than_the_column_does_not_convert() {
     for (literal, column) in [

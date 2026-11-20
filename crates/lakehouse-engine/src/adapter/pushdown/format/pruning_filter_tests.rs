@@ -116,7 +116,7 @@ fn every_leaf_lowers_to_the_predicate_it_implies() {
 fn a_leaf_without_a_column_and_an_exact_literal_constrains_nothing() {
     let leaves = [
         predicate_equal(col("MISSING"), num_lit(1)),
-        predicate_equal(col("ID"), str_lit("5")),
+        predicate_equal(col("ID"), str_lit("+5")),
         predicate_equal(col("ID"), num_lit("2.5")),
         in_list(col("ID"), [num_lit(1), str_lit("two")]),
         in_list(col("ID"), []),

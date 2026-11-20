@@ -202,6 +202,34 @@ fn a_decimal_literal_binds_at_the_columns_precision_and_scale() {
     }
 }
 
+/// Scenario: A digits-only text literal converts for an integer column
+#[test]
+fn a_digits_only_text_literal_prunes_an_integer_decimal_partition_column() {
+    let schema = Schema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            1,
+            "part_nr",
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 3,
+                scale: 0,
+            }),
+        ))])
+        .build()
+        .unwrap();
+    for node in [
+        predicate_equal(col("PART_NR"), str_lit("47")),
+        in_list(col("PART_NR"), [str_lit("47"), str_lit("99")]),
+    ] {
+        let predicate = translate_as_created(&node, &schema)
+            .unwrap_or_else(|| panic!("{node} must prune by its digits-only text"));
+        predicate
+            .bind(Arc::new(schema.clone()), false)
+            .unwrap_or_else(|e| panic!("{node} must bind to decimal(3,0): {e}"));
+    }
+    let wider = predicate_equal(col("PART_NR"), str_lit("1000"));
+    assert!(translate_as_created(&wider, &schema).is_none());
+}
+
 #[test]
 fn a_float_column_takes_only_a_literal_it_holds_exactly() {
     assert_eq!(

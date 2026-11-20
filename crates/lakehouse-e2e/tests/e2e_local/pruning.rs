@@ -88,6 +88,7 @@ fn pruning_fixture_files_hold_the_row_groups_and_pages_the_cases_need() {
 /// Scenario: A not-equal comparison prunes
 /// Scenario: LIKE predicate translates with optional escape character
 /// Scenario: Every pruning path keeps every file with a matching row for every column type
+/// Scenario: A digits-only text literal converts for an integer column
 #[test]
 fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
     setup();
