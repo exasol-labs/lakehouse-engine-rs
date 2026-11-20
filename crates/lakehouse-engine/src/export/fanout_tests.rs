@@ -96,23 +96,6 @@ fn rows_wait_per_partition_until_the_budget_writes_the_largest_one_out() {
     assert_eq!(rows_by_key(&rest), HashMap::from([(Some(2), 1), (None, 1)]));
 }
 
-#[test]
-fn an_unpartitioned_spec_buffers_every_row_under_one_key() {
-    let spec = PartitionSpec::builder(schema())
-        .add_partition_field("K", "K_void", Transform::Void)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut buffer = PartitionBuffer::new(schema(), &spec, usize::MAX).unwrap();
-
-    buffer.push(&batch(&[Some(1), Some(2)])).unwrap();
-    buffer.push(&batch(&[None])).unwrap();
-    let rest = buffer.drain();
-
-    assert_eq!(rows_by_key(&rest), HashMap::from([(None, 3)]));
-    assert_eq!(rest[0].0.data().fields(), [None]);
-}
-
 /// iceberg-rust's fast append refuses a data file of another spec ID or partition arity than the
 /// table's default spec.
 #[test]

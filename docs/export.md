@@ -106,6 +106,27 @@ The export appends to a partitioned table under its current partition spec (see 
 
 The export also refuses a table that keeps a dropped partition field under the name of a column. Apache Spark leaves this shape when it drops an identity partition field of a format version 1 table, such as `PARTITIONED BY (day)` followed by `DROP PARTITION FIELD day`. The commit library the export uses cannot commit to such a table, so the error names the table and the field before any write.
 
+### Data files
+
+The writers write Parquet data files, also into a table whose `write.format.default` names another format. Each data file follows the table's write properties:
+
+| Property | Sets | Default |
+|----------|------|-------------------|
+| `write.parquet.compression-codec` | The codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4_raw`, `uncompressed`, or `lz4`, which the [Parquet format deprecates](https://parquet.apache.org/docs/file-format/data-pages/compression/#lz4): use `lz4_raw` instead | `zstd` |
+| `write.parquet.compression-level` | The level of `zstd`, `gzip`, or `brotli`, ignored for other codecs | The codec's own |
+| `write.parquet.row-group-size-bytes` | The size at which a row group ends | 128 MiB |
+| `write.parquet.page-size-bytes`, `write.parquet.page-row-limit`, `write.parquet.dict-size-bytes` | Page and dictionary sizes | 1 MiB, 20,000 rows, 2 MiB |
+| `write.parquet.content-defined-chunking.*` | Content-defined chunking of pages, off unless `enabled` is `true` | Off |
+| `write.target-file-size-bytes` | The size at which a writer starts a new data file | 512 MiB |
+
+Both sizes are approximate. A row group of data that compresses well can hold several times `write.parquet.row-group-size-bytes` before compression, so a limit of a few MiB can still give one row group per file. Every row group but the last of each file holds at least one batch of 8,192 rows, so a small limit does not hold, and a row group also ends at 1,048,576 rows. A data file of data that compresses well can end well below `write.target-file-size-bytes`.
+
+A table the export creates carries `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728` (128 MiB), and `write.target-file-size-bytes = 268435456` (256 MiB), so every later writer of the table uses the same settings. To change these settings, set the properties on the table with another engine: every later append follows them.
+
+An append follows the properties of the table it appends to and never changes them. A property the export cannot use fails the export before any data is written, with an error that names the table, the property, and its value, for example `invalid write property write.parquet.compression-codec = 'lzo'`. This covers the `lzo` codec, which the export cannot write, a row group size or page row limit of 0, and a value that is not a number where one is expected.
+
+An export into an unpartitioned table writes each writer's rows into its open data file as they arrive, so a writer holds no rows beyond the row group in progress.
+
 ### Partitioned tables
 
 The export writes each row into the partition that the table's current partition spec assigns to it, both when it appends to a partitioned table and when `PARTITION_BY` makes the table it creates partitioned. Each data file holds the rows of one partition and lies under the partition's path, such as `data/D_day=2024-01-15/`, so a virtual schema prunes the exported files by partition. A row whose partition column is NULL lands in the partition whose value is null, such as `data/D_day=null/`.
@@ -134,7 +155,7 @@ Each transform takes these source types:
 
 The statement fails before it reads any source row when `PARTITION_BY` is empty or not a field list, names an unknown transform, has a width below 1, names a column the source lacks or a name that matches several source columns only by letter case, gives two fields the same name, gives a field the name of another source column, or puts two of `year`, `month`, `day`, and `hour` on one column. A transform that does not take its column's type fails the export at the writer, before it creates the table, with an error that names the field, the column, and the column's type. `PARTITION_BY` applies only to a table the export creates: with a table that exists, the statement fails before it reads any row, naming the table.
 
-A writer buffers the rows of each partition in memory, within a budget of half the per-instance memory limit after 200 MB of overhead, at least 64 MiB and at most 512 MiB, or 512 MiB when the limit is unknown. When the buffered rows exceed the budget, the writer writes the partition that buffers the most bytes into a data file. A writer whose rows exceed the budget therefore gives a partition several data files, and a source whose consecutive rows fall into many different partitions gives more and smaller files. Rows reach the writers in turn, not by partition, so every writer can write a file for every partition. Fewer writers, such as `SINGLE_COMMIT = 'true'`, give fewer files.
+A writer into a partitioned table buffers the rows of each partition in memory, within a budget of half the per-instance memory limit after 200 MB of overhead, at least 64 MiB and at most 512 MiB, or 512 MiB when the limit is unknown. When the buffered rows exceed the budget, the writer writes the partition that buffers the most bytes into data files of its own, which start a new file at `write.target-file-size-bytes`. Each such write-out gets new files, so a partition's files can stay below `write.target-file-size-bytes`. A writer whose rows exceed the budget therefore gives a partition several data files, and a source whose consecutive rows fall into many different partitions gives more and smaller files. Rows reach the writers in turn, not by partition, so every writer can write a file for every partition. Fewer writers, such as `SINGLE_COMMIT = 'true'`, give fewer files.
 
 ## How an export runs
 

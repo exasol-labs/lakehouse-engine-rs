@@ -22,6 +22,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 
   Every other type is refused. Exasol itself refuses a `GEOMETRY`, `HASHTYPE`, `INTERVAL`, or `TIMESTAMP WITH LOCAL TIME ZONE` column before the export reads it: with `Column type not supported: <type>`, or with `VM error: Unknown data type found`, which names no column. Which of the two a column gets varies between statements. The export refuses `TIMESTAMP(p)` with p > 6, and any other type that reaches it, with an error that names the column and its type and suggests a cast to `TIMESTAMP(6)`.
 * Iceberg table spec § Primitive Types: `decimal(P,S)` "Scale is fixed, precision must be 38 or less", which holds Exasol's precision of at most 36. `timestamp` is "Timestamp, microsecond precision, without timezone", and note 1 states "Timestamp values _without time zone_ represent a date and time of day regardless of zone", as Exasol's `TIMESTAMP` does. `timestamp_ns` is added by v3, so a version 2 table has no lossless target for `TIMESTAMP(7)` to `TIMESTAMP(9)`: refusing them is this feature's scoped exception. `string` is "Encoded with UTF-8". § Reserved Field IDs reserves metadata columns "that can be used in user data schemas, like the `_file` column".
+* Iceberg table spec § Table Metadata Fields: `properties` is "A string to string map of table properties. This is used to control settings that affect reading and writing". § Manifests: a data file's `file_format` is "String file format name, `avro`, `orc`, `parquet`, or `puffin`", so the data files of one table may differ in format.
 * Every snapshot that an export commits carries the summary property `lakehouse.export-id`, which identifies the export statement.
 * Between two attempts of one commit the writer waits the table's `commit.retry.min-wait-ms`, doubled after each retry up to its `commit.retry.max-wait-ms`, plus up to a tenth more at random. A property that is absent or not a whole number of milliseconds takes Iceberg's default of 100 ms or 60 s.
 * Every commit pins the schema and partition spec the writer checked. The writer binds source columns to the table's fields by name and writes their field IDs into its data files, so a commit after another engine changed the schema could land values that read as NULL under the names they were bound to, for example after a column is dropped and added again. Its partition values follow the checked spec, which a manifest under a newer default spec would misdescribe.
@@ -84,3 +85,10 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *WHEN* the writer commits its data files
 * *THEN* the commit SHALL assert the schema ID and the partition spec ID that the writer checked
 * *AND* a commit that reloads the changed table, before its first attempt or before a retry, SHALL fail with an error that names the table and what changed, and SHALL add no snapshot
+
+### Scenario: A table the export creates carries its write properties
+
+* *GIVEN* a table that does not exist
+* *WHEN* a user exports a source into it, with several writers or with `SINGLE_COMMIT = 'true'`
+* *THEN* the table's properties SHALL hold `write.parquet.compression-codec = zstd`, `write.parquet.row-group-size-bytes = 134217728`, and `write.target-file-size-bytes = 268435456`
+* *AND* every data file that the export writes SHALL be compressed with `zstd`

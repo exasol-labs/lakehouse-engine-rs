@@ -660,7 +660,7 @@ async fn a_missing_namespace_level_is_created_and_one_created_meanwhile_counts_a
 }
 
 #[test]
-fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
+fn a_create_request_carries_format_2_the_export_id_and_the_write_properties_and_does_not_stage() {
     let request = creation_request(&ident("ns", "t"), schema(), None, "e1");
 
     let sent = serde_json::to_value(&request).unwrap();
@@ -671,7 +671,10 @@ fn a_create_request_carries_format_2_and_the_export_id_and_does_not_stage() {
         serde_json::json!({
             "format-version": "2",
             "commit.retry.num-retries": "20",
-            "lakehouse.export-id": "e1"
+            "lakehouse.export-id": "e1",
+            "write.parquet.compression-codec": "zstd",
+            "write.parquet.row-group-size-bytes": "134217728",
+            "write.target-file-size-bytes": "268435456"
         })
     );
     assert_eq!(sent["schema"]["fields"][0]["name"], "ID");

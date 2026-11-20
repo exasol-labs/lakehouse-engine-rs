@@ -1,6 +1,6 @@
 # Feature: EXPORT INTO SCRIPT With SINGLE_COMMIT
 
-With `SINGLE_COMMIT = 'true'` an export into a new Iceberg table creates the table only together with all its rows, through the catalog's staged table creation, and a failed export leaves no table.
+With `SINGLE_COMMIT = 'true'` an export into a new Iceberg table creates the table only together with all its rows, through the catalog's staged table creation, and a failed export leaves no table. An export into an existing table appends all its rows as one snapshot.
 
 ## Background
 
@@ -33,3 +33,10 @@ With `SINGLE_COMMIT = 'true'` an export into a new Iceberg table creates the tab
 * *THEN* the statement SHALL fail, with the source's error when the source failed
 * *AND* the catalog SHALL NOT hold the table, and the namespace that the export created SHALL remain
 * *AND* the data files that the writer wrote SHALL NOT remain in storage
+
+### Scenario: SINGLE_COMMIT appends one snapshot, also on a catalog without staged creation
+
+* *GIVEN* an existing table, and a catalog that refuses staged table creation
+* *WHEN* a user exports a source of 1,000 rows into it with `SINGLE_COMMIT = 'true'`
+* *THEN* the export SHALL succeed, and the table SHALL gain exactly one snapshot, which adds the 1,000 rows and carries the export's `lakehouse.export-id`
+* *AND* the table's earlier snapshots SHALL be unchanged

@@ -1,5 +1,5 @@
-//! A writer's partition buffer: rows wait in memory per partition of the table's current spec, and
-//! the largest partitions go out as data files whenever the buffer passes its budget.
+//! A writer's partition buffer: rows wait in memory per partition of a partitioned table's current
+//! spec, and the largest partitions go out as data files whenever the buffer passes its budget.
 
 use arrow::record_batch::RecordBatch;
 use iceberg::arrow::RecordBatchPartitionSplitter;
@@ -43,15 +43,9 @@ pub(super) fn write_out(sizes: &[usize], budget: usize) -> Vec<usize> {
 
 /// The one partition of an unpartitioned `spec`: a null value per field. iceberg-rust's fast
 /// append refuses a data file of another spec ID or partition arity than the table's default spec.
-fn null_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
+pub(super) fn null_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
     let nulls = spec.fields().iter().map(|_| None).collect();
     PartitionKey::new(spec.clone(), schema, nulls)
-}
-
-/// How a batch splits into partitions: an unpartitioned spec has one key, whose values are null.
-enum Split {
-    Unpartitioned(PartitionKey),
-    ByValue(Box<RecordBatchPartitionSplitter>),
 }
 
 struct Buffered {
@@ -60,11 +54,11 @@ struct Buffered {
     bytes: usize,
 }
 
-/// One partition's buffered rows, ready to go into a data file.
+/// One partition's buffered rows, ready to go into the partition's data files.
 pub(super) type Partition = (PartitionKey, Vec<RecordBatch>);
 
 pub(super) struct PartitionBuffer {
-    split: Split,
+    splitter: RecordBatchPartitionSplitter,
     budget: usize,
     buffered: HashMap<Struct, Buffered>,
 }
@@ -75,19 +69,16 @@ impl PartitionBuffer {
         spec: &PartitionSpec,
         budget: usize,
     ) -> iceberg::Result<Self> {
-        // iceberg-rust's splitter refuses a spec without a field other than `void`.
-        let split = if spec.is_unpartitioned() {
-            Split::Unpartitioned(null_key(spec, schema))
-        } else {
-            Split::ByValue(Box::new(
-                RecordBatchPartitionSplitter::try_new_with_computed_values(
-                    schema,
-                    Arc::new(spec.clone()),
-                )?,
-            ))
-        };
+        debug_assert!(
+            !spec.is_unpartitioned(),
+            "the sink streams an unpartitioned table's rows"
+        );
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema,
+            Arc::new(spec.clone()),
+        )?;
         Ok(Self {
-            split,
+            splitter,
             budget,
             buffered: HashMap::new(),
         })
@@ -96,11 +87,7 @@ impl PartitionBuffer {
     /// Buffers `batch`'s rows by partition and hands back the partitions that must go out so
     /// that the rest fit the budget.
     pub(super) fn push(&mut self, batch: &RecordBatch) -> iceberg::Result<Vec<Partition>> {
-        let parts = match &self.split {
-            Split::Unpartitioned(key) => vec![(key.clone(), batch.clone())],
-            Split::ByValue(splitter) => splitter.split(batch)?,
-        };
-        for (key, part) in parts {
+        for (key, part) in self.splitter.split(batch)? {
             let bytes = part.get_array_memory_size();
             let entry = self
                 .buffered

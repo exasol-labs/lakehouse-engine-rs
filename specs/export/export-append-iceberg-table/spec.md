@@ -86,13 +86,6 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * *AND* with `SINGLE_COMMIT = 'true'` the table SHALL keep its snapshots unchanged, and the export SHALL leave no data file of its own in the table's storage
 * *AND* without `SINGLE_COMMIT` the table MAY keep the commits of the writers that finished before the failure
 
-### Scenario: SINGLE_COMMIT appends one snapshot, also on a catalog without staged creation
-
-* *GIVEN* an existing table, and a catalog that refuses staged table creation
-* *WHEN* a user exports a source of 1,000 rows into it with `SINGLE_COMMIT = 'true'`
-* *THEN* the export SHALL succeed, and the table SHALL gain exactly one snapshot, which adds the 1,000 rows and carries the export's `lakehouse.export-id`
-* *AND* the table's earlier snapshots SHALL be unchanged
-
 ### Scenario: A format-version 3 table is refused before any data is written
 
 * *GIVEN* a table of format version 3
@@ -100,3 +93,24 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * *THEN* the export SHALL fail with an error that names the table and its format version
 * *AND* the table SHALL keep its snapshots unchanged
 * *AND* the export SHALL write no data file
+
+### Scenario: An append writes data files by the table's write properties
+
+* *GIVEN* an unpartitioned table whose properties another catalog client set to `write.format.default = orc`, `write.parquet.compression-codec = snappy`, a `write.parquet.row-group-size-bytes` of 2 MiB, and a `write.target-file-size-bytes` of 4 MiB
+* *WHEN* a user exports a source of about 20 MiB of Parquet data into it with `SINGLE_COMMIT = 'true'`
+* *THEN* every data file that the append writes SHALL be Parquet compressed with `snappy`, and a data file SHALL hold several row groups, one of more than 8,192 rows
+* *AND* the append SHALL write several data files, none larger than 4 MiB plus one row group
+* *AND* the table's properties SHALL be unchanged
+
+### Scenario: A write property the table lacks takes the writer's default
+
+* *GIVEN* a table without `write.parquet.compression-codec`, `write.parquet.row-group-size-bytes`, and `write.target-file-size-bytes`
+* *WHEN* a user exports a source into it
+* *THEN* every data file that the append writes SHALL be compressed with `zstd`
+
+### Scenario: An unusable write property fails the export before any data is written
+
+* *GIVEN* a table whose `write.parquet.compression-codec` names a codec the export cannot write, such as `lzo`, whose `write.parquet.row-group-size-bytes` is 0, or whose `write.target-file-size-bytes` is not a number
+* *WHEN* a user exports a source into it
+* *THEN* the export SHALL fail with an error that names the table, the property, and its value
+* *AND* the table SHALL hold no new snapshot

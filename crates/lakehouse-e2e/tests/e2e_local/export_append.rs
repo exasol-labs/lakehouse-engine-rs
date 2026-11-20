@@ -3,6 +3,7 @@
 
 use std::sync::OnceLock;
 
+use parquet::basic::{Compression, ZstdLevel};
 use serde_json::Value;
 
 use crate::common::e2e_harness::{
@@ -16,8 +17,9 @@ use crate::common::export_append_fixtures::{
     V3_COLUMNS,
 };
 use crate::common::table_state::{
-    WAREHOUSE_BUCKET, assert_one_new_export, iceberg_columns, local_table_metadata, objects_under,
-    reset_to_unexported_snapshot, snapshot_ids,
+    DataFileFooter, assert_data_files, assert_one_new_export, data_file_footers, data_prefix,
+    iceberg_columns, local_table_metadata, objects_under, remove_table_properties,
+    reset_to_unexported_snapshot, set_table_properties, snapshot_ids,
 };
 use crate::fixtures::{
     EXPORT_DIRECT, EXPORT_PROXIED, lakehouse_vs, proxy_virtual_schemas, stack, vs_table,
@@ -28,6 +30,9 @@ const SOURCE_SCHEMA: &str = "EXPORT_APPEND_E2E";
 const SOURCE_ROWS: &str = "EXPORT_APPEND_E2E.SOURCE_ROWS";
 const LEVELS_20K: &str = "EXPORT_APPEND_E2E.LEVELS_20K";
 const ROWS_1K: &str = "EXPORT_APPEND_E2E.ROWS_1K";
+/// 200,000 rows of 128 hex characters, about 25 MB that Parquet barely compresses.
+const WIDE_ROWS: &str = "EXPORT_APPEND_E2E.WIDE_ROWS";
+const MIB: i64 = 1024 * 1024;
 const READ_VS: &str = "EXPORT_APPEND_READ";
 const READ_CONN: &str = "EXPORT_APPEND_READ_CREDS";
 
@@ -97,6 +102,11 @@ fn setup() {
             "CREATE OR REPLACE TABLE {ROWS_1K} AS SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID, \
              CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL FROM DUAL CONNECT BY LEVEL <= 1000"
         ));
+        sys.execute(&format!(
+            "CREATE OR REPLACE TABLE {WIDE_ROWS} AS SELECT CAST(LEVEL AS DECIMAL(18,0)) AS ID, \
+             HASH_SHA256(LEVEL) || HASH_SHA256(-LEVEL) AS PAYLOAD \
+             FROM DUAL CONNECT BY LEVEL <= 200000"
+        ));
         create_virtual_schema(
             &mut sys,
             &VsProps::new(READ_VS, NAMESPACE).with_catalog_conn_name(READ_CONN),
@@ -153,15 +163,6 @@ fn shape(metadata: &Value) -> Shape<'_> {
         transforms,
         iceberg_columns(metadata),
     )
-}
-
-/// The `data/` prefix of the table `metadata` describes, within the warehouse bucket.
-fn data_prefix(metadata: &Value) -> String {
-    let location = metadata["location"].as_str().unwrap();
-    let key = location
-        .strip_prefix(&format!("s3://{WAREHOUSE_BUCKET}/"))
-        .unwrap_or_else(|| panic!("{location} lies outside the warehouse bucket"));
-    format!("{key}/data/")
 }
 
 /// Scenario: Unquoted Exasol names append to a table that another engine created
@@ -394,4 +395,166 @@ fn export_single_commit_appends_one_snapshot_without_staged_creation() {
     let after = local_table_metadata(namespace, table);
     let added = assert_one_new_export("SINGLE_COMMIT", &before, &after, 1);
     assert_eq!(added[0]["summary"]["added-records"], "1000");
+}
+
+/// The first `rows` rows of `WIDE_ROWS`.
+fn wide_rows(rows: u32) -> String {
+    format!("(SELECT * FROM {WIDE_ROWS} WHERE ID <= {rows})")
+}
+
+/// A new table of `WIDE_ROWS`' columns, created by an export of its first 10 rows with `options`.
+fn wide_table(name: &str, options: &str) -> (String, String) {
+    let namespace = run_namespace("write_properties");
+    let table = format!("{namespace}.{name}");
+    exported_rows(
+        &mut exa_conn(),
+        &EXPORT_DIRECT.export(&wide_rows(10), &table, options),
+    );
+    (namespace, table)
+}
+
+/// Asserts that the table `metadata` describes carries the write properties of a created table.
+#[track_caller]
+fn assert_created_properties(case: &str, metadata: &Value) {
+    let properties = [
+        "write.parquet.compression-codec",
+        "write.parquet.row-group-size-bytes",
+        "write.target-file-size-bytes",
+    ]
+    .map(|key| metadata["properties"][key].as_str());
+    assert_eq!(
+        properties,
+        [Some("zstd"), Some("134217728"), Some("268435456")],
+        "{case}"
+    );
+}
+
+/// The data files of the table `metadata` describes that are not among `old`, the objects
+/// `objects_under` listed before.
+fn new_data_files(old: &[String], metadata: &Value) -> Vec<DataFileFooter> {
+    data_file_footers(metadata)
+        .into_iter()
+        .filter(|file| !old.contains(&file.path))
+        .collect()
+}
+
+/// Scenario: A table the export creates carries its write properties
+/// Scenario: An append writes data files by the table's write properties
+/// Scenario: A write property the table lacks takes the writer's default
+#[test]
+fn export_append_follows_the_table_write_properties() {
+    stack();
+    setup();
+    let (namespace, table) = wide_table("snappy", "WRITERS_PER_NODE = '4'");
+    let created = local_table_metadata(&namespace, "snappy");
+    assert_created_properties("several writers", &created);
+    assert!(
+        snapshot_ids(&created).len() > 1,
+        "several writers each commit a snapshot"
+    );
+    assert_data_files(
+        "created table",
+        &data_file_footers(&created),
+        Compression::ZSTD(ZstdLevel::default()),
+    );
+    set_table_properties(
+        &namespace,
+        "snappy",
+        &[
+            ("write.format.default", "orc"),
+            ("write.parquet.compression-codec", "snappy"),
+            ("write.parquet.row-group-size-bytes", "2097152"),
+            ("write.target-file-size-bytes", "4194304"),
+        ],
+    );
+    let before = local_table_metadata(&namespace, "snappy");
+    let old = objects_under(&data_prefix(&before));
+
+    let sql = EXPORT_DIRECT.export(WIDE_ROWS, &table, "SINGLE_COMMIT = 'true'");
+    assert_eq!(exported_rows(&mut exa_conn(), &sql), 200_000);
+
+    let after = local_table_metadata(&namespace, "snappy");
+    let added = new_data_files(&old, &after);
+    assert_data_files("snappy append", &added, Compression::SNAPPY);
+    // A 2 MiB row group holds several 8,192-row input batches, and the default 128 MiB one would
+    // hold a whole 4 MiB file.
+    let groups: Vec<_> = added
+        .iter()
+        .map(|file| {
+            file.footer
+                .row_groups()
+                .iter()
+                .map(|group| group.num_rows())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        groups.iter().any(|rows| rows.len() > 1)
+            && groups.iter().flatten().any(|rows| *rows > 8_192),
+        "a data file of several row groups, one of more than 8,192 rows: {groups:?}"
+    );
+    let sizes: Vec<u64> = added.iter().map(|file| file.size).collect();
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|size| *size <= 6 * MIB as u64),
+        "several data files of at most 4 MiB plus one row group: {sizes:?}"
+    );
+    assert_eq!(after["properties"], before["properties"]);
+
+    // Without the properties, an append takes the writer's defaults.
+    remove_table_properties(
+        &namespace,
+        "snappy",
+        &[
+            "write.parquet.compression-codec",
+            "write.parquet.row-group-size-bytes",
+            "write.target-file-size-bytes",
+        ],
+    );
+    let old = objects_under(&data_prefix(&after));
+    let sql = EXPORT_DIRECT.export(&wide_rows(5), &table, "");
+    assert_eq!(exported_rows(&mut exa_conn(), &sql), 5);
+    let defaulted = new_data_files(&old, &local_table_metadata(&namespace, "snappy"));
+    assert_data_files(
+        "append without write properties",
+        &defaulted,
+        Compression::ZSTD(ZstdLevel::default()),
+    );
+}
+
+/// Scenario: A table the export creates carries its write properties
+/// Scenario: An unusable write property fails the export before any data is written
+#[test]
+fn export_refuses_unusable_write_properties() {
+    stack();
+    setup();
+    // Unit tests name every other value.
+    let (namespace, table) = wide_table("lzo", "SINGLE_COMMIT = 'true'");
+    let created = local_table_metadata(&namespace, "lzo");
+    assert_created_properties("SINGLE_COMMIT", &created);
+    assert_data_files(
+        "created with SINGLE_COMMIT",
+        &data_file_footers(&created),
+        Compression::ZSTD(ZstdLevel::default()),
+    );
+    set_table_properties(
+        &namespace,
+        "lzo",
+        &[("write.parquet.compression-codec", "lzo")],
+    );
+    let before = local_table_metadata(&namespace, "lzo");
+    let data = data_prefix(&before);
+    let files = objects_under(&data);
+
+    let sql = EXPORT_DIRECT.export(&wide_rows(10), &table, "");
+    let error = export_error(&mut exa_conn(), &sql, NO_SECRETS);
+
+    let named =
+        format!("of table {table}: invalid write property write.parquet.compression-codec = 'lzo'");
+    assert!(error.contains(&named), "{error}");
+    let after = local_table_metadata(&namespace, "lzo");
+    assert_eq!(
+        (snapshot_ids(&after), objects_under(&data)),
+        (snapshot_ids(&before), files),
+        "the table keeps its snapshots, and the export leaves no data file"
+    );
 }
