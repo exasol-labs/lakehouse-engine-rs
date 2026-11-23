@@ -2551,16 +2551,20 @@ fn e2e_n_scan_leg_emits_no_column_that_only_its_scan_filter_reads() {
     setup_e2e();
     let mut conn = exa_conn();
     copy_join_tables_natively(&mut conn, VS_NAME);
-    // (WHERE, whether the outer wrapper reads L_LINENUMBER, so the LINEITEM leg emits it). The
-    // scan declines LIKE on a number, so that conjunct is the wrapper's.
+    // (WHERE, a LINEITEM column, whether the outer wrapper reads it, so the leg emits it). The
+    // scan declines a three-argument INSTR, so that conjunct is the wrapper's.
     let cases = [
-        ("l.L_LINENUMBER = 1", false),
-        ("l.L_LINENUMBER LIKE '1%'", true),
-        ("(l.L_LINENUMBER = 1 OR c.C_NAME = 'customer-02')", true),
+        ("l.L_LINENUMBER = 1", "L_LINENUMBER", false),
+        ("INSTR(l.L_RETURNFLAG, 'R', 2) = 0", "L_RETURNFLAG", true),
+        (
+            "(l.L_LINENUMBER = 1 OR c.C_NAME = 'customer-02')",
+            "L_LINENUMBER",
+            true,
+        ),
     ];
 
     let mut failures = Vec::new();
-    for (filter, emitted) in cases {
+    for (filter, column, emitted) in cases {
         let query = format!(
             "SELECT c.C_NAME, l.L_QUANTITY FROM {{T}}.DIM_CUSTOMER c \
              JOIN {{T}}.FACT_ORDERS o ON c.C_CUSTKEY = o.O_CUSTKEY \
@@ -2576,9 +2580,10 @@ fn e2e_n_scan_leg_emits_no_column_that_only_its_scan_filter_reads() {
         ));
         let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", VS_NAME));
         let legs = leg_emits_clauses(&pushed);
-        if legs.iter().any(|emits| emits.contains(r#""L_LINENUMBER""#)) != emitted {
+        let quoted = format!("\"{column}\"");
+        if legs.iter().any(|emits| emits.contains(&quoted)) != emitted {
             failures.push(format!(
-                "`{filter}`: a leg must emit L_LINENUMBER only when the outer WHERE reads it \
+                "`{filter}`: a leg must emit {column} only when the outer WHERE reads it \
                  ({emitted}): {legs:?}\n{pushed}"
             ));
         }
