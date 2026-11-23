@@ -1,8 +1,6 @@
 use super::*;
 use crate::test_support::{LOAD_TABLE_NO_SNAPSHOTS, STAGE_TABLE, data_file, ident, memory_table};
-use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, MAIN_BRANCH, Struct,
-};
+use iceberg::spec::{FormatVersion, MAIN_BRANCH};
 use iceberg_catalog_rest::LoadTableResult;
 
 fn tag_summary() -> HashMap<String, String> {
@@ -97,43 +95,5 @@ fn the_creation_updates_rebuild_the_staged_metadata_with_its_uuid_first() {
         !updates
             .iter()
             .any(|update| matches!(update, TableUpdate::AddSnapshot { .. }))
-    );
-}
-
-/// Delete the refusal of a `void` field named like a column in the engine's
-/// `refuse_unappendable` once this fails: iceberg-rust then commits to such a table.
-#[tokio::test]
-async fn iceberg_rust_still_refuses_a_commit_to_a_void_partition_field_named_like_a_column() {
-    let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
-    answer["metadata"]["format-version"] = 1.into();
-    answer["metadata"]["partition-specs"] = serde_json::json!([
-        {"spec-id": 0, "fields": [
-            {"name": "V", "transform": "void", "source-id": 2, "field-id": 1000}
-        ]}
-    ]);
-    answer["metadata"]["last-partition-id"] = 1000.into();
-    let table = memory_table(&answer.to_string(), &ident("ns", "t"));
-    let file = DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(format!("{}/data/a.parquet", table.metadata().location()))
-        .file_format(DataFileFormat::Parquet)
-        .file_size_in_bytes(1024)
-        .record_count(10)
-        .partition_spec_id(0)
-        .partition(Struct::from_iter([None::<Literal>]))
-        .build()
-        .unwrap();
-
-    let refused = capture_fast_append(&table, vec![file], tag_summary())
-        .await
-        .err()
-        .map(|error| error.message().to_string());
-
-    assert_eq!(
-        refused.as_deref(),
-        Some(
-            "Cannot create partition with name: 'V' that conflicts with schema field and is not \
-             an identity transform."
-        )
     );
 }

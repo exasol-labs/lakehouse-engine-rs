@@ -213,17 +213,17 @@ fn untrusted_deletion_vector_containers_fail_loud_without_panicking() {
             .decode(None, &data_file(), &secrets()),
         "an inline payload that does not decode",
     );
+    for payload in ["", "0", "01234"] {
+        assert_clean_refusal(
+            resolve(DeltaDeletionVectorStorage::Inline, payload)
+                .and_then(|vector| vector.decode(None, &data_file(), &secrets())),
+            "an inline payload too short to hold the portable magic",
+        );
+    }
 }
 
 #[test]
 fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
-    for payload in ["", "0", "01234"] {
-        assert_clean_refusal(
-            resolve(DeltaDeletionVectorStorage::Inline, payload),
-            "an inline payload too short to hold the portable magic",
-        );
-    }
-
     let short_size = DeltaDeletionVector::resolve(
         LoggedDeletionVector {
             size_in_bytes: 3,

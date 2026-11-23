@@ -1,7 +1,7 @@
 //! Ground truth for the Spark merge-on-read positional-delete and deletion-vector
 //! fixtures and the unsupported-format fixture. Authored at stack bring-up by the
-//! `spark-iceberg-fixtures` job because iceberg-rust has no position-delete writer
-//! (#344). Must stay in lockstep with the `scripts/spark-fixtures/*.sql` scripts.
+//! `spark-iceberg-fixtures` job, so the read path is checked against Spark's own merge-on-read
+//! output. Must stay in lockstep with the `scripts/spark-fixtures/*.sql` scripts.
 
 pub const NAMESPACE: &str = "e2e_lakehouse";
 

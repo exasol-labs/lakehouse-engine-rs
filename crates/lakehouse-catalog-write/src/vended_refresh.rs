@@ -13,8 +13,7 @@ use lakehouse_catalog::{
     VendedCredentialSet, VendedS3Credentials, aws_lease, redact_error_text, scheme_of,
 };
 use object_store::CredentialProvider;
-use object_store::azure::{AzureAccessKey, AzureCredential};
-use percent_encoding::percent_decode_str;
+use object_store::azure::{AzureAccessKey, AzureCredential, split_sas};
 use reqsign_core::{Context, ProvideCredential};
 use std::fmt;
 use std::sync::Arc;
@@ -368,23 +367,9 @@ fn account_key_secret(key: &str) -> Result<AdlsSecret, String> {
     })
 }
 
-/// Split as object_store's Azure builder splits a configured SAS, which it does not expose.
 fn sas_secret(sas: &str) -> Result<AdlsSecret, String> {
-    let malformed = || "SAS token is no query string of key=value pairs".to_string();
-    let decoded = percent_decode_str(sas)
-        .decode_utf8()
-        .map_err(|_| malformed())?;
-    let pairs = decoded
-        .trim_start_matches('?')
-        .split('&')
-        .filter(|pair| !pair.chars().all(char::is_whitespace))
-        .map(|pair| {
-            pair.trim()
-                .split_once('=')
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .ok_or_else(malformed)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let pairs = split_sas(sas)
+        .map_err(|_| "SAS token is no query string of key=value pairs".to_string())?;
     Ok(AdlsSecret {
         signing: Arc::new(AzureCredential::SASToken(pairs)),
         value: sas.to_string(),

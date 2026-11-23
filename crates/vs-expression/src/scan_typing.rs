@@ -1273,9 +1273,8 @@ fn rewrite_operands(
     }
 }
 
-/// DataFusion truncates a timestamp literal to its TIMESTAMP operand's unit, while Exasol compares
-/// at full precision (#461, apache/datafusion#22142, fixed by apache/datafusion#22906). A DATE
-/// needs no floor, because it compares at the unit that holds the literal.
+/// DataFusion compares a TIMESTAMP with a finer literal at nanoseconds, failing outside 1677-2262,
+/// so the literal is floored to the operand's unit. A DATE compares at the literal's unit instead.
 fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
     let precision = |field: &str| children.one(field)?.value_digits();
     let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();

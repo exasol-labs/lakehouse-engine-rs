@@ -93,20 +93,11 @@ pub(super) async fn read_footer(
 
 /// The span of every column and offset index, which the opener reads in one request.
 fn page_index_range(metadata: &ParquetMetaData) -> Option<Range<u64>> {
-    let span = |offset: Option<i64>, length: Option<i32>| {
-        let start = u64::try_from(offset?).ok()?;
-        Some(start..start + u64::try_from(length?).ok()?)
-    };
     metadata
         .row_groups()
         .iter()
         .flat_map(|row_group| row_group.columns())
-        .flat_map(|column| {
-            [
-                span(column.column_index_offset(), column.column_index_length()),
-                span(column.offset_index_offset(), column.offset_index_length()),
-            ]
-        })
+        .flat_map(|column| [column.column_index_range(), column.offset_index_range()])
         .flatten()
         .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
 }

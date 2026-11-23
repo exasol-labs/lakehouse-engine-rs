@@ -102,7 +102,7 @@ A source that lacks a table column, even an optional one, has a column the table
 
 The export appends to a partitioned table under its current partition spec (see [Partitioned tables](#partitioned-tables)). It refuses a table of format version 3 or later, with an error that names the table and its format version.
 
-The export also refuses a table that keeps a dropped partition field under the name of a column. Apache Spark leaves this shape when it drops an identity partition field of a format version 1 table, such as `PARTITIONED BY (day)` followed by `DROP PARTITION FIELD day`. The commit library the export uses cannot commit to such a table, so the error names the table and the field before any write.
+The export also refuses a table that keeps a dropped partition field under the name of a column. Apache Spark leaves this shape when it drops an identity partition field of a format version 1 table, such as `PARTITIONED BY (day)` followed by `DROP PARTITION FIELD day`. Not every catalog accepts a commit to such a table, so the export refuses it before any write, with an error that names the table and the field.
 
 ### Data files
 

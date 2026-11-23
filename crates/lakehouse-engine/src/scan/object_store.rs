@@ -283,7 +283,7 @@ pub(crate) fn build_admission_limited_store(
     )
 }
 
-/// `object_store` 0.13.2 has no in-flight connection cap; `pool_max_idle_per_host` (unbounded by
+/// `object_store` has no in-flight connection cap; `pool_max_idle_per_host` (unbounded by
 /// default in reqwest) is the closest knob, bounding warm connections per host.
 fn client_options_for(budget: usize) -> ClientOptions {
     ClientOptions::new().with_pool_max_idle_per_host(budget.max(1))
@@ -313,7 +313,7 @@ fn index_file_sizes(
     Ok(())
 }
 
-/// DataFusion resolves an exact-file URL via `head`, which object_store 0.13.2 dispatches to
+/// DataFusion resolves an exact-file URL via `head`, which object_store dispatches to
 /// `get_opts(.., GetOptions { head: true, .. })`, so HEADs for indexed paths are answered here
 /// with no I/O; everything else delegates.
 #[derive(Debug)]
@@ -373,6 +373,7 @@ impl ObjectStore for SpecSizedObjectStore {
                 meta,
                 range: 0..0,
                 attributes: object_store::Attributes::default(),
+                extensions: Default::default(),
             });
         }
         self.inner.get_opts(location, options).await

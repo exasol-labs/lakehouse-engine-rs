@@ -2,14 +2,15 @@
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 
 use crate::common::e2e_harness::{
-    BROADCAST_JOIN, Expect, PathCheck, SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps,
+    BROADCAST_JOIN, Expect, NATIVE_COPY, PathCheck, SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps,
     assert_binary_columns_match_native_copy, assert_decimal_orders_numerically,
     assert_filters_match_native_copy, assert_hex_literal_compares_bytes, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_text_columns, assert_type_matrix,
-    column_adapter_notes, create_virtual_schema_with_password, declared_type, error_text, exa_conn,
-    explain_virtual_sql, has_broadcast_join_block, identifier_note, native_copy_mismatch, note_of,
-    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses, skip_reason,
-    skipped_entries, text_column, try_create_virtual_schema_with_password, value_to_string,
+    column_adapter_notes, create_native_copy, create_virtual_schema_with_password, declared_type,
+    error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block, identifier_note,
+    native_copy_mismatch, note_of, nullable_text, parse_int, parse_numeric, partition_positions,
+    reads, refuses, skip_reason, skipped_entries, text_column,
+    try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::{
@@ -762,6 +763,37 @@ fn date_range_batch() -> RecordBatch {
     .expect("date_range batch construction is infallible")
 }
 
+/// `DCM` in cents: fractions next to both integers, both signs, and the precision's bounds.
+const DECIMAL_ROUNDING_CENTS: [Option<i128>; 8] = [
+    Some(101),
+    Some(199),
+    Some(-101),
+    Some(-199),
+    Some(0),
+    Some(999_999_999),
+    Some(-999_999_999),
+    None,
+];
+
+fn decimal_rounding_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("DCM", DataType::Decimal128(9, 2), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=8)),
+            Arc::new(
+                Decimal128Array::from(DECIMAL_ROUNDING_CENTS.to_vec())
+                    .with_precision_and_scale(9, 2)
+                    .expect("DECIMAL(9,2) is valid"),
+            ),
+        ],
+    )
+    .expect("decimal_rounding batch construction is infallible")
+}
+
 const STATS_FILES: i64 = 3;
 
 /// #478 shape, one file per shard: Int64 and Int32 values whose squares overflow, constant groups
@@ -993,6 +1025,10 @@ fn write_all_fixtures() {
     write_parquet_fixture(
         &format!("{BASE_DIRECT}date_range/file1.parquet"),
         date_range_batch(),
+    );
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}decimal_rounding/file1.parquet"),
+        decimal_rounding_batch(),
     );
 
     for file in 0..STATS_FILES {
@@ -2356,6 +2392,90 @@ fn placeholder_dates_meet_timestamps_like_native() {
         .iter()
         .filter_map(|(query, path)| {
             native_copy_mismatch(&mut conn, &table, oracle, query, *path, Expect::Rows)
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scenario: A timestamp filter compares at full precision
+#[test]
+fn a_finer_timestamp_literal_compares_outside_the_nanosecond_range_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    if !engine_honors_declared_precision(&mut conn) {
+        return;
+    }
+    let table = vs_table(VS_DIRECT, "DATE_RANGE");
+    create_native_copy(&mut conn, &table, "STORED_TS");
+
+    // STORED_TS holds microseconds at 0001-01-01 and 9999-12-31, and every literal spells more
+    // digits, so each case compares a value or a literal outside 1677-09-21 to 2262-04-11.
+    let filters = [
+        "STORED_TS = TIMESTAMP '9999-12-31 23:59:59.999999999'",
+        "STORED_TS < TIMESTAMP '9999-12-31 23:59:59.999999999'",
+        "TIMESTAMP '0001-01-01 00:00:00.0000001' > STORED_TS",
+        "STORED_TS = TIMESTAMP '2024-01-01 12:00:00.1234565'",
+        "STORED_TS <> TIMESTAMP '2024-01-01 12:00:00.1234565'",
+        "STORED_TS IN (TIMESTAMP '2024-01-01 12:00:00.1234565', \
+         TIMESTAMP '9999-12-31 23:59:59.9999995')",
+        "STORED_TS IS NULL OR STORED_TS >= TIMESTAMP '2024-01-01 12:00:00.0000005'",
+        "NOT (STORED_TS BETWEEN TIMESTAMP '0001-01-01 00:00:00.0000005' \
+         AND TIMESTAMP '9999-12-31 23:59:59.9999995')",
+        "COALESCE(STORED_TS, TIMESTAMP '2000-01-01 00:00:00') \
+         > TIMESTAMP '2024-01-01 12:00:00.0000005'",
+        "GREATEST(STORED_TS, TIMESTAMP '0001-01-01 00:00:00') \
+         = TIMESTAMP '9999-12-31 23:59:59.9999991'",
+        "NULLIF(STORED_TS, TIMESTAMP '0001-01-01 00:00:00') \
+         < TIMESTAMP '9999-12-31 23:59:59.9999995'",
+        "CASE WHEN ID > 0 THEN STORED_TS END <= TIMESTAMP '9999-12-31 23:59:59.9999995'",
+        "DATE_TRUNC('second', STORED_TS) <> TIMESTAMP '9999-12-31 23:59:59.0000005'",
+    ];
+    let failures: Vec<String> = filters
+        .iter()
+        .filter_map(|filter| {
+            native_copy_mismatch(
+                &mut conn,
+                &table,
+                NATIVE_COPY,
+                &format!("SELECT ID FROM {{T}} WHERE {filter}"),
+                PathCheck::Has("\"filter\":\""),
+                Expect::Rows,
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scenario: FLOOR and CEIL over a DECIMAL return native values
+#[test]
+fn floor_and_ceil_over_a_decimal_match_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = vs_table(VS_DIRECT, "DECIMAL_ROUNDING");
+    create_native_copy(&mut conn, &table, "DCM");
+
+    let cases = [
+        (
+            "SELECT ID, FLOOR(DCM), CEIL(DCM) FROM {T}",
+            PathCheck::Has("floor("),
+        ),
+        (
+            "SELECT ID FROM {T} WHERE CEIL(DCM) = 2",
+            PathCheck::Has("ceil("),
+        ),
+        (
+            "SELECT ID FROM {T} WHERE FLOOR(DCM) = -2 OR CEIL(DCM) = -1",
+            PathCheck::Has("floor("),
+        ),
+        (
+            "SELECT ID FROM {T} WHERE CEIL(DCM) > 9999999",
+            PathCheck::Has("ceil("),
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(query, path)| {
+            native_copy_mismatch(&mut conn, &table, NATIVE_COPY, query, *path, Expect::Rows)
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));

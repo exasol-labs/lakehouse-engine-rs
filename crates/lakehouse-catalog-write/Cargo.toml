@@ -27,7 +27,6 @@ object_store = { workspace = true, features = ["azure"] }
 typetag      = "0.2"
 bytes        = "1"
 futures      = { workspace = true }
-percent-encoding = { workspace = true }
 
 async-trait = { workspace = true }
 rand        = { workspace = true }
