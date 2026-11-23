@@ -134,7 +134,7 @@ impl DeltaSnapshot {
         Ok(active)
     }
 
-    fn failed_to(&self, attempted: &str, cause: &(dyn std::error::Error + 'static)) -> UdfError {
+    fn failed_to(&self, attempted: &str, cause: &delta_kernel::KernelError) -> UdfError {
         UdfError::User(format!(
             "failed to {attempted} for Delta table root '{}': {}",
             self.snapshot.table_root(),

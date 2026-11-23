@@ -145,15 +145,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ar_archive_writer"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523e5e187fff36fcb8d1d19ccf0ca4ca43ec3d158316057f66dc6f72716bc5ec"
-dependencies = [
- "object",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2246,7 +2237,8 @@ dependencies = [
 [[package]]
 name = "delta_kernel"
 version = "0.30.1"
-source = "git+https://github.com/delta-io/delta-kernel-rs?rev=eb57996736775c28438f724d46bb6cba53f03a81#eb57996736775c28438f724d46bb6cba53f03a81"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54126a2c4de6be3940069183355206f82bb0567fb54432dfdf54ecea9d9b8f0c"
 dependencies = [
  "arrow",
  "bytes",
@@ -2266,8 +2258,6 @@ dependencies = [
  "rustc_version",
  "serde",
  "serde_json",
- "serde_stacker",
- "stacker",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "tracing",
@@ -2280,7 +2270,8 @@ dependencies = [
 [[package]]
 name = "delta_kernel_default_engine"
 version = "0.30.1"
-source = "git+https://github.com/delta-io/delta-kernel-rs?rev=eb57996736775c28438f724d46bb6cba53f03a81#eb57996736775c28438f724d46bb6cba53f03a81"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e15ad6ff8c6f38d0dea9dc60afd1db822625b35e29d9df85a867e6b36f0b891f"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2301,7 +2292,8 @@ dependencies = [
 [[package]]
 name = "delta_kernel_derive"
 version = "0.30.1"
-source = "git+https://github.com/delta-io/delta-kernel-rs?rev=eb57996736775c28438f724d46bb6cba53f03a81#eb57996736775c28438f724d46bb6cba53f03a81"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dfb679de985e2b329db00789c7ae99914e83d18b784d0f57e1035f4d210031b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3994,15 +3986,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "object"
-version = "0.39.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "object_store"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4648,16 +4631,6 @@ dependencies = [
  "syn 2.0.118",
  "version_check",
  "yansi",
-]
-
-[[package]]
-name = "psm"
-version = "0.1.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
-dependencies = [
- "ar_archive_writer",
- "cc",
 ]
 
 [[package]]
@@ -5403,17 +5376,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_stacker"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a"
-dependencies = [
- "serde",
- "serde_core",
- "stacker",
-]
-
-[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5630,19 +5592,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "stacker"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "psm",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "static_assertions"

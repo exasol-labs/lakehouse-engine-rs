@@ -8,7 +8,7 @@ use crate::scan::spec::DeltaDeletionVectorStorage;
 use bytes::Bytes;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::{
-    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler,
+    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIteratorStatic, StorageHandler,
 };
 use exasol_udf_sdk::error::UdfError;
 use iceberg::delete_vector::DeleteVector;
@@ -311,18 +311,11 @@ fn unsupported(operation: &str) -> KernelError {
 }
 
 impl StorageHandler for PrefetchedDeletionVectorBytes {
-    fn list_from(
-        &self,
-        _path: &Url,
-        _end: Option<&Url>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
         Err(unsupported("list_from"))
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
         let bodies: Vec<KernelResult<Bytes>> = files
             .into_iter()
             .map(|(location, range)| self.body(&location, range))

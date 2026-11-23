@@ -138,7 +138,7 @@ fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     );
 
     let refusals = [
-        ("list_from", shim.list_from(&served, None).err().is_some()),
+        ("list_from", shim.list_from(&served).err().is_some()),
         (
             "copy_atomic",
             shim.copy_atomic(&served, &elsewhere).is_err(),
