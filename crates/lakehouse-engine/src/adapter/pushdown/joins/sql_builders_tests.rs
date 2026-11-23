@@ -8,7 +8,6 @@ use super::super::tests::{
     join_request, legs_from_leaves, nq3_join_request, request_legs, resolved_side,
     self_join_request, three_table_join_request, two_scan_tuning,
 };
-use super::super::where_placement::tests::scan_applies;
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::adapter::tuning::Tuning;
@@ -1740,7 +1739,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         fan_out_spec,
         &first_table_column_types(&request),
         &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
-        &scan_applies(None),
+        &single_scan_placement(&request),
         &test_context(),
     )
     .expect("the grouped qualified fallback must build");
@@ -1801,13 +1800,8 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let rich_pushdown = parsed_pushdown(&rich_request);
-    let rich = single_table_emission(
-        &rich_request,
-        &rich_pushdown,
-        &WherePlacement::whole(&rich_pushdown),
-        &column_types(&all_cols),
-    )
-    .expect("the request names no refused column");
+    let rich = whole_request_emission(&rich_request, &rich_pushdown, &column_types(&all_cols))
+        .expect("the request names no refused column");
     let (proj, types) = split_projection(&rich.projection());
     let names = proj_names(&proj);
     for expected in ["GK", "REGION", "HCOL", "OCOL", "FCOL"] {
@@ -1846,13 +1840,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let grouped_req = parsed_pushdown(&grouped_request);
-    let grouped = single_table_emission(
-        &grouped_request,
-        &grouped_req,
-        &WherePlacement::whole(&grouped_req),
-        &column_types(&grouped_all),
-    )
-    .expect("the request names no refused column");
+    let grouped =
+        whole_request_emission(&grouped_request, &grouped_req, &column_types(&grouped_all))
+            .expect("the request names no refused column");
     let (gproj, _) = split_projection(&grouped.projection());
     assert_eq!(
         proj_names(&gproj),
@@ -1866,7 +1856,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         fan_out_base(),
         &column_types(&grouped_all),
         &unqualified_shards(shards.to_vec()),
-        &scan_applies(None),
+        &single_scan_placement(&grouped_request),
         &test_context(),
     )
     .expect("grouped decline wrapper must build");
@@ -1897,13 +1887,8 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let sg_req = parsed_pushdown(&sg_request);
-    let single_group = single_table_emission(
-        &sg_request,
-        &sg_req,
-        &WherePlacement::whole(&sg_req),
-        &column_types(&sg_all),
-    )
-    .expect("the request names no refused column");
+    let single_group = whole_request_emission(&sg_request, &sg_req, &column_types(&sg_all))
+        .expect("the request names no refused column");
     let (sproj, _) = split_projection(&single_group.projection());
     assert_eq!(
         proj_names(&sproj),
@@ -1916,7 +1901,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         fan_out_base(),
         &column_types(&sg_all),
         &unqualified_shards(shards.to_vec()),
-        &scan_applies(None),
+        &single_scan_placement(&sg_request),
         &test_context(),
     )
     .expect("single-group Case 2/3 wrapper must build");
@@ -1939,17 +1924,12 @@ fn fallback_projection_narrows_to_referenced_columns() {
 /// The names [`single_table_emission`] answers for `request` over `columns`.
 fn wrapper_emission_names(request: &Json, columns: &ColumnTypes) -> Vec<String> {
     let pushdown = parsed_pushdown(request);
-    single_table_emission(
-        request,
-        &pushdown,
-        &WherePlacement::whole(&pushdown),
-        columns,
-    )
-    .expect("the request names no refused column")
-    .columns()
-    .iter()
-    .map(|(column, _)| column.name.clone())
-    .collect()
+    whole_request_emission(request, &pushdown, columns)
+        .expect("the request names no refused column")
+        .columns()
+        .iter()
+        .map(|(column, _)| column.name.clone())
+        .collect()
 }
 
 #[test]
@@ -2015,13 +1995,8 @@ fn the_wrapper_fan_out_emits_the_first_column_the_reader_does_not_refuse() {
     ] {
         let all_cols = refusing_column_types(&all_cols, &refused);
         let pushdown = parsed_pushdown(&request);
-        let emitted = single_table_emission(
-            &request,
-            &pushdown,
-            &WherePlacement::whole(&pushdown),
-            &all_cols,
-        )
-        .expect("a readable column is left");
+        let emitted = whole_request_emission(&request, &pushdown, &all_cols)
+            .expect("a readable column is left");
 
         let (proj, types) = split_projection(&emitted.projection());
 
@@ -2042,7 +2017,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &request,
         &pushdown,
         &base,
-        &scan_applies(None),
+        &single_scan_placement(&request),
         &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
         &first_table_column_types(&request),
         &test_context(),

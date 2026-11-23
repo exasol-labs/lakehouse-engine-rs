@@ -31,8 +31,6 @@ pub(super) use sql_builders::{
     EmptyRelation, n_scan_emission, qualified_single_table_fallback_pushdown, single_table_emission,
 };
 pub(super) use where_placement::WherePlacement;
-#[cfg(test)]
-pub(super) use where_placement::tests::scan_applies;
 // The dispatch-golden sibling module drives the broadcast and N-scan builders directly.
 #[cfg(test)]
 pub(super) use sql_builders::{

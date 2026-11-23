@@ -1,4 +1,3 @@
-use super::joins::scan_applies;
 use super::test_support::*;
 use super::*;
 use crate::adapter::tuning::Tuning;
@@ -683,7 +682,7 @@ fn guard_dispatch_sql(
             RowProjection::Direct(projected_columns(&proj_cols, &proj_types))
         },
         &column_types(&guard_col_types()),
-        scan_applies(None),
+        single_scan_placement(request),
         limit,
         logical_schema,
         &sample_scan_storage(),
@@ -712,12 +711,7 @@ fn dispatch_with(
         &pushdown,
         projection,
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
-        &single_table_emission(
-            request,
-            &pushdown,
-            &WherePlacement::whole(&pushdown),
-            col_types,
-        )?,
+        &whole_request_emission(request, &pushdown, col_types)?,
         scan_for(col_types, &pushdown),
         placement,
         limit,
@@ -1733,7 +1727,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection,
         &emitting(&columns),
         scan_for(&columns, &pushdown),
-        scan_applies(None),
+        single_scan_placement(&request),
         None,
         false,
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),

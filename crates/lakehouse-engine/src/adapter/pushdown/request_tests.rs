@@ -74,32 +74,24 @@ fn a_rewrite_that_makes_every_sort_key_constant_drops_the_order_by() {
     let pushdown = request(json!({
         "orderBy": [{"expression": column("A"), "isAscending": true, "nullsLast": true}],
     }));
-    let rewritten = pushdown
-        .try_map_clauses(&[Clause::OrderBy], |order_by| {
-            order_by[0]["expression"] = json!({"type": "literal_exactnumeric", "value": "1"});
-            Ok::<_, UdfError>(())
-        })
-        .expect("the rewrite cannot fail");
+    let rewritten = pushdown.map_clauses(&[Clause::OrderBy], |order_by| {
+        let mut order_by = order_by.clone();
+        order_by[0]["expression"] = json!({"type": "literal_exactnumeric", "value": "1"});
+        order_by
+    });
     assert!(rewritten.order_by().is_empty());
 }
 
 #[test]
-fn try_map_select_items_passes_each_item_its_index() {
-    let pushdown = PushdownRequest::parse(json!({
-        "selectList": [column("A"), column("B")],
-        "selectListDataTypes": [{"type": "BOOLEAN"}, {"type": "BOOLEAN"}],
-    }))
-    .expect("the fixture parses");
-    let rewritten = pushdown
-        .try_map_select_items(|index, item| {
-            *item = column(&format!("C{index}"));
-            Ok::<_, UdfError>(())
-        })
-        .expect("the rewrite cannot fail");
-    assert_eq!(
-        rewritten.select_items(),
-        Some([column("C0"), column("C1")].as_slice())
-    );
+fn try_map_clauses_names_each_clause_and_stops_at_the_first_error() {
+    let pushdown = request(json!({"filter": column("A"), "having": column("B")}));
+    let mut seen = Vec::new();
+    let result = pushdown.try_map_clauses(&Clause::ALL, |clause, _| {
+        seen.push(clause);
+        Err(clause)
+    });
+    assert_eq!(result.err(), Some(Clause::Filter));
+    assert_eq!(seen, [Clause::Filter]);
 }
 
 #[test]

@@ -2,12 +2,6 @@ use super::super::super::test_support::*;
 use super::*;
 use crate::types::exasol_type::ExasolType;
 
-/// A placement whose one scan applies `sql` and whose wrapper applies nothing, for a golden that
-/// renders a scan filter its fixture does not carry.
-pub(in super::super::super) fn scan_applies(sql: Option<String>) -> WherePlacement {
-    WherePlacement::one_scan(sql, None)
-}
-
 fn id_and_amount() -> crate::adapter::pushdown::ColumnTypes {
     column_types(&[
         ("ID", ExasolType::decimal(20, 0)),

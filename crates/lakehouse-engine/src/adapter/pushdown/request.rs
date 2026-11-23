@@ -224,39 +224,24 @@ impl PushdownRequest {
         which: &[Clause],
         mut rewrite: impl FnMut(&Json) -> Json,
     ) -> Self {
-        let mut json = self.json.clone();
-        for &clause in which {
-            if let Some(value) = self.clause(clause) {
-                json[clause.key()] = rewrite(value);
-            }
-        }
-        self.rebuilt(json)
+        let Ok(rewritten) = self.try_map_clauses(which, |_, value| {
+            *value = rewrite(value);
+            Ok::<_, std::convert::Infallible>(())
+        });
+        rewritten
     }
 
-    /// [`Self::map_clauses`] with an in-place rewrite that can fail.
+    /// [`Self::map_clauses`] with an in-place rewrite that can fail and is told which clause it
+    /// rewrites.
     pub(super) fn try_map_clauses<E>(
         &self,
         which: &[Clause],
-        mut rewrite: impl FnMut(&mut Json) -> Result<(), E>,
+        mut rewrite: impl FnMut(Clause, &mut Json) -> Result<(), E>,
     ) -> Result<Self, E> {
         let mut json = self.json.clone();
         for &clause in which {
             if let Some(value) = json.get_mut(clause.key()).filter(|value| !value.is_null()) {
-                rewrite(value)?;
-            }
-        }
-        Ok(self.rebuilt(json))
-    }
-
-    /// This request with `rewrite` applied to each select-list item beside its index.
-    pub(super) fn try_map_select_items<E>(
-        &self,
-        mut rewrite: impl FnMut(usize, &mut Json) -> Result<(), E>,
-    ) -> Result<Self, E> {
-        let mut json = self.json.clone();
-        if let Some(Json::Array(items)) = json.get_mut(Clause::SelectList.key()) {
-            for (index, item) in items.iter_mut().enumerate() {
-                rewrite(index, item)?;
+                rewrite(clause, value)?;
             }
         }
         Ok(self.rebuilt(json))

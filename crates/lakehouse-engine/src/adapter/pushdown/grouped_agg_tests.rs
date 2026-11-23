@@ -1,5 +1,5 @@
 use super::super::detect_aggregates;
-use super::super::joins::{build_qualified_single_table_fallback_sql, scan_applies};
+use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::merge_select_items;
 use super::super::support::{SCAN_UDF_NAME, involved_columns, shard_count};
 use super::super::test_support::*;
@@ -1527,7 +1527,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         fan_out_spec,
         &column_types(&all_cols),
         &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
-        &scan_applies(None),
+        &single_scan_placement(&request),
         &test_context(),
     )
     .expect("qualified fallback must build");

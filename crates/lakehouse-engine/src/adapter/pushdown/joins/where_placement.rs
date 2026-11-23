@@ -98,4 +98,4 @@ impl WherePlacement {
 
 #[cfg(test)]
 #[path = "where_placement_tests.rs"]
-pub(super) mod tests;
+mod tests;

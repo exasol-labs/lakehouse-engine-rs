@@ -59,18 +59,17 @@ impl StatementClock {
     /// TSTZ keeps the UTC instant, which the Exasol dialect converts into `SESSIONTIMEZONE`.
     /// Everywhere else a TSTZ value compares as the plain wall clock of the folding zone.
     pub(super) fn fold(&self, pushdown: PushdownRequest) -> Result<PushdownRequest, UdfError> {
-        let others: Vec<Clause> = Clause::ALL
-            .into_iter()
-            .filter(|&clause| clause != Clause::SelectList)
-            .collect();
-        let folded = pushdown.try_map_clauses(&others, |clause| {
-            self.walk(clause, &|tstz| self.wall_clock_literal(tstz))
-        })?;
-        folded.try_map_select_items(|index, item| match pushdown.select_type(index) {
-            Some(ExasolType::TimestampWithLocalTimeZone { .. }) => {
-                self.walk(item, &|tstz| Ok(tstz_literal(tstz)))
+        pushdown.try_map_clauses(&Clause::ALL, |clause, value| match clause {
+            Clause::SelectList => {
+                let mut items = value.as_array_mut().into_iter().flatten().enumerate();
+                items.try_for_each(|(index, item)| match pushdown.select_type(index) {
+                    Some(ExasolType::TimestampWithLocalTimeZone { .. }) => {
+                        self.walk(item, &|tstz| Ok(tstz_literal(tstz)))
+                    }
+                    _ => self.walk(item, &|tstz| self.wall_clock_literal(tstz)),
+                })
             }
-            _ => self.walk(item, &|tstz| self.wall_clock_literal(tstz)),
+            _ => self.walk(value, &|tstz| self.wall_clock_literal(tstz)),
         })
     }
 

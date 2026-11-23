@@ -708,6 +708,21 @@ pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
     PushdownRequest::parse(pd(request)).expect("the fixture declares a valid selectListDataTypes")
 }
 
+/// Every column `pushdown` names, its whole WHERE included, as the single-table dispatch
+/// derives the columns its row scan projects from.
+pub(super) fn whole_request_emission(
+    request: &Json,
+    pushdown: &PushdownRequest,
+    columns: &ColumnTypes,
+) -> Result<Emitted, UdfError> {
+    single_table_emission(request, pushdown, &WherePlacement::whole(pushdown), columns)
+}
+
+/// The placement production gives `request`'s WHERE over its first table.
+pub(super) fn single_scan_placement(request: &Json) -> WherePlacement {
+    WherePlacement::single_scan(scan_of(request), &parsed_pushdown(request))
+}
+
 /// [`parsed_pushdown`] without the request check, for the check itself.
 fn parsed_pushdown_unchecked(request: &Json) -> PushdownRequest {
     PushdownRequest::parse(request["pushdownRequest"].clone())
