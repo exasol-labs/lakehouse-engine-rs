@@ -5,6 +5,7 @@ use crate::scan::test_support::{CountingObjectStore, current_thread_runtime, par
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
 use chrono::TimeZone;
+use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
 use object_store::GetRange;
 use object_store::PutPayload;
 use object_store::memory::InMemory;
@@ -55,8 +56,6 @@ fn get_test_schema_descr() -> SchemaDescPtr {
 /// The whole-file selection of the scanned row groups, concatenating each row group's local
 /// selection; a skipped row group contributes no rows.
 fn overall_selection(plan: ParquetAccessPlan, metas: &[RowGroupMetaData]) -> RowSelection {
-    use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
-
     let mut selectors = Vec::new();
     for (access, meta) in plan.into_inner().into_iter().zip(metas) {
         let rows = usize::try_from(meta.num_rows()).unwrap();
@@ -133,8 +132,6 @@ fn access_plan_matches_upstream_whole_file_selection() {
 
 #[test]
 fn access_plan_leaves_untouched_row_groups_unselected() {
-    use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
-
     let metas = row_groups_of(&[1000, 500, 500]);
     // Deletes touch row groups 0 and 2 but not row group 1 (rows 1000..1500).
     let deletes = RoaringTreemap::from_iter([0u64, 999, 1500]);
@@ -149,8 +146,6 @@ fn access_plan_leaves_untouched_row_groups_unselected() {
 /// Scenario: Access-plan construction cost does not grow with the row-group count
 #[test]
 fn access_plan_skips_a_fully_deleted_row_group_and_splits_runs_at_its_bounds() {
-    use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
-
     let metas = row_groups_of(&[4, 4, 4]);
     // One run spans the end of row group 0, all of row group 1, and the start of row group 2.
     let deletes = RoaringTreemap::from_iter(2u64..9);

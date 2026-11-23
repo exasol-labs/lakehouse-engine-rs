@@ -5,7 +5,7 @@ A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal fi
 ## Background
 
 * Exasol compares a `TIMESTAMP(p)` value with a timestamp literal at the literal's full precision. A bare `TIMESTAMP` declaration holds 3 fractional digits.
-* DataFusion converts a DATE and a TIMESTAMP of any unit to a nanosecond timestamp when it compares or unifies them. A nanosecond timestamp spans only 1677-09-21 to 2262-04-11.
+* DataFusion converts a DATE and a TIMESTAMP of any unit to a nanosecond timestamp when it compares or unifies them, and a TIMESTAMP when it compares it with a literal finer than its unit. A nanosecond timestamp spans only 1677-09-21 to 2262-04-11.
 * File pruning converts a timestamp literal at the column's unit, which is nanoseconds only for an Iceberg `timestamp_ns` or `timestamptz_ns` column.
 * On Exasol 8.x every timestamp column is declared at milliseconds, so a native table cannot hold a finer source value. A filter there compares at the source unit. This is the named Exasol 8.x target-type limitation, and this feature does not cover that engine arm.
 
@@ -13,7 +13,8 @@ A pushed-down filter that compares a DATE or TIMESTAMP operand with a literal fi
 
 ### Scenario: A timestamp filter compares at full precision
 
-* *GIVEN* an operand whose Exasol type the typed pass derives as `TIMESTAMP(p)`, and a timestamp literal with more than `p` significant fractional digits
+* *GIVEN* an operand of Exasol type `TIMESTAMP(p)`, and a timestamp literal with more than `p` significant fractional digits
+* *AND* the operand's values and the literal lie anywhere from 0001-01-01 to 9999-12-31, also outside 1677-09-21 to 2262-04-11, unless the operand itself fails there (`sql-functions/vs-expression-translator-date-fns`)
 * *AND* the operand is a column declared with the `p` fractional digits of its source unit, a CAST, a date addition, `DATE_TRUNC`, `NULLIF`, or a CASE, `COALESCE`, `GREATEST`, or `LEAST`
 * *WHEN* a filter compares the operand with the literal through `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, or `IN`, with the literal on either side, under `NOT`, or inside `OR`
 * *THEN* the query SHALL return the rows native Exasol returns for the same values

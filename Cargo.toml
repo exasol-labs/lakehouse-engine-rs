@@ -35,7 +35,7 @@ regex = { version = "1" }
 roaring = { version = "0.11" }
 
 # Must link the same arrow major as datafusion/exasol-udf-sdk. Pinned to one `main` rev
-# because no release is on arrow 60 yet (#499); all three crates must share the rev.
+# because no release is on arrow 60 yet; all three crates must share the rev.
 iceberg              = { git = "https://github.com/apache/iceberg-rust", rev = "a7160a0a2318028df1a8ae88abbb3b5d611fa3d8" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "a7160a0a2318028df1a8ae88abbb3b5d611fa3d8" }
 # RestCatalog requires a StorageFactory; iceberg core ships no S3 one.

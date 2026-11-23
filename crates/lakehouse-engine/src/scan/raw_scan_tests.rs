@@ -1113,3 +1113,43 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
         "the resolved credential must be stripped from a raw-scan error: {text}"
     );
 }
+
+#[tokio::test]
+async fn datafusion_fails_a_finer_timestamp_literal_against_a_value_outside_nanoseconds() {
+    use datafusion::arrow::array::TimestampMicrosecondArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::SessionContext;
+
+    // DataFusion compares a microsecond column with a finer literal at nanoseconds. A pass means it
+    // no longer does, and `floor_timestamp_literals` (vs-expression `scan_typing.rs`) and this go.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let end_of_time = 253_402_300_799_999_999;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![end_of_time]))],
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+
+    let outcome = match ctx
+        .sql("SELECT ts FROM t WHERE ts = TIMESTAMP '2024-01-01 00:00:00.1234565'")
+        .await
+    {
+        Ok(frame) => frame.collect().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+
+    assert!(
+        outcome.is_err(),
+        "DataFusion compares a finer literal without the nanosecond cast: remove \
+         `floor_timestamp_literals` and this test"
+    );
+}

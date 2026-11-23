@@ -464,10 +464,11 @@ fn refuse_date_promotion(
 fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
     let path = delete.file_path().to_string();
-    // A task planned from a manifest entry always carries these, and iceberg-rust refuses to build
-    // a deletion-vector task missing them, so the defaults never apply.
+    // A task planned from a manifest entry always carries the size, so the default never applies.
     let size = delete.file_size_in_bytes().unwrap_or_default();
     match (delete.file_type(), delete.file_format()) {
+        // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
+        // never apply.
         (PositionDeletes, iceberg::spec::DataFileFormat::Puffin) => {
             DeleteMechanism::IcebergPuffinDeletionVector {
                 path,

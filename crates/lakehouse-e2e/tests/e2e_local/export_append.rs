@@ -232,47 +232,9 @@ fn export_appends_into_spark_tables() {
     }
 }
 
-/// Scenario: A void partition field named like its column takes appends
-#[test]
-fn export_appends_into_a_void_partition_field_named_like_its_column() {
-    stack();
-    setup();
-    reset_to_unexported_snapshot(NAMESPACE, V1_VOID_COLUMN);
-    let before = local_table_metadata(NAMESPACE, V1_VOID_COLUMN);
-    assert_eq!(
-        shape(&before),
-        (
-            1,
-            V1_VOID_COLUMN_SPEC.to_vec(),
-            V1_VOID_COLUMN_COLUMNS.to_vec()
-        ),
-        "fixture guard"
-    );
-
-    let sql = EXPORT_DIRECT.export(
-        "(SELECT CAST(2 AS DECIMAL(18,0)) AS ID, DATE '2024-01-16' AS \"DAY\" FROM DUAL)",
-        &qualified(V1_VOID_COLUMN),
-        "",
-    );
-    assert_eq!(exported_rows(&mut exa_conn(), &sql), 1);
-
-    let after = local_table_metadata(NAMESPACE, V1_VOID_COLUMN);
-    assert_one_new_export(V1_VOID_COLUMN, &before, &after, 1);
-    let rows = exa_conn().query_columns(&format!(
-        "SELECT TO_CHAR(ID), TO_CHAR(\"DAY\", 'YYYY-MM-DD') FROM {} ORDER BY ID",
-        vs_table(READ_VS, V1_VOID_COLUMN)
-    ));
-    let rows: Vec<Vec<Option<String>>> = rows.iter().map(|column| text_column(column)).collect();
-    let text = |values: [&str; 2]| values.map(|value| Some(value.to_string())).to_vec();
-    assert_eq!(
-        rows,
-        vec![text(["1", "2"]), text(["2024-01-15", "2024-01-16"])],
-        "the Spark row and the exported row, by column"
-    );
-}
-
 /// Scenario: Every column mismatch fails the export in one error before any data is written
 /// Scenario: A format-version 3 table is refused before any data is written
+/// Scenario: A void partition field named like a column is refused before any data is written
 #[test]
 fn export_refuses_appends_the_table_cannot_take() {
     stack();
@@ -325,6 +287,17 @@ fn export_refuses_appends_the_table_cannot_take() {
                 qualified(V3)
             ),
             Some((3, &[][..], &V3_COLUMNS[..])),
+        ),
+        (
+            "a void partition field named like a column",
+            (NAMESPACE, V1_VOID_COLUMN),
+            "(SELECT CAST(2 AS DECIMAL(18,0)) AS ID, DATE '2024-01-16' AS \"DAY\" FROM DUAL)",
+            format!(
+                "table {} keeps the dropped partition field day (void) under the name of a \
+                 column",
+                qualified(V1_VOID_COLUMN)
+            ),
+            Some((1, V1_VOID_COLUMN_SPEC, &V1_VOID_COLUMN_COLUMNS[..])),
         ),
     ];
 

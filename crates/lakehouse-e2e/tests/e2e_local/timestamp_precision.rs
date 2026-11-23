@@ -750,8 +750,8 @@ fn a_derived_timestamp_operand_compares_with_a_finer_literal_like_native() {
     let mut conn = exa_conn();
     let table = qualified_probe();
 
-    // Every literal spells more digits than its operand's precision, so each case compares
-    // below the operand's unit.
+    // Every literal spells more digits than its operand's precision, so each case is floored
+    // except the DATE, which compares at the literal's unit.
     let filters = [
         "COALESCE(TS, TIMESTAMP '2000-01-01 00:00:00') < TIMESTAMP '2024-01-01 00:00:00.1234565'",
         "GREATEST(TS, TIMESTAMP '2000-01-01 00:00:00.1') = TIMESTAMP '2024-01-01 00:00:00.1234561'",

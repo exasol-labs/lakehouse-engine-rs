@@ -75,10 +75,11 @@ fn only_a_table_of_format_version_1_or_2_takes_appends() {
     }
 }
 
+/// Scenario: A void partition field named like a column is refused before any data is written
 #[test]
-fn a_partition_field_named_like_a_column_is_refused_unless_it_is_its_identity_or_void() {
+fn a_void_partition_field_named_like_a_column_is_refused_naming_it() {
     // The spec comes from JSON as a catalog serves it, because the partition spec builder refuses
-    // a field named like a column that is not its identity or void.
+    // a field named like another column.
     let spec = |first: &str, source: i32| -> PartitionSpec {
         serde_json::from_value(serde_json::json!({
             "spec-id": 1,
@@ -102,25 +103,21 @@ fn a_partition_field_named_like_a_column_is_refused_unless_it_is_its_identity_or
     };
 
     assert_eq!(
-        refused("bucket[4]", 1),
+        refused("void", 1),
         Some(
-            "LAKEHOUSE_EXPORT: table ns.t has the partition field c0 (bucket[4]) named like a \
-             column; the export appends only to tables whose partition fields are named like a \
-             column only as that column's identity or void field"
+            "LAKEHOUSE_EXPORT: table ns.t keeps the dropped partition field c0 (void) under the \
+             name of a column; the export appends only to tables whose partition fields are not \
+             named like a column"
                 .to_string()
         )
     );
-    for (transform, why) in [
-        ("identity", "an identity field is named like its column"),
-        (
-            "void",
-            "Spark keeps a dropped version 1 identity field as void under its name",
-        ),
-    ] {
-        assert_eq!(refused(transform, 1), None, "{why}");
-        assert!(
-            refused(transform, 2).is_some(),
-            "a {transform} field of another column named like c0"
-        );
-    }
+    assert_eq!(
+        refused("identity", 1),
+        None,
+        "an identity field is named like its column"
+    );
+    assert!(
+        refused("identity", 2).is_some(),
+        "an identity field of another column named like c0"
+    );
 }

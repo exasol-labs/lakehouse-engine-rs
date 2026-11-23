@@ -117,8 +117,8 @@ impl ExportTarget for IcebergRestTarget {
 }
 
 /// Refuses format version 3 or later, whose row lineage and encryption keys the export does not
-/// maintain, and a partition field named like a column unless it is that column's identity or
-/// void, which iceberg-rust cannot commit to.
+/// maintain, and a partition field named like a column unless it is that column's identity, which
+/// a commit cannot land on.
 fn refuse_unappendable(
     table: &TableIdent,
     version: FormatVersion,
@@ -132,24 +132,22 @@ fn refuse_unappendable(
             version as u8
         )));
     }
-    // iceberg-rust's commit rebinds the default spec and refuses a field named like a column unless
-    // it is that column's identity or void.
+    // iceberg-rust refuses such a field unless it is identity or void, and Lakekeeper refuses the
+    // void one Spark leaves in version 1 with a 409 that the commit loop retries for minutes.
     let named_like_columns: Vec<String> = spec
         .fields()
         .iter()
         .filter(|field| {
             schema.field_by_name(&field.name).is_some_and(|column| {
-                !matches!(field.transform, Transform::Identity | Transform::Void)
-                    || column.id != field.source_id
+                field.transform != Transform::Identity || column.id != field.source_id
             })
         })
         .map(|field| format!("{} ({})", field.name, field.transform))
         .collect();
     if !named_like_columns.is_empty() {
         return Err(refusal(format_args!(
-            "table {table} has the partition field {} named like a column; the export appends \
-             only to tables whose partition fields are named like a column only as that \
-             column's identity or void field",
+            "table {table} keeps the dropped partition field {} under the name of a column; the \
+             export appends only to tables whose partition fields are not named like a column",
             named_like_columns.join(", ")
         )));
     }

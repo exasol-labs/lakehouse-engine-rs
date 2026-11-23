@@ -42,3 +42,24 @@ fn a_literal_types_by_every_spelled_digit_and_fits_by_its_significant_ones() {
     assert!(literal.fits(TimestampUnit::Microsecond));
     assert!(!literal.fits(TimestampUnit::Millisecond));
 }
+
+#[test]
+fn floor_cuts_only_a_literal_finer_than_the_precision() {
+    let cases = [
+        (
+            "2024-01-01 00:00:00.1234567",
+            3,
+            Some("2024-01-01 00:00:00.123"),
+        ),
+        ("2024-01-01 00:00:00.9", 0, Some("2024-01-01 00:00:00")),
+        ("2024-01-01 00:00:00.123000", 3, None),
+        ("2024-01-01 00:00:00", 0, None),
+    ];
+    for (value, precision, expected) in cases {
+        assert_eq!(
+            TimestampLiteral(value).floor(precision).as_deref(),
+            expected,
+            "{value} at {precision}"
+        );
+    }
+}
