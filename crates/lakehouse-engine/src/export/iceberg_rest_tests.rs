@@ -78,8 +78,8 @@ fn only_a_table_of_format_version_1_or_2_takes_appends() {
 /// Scenario: A void partition field named like a column is refused before any data is written
 #[test]
 fn a_void_partition_field_named_like_a_column_is_refused_naming_it() {
-    // Spark keeps a dropped version 1 identity field as `void` under its column's name, which the
-    // partition spec builder refuses, so the spec comes from JSON as a catalog serves it.
+    // The spec comes from JSON as a catalog serves it, because the partition spec builder refuses
+    // a field named like another column.
     let spec = |first: &str, source: i32| -> PartitionSpec {
         serde_json::from_value(serde_json::json!({
             "spec-id": 1,

@@ -962,7 +962,7 @@ fn size_index_keys_by_listing_url_prefix() {
     assert_eq!(index.get(&rel_key), Some(&111));
     assert_eq!(index.get(&abs_key), Some(&222));
 
-    // The prefix DataFusion 54 hands to head().
+    // The prefix DataFusion hands to head().
     let rel_url = ListingTableUrl::parse("s3://bucket/db/table/data/rel.parquet").unwrap();
     assert_eq!(rel_url.prefix(), &rel_key);
 }

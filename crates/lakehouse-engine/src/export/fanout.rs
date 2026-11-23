@@ -41,8 +41,8 @@ pub(super) fn write_out(sizes: &[usize], budget: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The one partition of an unpartitioned `spec`: a null value per field. iceberg-rust's fast
-/// append refuses a data file of another spec ID or partition arity than the table's default spec.
+/// The one partition of an unpartitioned `spec`: a null value per field, because iceberg-rust's
+/// fast append refuses a data file whose partition arity differs from its spec's.
 pub(super) fn null_key(spec: &PartitionSpec, schema: SchemaRef) -> PartitionKey {
     let nulls = spec.fields().iter().map(|_| None).collect();
     PartitionKey::new(spec.clone(), schema, nulls)

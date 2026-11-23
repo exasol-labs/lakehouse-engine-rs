@@ -103,11 +103,12 @@ pub fn parse_footer(parquet: Bytes, name: &str) -> ParquetMetaData {
 fn assert_pruning_shape(label: &str, uri: &str, metadata: &ParquetMetaData) {
     let cannot = "so the fixture cannot prove row-group or page pruning \
                   (specs/testing.md § Fixtures and § Correctness oracles)";
-    let (Some(column_index), Some(offset_index)) =
-        (metadata.column_index(), metadata.offset_index())
-    else {
+    if !metadata
+        .page_index()
+        .is_some_and(|index| index.is_complete())
+    {
         panic!("{label} ({uri}) carries no column index or offset index, {cannot}");
-    };
+    }
     if ROW_GROUP_SPLIT_FILES.contains(&label) {
         assert!(
             metadata.num_row_groups() >= 2,
@@ -125,12 +126,17 @@ fn assert_pruning_shape(label: &str, uri: &str, metadata: &ParquetMetaData) {
         .iter()
         .position(|column| column.name() == "k")
         .unwrap_or_else(|| panic!("{label} ({uri}) has no `k` column"));
-    let pages = offset_index[0][k].page_locations().len();
+    let first_row_group = metadata.page_index_for_row_group(0);
+    let pages = first_row_group
+        .offset_index(k)
+        .unwrap_or_else(|| panic!("{label} ({uri}) has no `k` offset index, {cannot}"))
+        .page_locations()
+        .len();
     assert!(
         pages >= 2,
         "the first row group of {label} ({uri}) holds {pages} `k` page, {cannot}"
     );
-    let ColumnIndexMetaData::INT64(k_index) = &column_index[0][k] else {
+    let Some(ColumnIndexMetaData::INT64(k_index)) = first_row_group.column_index(k) else {
         panic!("{label} ({uri}) has no INT64 column index for `k`, {cannot}");
     };
     let first_page_max = *k_index
@@ -256,8 +262,7 @@ const NON_NULL_STATS: &[&str] = &["a1", "a2", "b1", "n1", "n2"];
 
 /// All-NULL columns fail comparisons. Iceberg: `!=`/`NOT IN` keep NULL partitions and all stats.
 /// Delta: NULL partitions fail every comparison; `!=`/`NOT IN` prune. Hive: three-valued logic.
-/// iceberg-rust keeps a file whose bounds lie between an `IN` list's values. A literal the
-/// column's type cannot hold exactly prunes nothing (`F` is `float`, `Q` and `D`
+/// A literal the column's type cannot hold exactly prunes nothing (`F` is `float`, `Q` and `D`
 /// have scale 1 and 2, `TZ` holds microseconds).
 const CASES: &[Case] = &[
     Case::new("Q = 2.5", Scan)
@@ -300,9 +305,7 @@ const CASES: &[Case] = &[
     Case::new("D <= 10.25", Scan).iceberg_and_delta(&["a1", "b1", "n1"]),
     Case::new("D > 40.25", Scan).iceberg_and_delta(&["b1", "n2"]),
     Case::new("D >= 40.25", Scan).iceberg_and_delta(&["a2", "b1", "n2"]),
-    Case::new("D IN (5.25, 60.25)", Scan)
-        .iceberg(NON_NULL_STATS)
-        .delta(&["b1", "n1", "n2"]),
+    Case::new("D IN (5.25, 60.25)", Scan).iceberg_and_delta(&["b1", "n1", "n2"]),
     Case::new("D BETWEEN 41 AND 44", Scan).iceberg_and_delta(&["b1"]),
     Case::new("D <> 20.25", Scan)
         .iceberg(ALL_FILES)

@@ -109,12 +109,12 @@ impl PartitionedScanSchema {
 
     /// `FileScanConfig` applies indices in the given order, so the remap alone restores declared
     /// order. An absent projection is made explicit on a partitioned table, where the orders differ.
-    pub(crate) fn remap_projection(&self, projection: Option<&Vec<usize>>) -> Option<Vec<usize>> {
+    pub(crate) fn remap_projection(&self, projection: Option<&[usize]>) -> Option<Vec<usize>> {
         if self.file_source.table_partition_cols().is_empty() {
-            return projection.cloned();
+            return projection.map(<[usize]>::to_vec);
         }
         let declared_indices = match projection {
-            Some(indices) => indices.clone(),
+            Some(indices) => indices.to_vec(),
             None => (0..self.declared.fields().len()).collect(),
         };
         Some(

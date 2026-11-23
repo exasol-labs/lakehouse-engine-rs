@@ -1125,7 +1125,7 @@ fn make_empty_string_batch(rows: &[EmptyStringRow]) -> RecordBatch {
         Field::new("id", DataType::Int64, false),
         Field::new("s", DataType::Utf8, true),
         Field::new("k", DataType::Utf8, true),
-        Field::new("b", DataType::LargeBinary, true),
+        Field::new("b", DataType::Binary, true),
     ]));
     RecordBatch::try_new(
         schema,
@@ -1133,7 +1133,7 @@ fn make_empty_string_batch(rows: &[EmptyStringRow]) -> RecordBatch {
             Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
             Arc::new(StringArray::from_iter(rows.iter().map(|row| row.1))),
             Arc::new(StringArray::from_iter(rows.iter().map(|row| row.2))),
-            Arc::new(LargeBinaryArray::from_iter(rows.iter().map(|row| row.3))),
+            Arc::new(BinaryArray::from_iter(rows.iter().map(|row| row.3))),
         ],
     )
     .expect("empty_strings RecordBatch construction is infallible")
@@ -2210,7 +2210,7 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             false,
         ),
         Field::new(EVO_INITDEF_COL_DEC38, DataType::Decimal128(38, 2), true),
-        Field::new(EVO_INITDEF_COL_BINARY, DataType::LargeBinary, true),
+        Field::new(EVO_INITDEF_COL_BINARY, DataType::Binary, true),
         Field::new(EVO_INITDEF_COL_FIXED, DataType::FixedSizeBinary(4), true),
         Field::new(EVO_INITDEF_COL_UUID, DataType::FixedSizeBinary(16), true),
     ]));
@@ -2249,7 +2249,7 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
             Arc::new(Time64MicrosecondArray::from(vec![INITDEF_TIME_MICROS; n])),
             Arc::new(dec38),
-            Arc::new(LargeBinaryArray::from_iter_values(vec![INITDEF_BINARY; n])),
+            Arc::new(BinaryArray::from_iter_values(vec![INITDEF_BINARY; n])),
             Arc::new(
                 FixedSizeBinaryArray::try_from_iter(vec![INITDEF_FIXED; n].into_iter())
                     .expect("initdef fixed(4) values"),
@@ -3610,8 +3610,7 @@ pub fn time64_values() -> ArrayRef {
     ]))
 }
 
-/// Bytes that are not UTF-8, then the empty value, then NULL. `LargeBinary` is what
-/// `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
+/// Bytes that are not UTF-8, then the empty value, then NULL, as `Binary` or `LargeBinary`.
 pub fn binary_values(data_type: &DataType) -> ArrayRef {
     let values = vec![
         Some([0x00, 0xab, 0xff].as_slice()),
@@ -4154,7 +4153,7 @@ pub async fn seed_ident_part_bytes(catalog_url: &str, warehouse: &str) -> Result
         arrow_schema,
         vec![
             Arc::new(Int64Array::from(vec![2])),
-            Arc::new(LargeBinaryArray::from_vec(vec![&[0x00, 0xab, 0xff][..]])),
+            Arc::new(BinaryArray::from_vec(vec![&[0x00, 0xab, 0xff][..]])),
             Arc::new(
                 FixedSizeBinaryArray::try_from_iter([[0x55; 16]].into_iter()).expect("fixed(16)"),
             ),

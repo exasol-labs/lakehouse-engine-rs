@@ -67,7 +67,6 @@ aws-sigv4              = { workspace = true }
 aws-credential-types   = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 
-# Not tpchgen-arrow: it has no arrow-58 release.
 tpchgen = { version = "2.0.2" }
 
 [[test]]
