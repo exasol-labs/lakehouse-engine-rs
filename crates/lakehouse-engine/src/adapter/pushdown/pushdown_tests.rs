@@ -918,6 +918,48 @@ fn a_split_where_keeps_each_declined_conjunct_as_exasol_sent_it() {
     );
 }
 
+/// Two `COUNT(DISTINCT)`s need the wrapper whatever the scan applies of the WHERE, so the
+/// fan-out's columns show which conjuncts the wrapper reads.
+#[test]
+fn the_wrapper_fan_out_emits_no_column_that_only_a_scan_conjunct_names() {
+    let region_is_x = compare("predicate_equal", col("REGION"), str_lit("x"));
+    let cases = [
+        ("pushed", region_is_x.clone(), ["NAME", "ID"].as_slice()),
+        (
+            "split",
+            and([region_is_x.clone(), declined_like_on_decimal()]),
+            &["NAME", "AMOUNT", "ID"],
+        ),
+        (
+            "declined",
+            or([region_is_x, declined_like_on_decimal()]),
+            &["REGION", "NAME", "AMOUNT", "ID"],
+        ),
+    ];
+
+    for (case, filter, expected) in cases {
+        let sql = dispatch_sql_for_body(
+            guard_events()
+                .single_group()
+                .item(
+                    agg_item("COUNT", Some("NAME"), true),
+                    ExasolType::decimal(18, 0),
+                )
+                .item(
+                    agg_item("COUNT", Some("ID"), true),
+                    ExasolType::decimal(18, 0),
+                )
+                .filter(filter),
+        );
+        let emits = emits_clause(&sql);
+        let emitted: Vec<&str> = ["REGION", "NAME", "AMOUNT", "ID"]
+            .into_iter()
+            .filter(|column| emits.contains(&format!("\"{column}\" ")))
+            .collect();
+        assert_eq!(emitted, expected, "{case} filter: {sql}");
+    }
+}
+
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events()

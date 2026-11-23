@@ -1525,7 +1525,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         &request,
         &pushdown,
         fan_out_spec,
-        &emitting(&column_types(&all_cols)),
+        &column_types(&all_cols),
         &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
         None,
         &test_context(),

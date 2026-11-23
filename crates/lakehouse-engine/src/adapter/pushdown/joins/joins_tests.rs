@@ -846,16 +846,11 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
     let mut customer = resolved_side("CUSTOMER", Vec::new());
     customer.scan.refused_columns = vec![unread_refused("Parquet", "x", None, "geometry")];
     let sides = request_typed(&request, &[customer, resolved_side("ORDERS", Vec::new())]);
-    let emitted = vec![
-        emitting_named(&sides[0].column_types, &["ID"]),
-        emitting_named(&sides[1].column_types, &["ID", "X"]),
-    ];
 
     let response = empty_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &sides,
-        emitted,
         &test_context(),
     )
     .expect("ORDERS.X is readable");

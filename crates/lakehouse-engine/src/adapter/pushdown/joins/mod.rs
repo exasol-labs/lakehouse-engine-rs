@@ -12,7 +12,7 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, Emitted, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
+    ColumnTypes, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
     project_columns, pushdown_response,
 };
 
@@ -85,14 +85,15 @@ fn ensure_no_side_refuses_a_referenced_column(
 }
 
 /// The empty result of a join with a fileless side. Every column binds leg-qualified, so a name
-/// two legs share reads its own leg's type and refusal.
+/// two legs share reads its own leg's type and refusal. It evaluates the whole WHERE, so every
+/// column the WHERE names is emitted.
 fn empty_join_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    emitted: Vec<Emitted>,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
+    let emitted = n_scan_emission(pushdown, join, sides)?;
     let legs = join.legs();
     let col_types = ColumnTypes::per_relation(
         sides
@@ -196,17 +197,16 @@ pub(super) async fn plan_join(
     // Both before the zero-files return: a refused column must error, never yield an empty
     // result.
     ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
-    let emitted = n_scan_emission(pushdown, join, &sides)?;
 
     if sides.iter().any(|s| s.scan.files.is_empty()) {
-        return empty_join_sql(pushdown, join, &sides, emitted, context);
+        return empty_join_sql(pushdown, join, &sides, context);
     }
 
     if let Some(sql) = plan_broadcast_join(pushdown, join, &sides, context)? {
         return Ok(pushdown_response(sql));
     }
 
-    let sql = build_n_scan_join_sql(pushdown, join, &sides, &emitted, context)?;
+    let sql = build_n_scan_join_sql(pushdown, join, &sides, context)?;
     Ok(pushdown_response(sql))
 }
 

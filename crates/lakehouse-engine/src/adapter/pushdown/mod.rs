@@ -184,8 +184,9 @@ pub(crate) async fn handle_pushdown(
     )
 }
 
-/// `emitted` is the single-table emission every row fan-out of the request draws its columns
-/// from, except the wrapper of a split WHERE, whose filter is only the declined conjuncts.
+/// `emitted` is the single-table emission of the whole request, which the bare row scan and the
+/// lone `COUNT(DISTINCT)` fan-out draw their columns from. The qualified wrapper derives its own
+/// from the WHERE it renders.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
     request: &Json,
@@ -201,32 +202,22 @@ fn build_dispatch_sql(
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pushdown.json();
-    let fallback = |emitted: &Emitted| {
+    let fallback = || {
         qualified_single_table_fallback_pushdown(
             request,
             pushdown,
             &base,
             &scan_where,
             shards,
-            emitted,
+            scan.columns(),
             context,
         )
     };
 
     // Ahead of shape routing so it applies before aggregating, grouping, and
     // truncating (`_decision/045`).
-    match &scan_where {
-        ScanWhere::Declined(_) => return fallback(emitted),
-        ScanWhere::Split { declined, .. } => {
-            // The wrapper never applies a rendered conjunct, so a column that only a rendered
-            // conjunct names stays out of the fan-out.
-            return fallback(&single_table_emission(
-                request,
-                &pushdown.with_filter(declined.clone()),
-                scan.columns(),
-            )?);
-        }
-        ScanWhere::Absent | ScanWhere::Pushed(_) => {}
+    if scan_where.declined().is_some() {
+        return fallback();
     }
     let filter = scan_where.pushed();
 
@@ -273,7 +264,7 @@ fn build_dispatch_sql(
             );
             let Some(sql) = sql else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback(emitted);
+                return fallback();
             };
             return Ok(pushdown_response(sql));
         }
@@ -282,7 +273,7 @@ fn build_dispatch_sql(
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
             // aggregate the materialized rows (#82). No outer WHERE is needed: an
             // untranslatable filter never reaches this arm.
-            return fallback(emitted);
+            return fallback();
         }
         RequestShape::SingleGroupAgg {
             items,
@@ -317,7 +308,7 @@ fn build_dispatch_sql(
             // subqueries ("emitting function in expression"). Use the qualified wrapper,
             // narrowed to referenced columns (#160).
             if has_distinct(&items) {
-                return fallback(emitted);
+                return fallback();
             }
             let merge_select =
                 single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
@@ -328,14 +319,14 @@ fn build_dispatch_sql(
             });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback(emitted);
+                return fallback();
             };
             (Some((plans, merge_inputs)), Vec::new())
         }
         // An item only Exasol computes goes to the qualified wrapper. `project_columns` decides
         // it, never a column-count comparison, which can coincide (#196).
         RequestShape::RowScan => match projection {
-            RowProjection::Wrapped => return fallback(emitted),
+            RowProjection::Wrapped => return fallback(),
             RowProjection::Direct(projection) => (None, projection),
         },
     };

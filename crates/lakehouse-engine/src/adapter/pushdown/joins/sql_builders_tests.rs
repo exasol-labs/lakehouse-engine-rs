@@ -16,7 +16,7 @@ use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
-    full_row_n_scan_sql(
+    build_n_scan_join_sql(
         &parsed_pushdown(request),
         &detected_join(request),
         &customer_orders_sides(request, 10, 100),
@@ -283,6 +283,45 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     );
 }
 
+/// The ORDERS leg's fan-out shows whether the outer wrapper reads `O_ORDERDATE`.
+#[test]
+fn an_n_scan_leg_emits_no_column_that_only_its_scan_filter_names() {
+    let orderdate = || table_col("ORDERS", "O_ORDERDATE");
+    let cases = [
+        (
+            "pushed into the leg",
+            compare("predicate_greater", orderdate(), date_lit("1995-01-01")),
+            false,
+        ),
+        ("declined by the leg", like(orderdate(), "1995%"), true),
+        (
+            "cross-leg residual",
+            or([
+                is_null(orderdate()),
+                string_equal("CUSTOMER", "C_NAME", "x"),
+            ]),
+            true,
+        ),
+    ];
+
+    for (case, filter, emits_orderdate) in cases {
+        let request = built_join(
+            customer_orders_request(Json::Null, equi_condition())
+                .column(table_col("CUSTOMER", "C_NAME"))
+                .filter(filter),
+        );
+        let sql = n_scan_sql(&request).expect("the two-table N-scan must build");
+        let orders_leg = &sql[sql.find(r#"AS "LHS_T0""#).expect("the CUSTOMER leg")..];
+        let emits = emits_clause(orders_leg);
+        assert_eq!(
+            emits.contains(r#""O_ORDERDATE""#),
+            emits_orderdate,
+            "{case}: the ORDERS leg must emit O_ORDERDATE only when the outer WHERE reads it: \
+             {sql}"
+        );
+    }
+}
+
 #[test]
 fn colliding_columns_render_qualified_unified_wrapper_without_error() {
     let request = with_identifier_notes(
@@ -322,7 +361,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -354,7 +393,7 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -399,7 +438,7 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
         resolved_side("REGION", vec![("s3://w/r-0.parquet", 2)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -436,7 +475,7 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 5)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 3)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -522,7 +561,7 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
         resolved_side("TAGS", vec![("s3://w/t-0.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &multi,
         &request_typed(&request, &sides),
@@ -552,7 +591,7 @@ fn self_join_renders_each_occurrence_as_its_own_leg() {
             resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
             resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         ];
-        let sql = full_row_n_scan_sql(
+        let sql = build_n_scan_join_sql(
             &parsed_pushdown(&request),
             &detected_join(&request),
             &request_typed(&request, &sides),
@@ -582,7 +621,7 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f2.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -637,7 +676,7 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -676,7 +715,7 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &request_typed(&request, &sides),
@@ -751,7 +790,7 @@ fn three_table_join_inner_join_on_chain() {
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -830,7 +869,7 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
         resolved_side("N2", vec![("s3://w/n2-0.parquet", 10)]),
         resolved_side("FACT", vec![("s3://w/f-0.parquet", 500)]),
     ];
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
@@ -1695,7 +1734,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         &request,
         &pushdown_req,
         fan_out_spec,
-        &emitting(&first_table_column_types(&request)),
+        &first_table_column_types(&request),
         &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
         None,
         &test_context(),
@@ -1703,7 +1742,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -1815,7 +1854,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &grouped_request,
         &grouped_req,
         fan_out_base(),
-        &emitting_named(&column_types(&grouped_all), &["GK", "REGION"]),
+        &column_types(&grouped_all),
         &unqualified_shards(shards.to_vec()),
         None,
         &test_context(),
@@ -1860,7 +1899,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         &sg_request,
         &sg_req,
         fan_out_base(),
-        &emitting_named(&column_types(&sg_all), &["A", "B"]),
+        &column_types(&sg_all),
         &unqualified_shards(shards.to_vec()),
         None,
         &test_context(),
@@ -1978,7 +2017,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &base,
         &ScanWhere::Absent,
         &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
-        &emitting(&first_table_column_types(&request)),
+        &first_table_column_types(&request),
         &test_context(),
     )
 }

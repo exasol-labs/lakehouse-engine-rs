@@ -682,20 +682,6 @@ pub(super) fn emitting_named(columns: &ColumnTypes, names: &[&str]) -> Emitted {
         .expect("the fixture names no refused column")
 }
 
-/// The N-scan wrapper over `sides`, each leg's fan-out emitting every column of its side.
-pub(super) fn full_row_n_scan_sql(
-    pushdown: &PushdownRequest,
-    join: &joins::DetectedJoin,
-    sides: &[joins::ResolvedJoinSide],
-    context: &PushdownContext<'_>,
-) -> Result<String, UdfError> {
-    let emitted: Vec<Emitted> = sides
-        .iter()
-        .map(|side| emitting(&side.column_types))
-        .collect();
-    joins::build_n_scan_join_sql(pushdown, join, sides, &emitted, context)
-}
-
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
 /// returns only its JSON or whose select list a test replaced in place.
 pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
@@ -718,7 +704,7 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
-        &emitting(&first_table_column_types(request)),
+        &first_table_column_types(request),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         Some(declined),
         &test_context(),

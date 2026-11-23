@@ -1040,7 +1040,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         &request,
         &pushdown,
         count_distinct_base_spec().common,
-        &emitting(&column_types(&all_cols)),
+        &column_types(&all_cols),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
         None,
         &test_context(),

@@ -1107,10 +1107,18 @@ impl PushdownRequest {
         }
     }
 
-    /// This request with its WHERE replaced by `filter`, its select list and checked types kept.
-    pub(super) fn with_filter(&self, filter: Json) -> Self {
+    /// This request with its WHERE replaced by `filter`, or removed for `None`, its select list
+    /// and checked types kept.
+    pub(super) fn with_filter(&self, filter: Option<Json>) -> Self {
         let mut json = self.json.clone();
-        json["filter"] = filter;
+        match filter {
+            Some(filter) => json["filter"] = filter,
+            None => {
+                if let Some(request) = json.as_object_mut() {
+                    request.remove("filter");
+                }
+            }
+        }
         self.with_json(json)
     }
 }

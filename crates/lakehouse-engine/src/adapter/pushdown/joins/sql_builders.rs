@@ -333,10 +333,11 @@ fn outer_wrapper_clauses(
     Ok(OuterWrapperClauses { select, trailing })
 }
 
-/// What each leg's fan-out of the N-scan wrapper emits: its columns that a join condition or a
-/// request clause names. The wrapper renders the whole WHERE, so the filter counts.
+/// What each leg's fan-out emits under a wrapper that evaluates `wrapper`: its columns that a
+/// join condition or a clause of `wrapper`, WHERE included, names. `wrapper` carries only the
+/// WHERE the wrapper renders, so a conjunct a leg's scan applies adds no column.
 pub(in super::super) fn n_scan_emission(
-    pushdown: &PushdownRequest,
+    wrapper: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
 ) -> Result<Vec<Emitted>, UdfError> {
@@ -344,12 +345,12 @@ pub(in super::super) fn n_scan_emission(
     let above: Vec<&Json> = join
         .conditions
         .iter()
-        .chain(referenced_clause_values(pushdown.json()))
+        .chain(referenced_clause_values(wrapper.json()))
         .collect();
     sides
         .iter()
         .enumerate()
-        .map(|(leg, side)| leg_emission(pushdown.output(), &above, &legs, leg, &side.column_types))
+        .map(|(leg, side)| leg_emission(wrapper.output(), &above, &legs, leg, &side.column_types))
         .collect()
 }
 
@@ -370,11 +371,8 @@ pub(in super::super) fn build_n_scan_join_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    emitted: &[Emitted],
     context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
-    let cols_per_side: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
-
     let legs = join.legs();
 
     let conditions: Vec<String> = join
@@ -383,25 +381,19 @@ pub(in super::super) fn build_n_scan_join_sql(
         .map(|cond| render_expression_qualified(cond, &legs))
         .collect();
 
-    let pushdown_req = pushdown.json();
-    let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let where_filter = pushdown.json().get("filter").filter(|f| !f.is_null());
 
-    let mut fan_outs = Vec::with_capacity(sides.len());
+    let mut side_filters = Vec::with_capacity(sides.len());
     let mut declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
         let (side_filter, side_declined) =
             match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
-                Some(side_local) => screen_leg_filter(&side_local, cols_per_side[i], context)?,
+                Some(side_local) => screen_leg_filter(&side_local, &side.column_types, context)?,
                 None => (None, None),
             };
         // Disjoint by attribution, so no conjunct is double-applied.
         declined = conjoin_filters(declined, side_declined);
-        fan_outs.push(build_side_fan_out_sql(
-            side,
-            &emitted[i],
-            side_filter,
-            context,
-        )?);
+        side_filters.push(side_filter);
     }
 
     // With the per-side leg filters, these partition the request's filter.
@@ -409,10 +401,22 @@ pub(in super::super) fn build_n_scan_join_sql(
         where_filter.and_then(|f| cross_leg_residual_filter(f, &legs)),
         declined,
     );
-    let filter = residual.map(|tree| render_expression_qualified(&tree, &legs));
+    let filter = residual
+        .as_ref()
+        .map(|tree| render_expression_qualified(tree, &legs));
+    let emitted = n_scan_emission(&pushdown.with_filter(residual), join, sides)?;
+
+    let fan_outs = sides
+        .iter()
+        .zip(&emitted)
+        .zip(side_filters)
+        .map(|((side, emitted), side_filter)| {
+            build_side_fan_out_sql(side, emitted, side_filter, context)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown, &legs, emitted, LegColumns::Relations, context)?;
+        outer_wrapper_clauses(pushdown, &legs, &emitted, LegColumns::Relations, context)?;
 
     let from = build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
@@ -728,24 +732,30 @@ fn join_order_by(pushdown_req: &Json, legs: &JoinLegs, naming: LegColumns) -> Op
     Some(parts.join(", "))
 }
 
-/// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out, which emits
-/// `emitted`. `declined_filter` is the wrapper's WHERE.
+/// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out.
+/// `declined_filter` is the wrapper's WHERE, and the fan-out emits only the columns the wrapper
+/// reads, so a conjunct the scan applies adds none.
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown: &PushdownRequest,
     fan_out: CommonScanSpec,
-    emitted: &Emitted,
+    columns: &ColumnTypes,
     shards: &Shards<E>,
     declined_filter: Option<&Json>,
     context: &PushdownContext<'_>,
 ) -> Result<String, UdfError> {
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
+    let emitted = single_table_emission(
+        request,
+        &pushdown.with_filter(declined_filter.cloned()),
+        columns,
+    )?;
 
     let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
         pushdown,
         &legs,
-        std::slice::from_ref(emitted),
+        std::slice::from_ref(&emitted),
         LegColumns::Relations,
         context,
     )?;
@@ -774,16 +784,15 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     Ok(sql)
 }
 
-/// The emission is decided by the request's clauses, not the decline, so a declined filter over a
-/// real select list keeps the narrowing (#160), which matters here since the fan-out ships every
-/// row.
+/// The qualified single-table wrapper over a fan-out that applies the pushed part of the WHERE.
+/// The fan-out ships every row, so its columns narrow to what the wrapper reads (#160).
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
     request: &Json,
     pushdown: &PushdownRequest,
     base: &CommonScanSpec,
     scan_where: &ScanWhere<'_>,
     shards: &Shards,
-    emitted: &Emitted,
+    columns: &ColumnTypes,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let fan_out = CommonScanSpec {
@@ -799,7 +808,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
         request,
         pushdown,
         fan_out,
-        emitted,
+        columns,
         shards,
         scan_where.declined(),
         context,

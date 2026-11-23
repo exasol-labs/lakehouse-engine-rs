@@ -2,11 +2,12 @@
 //! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
 //! diff in one of them is always a regression, never an expected update.
 
+use super::joins::build_n_scan_join_sql;
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, dispatch_base, dispatch_context, float_div, full_row_n_scan_sql, parsed_pushdown,
-    pd, projected_columns, pushdown_request, request_sides, request_typed, resolved_table,
-    round_of, sample_storage, scan_for, test_context, unqualified_shards, with_identifier_notes,
+    count_star, dispatch_base, dispatch_context, float_div, parsed_pushdown, pd, projected_columns,
+    pushdown_request, request_sides, request_typed, resolved_table, round_of, sample_storage,
+    scan_for, test_context, unqualified_shards, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -840,7 +841,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = full_row_n_scan_sql(
+    let n_scan_sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
@@ -889,7 +890,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = full_row_n_scan_sql(
+    let n_scan_sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),

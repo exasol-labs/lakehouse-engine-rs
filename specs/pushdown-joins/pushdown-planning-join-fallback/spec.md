@@ -55,6 +55,7 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *AND* a top-level WHERE conjunct SHALL be pushed INTO a leg's fan-out as a DataFusion filter if and only if it references only that ONE LEG AND the scan translator renders it against THAT LEG's own column metadata
 * *AND* the screen SHALL run PER LEG and PER CONJUNCT, AFTER leg-local attribution, and MUST NOT be folded into the pre-attribution syntactic screen, because two N-scan legs MAY declare the same column name with different Exasol types and only the owning leg's metadata resolves it correctly
 * *AND* every OTHER conjunct SHALL be RESIDUAL and remain in the outer wrapper's `WHERE`: cross-leg, OR-spanning, column-free, leg-local-but-unrenderable, or leg-local-but-declined
+* *AND* each leg's fan-out SHALL emit only the columns that a join condition, a residual conjunct, or another clause of the request names, so a column that only a conjunct pushed into that leg names is not emitted
 * *AND* the partition SHALL stay total and disjoint under the added condition, so no conjunct is dropped and none is applied twice
 * *AND* a decline SHALL cost only the offending CONJUNCT's leg pushdown, so the same leg's other leg-local conjuncts SHALL still be pushed into its fan-out
 * *AND* each leg-local conjunct SHALL be rendered exactly once, against its leg's column types, and the leg's filter SHALL be the conjunction of the accepted conjuncts' rendered SQL, so no second render can decline it
