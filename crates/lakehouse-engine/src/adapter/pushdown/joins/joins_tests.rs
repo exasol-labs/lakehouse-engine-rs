@@ -247,7 +247,7 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
 }
 
 pub(super) fn detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(request, &pd(request)).expect("detected join shape") {
+    match detect_join(request, &parsed_pushdown(request)).expect("detected join shape") {
         JoinShape::Join(join) => join,
         other => panic!("expected Join, got {other:?}"),
     }
@@ -255,7 +255,7 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
 
 /// The legs production binds for `request`: its join's legs, or its one table's.
 pub(super) fn request_legs(request: &Json) -> JoinLegs {
-    match detect_join(request, &pd(request)).expect("a plannable request") {
+    match detect_join(request, &parsed_pushdown(request)).expect("a plannable request") {
         JoinShape::Join(join) => join.legs(),
         JoinShape::NotAJoin => JoinLegs::for_single_scan(request),
     }
@@ -266,7 +266,6 @@ pub(super) fn request_legs(request: &Json) -> JoinLegs {
 pub(super) fn broadcast_projection(request: &Json) -> RowProjection {
     let join = detected_join(request);
     let legs = join.legs();
-    let qualified = legs.qualify(&pd(request));
     let sides = request_sides(request, &join);
     let leg_types = ColumnTypes::per_relation(
         sides
@@ -274,7 +273,9 @@ pub(super) fn broadcast_projection(request: &Json) -> RowProjection {
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    project_row(&parsed_pushdown(request).with_json(qualified), &leg_types).expect("projectable")
+    let qualified =
+        parsed_pushdown(request).map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
+    project_row(&qualified, &leg_types).expect("projectable")
 }
 
 /// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play
@@ -846,16 +847,11 @@ fn an_empty_join_reads_a_shared_column_name_from_the_leg_the_request_names() {
     let mut customer = resolved_side("CUSTOMER", Vec::new());
     customer.scan.refused_columns = vec![unread_refused("Parquet", "x", None, "geometry")];
     let sides = request_typed(&request, &[customer, resolved_side("ORDERS", Vec::new())]);
-    let emitted = vec![
-        emitting_named(&sides[0].column_types, &["ID"]),
-        emitting_named(&sides[1].column_types, &["ID", "X"]),
-    ];
 
     let response = empty_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &sides,
-        emitted,
         &test_context(),
     )
     .expect("ORDERS.X is readable");

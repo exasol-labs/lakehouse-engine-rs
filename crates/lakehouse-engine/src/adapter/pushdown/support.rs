@@ -20,6 +20,7 @@ use vs_expression::{
 use super::RefusedColumn;
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
 use super::context::Shards;
+use super::request::{OutputContract, PushdownRequest};
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
@@ -687,11 +688,11 @@ impl<'a> ScanTranslator<'a> {
         self.typing().render_operand(expr).ok()
     }
 
-    /// `None` declines the join. A condition renders as a filter does, so its string keys stay
-    /// bare columns that the hash join reads.
-    pub(super) fn join_condition(self, condition: &Json) -> Option<String> {
+    /// `None` declines the whole filter, whose conjuncts may still render one by one through
+    /// [`Self::screen_conjuncts`].
+    pub(super) fn filter(self, filter: &Json) -> Option<String> {
         self.typing()
-            .render_filter(&compare_binary_bytes(condition.clone(), self.columns))
+            .render_filter(&compare_binary_bytes(filter.clone(), self.columns))
             .ok()
     }
 
@@ -699,26 +700,6 @@ impl<'a> ScanTranslator<'a> {
         self.typing()
             .render_conjunct(&compare_binary_bytes(conjunct.clone(), self.columns))
             .ok()
-    }
-
-    /// Where each conjunct of the request's WHERE applies, the scan or Exasol (`_decision/045`).
-    /// A filter that renders whole keeps its one rendered SQL. Otherwise each top-level conjunct
-    /// renders on its own through [`Self::screen_conjuncts`], so a declined conjunct takes only
-    /// itself out of the scan.
-    pub(super) fn split_where(self, filter: Option<&Json>) -> ScanWhere<'_> {
-        let Some(raw) = filter else {
-            return ScanWhere::Absent;
-        };
-        if let Ok(sql) = self
-            .typing()
-            .render_filter(&compare_binary_bytes(raw.clone(), self.columns))
-        {
-            return ScanWhere::Pushed(sql);
-        }
-        match self.screen_conjuncts(raw, Json::clone) {
-            (Some(pushed), Some(declined)) => ScanWhere::Split { pushed, declined },
-            _ => ScanWhere::Declined(raw),
-        }
     }
 
     /// The one per-conjunct rule: each top-level conjunct of `filter` renders on its own, nested
@@ -739,42 +720,6 @@ impl<'a> ScanTranslator<'a> {
             }
         }
         (conjoin_scan_filters(rendered), conjoin(declined))
-    }
-}
-
-/// A request's WHERE, as [`ScanTranslator::split_where`] places it. Each conjunct applies exactly
-/// once, in the scan filter or in the qualified wrapper's `WHERE`.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum ScanWhere<'a> {
-    Absent,
-    /// The scan applies the whole rendered filter.
-    Pushed(String),
-    /// The scan applies the rendered conjuncts, and Exasol the raw `AND` of the declined ones.
-    Split {
-        pushed: String,
-        declined: Json,
-    },
-    /// The filter declines and no conjunct renders alone: the raw tree, which Exasol applies
-    /// itself.
-    Declined(&'a Json),
-}
-
-impl ScanWhere<'_> {
-    /// The filter the scan applies.
-    pub(super) fn pushed(&self) -> Option<String> {
-        match self {
-            Self::Pushed(sql) | Self::Split { pushed: sql, .. } => Some(sql.clone()),
-            Self::Absent | Self::Declined(_) => None,
-        }
-    }
-
-    /// The raw filter the qualified wrapper's `WHERE` applies.
-    pub(super) fn declined(&self) -> Option<&Json> {
-        match self {
-            Self::Split { declined, .. } => Some(declined),
-            Self::Declined(raw) => Some(raw),
-            Self::Absent | Self::Pushed(_) => None,
-        }
     }
 }
 
@@ -882,22 +827,6 @@ pub(super) fn collect_all_column_names(
     });
 }
 
-pub(super) fn extract_limit(pushdown_req: &Json) -> Option<u64> {
-    pushdown_req
-        .get("limit")
-        .and_then(|l| l.get("numElements"))
-        .and_then(|n| n.as_u64())
-}
-
-/// Exasol normalises `OFFSET 0` away, so an absent key and zero are the same request.
-pub(super) fn extract_offset(pushdown_req: &Json) -> u64 {
-    pushdown_req
-        .get("limit")
-        .and_then(|l| l.get("offset"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0)
-}
-
 /// Callers must render their own `ORDER BY` first: Exasol rejects `OFFSET` without
 /// one. A limit-less offset cannot occur, since Exasol ties `OFFSET` to `LIMIT`.
 pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {
@@ -905,213 +834,6 @@ pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {
         (None, _) => String::new(),
         (Some(n), 0) => format!(" LIMIT {n}"),
         (Some(n), m) => format!(" LIMIT {n} OFFSET {m}"),
-    }
-}
-
-/// Exasol withholds `limit` when it cannot delegate the ordering, so this flag
-/// triggers the anti-wrong-truncation guard (decision [4]).
-pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
-    pushdown_req
-        .get("orderBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-}
-
-/// Exasol rejects `OFFSET` without `ORDER BY` but accepts `ORDER BY FALSE`, which no select-list
-/// position can name, so a windowed all-constant `orderBy` keeps one `FALSE` key.
-fn drop_constant_sort_keys(json: &mut Json) {
-    let offset = extract_offset(json);
-    let Some(keys) = json.get_mut("orderBy").and_then(Json::as_array_mut) else {
-        return;
-    };
-    let Some(first) = keys.first().cloned() else {
-        return;
-    };
-    keys.retain(|key| !is_constant_sort_key(key));
-    if !keys.is_empty() {
-        return;
-    }
-    if offset == 0 {
-        if let Some(request) = json.as_object_mut() {
-            request.remove("orderBy");
-        }
-        return;
-    }
-    let mut false_key = first;
-    false_key["expression"] = serde_json::json!({"type": "literal_bool", "value": false});
-    keys.push(false_key);
-}
-
-/// Every `literal_*` node is constant, including types the select list cannot project.
-fn is_constant_sort_key(key: &Json) -> bool {
-    key.get("expression")
-        .and_then(|expression| expression.get("type"))
-        .and_then(Json::as_str)
-        .is_some_and(|node_type| node_type.starts_with("literal_"))
-}
-
-/// Exasol's `aggregationType`, which it sets on every request that aggregates, including one whose
-/// select list it stripped of every aggregate (#627).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AggregationType {
-    SingleGroup,
-    GroupBy,
-}
-
-pub(super) fn aggregation_type(pushdown_req: &Json) -> Option<AggregationType> {
-    match pushdown_req.get("aggregationType").and_then(Json::as_str)? {
-        "single_group" => Some(AggregationType::SingleGroup),
-        "group_by" => Some(AggregationType::GroupBy),
-        _ => None,
-    }
-}
-
-/// What Exasol validates positionally in the result of the pushed query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OutputContract {
-    /// `selectList` absent or JSON null, Exasol's `SELECT *`: every declared column, in order.
-    WholeRow,
-    /// `selectList` `[]`: Exasol needs no column and accepts exactly one, whose value it ignores.
-    AnyOneColumn,
-    /// One output column per `selectList` item.
-    Items,
-}
-
-/// [`PushdownRequest::parse`] is the only constructor, so every holder has passed the strict
-/// checks, and no consumer re-reads `selectList` or `selectListDataTypes`.
-///
-/// Its `orderBy` holds no constant key that Exasol pushed, because a constant does not change the order
-/// and Exasol reads a bare number there as a select-list position. An `orderBy` of constants only with
-/// a non-zero offset holds one `FALSE` key instead.
-#[derive(Debug, Clone)]
-pub struct PushdownRequest {
-    json: Json,
-    select_types: Vec<ExasolType>,
-    output: OutputContract,
-}
-
-impl PushdownRequest {
-    /// Exasol sends an aggregating request at least a `literal_null` item (#627, verified live),
-    /// so `[]` beside `aggregationType` fails like any other malformed select list.
-    pub fn parse(mut json: Json) -> Result<Self, UdfError> {
-        let entries = json
-            .get("selectListDataTypes")
-            .and_then(Json::as_array)
-            .ok_or_else(|| {
-                UdfError::User(
-                    "the pushdown request carries no selectListDataTypes array; the adapter \
-                     needs Exasol 8.29 or later"
-                        .into(),
-                )
-            })?;
-        let select_types = entries
-            .iter()
-            .map(exasol_type_from_json)
-            .collect::<Result<Vec<_>, _>>()?;
-        let output = match json.get("selectList") {
-            None | Some(Json::Null) => OutputContract::WholeRow,
-            Some(Json::Array(items)) if items.is_empty() => {
-                if aggregation_type(&json).is_some() {
-                    return Err(UdfError::User(
-                        "the pushdown request aggregates under an empty selectList".into(),
-                    ));
-                }
-                OutputContract::AnyOneColumn
-            }
-            Some(Json::Array(items)) => {
-                if items.len() != select_types.len() {
-                    return Err(UdfError::User(format!(
-                        "the pushdown request declares {} selectListDataTypes entries for {} selectList items",
-                        select_types.len(),
-                        items.len()
-                    )));
-                }
-                OutputContract::Items
-            }
-            Some(_) => {
-                return Err(UdfError::User(
-                    "the pushdown request's selectList is neither an array nor absent".into(),
-                ));
-            }
-        };
-        drop_constant_sort_keys(&mut json);
-        Ok(Self {
-            json,
-            select_types,
-            output,
-        })
-    }
-
-    pub(super) fn output(&self) -> OutputContract {
-        self.output
-    }
-
-    /// The select-list items, `None` unless the contract is [`OutputContract::Items`].
-    pub(super) fn select_items(&self) -> Option<&[Json]> {
-        match self.output {
-            OutputContract::Items => self
-                .json
-                .get("selectList")
-                .and_then(Json::as_array)
-                .map(Vec::as_slice),
-            OutputContract::WholeRow | OutputContract::AnyOneColumn => None,
-        }
-    }
-
-    /// `row`, the declared columns a `SELECT *` returns. Exasol validates them positionally
-    /// against `selectListDataTypes`, so another width is an adapter bug.
-    pub(super) fn whole_row<T>(&self, row: Vec<T>) -> Result<Vec<T>, UdfError> {
-        if row.len() != self.select_types.len() {
-            return Err(UdfError::User(format!(
-                "internal adapter error: the pushdown query returns {} column(s), Exasol expects {}",
-                row.len(),
-                self.select_types.len()
-            )));
-        }
-        Ok(row)
-    }
-
-    /// The `pushdownRequest` object as Exasol sent it, or as a rewrite kept it, minus its constant
-    /// sort keys (see [`PushdownRequest`]).
-    pub fn json(&self) -> &Json {
-        &self.json
-    }
-
-    /// One type per select-list item, or per table column for `SELECT *`.
-    pub fn select_types(&self) -> &[ExasolType] {
-        &self.select_types
-    }
-
-    /// `None` only for an index past the list, which the count check rules out for every
-    /// select-list item; the consumer then declines rather than guess a type.
-    pub fn select_type(&self, select_index: usize) -> Option<ExasolType> {
-        self.select_types.get(select_index).copied()
-    }
-
-    /// [`Self::select_type`] when a scan UDF can emit it. `None` means the scan has no value of
-    /// the item's type, so Exasol must compute the item over the scan output.
-    pub fn emittable_select_type(&self, select_index: usize) -> Option<ExasolType> {
-        self.select_type(select_index)
-            .filter(ExasolType::is_udf_emittable)
-    }
-
-    /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
-    /// copy a broadcast join projects from, beside the types already checked for it. A rewrite can
-    /// turn a sort key constant, such as a folded clock function, so the drop runs again.
-    pub fn with_json(&self, mut json: Json) -> Self {
-        drop_constant_sort_keys(&mut json);
-        Self {
-            json,
-            select_types: self.select_types.clone(),
-            output: self.output,
-        }
-    }
-
-    /// This request with its WHERE replaced by `filter`, its select list and checked types kept.
-    pub(super) fn with_filter(&self, filter: Json) -> Self {
-        let mut json = self.json.clone();
-        json["filter"] = filter;
-        self.with_json(json)
     }
 }
 

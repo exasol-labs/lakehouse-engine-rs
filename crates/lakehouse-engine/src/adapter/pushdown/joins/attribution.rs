@@ -2,6 +2,7 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
+use crate::adapter::pushdown::request::{Clause, PushdownRequest};
 use crate::adapter::pushdown::scalar_over_agg::substitute_subtrees;
 use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::{ColumnRef, relation_alias};
@@ -149,23 +150,25 @@ impl JoinLegs {
     /// request column binds.
     pub(super) fn ensure_columns_declared(
         &self,
-        pushdown: &Json,
+        pushdown: &PushdownRequest,
         declared: &[&InvolvedColumns<'_>],
     ) -> Result<(), UdfError> {
         let mut failure = None;
-        walk_column_nodes(pushdown, &mut |column| {
-            if failure.is_some() {
-                return;
-            }
-            let name = column.upper_name();
-            failure = match self.leg_of(column) {
-                None => Some(unbound_column_error(column)),
-                Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
-                    Some(undeclared_column_error(&name))
+        for clause in pushdown.clauses(&Clause::ALL) {
+            walk_column_nodes(clause, &mut |column| {
+                if failure.is_some() {
+                    return;
                 }
-                Some(_) => None,
-            };
-        });
+                let name = column.upper_name();
+                failure = match self.leg_of(column) {
+                    None => Some(unbound_column_error(column)),
+                    Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
+                        Some(undeclared_column_error(&name))
+                    }
+                    Some(_) => None,
+                };
+            });
+        }
         failure.map_or(Ok(()), Err)
     }
 }

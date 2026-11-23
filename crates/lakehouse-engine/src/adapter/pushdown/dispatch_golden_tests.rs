@@ -2,15 +2,17 @@
 //! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
 //! diff in one of them is always a regression, never an expected update.
 
+use super::joins::build_n_scan_join_sql;
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, dispatch_base, dispatch_context, float_div, full_row_n_scan_sql, parsed_pushdown,
-    pd, projected_columns, pushdown_request, request_sides, request_typed, resolved_table,
-    round_of, sample_storage, scan_for, test_context, unqualified_shards, with_identifier_notes,
+    count_star, dispatch_base, dispatch_context, float_div, parsed_pushdown, pd, projected_columns,
+    pushdown_request, request_sides, request_typed, resolved_table, round_of, sample_storage,
+    scan_for, test_context, unqualified_shards, whole_request_emission, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, compare, customer_orders_join, num_lit, string_equal, table_col,
+    aliased_col, col, compare, customer_orders_join, num_lit, predicate_equal, str_lit,
+    string_equal, table_col,
 };
 use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
@@ -194,8 +196,26 @@ fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
 
 /// The dispatcher's own emission: a golden pins the SQL the dispatcher generates, fan-out included.
 fn golden_emission(request: &Json, pushdown: &PushdownRequest, columns: &ColumnTypes) -> Emitted {
-    super::joins::single_table_emission(request, pushdown, columns)
+    whole_request_emission(request, pushdown, columns)
         .expect("a golden fixture names no refused column")
+}
+
+/// `request` with `filter` as its WHERE.
+fn with_where(mut request: Json, filter: Json) -> Json {
+    request["pushdownRequest"]["filter"] = filter;
+    request
+}
+
+fn amount_above_100() -> Json {
+    compare(
+        "predicate_greater",
+        table_col("EVENTS", "AMOUNT"),
+        num_lit(100),
+    )
+}
+
+fn region_is_eu() -> Json {
+    predicate_equal(table_col("EVENTS", "REGION"), str_lit("EU"))
 }
 
 /// Every golden shape has no ORDER BY and derives one projection item per
@@ -204,7 +224,6 @@ fn dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
     proj_types: Vec<ExasolType>,
-    filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
     let pushdown_req = pd(request);
@@ -214,7 +233,6 @@ fn dispatch_sql(
         proj_cols,
         proj_types,
         base_col_types(),
-        filter,
         limit,
     )
 }
@@ -226,7 +244,7 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
     let columns = column_types(&base_col_types());
     let emitted = golden_emission(request, &pushdown, &columns);
     let projection =
-        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()), &emitted)
+        super::support::project_columns(&pushdown, scan_for(&columns, &pushdown), &emitted)
             .expect("the fixture must project");
     assert_eq!(
         projection,
@@ -238,8 +256,8 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         &pushdown,
         projection,
         &emitted,
-        scan_for(&columns, pushdown.json()),
-        ScanWhere::Absent,
+        scan_for(&columns, &pushdown),
+        WherePlacement::single_scan(scan_for(&columns, &pushdown), &pushdown),
         None,
     )
 }
@@ -252,7 +270,6 @@ fn dispatch_sql_with_pushdown_req(
     proj_cols: Vec<ProjectionItem>,
     proj_types: Vec<ExasolType>,
     col_types: Vec<(String, ExasolType)>,
-    filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
     let pushdown = PushdownRequest::parse(pushdown_req.clone())
@@ -263,24 +280,25 @@ fn dispatch_sql_with_pushdown_req(
         &pushdown,
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
         &golden_emission(request, &pushdown, &columns),
-        scan_for(&columns, pushdown_req),
-        filter.map_or(ScanWhere::Absent, ScanWhere::Pushed),
+        scan_for(&columns, &pushdown),
+        WherePlacement::single_scan(scan_for(&columns, &pushdown), &pushdown),
         limit,
     )
 }
 
-/// Places the request's own filter through `split_where`, as `handle_pushdown` does.
+/// Places the request's own filter through [`WherePlacement::single_scan`], as `handle_pushdown`
+/// does.
 fn dispatch_sql_placing_filter(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
     let columns = column_types(&base_col_types());
-    let scan = scan_for(&columns, pushdown.json());
+    let scan = scan_for(&columns, &pushdown);
     golden_dispatch(
         request,
         &pushdown,
         RowProjection::Direct(Vec::new()),
         &golden_emission(request, &pushdown, &columns),
         scan,
-        scan.split_where(pushdown.json().get("filter")),
+        WherePlacement::single_scan(scan, &pushdown),
         None,
     )
 }
@@ -292,7 +310,7 @@ fn golden_dispatch(
     projection: RowProjection,
     emitted: &Emitted,
     scan: ScanTranslator<'_>,
-    scan_where: ScanWhere<'_>,
+    placement: WherePlacement,
     limit: Option<u64>,
 ) -> String {
     let result = build_dispatch_sql(
@@ -301,7 +319,7 @@ fn golden_dispatch(
         projection,
         emitted,
         scan,
-        scan_where,
+        placement,
         limit,
         false,
         &unqualified_shards(fixed_shards()),
@@ -326,7 +344,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &pushdown,
         &pushdown,
         &RowProjection::Direct(projected_columns(proj_cols, proj_types)),
-        scan_for(&columns, &pd(request)),
+        scan_for(&columns, &pushdown),
         &EmptyRelation::single_scan(request, golden_emission(request, &pushdown, &columns)),
         &test_context(),
     )
@@ -340,10 +358,9 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
 #[test]
 fn grouped_aggregate_matches_golden() {
     let actual = dispatch_sql(
-        &grouped_request().0,
+        &with_where(grouped_request().0, amount_above_100()),
         Vec::new(),
         Vec::new(),
-        Some(r#"("AMOUNT" > 100)"#.to_string()),
         Some(50),
     );
     let expected = include_str!("testdata/dispatch_golden/grouped_aggregate.sql");
@@ -352,13 +369,7 @@ fn grouped_aggregate_matches_golden() {
 
 #[test]
 fn group_by_fallback_matches_golden() {
-    let actual = dispatch_sql(
-        &group_by_fallback_request().0,
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-    );
+    let actual = dispatch_sql(&group_by_fallback_request().0, Vec::new(), Vec::new(), None);
     let expected = include_str!("testdata/dispatch_golden/group_by_fallback.sql");
     assert_eq!(actual, expected);
 }
@@ -376,7 +387,6 @@ fn lone_count_distinct_matches_golden() {
         &lone_count_distinct_request().0,
         Vec::new(),
         Vec::new(),
-        None,
         Some(10),
     );
     let expected = include_str!("testdata/dispatch_golden/lone_count_distinct.sql");
@@ -390,7 +400,6 @@ fn multi_count_distinct_decline_matches_golden() {
         Vec::new(),
         Vec::new(),
         None,
-        None,
     );
     let expected = include_str!("testdata/dispatch_golden/multi_count_distinct_decline.sql");
     assert_eq!(actual, expected);
@@ -400,10 +409,9 @@ fn multi_count_distinct_decline_matches_golden() {
 fn single_group_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
     let actual = dispatch_sql(
-        &row_scan_request().0,
+        &with_where(row_scan_request().0, region_is_eu()),
         proj_cols,
         proj_types,
-        Some(r#"("REGION" = 'EU')"#.to_string()),
         Some(100),
     );
     let expected = include_str!("testdata/dispatch_golden/single_group_row_scan.sql");
@@ -424,7 +432,6 @@ fn single_group_scalar_over_aggregate_matches_golden() {
         Vec::new(),
         Vec::new(),
         None,
-        None,
     );
     let expected = include_str!("testdata/dispatch_golden/single_group_scalar_over_aggregate.sql");
     assert_eq!(actual, expected);
@@ -436,7 +443,6 @@ fn single_group_scalar_over_aggregate_dedup_matches_golden() {
         &single_group_scalar_over_aggregate_dedup_request().0,
         Vec::new(),
         Vec::new(),
-        None,
         None,
     );
     let expected =
@@ -451,7 +457,6 @@ fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
         Vec::new(),
         Vec::new(),
         None,
-        None,
     );
     let expected =
         include_str!("testdata/dispatch_golden/single_group_scalar_over_aggregate_interleaved.sql");
@@ -464,7 +469,6 @@ fn single_group_scalar_over_variance_matches_golden() {
         &single_group_scalar_over_variance_request().0,
         Vec::new(),
         Vec::new(),
-        None,
         None,
     );
     let expected = include_str!("testdata/dispatch_golden/single_group_scalar_over_variance.sql");
@@ -494,7 +498,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
 
     let shape = classify_request_shape(
         &parsed_pushdown(&request),
-        scan_for(&column_types(&base_col_types()), &pd(&request)),
+        scan_for(&column_types(&base_col_types()), &parsed_pushdown(&request)),
     );
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -541,7 +545,14 @@ fn aliased_grouped_request() -> (Json, Vec<ExasolType>) {
 
 #[test]
 fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
-    let request = aliased_grouped_request().0;
+    let request = with_where(
+        aliased_grouped_request().0,
+        compare(
+            "predicate_greater",
+            aliased_col("EVENTS", "E", "AMOUNT"),
+            num_lit(100),
+        ),
+    );
     let raw_pushdown_req = pd(&request);
     let stripped_pushdown_req = strip_table_alias(&raw_pushdown_req);
 
@@ -551,7 +562,6 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
         Vec::new(),
         Vec::new(),
         base_col_types(),
-        Some(r#"("AMOUNT" > 100)"#.to_string()),
         Some(50),
     );
 
@@ -598,7 +608,6 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
         Vec::new(),
         base_col_types(),
         None,
-        None,
     );
     let sql_stripped = dispatch_sql_with_pushdown_req(
         &request,
@@ -606,7 +615,6 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
         Vec::new(),
         Vec::new(),
         base_col_types(),
-        None,
         None,
     );
 
@@ -693,7 +701,6 @@ fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, ExasolTyp
         Vec::new(),
         col_types,
         None,
-        None,
     )
 }
 
@@ -753,7 +760,8 @@ fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
 }
 
 fn two_table_detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(request, &pd(request)).expect("two-table join must be detected") {
+    match detect_join(request, &parsed_pushdown(request)).expect("two-table join must be detected")
+    {
         JoinShape::Join(join) => join,
         other => panic!("expected a detected join, got {other:?}"),
     }
@@ -814,7 +822,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
 #[test]
 fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let (proj_cols, proj_types) = row_scan_projection();
-    let single_table_sql = dispatch_sql(&row_scan_request().0, proj_cols, proj_types, None, None);
+    let single_table_sql = dispatch_sql(&row_scan_request().0, proj_cols, proj_types, None);
     assert_eq!(
         single_table_sql,
         include_str!("testdata/dispatch_golden/filterless_single_table.sql")
@@ -840,7 +848,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = full_row_n_scan_sql(
+    let n_scan_sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),
@@ -857,10 +865,9 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
 fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let (proj_cols, proj_types) = row_scan_projection();
     let single_table_sql = dispatch_sql(
-        &row_scan_request().0,
+        &with_where(row_scan_request().0, region_is_eu()),
         proj_cols,
         proj_types,
-        Some(r#"("REGION" = 'EU')"#.to_string()),
         None,
     );
     assert_eq!(
@@ -889,7 +896,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     );
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = full_row_n_scan_sql(
+    let n_scan_sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &join,
         &request_typed(&request, &sides),

@@ -682,7 +682,7 @@ fn guard_dispatch_sql(
             RowProjection::Direct(projected_columns(&proj_cols, &proj_types))
         },
         &column_types(&guard_col_types()),
-        ScanWhere::Absent,
+        single_scan_placement(request),
         limit,
         logical_schema,
         &sample_scan_storage(),
@@ -700,23 +700,22 @@ fn dispatch_with(
     request: &Json,
     projection: RowProjection,
     col_types: &ColumnTypes,
-    scan_where: ScanWhere<'_>,
+    placement: WherePlacement,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
     scan_storage: &ScanStorage,
 ) -> Result<Json, UdfError> {
-    let pushdown_req = pd(request);
-    let pushdown = PushdownRequest::parse(pushdown_req.clone())?;
+    let pushdown = PushdownRequest::parse(pd(request))?;
     build_dispatch_sql(
         request,
         &pushdown,
         projection,
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
-        &single_table_emission(request, &pushdown, col_types)?,
-        scan_for(col_types, &pushdown_req),
-        scan_where,
+        &whole_request_emission(request, &pushdown, col_types)?,
+        scan_for(col_types, &pushdown),
+        placement,
         limit,
-        order_by_present(&pushdown_req),
+        !pushdown.order_by().is_empty(),
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),
         CommonScanSpec {
             storage: scan_storage.clone(),
@@ -738,13 +737,13 @@ fn dispatch_planned(
 ) -> Result<Json, UdfError> {
     let pushdown_req = pd(request);
     let projection = project_first_table(request, &pushdown_req).expect("the fixture must project");
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let pushdown = parsed_pushdown(request);
     dispatch_with(
         request,
         projection,
         col_types,
-        scan_for(col_types, &pushdown_req).split_where(filter),
-        extract_limit(&pushdown_req),
+        WherePlacement::single_scan(scan_for(col_types, &pushdown), &pushdown),
+        pushdown.limit(),
         logical_schema,
         scan_storage,
     )
@@ -884,37 +883,6 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     assert!(
         sql.contains(r#""aggregates":[{"kind":"sum","column":"AMOUNT""#),
         "the per-shard scan must carry the inner aggregate as a partial plan: {sql}"
-    );
-}
-
-#[test]
-fn a_split_where_keeps_each_declined_conjunct_as_exasol_sent_it() {
-    // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
-    // is rewritten, so the equality assertion distinguishes original from rewritten.
-    let id_above_five = compare("predicate_greater", col("id"), num_lit(5));
-    let second = declined_second_predicate(col("ts"));
-    let length = compare(
-        "predicate_greater",
-        scalar_fn("LENGTH", [col("amount")]),
-        num_lit(5),
-    );
-    let filter = and([id_above_five.clone(), second.clone(), length.clone()]);
-    let col_types = column_types(&[
-        ("ID", ExasolType::decimal(20, 0)),
-        ("TS", ExasolType::BARE_TIMESTAMP),
-        ("AMOUNT", ExasolType::decimal(18, 2)),
-    ]);
-    let scan_where = scan_over(&col_types).split_where(Some(&filter));
-
-    assert_eq!(
-        scan_where,
-        ScanWhere::Split {
-            pushed: scan_filter_sql(&id_above_five, &col_types)
-                .expect("the bare id comparison renders"),
-            declined: and([second, length]),
-        },
-        "the declined half must hold the declined conjuncts as Exasol sent them, not their scan \
-         rewrites"
     );
 }
 
@@ -1716,8 +1684,8 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         &pushdown,
         projection,
         &emitting(&columns),
-        scan_for(&columns, &pushdown_req),
-        ScanWhere::Absent,
+        scan_for(&columns, &pushdown),
+        single_scan_placement(&request),
         None,
         false,
         &unqualified_shards(vec![vec![FileEntry::new("data/part-0.parquet", 1_000)]]),

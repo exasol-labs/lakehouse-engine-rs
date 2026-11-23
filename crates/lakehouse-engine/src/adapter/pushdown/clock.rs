@@ -12,7 +12,7 @@ use vs_expression::timestamp::TimestampLiteral;
 use crate::adapter::time_zone::TimeZone;
 use crate::types::exasol_type::ExasolType;
 
-use super::PushdownRequest;
+use super::request::{Clause, PushdownRequest};
 
 /// Exasol's default fractional-seconds precision, and the only one Exasol 8 has.
 const DEFAULT_DIGITS: usize = 3;
@@ -59,25 +59,18 @@ impl StatementClock {
     /// TSTZ keeps the UTC instant, which the Exasol dialect converts into `SESSIONTIMEZONE`.
     /// Everywhere else a TSTZ value compares as the plain wall clock of the folding zone.
     pub(super) fn fold(&self, pushdown: PushdownRequest) -> Result<PushdownRequest, UdfError> {
-        let mut json = pushdown.json().clone();
-        let mut select_list = json
-            .as_object_mut()
-            .and_then(|fields| fields.remove("selectList"));
-        self.walk(&mut json, &|tstz| self.wall_clock_literal(tstz))?;
-        if let Some(Json::Array(items)) = &mut select_list {
-            for (index, item) in items.iter_mut().enumerate() {
-                match pushdown.select_type(index) {
+        pushdown.try_map_clauses(&Clause::ALL, |clause, value| match clause {
+            Clause::SelectList => {
+                let mut items = value.as_array_mut().into_iter().flatten().enumerate();
+                items.try_for_each(|(index, item)| match pushdown.select_type(index) {
                     Some(ExasolType::TimestampWithLocalTimeZone { .. }) => {
-                        self.walk(item, &|tstz| Ok(tstz_literal(tstz)))?;
+                        self.walk(item, &|tstz| Ok(tstz_literal(tstz)))
                     }
-                    _ => self.walk(item, &|tstz| self.wall_clock_literal(tstz))?,
-                }
+                    _ => self.walk(item, &|tstz| self.wall_clock_literal(tstz)),
+                })
             }
-        }
-        if let (Some(list), Json::Object(fields)) = (select_list, &mut json) {
-            fields.insert("selectList".to_string(), list);
-        }
-        Ok(pushdown.with_json(json))
+            _ => self.walk(value, &|tstz| self.wall_clock_literal(tstz)),
+        })
     }
 
     fn walk(
