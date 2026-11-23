@@ -7,7 +7,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 
 use super::RefusedColumn;
-use crate::adapter::column_notes::variant_cause;
+use crate::adapter::column_notes::{unread_type_cause, variant_cause};
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
@@ -263,6 +263,7 @@ fn walk_type(
     match data_type {
         DataType::Primitive(primitive) => Ok(walk_primitive(primitive)),
         DataType::Variant(_) => Ok(refused_type(path, variant_cause())),
+        DataType::File(_) => Ok(refused_type(path, unread_type_cause("file"))),
         DataType::Array(array) => {
             match walk_type(array.element_type(), &path.child(ELEMENT_SEGMENT), mode)? {
                 Walked::Refused(refusal) => Ok(Walked::Refused(refusal)),
@@ -317,7 +318,7 @@ fn walk_primitive(primitive: &PrimitiveType) -> Walked<MappedType> {
         Date => tagged("date32"),
         Timestamp => tagged("timestamptz_us"),
         TimestampNtz => tagged("timestamp_us"),
-        Void | IntervalYearMonth | IntervalDayTime => tagged("utf8"),
+        Void | IntervalYearMonth(_) | IntervalDayTime(_) => tagged("utf8"),
         Decimal(decimal) => match ExasolDecimal::new(decimal.precision(), decimal.scale()) {
             Some(decimal) => tagged(&format!(
                 "decimal128({},{})",

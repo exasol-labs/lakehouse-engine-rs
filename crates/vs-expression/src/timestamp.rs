@@ -52,20 +52,6 @@ impl<'a> TimestampLiteral<'a> {
     pub fn fits(self, unit: TimestampUnit) -> bool {
         self.significant_digits() <= usize::from(unit.digits())
     }
-
-    /// The literal cut to `precision` fractional digits. `None` when the cut drops no nonzero
-    /// digit.
-    pub fn floor(self, precision: u8) -> Option<String> {
-        let precision = usize::from(precision);
-        if self.significant_digits() <= precision {
-            return None;
-        }
-        let (instant, fraction) = self.0.split_once('.')?;
-        Some(match precision {
-            0 => instant.to_string(),
-            p => format!("{instant}.{}", &fraction[..p]),
-        })
-    }
 }
 
 #[cfg(test)]

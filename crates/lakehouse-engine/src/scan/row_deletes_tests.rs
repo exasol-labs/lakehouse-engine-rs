@@ -19,7 +19,7 @@ fn build_test_row_group_meta(
     schema_descr: SchemaDescPtr,
     columns: Vec<ColumnChunkMetaData>,
     num_rows: i64,
-    ordinal: i16,
+    ordinal: i32,
 ) -> RowGroupMetaData {
     RowGroupMetaData::builder(schema_descr.clone())
         .set_num_rows(num_rows)
@@ -52,6 +52,27 @@ fn get_test_schema_descr() -> SchemaDescPtr {
     Arc::new(SchemaDescriptor::new(Arc::new(schema)))
 }
 
+/// The whole-file selection of the scanned row groups, concatenating each row group's local
+/// selection; a skipped row group contributes no rows.
+fn overall_selection(plan: ParquetAccessPlan, metas: &[RowGroupMetaData]) -> RowSelection {
+    use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
+
+    let mut selectors = Vec::new();
+    for (access, meta) in plan.into_inner().into_iter().zip(metas) {
+        let rows = usize::try_from(meta.num_rows()).unwrap();
+        match access {
+            RowGroupAccess::Skip => {}
+            RowGroupAccess::Scan => selectors.push(RowSelector::select(rows)),
+            RowGroupAccess::Selection(selection) => {
+                let local: Vec<RowSelector> = selection.into();
+                assert_eq!(local.iter().map(|s| s.row_count).sum::<usize>(), rows);
+                selectors.extend(local);
+            }
+        }
+    }
+    selectors.into_iter().collect()
+}
+
 fn row_groups_of(row_counts: &[i64]) -> Vec<RowGroupMetaData> {
     let schema_descr = get_test_schema_descr();
     let columns: Vec<ColumnChunkMetaData> = schema_descr
@@ -63,7 +84,12 @@ fn row_groups_of(row_counts: &[i64]) -> Vec<RowGroupMetaData> {
         .iter()
         .enumerate()
         .map(|(ordinal, &rows)| {
-            build_test_row_group_meta(schema_descr.clone(), columns.clone(), rows, ordinal as i16)
+            build_test_row_group_meta(
+                schema_descr.clone(),
+                columns.clone(),
+                rows,
+                i32::try_from(ordinal).unwrap(),
+            )
         })
         .collect()
 }
@@ -77,10 +103,7 @@ fn access_plan_matches_upstream_whole_file_selection() {
         2001, 2100, 2200, 2201, 2202, 2999, 3000,
     ]);
 
-    let recombined = build_access_plan(&metas, &deletes)
-        .into_overall_row_selection(&metas)
-        .unwrap()
-        .unwrap();
+    let recombined = overall_selection(build_access_plan(&metas, &deletes), &metas);
 
     let expected = RowSelection::from(vec![
         RowSelector::select(1),
@@ -136,7 +159,7 @@ fn access_plan_skips_a_fully_deleted_row_group_and_splits_runs_at_its_bounds() {
 
     assert!(matches!(plan.inner()[1], RowGroupAccess::Skip));
     // The overall selection spans only the scanned row groups 0 and 2.
-    let recombined = plan.into_overall_row_selection(&metas).unwrap().unwrap();
+    let recombined = overall_selection(plan, &metas);
     assert_eq!(
         recombined,
         RowSelection::from(vec![

@@ -73,6 +73,11 @@ impl FileSource for DeleteApplyingSource {
         self.inner.filter()
     }
 
+    // Applying deletes only drops rows, so every row still satisfies the inner exact filter.
+    fn exact_filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner.exact_filter()
+    }
+
     fn projection(&self) -> Option<&ProjectionExprs> {
         self.inner.projection()
     }

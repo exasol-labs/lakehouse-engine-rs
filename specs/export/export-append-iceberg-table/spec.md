@@ -23,7 +23,7 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * An `int` or `long` column takes a `DECIMAL(p,0)` of any precision, so Exasol `INTEGER` and `BIGINT` fill both, and a value outside the column's range fails the export. A `timestamptz` column takes a `TIMESTAMP` value as a date and time in UTC, the inverse of how a virtual schema reads a `timestamptz` column.
 * A column mismatch is a table column that no export column matches, even an optional one, an export column that matches no table column, a matched pair whose types § Background does not accept, or an ambiguous name. A table column that an ambiguous name matches is listed under that ambiguity only, not as unmatched. One error names the table and lists every mismatch, with the names of its columns and the Exasol type of each export column and the Iceberg type of each table column.
 * The export refuses a table of format version 3 or later, with an error that names the table and its format version. It appends to a partitioned table as export/export-partitioned-iceberg-table states.
-* The export also refuses a table whose current partition spec has a `void` field named like a table column, the shape Apache Spark leaves when it drops an identity partition field of a format version 1 table. The error names the table and the field.
+* The export also refuses a table whose current partition spec has a field named like a table column, unless the field is that column's `identity` or `void` field. The error names the table and the field. A `void` field named like its column is the shape Apache Spark leaves when it drops an identity partition field of a format version 1 table, and the export appends to it.
 * The export checks the table and the columns before it writes any data, and only when the source has rows (export/export-into-script § Background). Every writer checks the same table, so a column mismatch fails the export before any write in every mode.
 * A value failure is a NULL for a required column or a value outside an `int` or `long` column's range. Each writer finds it only in its own rows, and the error names the table and the column of the first such value. The one-error mismatch list covers column mismatches only. With `SINGLE_COMMIT` a value failure leaves the table unchanged. Without it, writers that committed before the failure keep their commits.
 * An append writes into the schema and partition spec that the writer checked. Every commit asserts the table's current schema ID and default partition spec ID (Iceberg REST `assert-current-schema-id`, `assert-default-spec-id`). Each commit reloads the table before its first attempt and before every retry. A reload that shows another current schema ID, another default partition spec ID, or format version 3 or later fails the commit with an error that names the table and what changed, and adds no snapshot. Iceberg REST has no requirement on the format version, so an upgrade to version 3 that lands between that reload and the commit, and changes neither the snapshot, the schema, nor the partition spec, is not detected: this is a named residual risk.
@@ -70,13 +70,12 @@ When the table that `TABLE_NAME` names exists, the export appends the source row
 * *AND* the table SHALL keep its snapshots unchanged
 * *AND* the export SHALL write no data file
 
-### Scenario: A void partition field named like a column is refused before any data is written
+### Scenario: A void partition field named like its column takes appends
 
 * *GIVEN* a format version 1 table whose dropped identity partition field stays as a `void` field named like its column
 * *WHEN* a user exports a source with rows into it
-* *THEN* the export SHALL fail with an error that names the table and the partition field
-* *AND* the table SHALL keep its snapshots unchanged
-* *AND* the export SHALL write no data file
+* *THEN* the export SHALL succeed
+* *AND* the table, read through a virtual schema, SHALL hold its earlier rows and the exported rows
 
 ### Scenario: A value that the table column cannot hold fails the export
 

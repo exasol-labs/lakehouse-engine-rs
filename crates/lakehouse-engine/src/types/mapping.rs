@@ -358,8 +358,8 @@ fn spark_primitive_to_exasol(
         SparkPrimitive::String
         | SparkPrimitive::Binary
         | SparkPrimitive::Void
-        | SparkPrimitive::IntervalYearMonth
-        | SparkPrimitive::IntervalDayTime => ExasolType::WIDEST_VARCHAR,
+        | SparkPrimitive::IntervalYearMonth(_)
+        | SparkPrimitive::IntervalDayTime(_) => ExasolType::WIDEST_VARCHAR,
     }
 }
 

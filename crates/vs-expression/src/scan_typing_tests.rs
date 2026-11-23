@@ -1547,46 +1547,11 @@ fn a_date_addition_computes_in_the_unit_that_holds_its_argument() {
 }
 
 #[test]
-fn overprecise_timestamp_literal_is_floored_to_the_column_precision() {
-    let lit = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
-    for (op, mirrored, want_op, want_right) in [
-        ("predicate_equal", false, "predicate_notequal", col("TS3")),
-        ("predicate_notequal", false, "predicate_equal", col("TS3")),
-        ("predicate_less", false, "predicate_lessequal", floor()),
-        ("predicate_lessequal", false, "predicate_lessequal", floor()),
-        ("predicate_greater", false, "predicate_greater", floor()),
-        (
-            "predicate_greaterequal",
-            false,
-            "predicate_greater",
-            floor(),
-        ),
-        ("predicate_less", true, "predicate_greater", floor()),
-        (
-            "predicate_greaterequal",
-            true,
-            "predicate_lessequal",
-            floor(),
-        ),
-    ] {
-        let filter = if mirrored {
-            compare(op, lit(), col("TS3"))
-        } else {
-            compare(op, col("TS3"), lit())
-        };
-        assert_eq!(
-            typed(&filter),
-            compare(want_op, col("TS3"), want_right),
-            "{op} mirrored={mirrored}"
-        );
-    }
-}
-
-#[test]
-fn timestamp_literal_within_the_operand_precision_is_unchanged() {
+fn a_timestamp_literal_compares_as_written_at_any_precision() {
     for (column, value) in [
         ("TS3", "2025-06-01 00:00:00.123000"),
+        ("TS3", "2025-06-01 00:00:00.123500"),
+        ("TS0", "2025-06-01 00:00:00.5"),
         ("TS", "2025-06-01 00:00:00.123456"),
         ("TS9", "2025-06-01 00:00:00.123456789"),
         ("TS0", "2025-06-01 00:00:00"),
@@ -1597,31 +1562,7 @@ fn timestamp_literal_within_the_operand_precision_is_unchanged() {
 }
 
 #[test]
-fn between_and_in_with_an_overprecise_timestamp_expand_to_floored_comparisons() {
-    let fits = || timestamp_lit("2025-06-01 00:00:00.122");
-    let over = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
-
-    assert_eq!(
-        typed(&between(col("TS3"), fits(), over())),
-        and([
-            compare("predicate_greaterequal", col("TS3"), fits()),
-            compare("predicate_lessequal", col("TS3"), floor())
-        ])
-    );
-    assert_eq!(
-        typed(&in_list(col("TS3"), [over(), fits()])),
-        or([
-            compare("predicate_notequal", col("TS3"), col("TS3")),
-            predicate_equal(col("TS3"), fits())
-        ])
-    );
-    let fitting_in = in_list(col("TS3"), [fits()]);
-    assert_eq!(typed(&fitting_in), fitting_in);
-}
-
-#[test]
-fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_precision() {
+fn a_timestamp_literal_against_a_date_addition_compares_as_written() {
     let call = || scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]);
     // The typed pass casts the call's first argument to the type it computes in.
     let typed_call = || {
@@ -1631,57 +1572,35 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         )
     };
     let over = || timestamp_lit("2024-01-01 01:00:00.0000001");
-    let floor = || timestamp_lit("2024-01-01 01:00:00");
     let fits = || timestamp_lit("2024-01-02 01:00:00");
-    let never_equal = || compare("predicate_notequal", typed_call(), typed_call());
 
-    for (shape, filter, expected) in [
-        ("=", predicate_equal(call(), over()), never_equal()),
-        ("= mirrored", predicate_equal(over(), call()), never_equal()),
-        (
-            "= a literal finer than the TIMESTAMP(0) result",
-            predicate_equal(call(), timestamp_lit("2024-01-01 01:00:00.123456")),
-            never_equal(),
-        ),
-        (
-            ">=",
-            compare("predicate_greaterequal", call(), over()),
-            compare("predicate_greater", typed_call(), floor()),
-        ),
-        (
-            ">= mirrored",
-            compare("predicate_greaterequal", over(), call()),
-            compare("predicate_lessequal", typed_call(), floor()),
-        ),
-        (
-            "BETWEEN",
-            between(call(), over(), fits()),
-            and([
-                compare("predicate_greater", typed_call(), floor()),
-                compare("predicate_lessequal", typed_call(), fits()),
-            ]),
-        ),
-        (
-            "IN",
-            in_list(call(), [over(), fits()]),
-            or([never_equal(), predicate_equal(typed_call(), fits())]),
-        ),
-    ] {
-        assert_eq!(typed(&filter), expected, "{shape}");
+    let shapes: [fn(Json, Json) -> Json; 6] = [
+        |call, literal| predicate_equal(call, literal),
+        |call, literal| predicate_equal(literal, call),
+        |call, literal| compare("predicate_greaterequal", call, literal),
+        |call, literal| compare("predicate_greaterequal", literal, call),
+        |call, literal| between(call, literal.clone(), literal),
+        |call, literal| in_list(call, [literal]),
+    ];
+    for shape in shapes {
+        for literal in [over(), fits()] {
+            let expected = shape(typed_call(), literal.clone());
+            assert_eq!(typed(&shape(call(), literal)), expected, "{expected}");
+        }
     }
 
     // ADD_MINUTES over a DATE is a TIMESTAMP(0); ADD_DAYS and ADD_WEEKS are a DATE, which
     // compares at the literal's unit.
-    for (name, floored) in [
-        ("ADD_MINUTES", true),
-        ("ADD_DAYS", false),
-        ("ADD_WEEKS", false),
+    for (name, is_date) in [
+        ("ADD_MINUTES", false),
+        ("ADD_DAYS", true),
+        ("ADD_WEEKS", true),
     ] {
         let typed_call = scalar_fn(name, [cast_to(ExasolType::Date, col("D")), num_lit(1)]);
-        let expected = if floored {
-            compare("predicate_notequal", typed_call.clone(), typed_call)
-        } else {
+        let expected = if is_date {
             predicate_equal(cast_to(ExasolType::timestamp(9), typed_call), over())
+        } else {
+            predicate_equal(typed_call, over())
         };
         assert_eq!(
             typed(&predicate_equal(
@@ -1693,17 +1612,6 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         );
     }
 
-    let unchanged: [fn(Json, Json) -> Json; 5] = [
-        |call, literal| predicate_equal(call, literal),
-        |call, literal| predicate_equal(literal, call),
-        |call, literal| compare("predicate_greaterequal", call, literal),
-        |call, literal| between(call, literal.clone(), literal),
-        |call, literal| in_list(call, [literal]),
-    ];
-    for shape in unchanged {
-        let expected = shape(typed_call(), fits());
-        assert_eq!(typed(&shape(call(), fits())), expected, "{expected}");
-    }
     let nanosecond_call = |argument| scalar_fn("ADD_DAYS", [argument, num_lit(1)]);
     let nanosecond_literal = || timestamp_lit("2024-01-02 00:00:00.000000001");
     assert_eq!(
@@ -1714,30 +1622,6 @@ fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_preci
         predicate_equal(
             nanosecond_call(cast_to(ExasolType::timestamp(9), col("TS9"))),
             nanosecond_literal()
-        )
-    );
-}
-
-#[test]
-fn a_literal_against_a_unified_timestamp_is_floored_to_the_unified_precision() {
-    let filter = compare(
-        "predicate_greaterequal",
-        case_when([col("B")], [col("TS0"), col("TS3")]),
-        timestamp_lit("2024-01-01 00:00:00.0005"),
-    );
-    let typed_union = case_when(
-        [col("B")],
-        [
-            cast_to(ExasolType::timestamp(3), col("TS0")),
-            cast_to(ExasolType::timestamp(3), col("TS3")),
-        ],
-    );
-    assert_eq!(
-        typed(&filter),
-        compare(
-            "predicate_greater",
-            typed_union,
-            timestamp_lit("2024-01-01 00:00:00.000")
         )
     );
 }

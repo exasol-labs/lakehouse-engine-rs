@@ -37,13 +37,13 @@ iceberg = { workspace = true }
 # `internal-api` is the only way the kernel exposes partition columns, column-mapping mode, and
 # the reader protocol; it has no semver guarantee, so its accessors are confined to
 # `format::delta_replay` and `format::delta_protocol`.
-delta_kernel = { version = "0.30.0", features = [
+delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "eb57996736775c28438f724d46bb6cba53f03a81", features = [
     "default-engine-base",
-    "arrow-59",
+    "arrow-60",
     "internal-api",
 ] }
-delta_kernel_default_engine = { version = "0.30.0", default-features = false, features = [
-    "arrow-59",
+delta_kernel_default_engine = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "eb57996736775c28438f724d46bb6cba53f03a81", default-features = false, features = [
+    "arrow-60",
     "rustls",
 ] }
 

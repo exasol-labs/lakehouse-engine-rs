@@ -19,13 +19,14 @@ license = "MIT"
 [workspace.dependencies]
 
 # Must match datafusion's arrow major.
-arrow   = { version = "59.3.2", default-features = false }
-parquet = { version = "59.3.2", features = ["async"] }
+arrow   = { version = "60.2.0", default-features = false }
+parquet = { version = "60.2.0", features = ["async"] }
 
-datafusion = { version = "55.2", default-features = false, features = ["parquet", "sql"] }
-datafusion-datasource = { version = "55.2", default-features = false }
+# Pinned to the 56.0.0 release tag until it is published to crates.io.
+datafusion = { git = "https://github.com/apache/datafusion", tag = "56.0.0", default-features = false, features = ["parquet", "sql"] }
+datafusion-datasource = { git = "https://github.com/apache/datafusion", tag = "56.0.0", default-features = false }
 
-object_store = { version = "0.13.2", features = ["aws"] }
+object_store = { version = "0.14.2", features = ["aws"] }
 
 regex = { version = "1" }
 
@@ -34,11 +35,11 @@ regex = { version = "1" }
 roaring = { version = "0.11" }
 
 # Must link the same arrow major as datafusion/exasol-udf-sdk. Pinned to one `main` rev
-# because no release is on arrow 59 yet (#499); all three crates must share the rev.
-iceberg              = { git = "https://github.com/apache/iceberg-rust", rev = "da5cc19a9f7c9e8ea14dc40d4a82974cd26def42" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "da5cc19a9f7c9e8ea14dc40d4a82974cd26def42" }
+# because no release is on arrow 60 yet (#499); all three crates must share the rev.
+iceberg              = { git = "https://github.com/apache/iceberg-rust", rev = "a7160a0a2318028df1a8ae88abbb3b5d611fa3d8" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "a7160a0a2318028df1a8ae88abbb3b5d611fa3d8" }
 # RestCatalog requires a StorageFactory; iceberg core ships no S3 one.
-iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "da5cc19a9f7c9e8ea14dc40d4a82974cd26def42", default-features = false, features = ["opendal-s3"] }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "a7160a0a2318028df1a8ae88abbb3b5d611fa3d8", default-features = false, features = ["opendal-s3"] }
 # Names the `Context` of `ProvideCredential::provide_credential`, which iceberg-storage-opendal does
 # not re-export. Pinned to the version it resolves, so both name the same trait.
 reqsign-core = { version = "=3.3.2" }
@@ -52,8 +53,8 @@ rand        = { version = "0.8" }
 
 # Also the SLC version (fingerprint must match). `make install-slc` and
 # deploy/scripts/install.sh scrape this line, so keep `version` inline.
-exasol-udf-sdk    = { version = "0.33.0", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.33.0" }
+exasol-udf-sdk    = { version = "0.34.0", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.34.0" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
@@ -74,7 +75,8 @@ aws-sdk-glue           = { version = "1.170", default-features = false, features
 # The `Retry-After` HTTP-date parser; aws-sdk-glue already compiles this crate.
 aws-smithy-types       = { version = "1.8" }
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"] }
+# The line iceberg, delta_kernel, and object_store link, so the `.so` carries one HTTP stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
 # The TLS stack under reqwest, for typed handshake errors.
 rustls  = { version = "0.23", default-features = false }
 # The HTTP stack under reqwest, for its typed incomplete-message error.

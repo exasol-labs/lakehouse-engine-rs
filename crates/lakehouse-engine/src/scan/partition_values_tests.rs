@@ -79,10 +79,10 @@ fn projection_indices_are_remapped_from_declared_order_to_file_then_partition_or
 
     // Declared a=0, p=1, b=2; scan order is a=0, b=1, p=2.
     assert_eq!(
-        split.remap_projection(Some(&vec![2, 1, 0])),
+        split.remap_projection(Some(&[2, 1, 0])),
         Some(vec![1, 2, 0])
     );
-    assert_eq!(split.remap_projection(Some(&vec![1])), Some(vec![2]));
+    assert_eq!(split.remap_projection(Some(&[1])), Some(vec![2]));
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn a_scan_without_partition_columns_keeps_its_schema_and_projection_unchanged() 
     );
     assert!(split.file_source_schema().table_partition_cols().is_empty());
     assert_eq!(split.remap_projection(None), None);
-    assert_eq!(split.remap_projection(Some(&vec![1, 0])), Some(vec![1, 0]));
+    assert_eq!(split.remap_projection(Some(&[1, 0])), Some(vec![1, 0]));
     assert!(
         split
             .partition_values_for(&FileEntry::new("part-0.parquet", 1))

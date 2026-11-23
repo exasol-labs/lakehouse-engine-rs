@@ -1,5 +1,6 @@
 use arrow::datatypes::DataType;
 use datafusion::common::config::{ConfigOptions, TableParquetOptions};
+use datafusion::common::parquet_config::DFTimeUnit;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
@@ -207,19 +208,15 @@ pub(super) async fn register_file_list(
     Ok(())
 }
 
-/// Matches Iceberg's own readers, which read INT96 as microseconds.
-const INT96_COERCE_TIME_UNIT: &str = "us";
-/// An INT96 instant is UTC.
-const INT96_COERCE_TZ: &str = "UTC";
-
 /// arrow-rs otherwise decodes INT96 as `Timestamp(Nanosecond)`, which overflows on far-future
 /// values legacy writers such as Fivetran emit (#143). The single source of truth for both
 /// schema inference ([`register_file_list`]) and decode ([`scan_table_parquet_format`]), since a
 /// divergence would be a schema mismatch.
 pub fn int96_coerced_parquet_format() -> ParquetFormat {
     let mut options = TableParquetOptions::default();
-    options.global.coerce_int96 = Some(INT96_COERCE_TIME_UNIT.to_string());
-    options.global.coerce_int96_tz = Some(INT96_COERCE_TZ.to_string());
+    // Microseconds match Iceberg's own readers, and an INT96 instant is UTC.
+    options.global.coerce_int96 = Some(DFTimeUnit::Microsecond);
+    options.global.coerce_int96_tz = Some("UTC".parse().expect("UTC is a valid time zone"));
     // Statistics pruning ignores an IN-list longer than this (default 20), so it covers the
     // largest key set the broadcast hash join pushes into the fact scan.
     options.global.max_in_list_size = ConfigOptions::default()

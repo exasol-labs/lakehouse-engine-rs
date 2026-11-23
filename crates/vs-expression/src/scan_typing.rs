@@ -714,7 +714,6 @@ impl<'a> ScanTyping<'a> {
             | "predicate_between"
             | "predicate_in_constlist" => {
                 type_comparison(node, out, children)?;
-                floor_timestamp_literals(node, out, children);
             }
             "predicate_is_null" | "predicate_is_not_null" => {}
             "function_scalar_case" => {
@@ -1273,57 +1272,6 @@ fn rewrite_operands(
     }
 }
 
-/// DataFusion truncates a timestamp literal to its TIMESTAMP operand's unit, while Exasol compares
-/// at full precision (#461, apache/datafusion#22142, fixed by apache/datafusion#22906). A DATE
-/// needs no floor, because it compares at the unit that holds the literal.
-fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
-    let precision = |field: &str| children.one(field)?.value_digits();
-    let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
-    match kind(node) {
-        "predicate_between" => {
-            let Some(p) = precision("expression") else {
-                return;
-            };
-            if !finer(&out["left"], p) && !finer(&out["right"], p) {
-                return;
-            }
-            let operand = &out["expression"];
-            *out = serde_json::json!({"type": "predicate_and", "expressions": [
-                floored_comparison("predicate_greaterequal", operand, &out["left"], p),
-                floored_comparison("predicate_lessequal", operand, &out["right"], p),
-            ]});
-        }
-        "predicate_in_constlist" => {
-            let Some(p) = precision("expression") else {
-                return;
-            };
-            let Some(Json::Array(values)) = out.get("arguments") else {
-                return;
-            };
-            if !values.iter().any(|value| finer(value, p)) {
-                return;
-            }
-            let operand = &out["expression"];
-            let expressions: Vec<Json> = values
-                .iter()
-                .map(|value| floored_comparison("predicate_equal", operand, value, p))
-                .collect();
-            *out = serde_json::json!({"type": "predicate_or", "expressions": expressions});
-        }
-        op => {
-            if let Some(p) = precision("left")
-                && finer(&out["right"], p)
-            {
-                *out = floored_comparison(op, &out["left"], &out["right"], p);
-            } else if let Some(p) = precision("right")
-                && finer(&out["left"], p)
-            {
-                *out = floored_comparison(mirrored(op), &out["right"], &out["left"], p);
-            }
-        }
-    }
-}
-
 fn mirrored(op: &str) -> &str {
     match op {
         "predicate_less" => "predicate_greater",
@@ -1332,29 +1280,6 @@ fn mirrored(op: &str) -> &str {
         "predicate_greaterequal" => "predicate_lessequal",
         op => op,
     }
-}
-
-fn floored_literal(node: &Json, precision: u8) -> Option<Json> {
-    if kind(node) != "literal_timestamp" {
-        return None;
-    }
-    let floor = TimestampLiteral(node.get("value")?.as_str()?).floor(precision)?;
-    Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
-}
-
-/// `operand <op> literal`, with a literal finer than `precision` floored. `x <> x` and `x = x`
-/// keep a NULL operand NULL, so an enclosing NOT stays exact.
-fn floored_comparison(op: &str, operand: &Json, literal: &Json, precision: u8) -> Json {
-    let Some(floor) = floored_literal(literal, precision) else {
-        return serde_json::json!({"type": op, "left": operand, "right": literal});
-    };
-    let (op, right) = match op {
-        "predicate_equal" => ("predicate_notequal", operand.clone()),
-        "predicate_notequal" => ("predicate_equal", operand.clone()),
-        "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
-        _ => ("predicate_greater", floor),
-    };
-    serde_json::json!({"type": op, "left": operand, "right": right})
 }
 
 fn integer_literal(digits: &str) -> Json {

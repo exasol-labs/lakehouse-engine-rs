@@ -2,18 +2,24 @@ use super::*;
 use crate::scan::session_config_for_spec;
 use crate::scan::test_support::WithFiles;
 use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
+use datafusion::common::parquet_config::DFTimeUnit;
 
 #[test]
 fn both_parquet_format_sites_coerce_int96_us_utc() {
     let format = int96_coerced_parquet_format();
     assert_eq!(
         format.coerce_int96(),
-        Some("us".to_string()),
+        Some(DFTimeUnit::Microsecond),
         "coerce_int96 must coerce INT96 timestamps to microsecond resolution"
     );
     assert_eq!(
-        format.options().global.coerce_int96_tz,
-        Some("UTC".to_string()),
+        format
+            .options()
+            .global
+            .coerce_int96_tz
+            .as_ref()
+            .map(|tz| tz.as_str()),
+        Some("UTC"),
         "coerce_int96_tz must treat coerced INT96 instants as UTC"
     );
 }
@@ -57,7 +63,7 @@ fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
         );
         assert_eq!(
             global.coerce_int96,
-            Some("us".to_string()),
+            Some(DFTimeUnit::Microsecond),
             "every decode format keeps the INT96 coercion of its base"
         );
     }
@@ -1105,51 +1111,5 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     assert!(
         !text.contains(SENTINEL),
         "the resolved credential must be stripped from a raw-scan error: {text}"
-    );
-}
-
-#[tokio::test]
-async fn datafusion_truncates_an_overprecise_timestamp_literal() {
-    use datafusion::arrow::array::TimestampMillisecondArray;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::MemTable;
-    use datafusion::execution::context::SessionContext;
-
-    // apache/datafusion#22142: DataFusion truncates a microsecond literal to the column's
-    // millisecond unit. A failure means the release carries apache/datafusion#22906, and
-    // `floor_timestamp_literals` (vs-expression `scan_typing.rs`) and this test go.
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "ts",
-        DataType::Timestamp(TimeUnit::Millisecond, None),
-        false,
-    )]));
-    let millis = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
-        .and_then(|day| day.and_hms_milli_opt(0, 0, 0, 123))
-        .expect("2025-06-01 00:00:00.123 is a valid instant")
-        .and_utc()
-        .timestamp_millis();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(TimestampMillisecondArray::from(vec![millis]))],
-    )
-    .unwrap();
-    let ctx = SessionContext::new();
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("t", Arc::new(table)).unwrap();
-
-    let batches = ctx
-        .sql("SELECT ts FROM t WHERE ts = TIMESTAMP '2025-06-01 00:00:00.123456'")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        rows, 1,
-        "DataFusion no longer truncates the literal to the column's unit: remove \
-         `floor_timestamp_literals` and this test"
     );
 }
