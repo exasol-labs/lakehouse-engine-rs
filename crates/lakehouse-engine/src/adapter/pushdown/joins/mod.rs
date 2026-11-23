@@ -9,12 +9,10 @@ use serde_json::Value as Json;
 use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
+use super::request::{Clause, OutputContract, PushdownRequest};
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
-use super::support::{
-    ColumnTypes, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
-    project_columns, pushdown_response,
-};
+use super::support::{ColumnTypes, InvolvedColumns, project_columns, pushdown_response};
 
 mod attribution;
 mod broadcast_policy;
@@ -22,6 +20,7 @@ mod condition_filters;
 mod planning;
 mod rendering;
 mod sql_builders;
+mod where_placement;
 
 pub(crate) use planning::{
     DetectedJoin, JoinLeaf, JoinShape, JoinSides, ResolvedJoinSide, detect_join,
@@ -31,6 +30,9 @@ pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 pub(super) use sql_builders::{
     EmptyRelation, n_scan_emission, qualified_single_table_fallback_pushdown, single_table_emission,
 };
+pub(super) use where_placement::WherePlacement;
+#[cfg(test)]
+pub(super) use where_placement::tests::scan_applies;
 // The dispatch-golden sibling module drives the broadcast and N-scan builders directly.
 #[cfg(test)]
 pub(super) use sql_builders::{
@@ -50,7 +52,7 @@ use sql_builders::{aggregation_reads, build_broadcast_plan_sql, qualified_emissi
 /// planners run it before any catalog request.
 pub(crate) fn ensure_columns_declared(
     request: &Json,
-    pushdown: &Json,
+    pushdown: &PushdownRequest,
     join: Option<&DetectedJoin>,
     declared: &[&InvolvedColumns<'_>],
 ) -> Result<(), UdfError> {
@@ -93,7 +95,7 @@ fn empty_join_sql(
     sides: &[ResolvedJoinSide],
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
-    let emitted = n_scan_emission(pushdown, join, sides)?;
+    let emitted = n_scan_emission(pushdown, &WherePlacement::whole(pushdown), join, sides)?;
     let legs = join.legs();
     let col_types = ColumnTypes::per_relation(
         sides
@@ -101,8 +103,12 @@ fn empty_join_sql(
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let bound = pushdown.with_json(legs.qualify(pushdown.json()));
-    let scan = ScanTranslator::over(&col_types, context.version, &[bound.json()])?;
+    let bound = pushdown.map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
+    let scan = ScanTranslator::over(
+        &col_types,
+        context.version,
+        &bound.clauses(&Clause::ALL).collect::<Vec<_>>(),
+    )?;
     let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
     empty_result_sql(
         pushdown,
@@ -148,13 +154,13 @@ pub(super) async fn plan_join(
     // Before the move, whose leg lookups rely on every column binding a leg.
     ensure_columns_declared(
         request,
-        pushdown.json(),
+        pushdown,
         Some(join),
         &involved.iter().collect::<Vec<_>>(),
     )?;
     let moved = match condition_filters::move_condition_filters(pushdown, &legs) {
         Some(moved) => {
-            let JoinShape::Join(moved_join) = detect_join(request, moved.json())? else {
+            let JoinShape::Join(moved_join) = detect_join(request, &moved)? else {
                 unreachable!("moving condition filters keeps every join node");
             };
             Some((moved, moved_join))
@@ -165,8 +171,7 @@ pub(super) async fn plan_join(
         Some((moved, moved_join)) => (moved, moved_join),
         None => (pushdown, join),
     };
-    let pushdown_req = pushdown.json();
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let filter = pushdown.filter();
     // Built once for every leg, so every leg's identifier passes its rule before any catalog
     // request.
     let identifiers: Vec<&str> = join
@@ -219,14 +224,13 @@ fn plan_broadcast_join(
     sides: &[ResolvedJoinSide],
     context: &PushdownContext<'_>,
 ) -> Result<Option<String>, UdfError> {
-    let pushdown_req = pushdown.json();
     let legs = join.legs();
     let keys_only = condition_filters::holds_only_join_keys(&join.conditions[0], &legs);
     // Exasol renders an aggregating request's window over the broadcast fan-out, so only a
     // request that does not aggregate has a window the path may be unable to serve.
-    let window_servable = aggregation_type(pushdown_req).is_some()
+    let window_servable = pushdown.aggregation_type().is_some()
         || !matches!(
-            classify_join_window(pushdown_req),
+            classify_join_window(pushdown),
             JoinWindowPlan::BroadcastUnservable
         );
     if join.tables.len() != 2 || !keys_only || !window_servable {
@@ -239,7 +243,7 @@ fn plan_broadcast_join(
         max_bytes: context.tuning.join_broadcast_max_bytes,
         legs: &legs,
         dimension_leg: candidate.dimension_leg,
-        filter: pushdown_req.get("filter").filter(|f| !f.is_null()),
+        filter: pushdown.filter(),
         aggregation_reads: reads
             .as_ref()
             .map(|read| read[candidate.dimension_leg].columns()),

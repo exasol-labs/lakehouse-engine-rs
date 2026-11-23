@@ -2,7 +2,7 @@
 //! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
 //! diff in one of them is always a regression, never an expected update.
 
-use super::joins::build_n_scan_join_sql;
+use super::joins::{build_n_scan_join_sql, scan_applies};
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
     count_star, dispatch_base, dispatch_context, float_div, parsed_pushdown, pd, projected_columns,
@@ -195,8 +195,13 @@ fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
 
 /// The dispatcher's own emission: a golden pins the SQL the dispatcher generates, fan-out included.
 fn golden_emission(request: &Json, pushdown: &PushdownRequest, columns: &ColumnTypes) -> Emitted {
-    super::joins::single_table_emission(request, pushdown, columns)
-        .expect("a golden fixture names no refused column")
+    super::joins::single_table_emission(
+        request,
+        pushdown,
+        &WherePlacement::whole(pushdown),
+        columns,
+    )
+    .expect("a golden fixture names no refused column")
 }
 
 /// Every golden shape has no ORDER BY and derives one projection item per
@@ -227,7 +232,7 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
     let columns = column_types(&base_col_types());
     let emitted = golden_emission(request, &pushdown, &columns);
     let projection =
-        super::support::project_columns(&pushdown, scan_for(&columns, pushdown.json()), &emitted)
+        super::support::project_columns(&pushdown, scan_for(&columns, &pushdown), &emitted)
             .expect("the fixture must project");
     assert_eq!(
         projection,
@@ -239,8 +244,8 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
         &pushdown,
         projection,
         &emitted,
-        scan_for(&columns, pushdown.json()),
-        ScanWhere::Absent,
+        scan_for(&columns, &pushdown),
+        scan_applies(None),
         None,
     )
 }
@@ -264,24 +269,25 @@ fn dispatch_sql_with_pushdown_req(
         &pushdown,
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
         &golden_emission(request, &pushdown, &columns),
-        scan_for(&columns, pushdown_req),
-        filter.map_or(ScanWhere::Absent, ScanWhere::Pushed),
+        scan_for(&columns, &pushdown),
+        scan_applies(filter),
         limit,
     )
 }
 
-/// Places the request's own filter through `split_where`, as `handle_pushdown` does.
+/// Places the request's own filter through [`WherePlacement::single_scan`], as `handle_pushdown`
+/// does.
 fn dispatch_sql_placing_filter(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
     let columns = column_types(&base_col_types());
-    let scan = scan_for(&columns, pushdown.json());
+    let scan = scan_for(&columns, &pushdown);
     golden_dispatch(
         request,
         &pushdown,
         RowProjection::Direct(Vec::new()),
         &golden_emission(request, &pushdown, &columns),
         scan,
-        scan.split_where(pushdown.json().get("filter")),
+        WherePlacement::single_scan(scan, &pushdown),
         None,
     )
 }
@@ -293,7 +299,7 @@ fn golden_dispatch(
     projection: RowProjection,
     emitted: &Emitted,
     scan: ScanTranslator<'_>,
-    scan_where: ScanWhere<'_>,
+    placement: WherePlacement,
     limit: Option<u64>,
 ) -> String {
     let result = build_dispatch_sql(
@@ -302,7 +308,7 @@ fn golden_dispatch(
         projection,
         emitted,
         scan,
-        scan_where,
+        placement,
         limit,
         false,
         &unqualified_shards(fixed_shards()),
@@ -327,7 +333,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &pushdown,
         &pushdown,
         &RowProjection::Direct(projected_columns(proj_cols, proj_types)),
-        scan_for(&columns, &pd(request)),
+        scan_for(&columns, &pushdown),
         &EmptyRelation::single_scan(request, golden_emission(request, &pushdown, &columns)),
         &test_context(),
     )
@@ -495,7 +501,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
 
     let shape = classify_request_shape(
         &parsed_pushdown(&request),
-        scan_for(&column_types(&base_col_types()), &pd(&request)),
+        scan_for(&column_types(&base_col_types()), &parsed_pushdown(&request)),
     );
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -754,7 +760,8 @@ fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
 }
 
 fn two_table_detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(request, &pd(request)).expect("two-table join must be detected") {
+    match detect_join(request, &parsed_pushdown(request)).expect("two-table join must be detected")
+    {
         JoinShape::Join(join) => join,
         other => panic!("expected a detected join, got {other:?}"),
     }

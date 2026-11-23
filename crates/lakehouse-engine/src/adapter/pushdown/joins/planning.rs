@@ -3,10 +3,9 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::super::ResolvedScan;
+use super::super::request::PushdownRequest;
 use super::super::scan_resolution::TableScanResolver;
-use super::super::support::{
-    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
-};
+use super::super::support::{ColumnTypes, InvolvedColumns, involved_columns};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,8 +57,11 @@ fn collect_join_tree(
 /// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
 /// the N-scan fallback renders any inner condition. A leaf without a readable identifier note is
 /// the same stale-schema condition the single-table path reports, so a hard `Err`.
-pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
-    let from = match pushdown_req.get("from") {
+pub(crate) fn detect_join(
+    request: &Json,
+    pushdown: &PushdownRequest,
+) -> Result<JoinShape, UdfError> {
+    let from = match pushdown.from() {
         Some(from) => from,
         None => return Ok(JoinShape::NotAJoin),
     };
@@ -213,14 +215,11 @@ pub(in super::super) enum JoinWindowPlan {
 /// Whether the projection can bind an `Ordered` key is decided at construction, once the broadcast
 /// render has built that projection. An aggregating request never reaches here: Exasol renders
 /// its window over the fan-out.
-pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
-    let limit = extract_limit(pushdown_req);
-    let offset = extract_offset(pushdown_req);
-    let Some(order_by) = pushdown_req
-        .get("orderBy")
-        .and_then(|v| v.as_array())
-        .filter(|elements| !elements.is_empty())
-    else {
+pub(super) fn classify_join_window(pushdown: &PushdownRequest) -> JoinWindowPlan {
+    let limit = pushdown.limit();
+    let offset = pushdown.offset();
+    let order_by = pushdown.order_by();
+    if order_by.is_empty() {
         // Exasol rejects OFFSET without ORDER BY and a per-shard offset does not compose.
         if offset != 0 {
             return JoinWindowPlan::BroadcastUnservable;
@@ -229,7 +228,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
             Some(n) => JoinWindowPlan::BareLimit(n),
             None => JoinWindowPlan::Unbounded,
         };
-    };
+    }
 
     let mut keys = Vec::with_capacity(order_by.len());
     for element in order_by {

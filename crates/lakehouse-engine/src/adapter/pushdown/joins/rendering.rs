@@ -8,8 +8,9 @@ use vs_expression::{
 };
 
 use super::super::context::PushdownContext;
+use super::super::request::OutputContract;
 use super::super::support::{
-    ColumnTypes, Emitted, OutputContract, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
+    ColumnTypes, Emitted, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
 };
 use super::attribution::JoinLegs;
 
@@ -168,18 +169,6 @@ pub(super) fn possible_side_column_names(
         }
     });
     names
-}
-
-/// The clauses an Exasol wrapper renders over a fan-out that already applied the WHERE.
-pub(super) fn wrapper_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
-    ["selectList", "groupBy", "orderBy", "having"]
-        .into_iter()
-        .filter_map(|clause| pushdown_req.get(clause))
-}
-
-/// The single owner of which clauses can name a source column.
-pub(super) fn referenced_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
-    wrapper_clause_values(pushdown_req).chain(pushdown_req.get("filter"))
 }
 
 /// Leg `leg`'s columns that `values` name, in declaration order. CROSS-FOLD: `full_cols` is

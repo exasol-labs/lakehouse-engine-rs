@@ -1,4 +1,4 @@
-use super::super::joins::single_table_emission;
+use super::super::joins::{WherePlacement, single_table_emission};
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
@@ -20,8 +20,13 @@ fn empty_sql(
         RowProjection::Direct(projected_columns(proj, proj_types))
     };
     // The dispatcher's own emission, so the empty wrapper is the one it builds.
-    let emitted = single_table_emission(request, &pushdown, scan.columns())
-        .expect("the fixture names no refused column");
+    let emitted = single_table_emission(
+        request,
+        &pushdown,
+        &WherePlacement::whole(&pushdown),
+        scan.columns(),
+    )
+    .expect("the fixture names no refused column");
     empty_result_sql(
         &pushdown,
         &pushdown,

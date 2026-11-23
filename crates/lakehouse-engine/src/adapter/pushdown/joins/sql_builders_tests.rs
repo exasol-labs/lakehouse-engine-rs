@@ -8,6 +8,7 @@ use super::super::tests::{
     join_request, legs_from_leaves, nq3_join_request, request_legs, resolved_side,
     self_join_request, three_table_join_request, two_scan_tuning,
 };
+use super::super::where_placement::tests::scan_applies;
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::adapter::tuning::Tuning;
@@ -91,9 +92,8 @@ fn broadcast_join_declines_wrapped_projection() {
             ExasolType::varchar(100),
         )],
     );
-    let pushdown_req = pd(&request);
     assert!(matches!(
-        classify_join_window(&pushdown_req),
+        classify_join_window(&parsed_pushdown(&request)),
         JoinWindowPlan::Unbounded
     ));
     let detected = detected_join(&request);
@@ -384,10 +384,11 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
 #[test]
 fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
     let request = three_table_join_request();
-    let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi =
+        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
     let sides = vec![
         resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
@@ -429,10 +430,11 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
 #[test]
 fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
     let request = q1_join_request();
-    let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi =
+        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
     let sides = vec![
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 10)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
@@ -465,10 +467,11 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
 #[test]
 fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
     let request = nq3_join_request();
-    let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi =
+        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
     let sides = vec![
         resolved_side("PART", vec![("s3://w/p-0.parquet", 10)]),
         resolved_side("PARTSUPP", vec![("s3://w/ps-0.parquet", 40)]),
@@ -552,10 +555,11 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
             ("TAGS", "lh.tags"),
         ],
     );
-    let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi =
+        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
     let sides = vec![
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
@@ -1176,7 +1180,7 @@ fn order_by_over_join_renders_qualified_in_unified_wrapper() {
     ),]);
 
     assert!(matches!(
-        classify_join_window(&pd(&request)),
+        classify_join_window(&parsed_pushdown(&request)),
         JoinWindowPlan::Ordered { .. }
     ));
 
@@ -1197,7 +1201,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
     ),]);
 
     assert!(matches!(
-        classify_join_window(&pd(&request)),
+        classify_join_window(&parsed_pushdown(&request)),
         JoinWindowPlan::BroadcastUnservable
     ));
 
@@ -1214,14 +1218,14 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
 fn join_window_classification_covers_every_unservable_and_served_shape() {
     let plain = join_request(Json::Null, equi_condition());
     assert!(matches!(
-        classify_join_window(&pd(&plain)),
+        classify_join_window(&parsed_pushdown(&plain)),
         JoinWindowPlan::Unbounded
     ));
 
     let mut limited = join_request(Json::Null, equi_condition());
     limited["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10});
     assert!(matches!(
-        classify_join_window(&pd(&limited)),
+        classify_join_window(&parsed_pushdown(&limited)),
         JoinWindowPlan::BareLimit(10)
     ));
 
@@ -1229,7 +1233,7 @@ fn join_window_classification_covers_every_unservable_and_served_shape() {
     offset_without_order["pushdownRequest"]["limit"] =
         serde_json::json!({"numElements": 10, "offset": 5});
     assert!(matches!(
-        classify_join_window(&pd(&offset_without_order)),
+        classify_join_window(&parsed_pushdown(&offset_without_order)),
         JoinWindowPlan::BroadcastUnservable
     ));
 
@@ -1240,7 +1244,7 @@ fn join_window_classification_covers_every_unservable_and_served_shape() {
         false
     ),]);
     assert!(matches!(
-        classify_join_window(&pd(&ordered)),
+        classify_join_window(&parsed_pushdown(&ordered)),
         JoinWindowPlan::Ordered { .. }
     ));
 
@@ -1251,7 +1255,7 @@ fn join_window_classification_covers_every_unservable_and_served_shape() {
         true
     ),]);
     assert!(matches!(
-        classify_join_window(&pd(&ordered_by_expression)),
+        classify_join_window(&parsed_pushdown(&ordered_by_expression)),
         JoinWindowPlan::BroadcastUnservable
     ));
 }
@@ -1736,7 +1740,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         fan_out_spec,
         &first_table_column_types(&request),
         &scan_distribute_shards(vec![vec![("s3://w/c-0.parquet".to_string(), 10u64)]]),
-        None,
+        &scan_applies(None),
         &test_context(),
     )
     .expect("the grouped qualified fallback must build");
@@ -1796,9 +1800,11 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .item(sum_case.clone(), ExasolType::WIDEST_VARCHAR)
         .build()
         .0;
+    let rich_pushdown = parsed_pushdown(&rich_request);
     let rich = single_table_emission(
         &rich_request,
-        &parsed_pushdown(&rich_request),
+        &rich_pushdown,
+        &WherePlacement::whole(&rich_pushdown),
         &column_types(&all_cols),
     )
     .expect("the request names no refused column");
@@ -1840,9 +1846,13 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let grouped_req = parsed_pushdown(&grouped_request);
-    let grouped =
-        single_table_emission(&grouped_request, &grouped_req, &column_types(&grouped_all))
-            .expect("the request names no refused column");
+    let grouped = single_table_emission(
+        &grouped_request,
+        &grouped_req,
+        &WherePlacement::whole(&grouped_req),
+        &column_types(&grouped_all),
+    )
+    .expect("the request names no refused column");
     let (gproj, _) = split_projection(&grouped.projection());
     assert_eq!(
         proj_names(&gproj),
@@ -1856,7 +1866,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         fan_out_base(),
         &column_types(&grouped_all),
         &unqualified_shards(shards.to_vec()),
-        None,
+        &scan_applies(None),
         &test_context(),
     )
     .expect("grouped decline wrapper must build");
@@ -1887,8 +1897,13 @@ fn fallback_projection_narrows_to_referenced_columns() {
         .build()
         .0;
     let sg_req = parsed_pushdown(&sg_request);
-    let single_group = single_table_emission(&sg_request, &sg_req, &column_types(&sg_all))
-        .expect("the request names no refused column");
+    let single_group = single_table_emission(
+        &sg_request,
+        &sg_req,
+        &WherePlacement::whole(&sg_req),
+        &column_types(&sg_all),
+    )
+    .expect("the request names no refused column");
     let (sproj, _) = split_projection(&single_group.projection());
     assert_eq!(
         proj_names(&sproj),
@@ -1901,7 +1916,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         fan_out_base(),
         &column_types(&sg_all),
         &unqualified_shards(shards.to_vec()),
-        None,
+        &scan_applies(None),
         &test_context(),
     )
     .expect("single-group Case 2/3 wrapper must build");
@@ -1923,12 +1938,18 @@ fn fallback_projection_narrows_to_referenced_columns() {
 
 /// The names [`single_table_emission`] answers for `request` over `columns`.
 fn wrapper_emission_names(request: &Json, columns: &ColumnTypes) -> Vec<String> {
-    single_table_emission(request, &parsed_pushdown(request), columns)
-        .expect("the request names no refused column")
-        .columns()
-        .iter()
-        .map(|(column, _)| column.name.clone())
-        .collect()
+    let pushdown = parsed_pushdown(request);
+    single_table_emission(
+        request,
+        &pushdown,
+        &WherePlacement::whole(&pushdown),
+        columns,
+    )
+    .expect("the request names no refused column")
+    .columns()
+    .iter()
+    .map(|(column, _)| column.name.clone())
+    .collect()
 }
 
 #[test]
@@ -1993,8 +2014,14 @@ fn the_wrapper_fan_out_emits_the_first_column_the_reader_does_not_refuse() {
         ),
     ] {
         let all_cols = refusing_column_types(&all_cols, &refused);
-        let emitted = single_table_emission(&request, &parsed_pushdown(&request), &all_cols)
-            .expect("a readable column is left");
+        let pushdown = parsed_pushdown(&request);
+        let emitted = single_table_emission(
+            &request,
+            &pushdown,
+            &WherePlacement::whole(&pushdown),
+            &all_cols,
+        )
+        .expect("a readable column is left");
 
         let (proj, types) = split_projection(&emitted.projection());
 
@@ -2015,7 +2042,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
         &request,
         &pushdown,
         &base,
-        &ScanWhere::Absent,
+        &scan_applies(None),
         &unqualified_shards(vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]]),
         &first_table_column_types(&request),
         &test_context(),
@@ -2182,7 +2209,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
     let events = emitting(&column_types(&events_columns()));
     let (pushdown, legs) = planned(request);
-    let leg_count = match detect_join(request, pushdown.json()).expect("a plannable request") {
+    let leg_count = match detect_join(request, &pushdown).expect("a plannable request") {
         JoinShape::Join(join) => join.tables.len(),
         JoinShape::NotAJoin => 1,
     };

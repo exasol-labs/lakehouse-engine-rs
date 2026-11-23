@@ -19,14 +19,17 @@ use serde_json::Value as Json;
 mod binary_filter;
 pub(crate) use binary_filter::literal_binary_bytes;
 
+mod request;
+use request::Clause;
+pub use request::PushdownRequest;
+
 mod support;
 pub use support::{
-    AggregateMergeInputs, ColumnTypes, FanOut, ProjectedColumn, PushdownRequest, ScanTranslator,
+    AggregateMergeInputs, ColumnTypes, FanOut, ProjectedColumn, ScanTranslator,
     build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    Emitted, RowProjection, ScanWhere, extract_limit, involved_columns, order_by_present,
-    project_columns, projection_items, pushdown_response,
+    Emitted, RowProjection, involved_columns, project_columns, projection_items, pushdown_response,
 };
 use vs_expression::strip_table_alias;
 
@@ -82,8 +85,8 @@ pub(crate) use joins::{
     detect_join, render_broadcast_join,
 };
 use joins::{
-    EmptyRelation, ensure_columns_declared, plan_join, qualified_single_table_fallback_pushdown,
-    single_table_emission,
+    EmptyRelation, WherePlacement, ensure_columns_declared, plan_join,
+    qualified_single_table_fallback_pushdown, single_table_emission,
 };
 
 #[cfg(test)]
@@ -118,7 +121,7 @@ pub(crate) async fn handle_pushdown(
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.
-    match detect_join(request, pushdown.json())? {
+    match detect_join(request, &pushdown)? {
         JoinShape::NotAJoin => {}
         JoinShape::Join(join) => {
             return plan_join(request, &pushdown, &join, statement, permission, context).await;
@@ -126,35 +129,40 @@ pub(crate) async fn handle_pushdown(
     }
 
     // Strip every `tableAlias` after the join gate and before any read (#193).
-    let pushdown = pushdown.with_json(strip_table_alias(pushdown.json()));
-    let pushdown_req = pushdown.json();
-
-    let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let pushdown = pushdown.map_clauses(&Clause::ALL, strip_table_alias);
 
     let involved = involved_columns(request, |tables| tables.first())?;
-    ensure_columns_declared(request, pushdown_req, None, &[&involved])?;
+    ensure_columns_declared(request, &pushdown, None, &[&involved])?;
 
-    let limit = extract_limit(pushdown_req);
+    let limit = pushdown.limit();
 
     // A limit is withheld from any ORDER BY request not matched as a bounded top-N, so
     // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
-    let has_order_by = order_by_present(pushdown_req);
+    let has_order_by = !pushdown.order_by().is_empty();
 
     let resolver =
         TableScanResolver::for_request(statement, permission, &[catalog.table.as_str()], context)
             .await?;
     let (resolved, col_types) = resolver
-        .resolve(&catalog.table, filter_json_raw, &involved)
+        .resolve(&catalog.table, pushdown.filter(), &involved)
         .await?;
-    let scan = ScanTranslator::over(&col_types, context.version, &[pushdown_req])?;
+    let scan = ScanTranslator::over(
+        &col_types,
+        context.version,
+        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+    )?;
     // Before the zero-files early return: a refused column must error, never yield an empty
     // result.
     ensure_no_refused_column_referenced(request, pushdown.output(), &resolved.refused_columns)?;
-    let emitted = single_table_emission(request, &pushdown, &col_types)?;
+    // Every column the request names, the row scan's projection and sort keys among them.
+    let emitted = single_table_emission(
+        request,
+        &pushdown,
+        &WherePlacement::whole(&pushdown),
+        &col_types,
+    )?;
     let projection = project_columns(&pushdown, scan, &emitted)?;
-    // `filter_json_raw` stays unmodified: format-level pruning must see the original
-    // predicate tree, whatever the adapter declines.
-    let scan_where = scan.split_where(filter_json_raw);
+    let placement = WherePlacement::single_scan(scan, &pushdown);
     let base = context.common_spec(&resolved)?;
 
     if resolved.files.is_empty() {
@@ -175,7 +183,7 @@ pub(crate) async fn handle_pushdown(
         projection,
         &emitted,
         scan,
-        scan_where,
+        placement,
         limit,
         has_order_by,
         &shards,
@@ -184,9 +192,9 @@ pub(crate) async fn handle_pushdown(
     )
 }
 
-/// `emitted` is the single-table emission of the whole request, which the bare row scan and the
-/// lone `COUNT(DISTINCT)` fan-out draw their columns from. The qualified wrapper derives its own
-/// from the WHERE it renders.
+/// `emitted` holds every column the request names, which the bare row scan and the lone
+/// `COUNT(DISTINCT)` fan-out draw their columns from. The qualified wrapper derives its own from
+/// the WHERE it renders.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
     request: &Json,
@@ -194,20 +202,19 @@ fn build_dispatch_sql(
     projection: RowProjection,
     emitted: &Emitted,
     scan: ScanTranslator<'_>,
-    scan_where: ScanWhere<'_>,
+    placement: WherePlacement,
     limit: Option<u64>,
     has_order_by: bool,
     shards: &Shards,
     base: CommonScanSpec,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
-    let pushdown_req = pushdown.json();
     let fallback = || {
         qualified_single_table_fallback_pushdown(
             request,
             pushdown,
             &base,
-            &scan_where,
+            &placement,
             shards,
             scan.columns(),
             context,
@@ -216,10 +223,10 @@ fn build_dispatch_sql(
 
     // Ahead of shape routing so it applies before aggregating, grouping, and
     // truncating (`_decision/045`).
-    if scan_where.declined().is_some() {
+    if placement.wrapper().is_some() {
         return fallback();
     }
-    let filter = scan_where.pushed();
+    let filter = placement.scan_filter(0);
 
     let (single_group_merge, mut projection) = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {
@@ -257,7 +264,7 @@ fn build_dispatch_sql(
                 &select_items,
                 pushdown.select_types(),
                 grouped_limit,
-                support::extract_offset(pushdown_req),
+                pushdown.offset(),
                 scan,
                 having.as_deref(),
                 grouped_order_by.as_deref(),
@@ -286,7 +293,7 @@ fn build_dispatch_sql(
             // is consulted.
             if is_lone_count_distinct(&items) {
                 debug_assert!(
-                    support::extract_offset(pushdown_req) == 0,
+                    pushdown.offset() == 0,
                     "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
                      (sqlCode 42000) before the adapter is consulted, so this wrapper \
                      can never see a non-zero offset"
@@ -341,7 +348,7 @@ fn build_dispatch_sql(
     // SELECT to drop it (#225).
     let topn = if aggregates.is_none() {
         detect_topn(
-            pushdown_req,
+            pushdown,
             &projection_items(&projection),
             &base.logical_schema,
         )
@@ -354,7 +361,7 @@ fn build_dispatch_sql(
     // top-N, so `effective_limit` is nulled and no LIMIT/OFFSET renders without an
     // ORDER BY (#191).
     debug_assert!(
-        support::extract_offset(pushdown_req) == 0 || has_order_by,
+        pushdown.offset() == 0 || has_order_by,
         "fact 5: a non-zero offset must never arrive without a non-empty orderBy"
     );
 
@@ -369,7 +376,7 @@ fn build_dispatch_sql(
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let mut keys = parse_order_by_keys(pushdown_req);
+        let mut keys = parse_order_by_keys(pushdown);
         topn::sort_by_select_items(&mut keys, pushdown, &projection);
         topn::extend_projection_with_sort_keys(&mut projection, &keys, emitted)?;
         keys
@@ -391,7 +398,7 @@ fn build_dispatch_sql(
     };
 
     debug_assert!(
-        !has_aggregates || support::extract_offset(pushdown_req) == 0,
+        !has_aggregates || pushdown.offset() == 0,
         "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
          (sqlCode 42000) before the adapter is consulted, so the single-group \
          aggregate merge can never see a non-zero offset"
@@ -414,7 +421,7 @@ fn build_dispatch_sql(
             visible_count,
             &declined_sort_keys,
             limit,
-            support::extract_offset(pushdown_req),
+            pushdown.offset(),
         )
     } else {
         sql

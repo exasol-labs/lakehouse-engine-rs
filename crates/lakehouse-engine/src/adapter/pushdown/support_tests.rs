@@ -1,4 +1,4 @@
-use super::super::joins::build_qualified_single_table_fallback_sql;
+use super::super::joins::{WherePlacement, build_qualified_single_table_fallback_sql};
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
@@ -455,29 +455,6 @@ fn row_scan_limit_in_common_arg() {
     assert!(
         common.contains(r#""limit":42"#),
         "row-scan common arg must carry limit=42: {common}"
-    );
-}
-
-#[test]
-fn limit_extracted_from_pushdown_request() {
-    let req = serde_json::json!({"numElements": 42});
-    assert_eq!(extract_limit(&req), None); // not nested under "limit"
-
-    let req2 = serde_json::json!({"limit": {"numElements": 42}});
-    assert_eq!(extract_limit(&req2), Some(42));
-}
-
-#[test]
-fn offset_extracted_from_pushdown_request() {
-    assert_eq!(extract_offset(&serde_json::json!({})), 0);
-    assert_eq!(
-        extract_offset(&serde_json::json!({"limit": {"numElements": 42}})),
-        0
-    );
-    assert_eq!(extract_offset(&serde_json::json!({"offset": 3})), 0);
-    assert_eq!(
-        extract_offset(&serde_json::json!({"limit": {"numElements": 12, "offset": 3}})),
-        3
     );
 }
 
@@ -1042,7 +1019,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         count_distinct_base_spec().common,
         &column_types(&all_cols),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
-        None,
+        &WherePlacement::single_scan(scan_of(&request), &pushdown),
         &test_context(),
     )
     .expect("Case 2/3 qualified wrapper must build");
@@ -2369,7 +2346,8 @@ fn select_list_data_types_check_answers_per_request_shape() {
         ),
     ];
     for (shape, request, expected) in cases {
-        let parsed = PushdownRequest::parse(pd(&request.build_unchecked().0))
+        // Unchecked: several shapes are ones Exasol never sends, which the parse must refuse.
+        let parsed = PushdownRequest::parse(request.build_unchecked().0["pushdownRequest"].clone())
             .map(|parsed| (parsed.output(), parsed.select_types().to_vec()));
         match (parsed, expected) {
             (Ok(parsed), Ok(expected)) => assert_eq!(parsed, expected, "{shape}"),
@@ -2448,7 +2426,7 @@ fn a_row_projection_draws_its_columns_from_the_emission() {
         let pushdown = request.build_pushdown();
         let projection = project_columns(
             &pushdown,
-            scan_for(&all_cols, pushdown.json()),
+            scan_for(&all_cols, &pushdown),
             &emitting_named(&all_cols, emitted),
         );
         match (projection, expected) {
@@ -2546,18 +2524,14 @@ fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
     }
 }
 
-fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Option<Vec<Json>> {
+fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Vec<Json> {
     let mut request = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
         .column(col("ID"))
         .order_by(Json::Array(keys.to_vec()));
     if let Some(offset) = offset {
         request = request.limit_with_offset(3, offset);
     }
-    request
-        .build_pushdown()
-        .json()
-        .get("orderBy")
-        .map(|keys| keys.as_array().expect("orderBy is an array").clone())
+    request.build_pushdown().order_by().to_vec()
 }
 
 /// Sort keys, the request's offset, and the `orderBy` that remains.
@@ -2622,7 +2596,7 @@ fn parse_drops_constant_sort_keys() {
     for (keys, offset, expected) in cases {
         assert_eq!(
             parsed_order_by(&keys, offset),
-            expected,
+            expected.unwrap_or_default(),
             "keys {keys:?}, offset {offset:?}"
         );
     }
@@ -2630,5 +2604,5 @@ fn parse_drops_constant_sort_keys() {
     let no_order_by = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
         .column(col("ID"))
         .build_pushdown();
-    assert!(no_order_by.json().get("orderBy").is_none());
+    assert!(no_order_by.order_by().is_empty());
 }
