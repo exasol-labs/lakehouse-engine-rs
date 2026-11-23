@@ -57,8 +57,8 @@ The table has 12 rows and one column for each Arrow/Exasol type pairing. Use it 
 ### Declared row cap versus pushdown `limit` (measured)
 
 `e2e_capture_pushdown` reads an optional `CAPTURE_RESULT_SET_MAX_ROWS` env var: unset
-means the capture connection declares no cap (`resultSetMaxRows: 0`); set to `n` means it
-calls `capped_result_sets(n)` before running the capture. `scripts/capture-pushdown-payload.sh`
+means the real execution declares no cap; set to `n` means it is sent with
+`resultSetMaxRows: n` through `try_execute_capped`. `scripts/capture-pushdown-payload.sh`
 needs no flag for this — it inherits whatever `CAPTURE_RESULT_SET_MAX_ROWS` is set in the
 environment it runs in. Set it, then diff two captures of the same statement to reproduce
 the comparison below for a new shape.
@@ -90,7 +90,7 @@ was an artifact of the tool, not a fact about the adapter: `EXPLAIN VIRTUAL`'s e
 under test, so it was structurally incapable of showing this regardless of which shape was
 captured.
 
-**If you are debugging a capped connection's join plan with
+**If you are debugging a capped query's join plan with
 `scripts/capture-pushdown-payload.sh`, its `EXPLAIN VIRTUAL` output never carries the declared
 cap, so it cannot show the per-shard post-join `LIMIT` a real capped query applies to a
 broadcast join.** The broadcast-vs-two-scan plan shape no longer flips on the cap — a bare
@@ -99,7 +99,7 @@ broadcast join.** The broadcast-vs-two-scan plan shape no longer flips on the ca
 execution or a direct capture of the adapter's incoming request, never against
 `EXPLAIN VIRTUAL` alone.
 
-See `ExaConn::capped_result_sets`'s doc comment
+See `ExaConn::try_execute_capped`'s doc comment
 (`crates/lakehouse-e2e/tests/common/exasol_ws.rs`) for the calling convention this
 table backs, and the `fix-e2e-harness-undeclared-limit` plan's `injection-surface.md` for
 the exact statements, the real-execution capture method, the original (superseded)

@@ -1,8 +1,9 @@
-//! `exa_conn()` declares no row cap unless a call site asks (#312).
+//! A statement carries no row cap unless its call site sends one (#312).
 //!
 //! All tests FAIL (never skip) when the stack is unavailable.
 
 use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::result_row_count;
 use crate::common::seed::{TYPED_COL_VARCHAR, TYPED_TABLE_TOTAL_ROWS};
 use crate::fixtures::{lakehouse_vs, typed_table};
 
@@ -38,11 +39,13 @@ fn declared_cap_truncates_returned_row_count() {
     const _: () = assert!((CAP_ROWS as usize) < TYPED_TABLE_TOTAL_ROWS);
 
     let sql = format!("SELECT {TYPED_COL_VARCHAR} FROM {}", typed_table());
-    let mut capped = exa_conn().capped_result_sets(CAP_ROWS);
-    let mut uncapped = exa_conn();
+    let mut conn = exa_conn();
 
-    let capped_rows = capped.query_row_count(&sql);
-    let uncapped_rows = uncapped.query_row_count(&sql);
+    let capped = conn.try_execute_capped(&sql, CAP_ROWS);
+    conn.assert_ok(&capped, &sql);
+    let capped_rows = result_row_count(&capped)
+        .unwrap_or_else(|| panic!("expected numRows from the capped statement: {capped}"));
+    let uncapped_rows = conn.query_row_count(&sql);
     assert_eq!(
         capped_rows, CAP_ROWS as i64,
         "a declared cap of {CAP_ROWS} must truncate the delivered result set to \
@@ -51,7 +54,7 @@ fn declared_cap_truncates_returned_row_count() {
     );
     assert_eq!(
         uncapped_rows, TYPED_TABLE_TOTAL_ROWS as i64,
-        "the no-cap connection must still deliver every seeded row, got \
-         {uncapped_rows}"
+        "the next statement on the same connection declares no cap and must deliver \
+         every seeded row, got {uncapped_rows}"
     );
 }
