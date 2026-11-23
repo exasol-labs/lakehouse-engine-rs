@@ -282,45 +282,6 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     );
 }
 
-/// The ORDERS leg's fan-out shows whether the outer wrapper reads `O_ORDERDATE`.
-#[test]
-fn an_n_scan_leg_emits_no_column_that_only_its_scan_filter_names() {
-    let orderdate = || table_col("ORDERS", "O_ORDERDATE");
-    let cases = [
-        (
-            "pushed into the leg",
-            compare("predicate_greater", orderdate(), date_lit("1995-01-01")),
-            false,
-        ),
-        ("declined by the leg", like(orderdate(), "1995%"), true),
-        (
-            "cross-leg residual",
-            or([
-                is_null(orderdate()),
-                string_equal("CUSTOMER", "C_NAME", "x"),
-            ]),
-            true,
-        ),
-    ];
-
-    for (case, filter, emits_orderdate) in cases {
-        let request = built_join(
-            customer_orders_request(Json::Null, equi_condition())
-                .column(table_col("CUSTOMER", "C_NAME"))
-                .filter(filter),
-        );
-        let sql = n_scan_sql(&request).expect("the two-table N-scan must build");
-        let orders_leg = &sql[sql.find(r#"AS "LHS_T0""#).expect("the CUSTOMER leg")..];
-        let emits = emits_clause(orders_leg);
-        assert_eq!(
-            emits.contains(r#""O_ORDERDATE""#),
-            emits_orderdate,
-            "{case}: the ORDERS leg must emit O_ORDERDATE only when the outer WHERE reads it: \
-             {sql}"
-        );
-    }
-}
-
 #[test]
 fn colliding_columns_render_qualified_unified_wrapper_without_error() {
     let request = with_identifier_notes(

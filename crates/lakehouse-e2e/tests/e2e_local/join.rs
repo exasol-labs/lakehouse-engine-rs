@@ -2551,9 +2551,11 @@ fn e2e_n_scan_leg_emits_no_column_that_only_its_scan_filter_reads() {
     setup_e2e();
     let mut conn = exa_conn();
     copy_join_tables_natively(&mut conn, VS_NAME);
-    // (WHERE, whether the outer wrapper reads L_LINENUMBER, so the LINEITEM leg emits it)
+    // (WHERE, whether the outer wrapper reads L_LINENUMBER, so the LINEITEM leg emits it). The
+    // scan declines LIKE on a number, so that conjunct is the wrapper's.
     let cases = [
         ("l.L_LINENUMBER = 1", false),
+        ("l.L_LINENUMBER LIKE '1%'", true),
         ("(l.L_LINENUMBER = 1 OR c.C_NAME = 'customer-02')", true),
     ];
 
