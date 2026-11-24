@@ -55,37 +55,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # actions/cache, not rust-cache: the build runs inside the container,
-      # whose cargo home rust-cache can't manage. UDF_CARGO_VOL is a host path
-      # so the registry persists. Only main saves, to stay within the 10 GB quota;
-      # the prefix restore-key serves main's entry to every branch.
-      - name: Restore Docker-side cargo registry and target/
-        id: docker-cache
-        uses: actions/cache/restore@v6
+      # The host toolchain only feeds rust-cache's key and its `cargo metadata`
+      # cleanup; the build itself runs in UDF_BUILDER_IMAGE, which pins the same rustc.
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
+
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
+
+      # The container mounts the host registry and git dirs below, so rust-cache
+      # saves them with target/ and prunes all three: it drops workspace crates, and
+      # after a fallback restore every artifact older than a week. Only main saves
+      # (10 GB quota). .udf-tools holds the cargo-exasol-udf the Makefile installs.
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo-docker-registry
-            target/
-          # .cargo/config.toml: a profile edit must rotate the key (see that file).
-          key: docker-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
-          restore-keys: |
-            docker-cargo-${{ matrix.arch }}-
+          cache-directories: .udf-tools
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build liblakehouse_engine.so
-        run: make cross-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
-
-      # The container writes as root; the cache save runs as the runner user.
-      - name: Fix Docker-side build output ownership
-        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
-
-      - name: Save Docker-side cargo registry and target/
-        if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ~/.cargo-docker-registry
-            target/
-          key: docker-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+        run: >-
+          make cross-udf-build
+          UDF_CARGO_VOL="${CARGO_HOME:-$HOME/.cargo}/registry"
+          UDF_CARGO_GIT_VOL="${CARGO_HOME:-$HOME/.cargo}/git"
 
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v7
@@ -109,7 +101,7 @@ jobs:
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: workspace-rlib
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -139,7 +131,7 @@ jobs:
 
       # Keep inputs identical across every workspace-rlib step, or readers stay cold (#133).
       - name: Restore cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: workspace-rlib
           save-if: "false"
@@ -172,7 +164,7 @@ jobs:
       # workspace-rlib: the coverage env never reaches rust-cache's key.
       # cache-on-failure: a red test must not discard a good dependency build.
       - name: Cache cargo & instrumented build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: llvm-cov
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -241,7 +233,7 @@ jobs:
 
       # rust-cache embeds the platform in the key and ignores `key:` with `shared-key`.
       - name: Cache cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: workspace-arm64
           save-if: ${{ github.ref == 'refs/heads/main' }}
