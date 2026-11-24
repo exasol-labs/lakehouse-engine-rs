@@ -1,6 +1,6 @@
 //! Ad-hoc pushdown-payload capture tool, not part of `make test-e2e`. Runs
 //! `CAPTURE_SQL` through `EXPLAIN VIRTUAL` and for real; optional
-//! `CAPTURE_RESULT_SET_MAX_ROWS` caps the connection. Usage: see
+//! `CAPTURE_RESULT_SET_MAX_ROWS` caps the real execution. Usage: see
 //! `scripts/capture-pushdown-payload.sh`.
 
 mod common;
@@ -31,15 +31,15 @@ fn capture_pushdown_payload() {
     install_slc();
     upload_so();
 
-    let conn = exa_conn();
-    let mut conn = match std::env::var("CAPTURE_RESULT_SET_MAX_ROWS") {
-        Ok(n) => conn
-            .capped_result_sets(n.parse().unwrap_or_else(|_| {
-                panic!("CAPTURE_RESULT_SET_MAX_ROWS must be a u32, got {n:?}")
-            })),
-        Err(std::env::VarError::NotPresent) => conn,
+    let cap: Option<u32> = match std::env::var("CAPTURE_RESULT_SET_MAX_ROWS") {
+        Ok(n) => Some(
+            n.parse()
+                .unwrap_or_else(|_| panic!("CAPTURE_RESULT_SET_MAX_ROWS must be a u32, got {n:?}")),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
         Err(err) => panic!("CAPTURE_RESULT_SET_MAX_ROWS: {err}"),
     };
+    let mut conn = exa_conn();
     create_schema_and_scripts(&mut conn);
     create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
 
@@ -55,6 +55,9 @@ fn capture_pushdown_payload() {
     println!("{explain}\n");
 
     println!("=== Real execution ===");
-    let resp = conn.try_execute(&vs_sql);
+    let resp = match cap {
+        Some(n) => conn.try_execute_capped(&vs_sql, n),
+        None => conn.try_execute(&vs_sql),
+    };
     println!("{}\n", serde_json::to_string_pretty(&resp).unwrap());
 }

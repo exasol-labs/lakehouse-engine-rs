@@ -38,7 +38,8 @@ iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 futures    = { workspace = true }
-serde_json = { workspace = true }
+# Exasol sends DOUBLE as shortest round-trip text; the default parser misreads ~10% by an ULP or two.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 anyhow     = { workspace = true }
 chrono     = { workspace = true }
 percent-encoding = { workspace = true }
