@@ -366,8 +366,7 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
         let shape = classify_request_shape(&req, scan);
         assert!(
             matches!(shape, RequestShape::SingleGroupWrapper),
-            "{}: {shape:?}",
-            req.json()
+            "{req:?}: {shape:?}"
         );
     }
 }

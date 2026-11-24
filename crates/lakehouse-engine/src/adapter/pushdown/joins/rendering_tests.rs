@@ -2,7 +2,7 @@ use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
 use super::super::planning::involved_table;
 use super::super::sql_builders::{
-    build_broadcast_join_sql, build_side_fan_out_sql, render_broadcast_join,
+    build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
     broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
@@ -1022,7 +1022,7 @@ fn unified_join_pushes_each_leg_local_filter_into_its_fan_out() {
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     );
 
-    let sql = full_row_n_scan_sql(
+    let sql = build_n_scan_join_sql(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &customer_orders_sides(&request, 10, 100),

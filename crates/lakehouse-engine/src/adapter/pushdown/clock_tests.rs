@@ -9,6 +9,17 @@ use vs_expression::test_support::{
     table_col, timestamp_lit,
 };
 
+/// The clauses of `pushdown` the clock rewrites, as one object to assert on.
+fn clauses(pushdown: &PushdownRequest) -> Json {
+    serde_json::json!({
+        "filter": pushdown.filter(),
+        "from": pushdown.from(),
+        "having": pushdown.having(),
+        "orderBy": pushdown.order_by(),
+        "selectList": pushdown.select_items(),
+    })
+}
+
 /// 2024-01-15 23:30:45.123456789 UTC: 18:30 on the 15th in New York (`TZ`), 08:30 on the 16th
 /// in Tokyo (`SESSION_TIME_ZONE`), so each folded value shows the zone it was folded in.
 fn instant() -> DateTime<Utc> {
@@ -45,7 +56,7 @@ fn folded_filter(clock: &StatementClock, right: Json) -> Result<Json, UdfError> 
     let pushdown = pushdown_request("T", &columns())
         .filter(compare("predicate_less", ts(), right))
         .build_pushdown();
-    Ok(clock.fold(pushdown)?.json()["filter"]["right"].clone())
+    Ok(clauses(&clock.fold(pushdown)?)["filter"]["right"].clone())
 }
 
 #[test]
@@ -126,7 +137,7 @@ fn tstz_values_fold_to_the_wall_clock_outside_tstz_select_items() {
         .build_pushdown();
 
     let folded = tokyo_clock().fold(pushdown).expect("the request folds");
-    let json = folded.json();
+    let json = clauses(&folded);
 
     assert_eq!(
         json["selectList"],
@@ -181,7 +192,7 @@ fn a_folded_clock_sort_key_is_dropped() {
     let folded = tokyo_clock().fold(pushdown).expect("the request folds");
 
     assert_eq!(
-        folded.json()["orderBy"],
+        clauses(&folded)["orderBy"],
         serde_json::json!([order_by_element(ts(), true, true)])
     );
 }
@@ -215,7 +226,7 @@ fn tstz_values_fold_in_a_join_condition_and_an_aggregate_argument() {
     let folded = tokyo_clock()
         .fold(parsed_pushdown(&request))
         .expect("the request folds");
-    let json = folded.json();
+    let json = clauses(&folded);
 
     assert_eq!(
         json["from"]["condition"]["right"],

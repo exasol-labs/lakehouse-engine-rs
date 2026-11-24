@@ -9,9 +9,10 @@
 use super::grouped_agg::{
     GroupedOrderBy, MergeScope, build_grouped_order_by_clause, render_having_over_merge,
 };
+use super::request::{AggregationType, PushdownRequest};
 use super::scalar_over_agg::TypedPlans;
 use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plans};
-use super::support::{AggregationType, PushdownRequest, ScanTranslator, aggregation_type};
+use super::support::ScanTranslator;
 use super::{GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates};
 
 #[derive(Debug)]
@@ -40,7 +41,6 @@ pub(super) fn classify_request_shape(
     pushdown: &PushdownRequest,
     scan: ScanTranslator<'_>,
 ) -> RequestShape {
-    let pushdown_req = pushdown.json();
     if let Some(detection) = detect_group_by_aggregates(pushdown, scan) {
         let scope = MergeScope {
             aggregates: &detection.aggregates,
@@ -48,12 +48,12 @@ pub(super) fn classify_request_shape(
         };
         // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
         // from the select list cannot be sorted on there (#198).
-        let order_by = match build_grouped_order_by_clause(pushdown_req, &scope, scan) {
+        let order_by = match build_grouped_order_by_clause(pushdown, &scope, scan) {
             Some(GroupedOrderBy::Clause(clause)) => Some(clause),
             Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
             None => None,
         };
-        let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
+        let having = match pushdown.having() {
             None => None,
             Some(node) => match render_having_over_merge(node, &scope, scan) {
                 Some(sql) => Some(sql),
@@ -67,7 +67,7 @@ pub(super) fn classify_request_shape(
         };
     }
 
-    if aggregation_type(pushdown_req) == Some(AggregationType::GroupBy) {
+    if pushdown.aggregation_type() == Some(AggregationType::GroupBy) {
         return RequestShape::GroupByWrapper;
     }
 
@@ -76,13 +76,13 @@ pub(super) fn classify_request_shape(
         let aggregates = single_group_plans(&items, pushdown.select_types(), scan)?;
         Some((items, aggregates))
     }) else {
-        return if aggregation_type(pushdown_req) == Some(AggregationType::SingleGroup) {
+        return if pushdown.aggregation_type() == Some(AggregationType::SingleGroup) {
             RequestShape::SingleGroupWrapper
         } else {
             RequestShape::RowScan
         };
     };
-    let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
+    let having = match pushdown.having() {
         None => None,
         Some(_) if has_distinct(&items) => return RequestShape::SingleGroupWrapper,
         Some(node) => {

@@ -4,7 +4,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::RefusedColumn;
-use super::support::{OutputContract, collect_all_column_names};
+use super::request::OutputContract;
+use super::support::collect_all_column_names;
 
 /// Columns are collected by one blind recursive walk over the whole `request`, so a later
 /// pushdown capability is gated automatically. `SELECT *` names no column, so it charges every one.

@@ -378,7 +378,7 @@ fn order_by_over_merge(
         aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
-    build_grouped_order_by_clause(req.json(), &scope, scan_for(col_types, req.json()))
+    build_grouped_order_by_clause(req, &scope, scan_for(col_types, req))
 }
 
 /// A HAVING over `detection`'s merge, scoped as `classify_request_shape` scopes it.
@@ -1525,9 +1525,9 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         &request,
         &pushdown,
         fan_out_spec,
-        &emitting(&column_types(&all_cols)),
+        &column_types(&all_cols),
         &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
-        None,
+        &single_scan_placement(&request),
         &test_context(),
     )
     .expect("qualified fallback must build");
@@ -1634,8 +1634,8 @@ fn having_over_a_group_key_reads_its_gk_column() {
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, scan_for(&col_types, req.json()))
-        .expect("grouped aggregate");
+    let detection =
+        detect_group_by_aggregates(&req, scan_for(&col_types, &req)).expect("grouped aggregate");
     let having = predicate_equal(col("REGION"), str_lit("EU"));
 
     assert_eq!(
@@ -1659,8 +1659,8 @@ fn having_over_a_key_inside_a_scalar_with_an_aggregate_reads_both_merged() {
             ExasolType::decimal(20, 0),
         )
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, scan_for(&col_types, req.json()))
-        .expect("grouped aggregate");
+    let detection =
+        detect_group_by_aggregates(&req, scan_for(&col_types, &req)).expect("grouped aggregate");
     let having = compare(
         "predicate_greater",
         scalar_fn("ADD", [col("K"), agg_item("SUM", Some("V"), false)]),
@@ -1904,8 +1904,7 @@ fn a_cast_to_char_declines_the_split() {
     ];
     for (label, req) in cases {
         let req = req.build_pushdown();
-        let detection =
-            detect_group_by_aggregates(&req, scan_for(&column_types(&columns), req.json()));
+        let detection = detect_group_by_aggregates(&req, scan_for(&column_types(&columns), &req));
         assert!(detection.is_none(), "{label}: the scan does not blank-pad");
     }
 }
