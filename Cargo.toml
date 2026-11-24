@@ -22,9 +22,8 @@ license = "MIT"
 arrow   = { version = "60.2.0", default-features = false }
 parquet = { version = "60.2.0", features = ["async"] }
 
-# Pinned to the 56.0.0 release tag until it is published to crates.io.
-datafusion = { git = "https://github.com/apache/datafusion", tag = "56.0.0", default-features = false, features = ["parquet", "sql"] }
-datafusion-datasource = { git = "https://github.com/apache/datafusion", tag = "56.0.0", default-features = false }
+datafusion = { version = "56.0.0", default-features = false, features = ["parquet", "sql"] }
+datafusion-datasource = { version = "56.0.0", default-features = false }
 
 object_store = { version = "0.14.2", features = ["aws"] }
 
