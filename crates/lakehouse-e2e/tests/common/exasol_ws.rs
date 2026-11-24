@@ -61,17 +61,30 @@ pub fn profiled_export_counts(conn: &mut ExaConn, export_sql: &str) -> (i64, i64
     (rows, parse_int(writers))
 }
 
+/// The value of a one-row, one-column integer result, else `None`, so a query that returns
+/// extra rows, extra columns, or text cannot pass on its first cell.
 pub fn scalar_i64(resp: &Value) -> Option<i64> {
-    let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let data_type = &result_set["columns"][0]["dataType"];
+    let one_cell =
+        result_set["numRows"].as_u64() == Some(1) && result_set["numColumns"].as_u64() == Some(1);
+    if !one_cell || data_type["type"] != "DECIMAL" || data_type["scale"] != 0 {
+        return None;
+    }
+    let value = &result_set["data"][0][0];
     value
         .as_i64()
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// The `numRows` of an execute response's first result set.
+pub fn result_row_count(resp: &Value) -> Option<i64> {
+    resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64()
+}
+
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     redact_sql: bool,
-    result_set_max_rows: u32,
 }
 
 impl ExaConn {
@@ -133,11 +146,7 @@ impl ExaConn {
             Some("ok"),
             "Exasol authentication failed: {resp}"
         );
-        ExaConn {
-            ws,
-            redact_sql,
-            result_set_max_rows: 0,
-        }
+        ExaConn { ws, redact_sql }
     }
 
     #[track_caller]
@@ -167,23 +176,25 @@ impl ExaConn {
     }
 
     pub fn try_execute(&mut self, sql: &str) -> Value {
-        let cmd = json!({
+        self.send_execute(json!({"command": "execute", "sqlText": sql}))
+    }
+
+    /// Exasol applies `resultSetMaxRows` to this statement only, never to later ones on the
+    /// session. The cap reaches the adapter as a pushdown `limit` on real execution (#314),
+    /// though `EXPLAIN VIRTUAL` never shows it, so a test of pushdown or plan shape sends none.
+    pub fn try_execute_capped(&mut self, sql: &str, max_rows: u32) -> Value {
+        self.send_execute(json!({
             "command": "execute",
             "sqlText": sql,
-            "attributes": {"resultSetMaxRows": self.result_set_max_rows}
-        });
+            "attributes": {"resultSetMaxRows": max_rows}
+        }))
+    }
+
+    fn send_execute(&mut self, cmd: Value) -> Value {
         self.ws
             .send(Message::Text(cmd.to_string().into()))
             .expect("send execute");
         Self::read_json(&mut self.ws)
-    }
-
-    /// A declared cap reaches the adapter as a pushdown `limit` on real execution (#314),
-    /// though `EXPLAIN VIRTUAL` never shows it. A test asserting pushdown or plan shape
-    /// must not declare one: it would silently alter the plan under test.
-    pub fn capped_result_sets(mut self, max_rows: u32) -> Self {
-        self.result_set_max_rows = max_rows;
-        self
     }
 
     pub fn query_scalar_i64(&mut self, sql: &str) -> i64 {
@@ -194,8 +205,7 @@ impl ExaConn {
 
     pub fn query_row_count(&mut self, sql: &str) -> i64 {
         let resp = self.execute(sql);
-        resp["responseData"]["results"][0]["resultSet"]["numRows"]
-            .as_i64()
+        result_row_count(&resp)
             .unwrap_or_else(|| panic!("expected numRows from:\n{sql}\n\nResponse: {resp}"))
     }
 
@@ -218,6 +228,12 @@ impl ExaConn {
         result_set: &Value,
         num_bytes: u64,
     ) -> (Vec<Vec<Value>>, usize) {
+        // A row-count result has no `resultSet`; reading it as zero columns passes vacuously.
+        assert!(
+            result_set.is_object(),
+            "expected a result set, got {result_set}: the statement returned a row count, \
+             or the caller read the wrong result"
+        );
         let advertised = result_set["numRows"].as_u64();
         // Exasol omits `data` for a zero-row result, so declared columns are the only shape source.
         let declared_columns = result_set["numColumns"]
