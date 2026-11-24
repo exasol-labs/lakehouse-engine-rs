@@ -1,7 +1,7 @@
 # Profiles live here, not in Cargo.toml: rust-cache never hashes the virtual
 # root manifest (Swatinem/rust-cache#268), so a profile edit there would poison
-# the cache under an unchanged key. This file IS hashed (also by build-so's
-# docker-cargo cache in ci.yml). Don't reintroduce `[profile.*]` in Cargo.toml.
+# the cache under an unchanged key. rust-cache hashes this file, in build-so
+# too. Don't reintroduce `[profile.*]` in Cargo.toml.
 
 [profile.dev]
 debug = 1
