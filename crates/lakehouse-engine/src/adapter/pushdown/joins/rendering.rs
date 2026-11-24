@@ -50,13 +50,6 @@ pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
     }
 }
 
-/// Stamps each `column` with its leg's subquery alias, then renders in the Exasol dialect,
-/// since the N-scan wrapper is parsed by Exasol (length-qualified `VARCHAR(n)` CAST targets,
-/// unlike the DataFusion-dialect broadcast render).
-pub(super) fn render_expression_qualified(expr: &Json, legs: &JoinLegs) -> String {
-    render_expression_exasol(&legs.qualify(expr))
-}
-
 /// How an Exasol wrapper names each leg's column. A leg with a fan-out of its own is a relation of
 /// the wrapper's FROM, `"LHS_T{leg}"."COLUMN"`. A leg of a broadcast fan-out is the fan-out's
 /// output `"LHS_T{leg}_COLUMN"`, qualified with the fan-out's alias `LHS_T{sharded}` when Exasol
@@ -342,15 +335,18 @@ pub(super) fn leg_columns_named_in<'a>(
     full_cols.narrowed(|column| names.contains(&column.name))
 }
 
-/// What the clauses `above` a fan-out make it emit per leg of `scanned`: every column for
-/// `SELECT *`, else the columns they name.
-pub(super) fn named_emission(
+/// The one owner of the columns a fan-out over `scanned` emits per leg: every column for
+/// `SELECT *`, else the columns the clauses `above` it name. Exasol only counts the rows of a
+/// fan-out whose clauses name none, so its first leg then emits one placeholder, never its row,
+/// which may hold a refused column.
+pub(super) fn fan_out_emission(
     output: OutputContract,
     above: &[&Json],
     legs: &JoinLegs,
     scanned: &[(usize, &ColumnTypes)],
+    prefer: &ColumnTypes,
 ) -> Result<Vec<Emitted>, UdfError> {
-    scanned
+    let mut emitted = scanned
         .iter()
         .map(|&(leg, cols)| match output {
             OutputContract::WholeRow => cols.named(|_| true),
@@ -359,34 +355,13 @@ pub(super) fn named_emission(
                 cols.named(|column| named.get(column).is_some())
             }
         })
-        .collect()
-}
-
-/// A fan-out must emit a column, and Exasol only counts the rows of one whose clauses name
-/// none. Its first leg then emits one placeholder, never its row, which may hold a refused column.
-pub(super) fn with_placeholder(
-    mut emitted: Vec<Emitted>,
-    scanned: &[(usize, &ColumnTypes)],
-    prefer: &ColumnTypes,
-) -> Result<Vec<Emitted>, UdfError> {
+        .collect::<Result<Vec<_>, _>>()?;
     if emitted.iter().all(Emitted::is_empty)
         && let Some((_, cols)) = scanned.first()
     {
         emitted[0] = cols.placeholder(prefer)?;
     }
     Ok(emitted)
-}
-
-/// The one owner of the columns a fan-out over `scanned` emits per leg.
-pub(super) fn fan_out_emission(
-    output: OutputContract,
-    above: &[&Json],
-    legs: &JoinLegs,
-    scanned: &[(usize, &ColumnTypes)],
-    prefer: &ColumnTypes,
-) -> Result<Vec<Emitted>, UdfError> {
-    let named = named_emission(output, above, legs, scanned)?;
-    with_placeholder(named, scanned, prefer)
 }
 
 /// [`fan_out_emission`] of a fan-out that scans the one leg `leg`.

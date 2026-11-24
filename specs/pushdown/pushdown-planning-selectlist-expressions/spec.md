@@ -10,7 +10,7 @@ Renders a scalar or boolean select-list expression with the `crates/vs-expressio
 * A row-scan projection evaluates its expressions per shard. An aggregate pushed as a projection item would compute a per-shard result, so aggregate items reach the aggregate planner or the wrapper instead.
 * The adapter probes a select-list item's whole subtree for `function_aggregate` before the node-type dispatch. The translator renders a nested aggregate verbatim as SQL text, so without the probe `ROUND(SUM(col), 2)` would compute per shard and return unmerged rows.
 * `pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate` decomposes the ungrouped scalar-over-aggregate shape into the partial/merge plan, so that shape never consults the wrapping signal.
-* The Exasol-dialect entry point is `render_expression_exasol`, reached through `render_expression_qualified`, and it renders every item Exasol sends (`sql-comprehension/vs-expression-translator`). The DataFusion-dialect entry point is the scan translator, which carries the column types.
+* The Exasol-dialect entry point is `render_expression_exasol`, and it renders every item Exasol sends (`sql-comprehension/vs-expression-translator`). The DataFusion-dialect entry point is the scan translator, which carries the column types.
 * The `dispatch_golden` fixtures under `adapter/pushdown/testdata/` number twenty-four: eighteen credential-bearing ones, whose `storage` value `storage-access/scan-spec-credential-reference` owns, and six `empty_*` ones with no `storage` value.
 
 ## Scenarios

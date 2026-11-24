@@ -1,5 +1,3 @@
-use serde_json::Value as Json;
-
 use super::super::request::{OutputContract, PushdownRequest};
 use super::super::support::column_node_ref;
 use super::super::topn::ParsedSortKey;
@@ -88,20 +86,16 @@ impl JoinPlan {
     }
 }
 
-/// Whether the shards run the request's aggregation, ordering, and limit: the plan is one
-/// broadcast fan-out, and Exasol filters and aggregates nothing over it. Otherwise Exasol runs them
-/// over the fan-outs.
-pub(super) fn tail_runs_in_shards(
-    plan: &JoinPlan,
-    residual: Option<&Json>,
-    pushdown: &PushdownRequest,
-) -> bool {
-    plan.fan_outs().len() == 1 && residual.is_none() && pushdown.aggregation_type().is_none()
+/// Whether Exasol runs the request's aggregation, ordering, and limit over a plan's fan-outs
+/// rather than the shards: the plan has several fan-outs, the request aggregates, or Exasol's
+/// WHERE applies a conjunct over them.
+pub(super) fn exasol_runs_tail(fan_outs: usize, aggregates: bool, exasol_filters: bool) -> bool {
+    fan_outs > 1 || aggregates || exasol_filters
 }
 
 /// Whether a two-leg broadcast can serve the request's window, so its pair may be broadcast at
 /// all (#675). Exasol renders the window of a join of more legs or of an aggregating request, as
-/// [`tail_runs_in_shards`] decides. Otherwise the window must classify, and every sort key must be
+/// [`exasol_runs_tail`] decides. Otherwise the window must classify, and every sort key must be
 /// a column the select list projects, as the shards bind it.
 pub(super) fn broadcast_serves_window(
     pushdown: &PushdownRequest,
@@ -125,10 +119,9 @@ pub(super) fn broadcast_serves_window(
                     .filter_map(column_node_ref)
                     .collect(),
             };
-            keys.iter().all(|key| match key {
-                ParsedSortKey::Column(key) => projected.contains(&key.column),
-                ParsedSortKey::Expression { .. } => false,
-            })
+            keys.iter().all(
+                |key| matches!(key, ParsedSortKey::Column(key) if projected.contains(&key.column)),
+            )
         }
     }
 }

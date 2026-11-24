@@ -300,27 +300,32 @@ pub fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
 }
 
 pub fn emits_clause(pushed_sql: &str) -> String {
-    let marker = "EMITS (";
-    let start = pushed_sql
-        .find(marker)
+    let open = pushed_sql
+        .find("EMITS (")
         .unwrap_or_else(|| panic!("no EMITS clause in pushed SQL:\n{pushed_sql}"))
-        + marker.len();
-    let mut depth = 1i32;
-    let mut end = pushed_sql.len();
-    for (i, c) in pushed_sql[start..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
+        + "EMITS ".len();
+    parenthesized(pushed_sql, open).to_string()
+}
+
+/// The text between the parenthesis that opens at byte `open` of `sql` and the one that closes
+/// it, skipping parentheses inside quoted literals.
+pub fn parenthesized(sql: &str, open: usize) -> &str {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (offset, ch) in sql[open..].char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
                 depth -= 1;
                 if depth == 0 {
-                    end = start + i;
-                    break;
+                    return &sql[open + 1..open + offset];
                 }
             }
             _ => {}
         }
     }
-    pushed_sql[start..end].to_string()
+    panic!("the parenthesis at byte {open} never closes:\n{sql}");
 }
 
 pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";

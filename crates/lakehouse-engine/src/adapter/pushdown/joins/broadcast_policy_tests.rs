@@ -15,32 +15,61 @@ struct Graph {
 }
 
 impl Graph {
+    /// A row scan of `legs` with no WHERE, reading no column above the join.
+    fn new(
+        legs: JoinLegs,
+        bytes: &[u64],
+        columns: Vec<ColumnTypes>,
+        conditions: Vec<Json>,
+    ) -> Self {
+        Self {
+            legs,
+            bytes: bytes.to_vec(),
+            columns,
+            conditions,
+            conjuncts: Vec::new(),
+            declined: Vec::new(),
+            above: Vec::new(),
+            aggregates: false,
+        }
+    }
+
     /// CUSTOMER (leg 0, 10 bytes) joined to ORDERS (leg 1, 100 bytes) on their customer key,
     /// grouping by `read`, the dimension's only columns.
     fn aggregating_customer_orders(read: ColumnTypes) -> Self {
-        let read_columns = read
+        let read_columns: Vec<Json> = read
             .iter()
             .map(|(column, _)| table_col("CUSTOMER", &column.name))
             .collect();
+        let condition = predicate_equal(
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        );
+        let columns = vec![read, column_types(NO_COLUMNS)];
         Self {
-            legs: customer_orders_legs(),
-            bytes: vec![10, 100],
-            columns: vec![read, column_types(NO_COLUMNS)],
-            conditions: vec![predicate_equal(
-                table_col("CUSTOMER", "C_CUSTKEY"),
-                table_col("ORDERS", "O_CUSTKEY"),
-            )],
-            conjuncts: Vec::new(),
-            declined: Vec::new(),
-            above: read_columns,
             aggregates: true,
+            ..Self::new(customer_orders_legs(), &[10, 100], columns, vec![condition])
         }
+        .reading(read_columns)
     }
 
     fn filtered(mut self, filter: Option<Json>) -> Self {
         self.conjuncts = filter
             .map(|filter| flatten_conjuncts(&filter).into_iter().cloned().collect())
             .unwrap_or_default();
+        self
+    }
+
+    /// The graph with `conjunct` in its WHERE, a conjunct the scan declines.
+    fn declining(mut self, conjunct: Json) -> Self {
+        self.conjuncts.push(conjunct.clone());
+        self.declined.push(conjunct);
+        self
+    }
+
+    /// The graph whose clauses above the join also read `columns`.
+    fn reading(mut self, columns: impl IntoIterator<Item = Json>) -> Self {
+        self.above.extend(columns);
         self
     }
 
@@ -206,22 +235,20 @@ fn a_literal_condition_bounds_only_its_own_self_join_leg() {
         str_lit("rush"),
     );
     let self_join = |dimension_leg: usize| {
-        let alias = ["A", "B"][dimension_leg];
-        let mut bytes = vec![100, 100];
+        let mut bytes = [100, 100];
         bytes[1 - dimension_leg] = 1000;
+        let condition = predicate_equal(
+            aliased_col("FACT_ORDERS", "A", "O_KEY"),
+            aliased_col("FACT_ORDERS", "B", "O_KEY"),
+        );
+        let columns = vec![comment.narrowed(|_| true), comment.narrowed(|_| true)];
+        let alias = ["A", "B"][dimension_leg];
         Graph {
-            legs: self_join_legs(),
-            bytes,
-            columns: vec![comment.narrowed(|_| true), comment.narrowed(|_| true)],
-            conditions: vec![predicate_equal(
-                aliased_col("FACT_ORDERS", "A", "O_KEY"),
-                aliased_col("FACT_ORDERS", "B", "O_KEY"),
-            )],
-            conjuncts: vec![filter.clone()],
-            declined: Vec::new(),
-            above: vec![aliased_col("FACT_ORDERS", alias, "O_COMMENT")],
             aggregates: true,
+            ..Graph::new(self_join_legs(), &bytes, columns, vec![condition])
         }
+        .filtered(Some(filter.clone()))
+        .reading([aliased_col("FACT_ORDERS", alias, "O_COMMENT")])
     };
 
     assert!(self_join(0).broadcast());
@@ -231,135 +258,124 @@ fn a_literal_condition_bounds_only_its_own_self_join_leg() {
 #[test]
 fn a_two_leg_row_scan_reads_unbounded_text_only_once_a_conjunct_is_left_for_exasol() {
     let text = || column_types(&[("C_NAME", ExasolType::WIDEST_VARCHAR)]);
+    let row_scan = || Graph {
+        aggregates: false,
+        ..Graph::aggregating_customer_orders(text())
+    };
     let declined = compare(
         "predicate_like",
         table_col("CUSTOMER", "C_NAME"),
         str_lit("A%"),
     );
-    let mut row_scan = Graph::aggregating_customer_orders(text());
-    row_scan.aggregates = false;
-    assert!(row_scan.broadcast());
-
-    let mut declining = Graph::aggregating_customer_orders(text()).filtered(Some(declined.clone()));
-    declining.aggregates = false;
-    declining.declined = vec![declined];
-    assert!(!declining.broadcast());
-
     // Exasol applies a declined literal after the fan-out has emitted the column, so it bounds
     // nothing.
     let literal = string_equal("CUSTOMER", "C_NAME", "x");
-    let mut declined_literal =
-        Graph::aggregating_customer_orders(text()).filtered(Some(literal.clone()));
-    declined_literal.declined = vec![literal];
-    assert!(!declined_literal.broadcast());
-}
-
-/// LINEITEM (leg 0) joined to PART (leg 1) and SUPPLIER (leg 2) on its own keys.
-fn star(bytes: [u64; 3], part_filter: Option<Json>) -> Graph {
-    let lineitem = |name: &str| table_col("LINEITEM", name);
-    Graph {
-        legs: legs_of(&["LINEITEM", "PART", "SUPPLIER"]),
-        bytes: bytes.to_vec(),
-        columns: vec![
-            column_types(&[("L_PARTKEY", ExasolType::decimal(18, 0))]),
-            column_types(&[
-                ("P_PARTKEY", ExasolType::decimal(18, 0)),
-                ("P_BRAND", ExasolType::WIDEST_VARCHAR),
-            ]),
-            column_types(&[("S_SUPPKEY", ExasolType::decimal(18, 0))]),
-        ],
-        conditions: vec![
-            predicate_equal(lineitem("L_PARTKEY"), table_col("PART", "P_PARTKEY")),
-            predicate_equal(lineitem("L_SUPPKEY"), table_col("SUPPLIER", "S_SUPPKEY")),
-        ],
-        conjuncts: part_filter.into_iter().collect(),
-        declined: Vec::new(),
-        above: vec![lineitem("L_PARTKEY")],
-        aggregates: false,
+    let cases = [
+        ("a row scan", row_scan(), true),
+        ("a declined conjunct", row_scan().declining(declined), false),
+        (
+            "a declined literal",
+            Graph::aggregating_customer_orders(text()).declining(literal),
+            false,
+        ),
+    ];
+    for (case, graph, broadcast) in cases {
+        assert_eq!(graph.broadcast(), broadcast, "{case}");
     }
 }
 
+/// LINEITEM (leg 0) joined to PART (leg 1) and SUPPLIER (leg 2) on its own keys.
+fn star(bytes: [u64; 3]) -> Graph {
+    let lineitem = |name: &str| table_col("LINEITEM", name);
+    let columns = vec![
+        column_types(&[("L_PARTKEY", ExasolType::decimal(18, 0))]),
+        column_types(&[
+            ("P_PARTKEY", ExasolType::decimal(18, 0)),
+            ("P_BRAND", ExasolType::WIDEST_VARCHAR),
+        ]),
+        column_types(&[("S_SUPPKEY", ExasolType::decimal(18, 0))]),
+    ];
+    let conditions = vec![
+        predicate_equal(lineitem("L_PARTKEY"), table_col("PART", "P_PARTKEY")),
+        predicate_equal(lineitem("L_SUPPKEY"), table_col("SUPPLIER", "S_SUPPKEY")),
+    ];
+    Graph::new(
+        legs_of(&["LINEITEM", "PART", "SUPPLIER"]),
+        &bytes,
+        columns,
+        conditions,
+    )
+    .reading([lineitem("L_PARTKEY")])
+}
+
+/// The eligible pairs of a three-leg join, in rank order.
 #[test]
 fn ranks_candidate_pairs_by_filter_then_fact_bytes_then_dimension_bytes_then_order() {
-    let brand = string_equal("PART", "P_BRAND", "Brand#23");
-    let ranked = |graph: &Graph| graph.grouping();
-
-    assert_eq!(
-        ranked(&star([90, 50, 10], Some(brand.clone()))),
-        [LegGroup::pair(0, 1), LegGroup::pair(0, 2)],
-        "the filtered dimension ranks first, though the other is smaller"
-    );
-    let mut declined = star([90, 50, 10], Some(brand.clone()));
-    declined.declined = vec![brand];
-    assert_eq!(
-        ranked(&declined),
-        [LegGroup::pair(0, 2)],
-        "a filter the scan declines neither ranks nor bounds the text column Exasol reads over PART"
-    );
-    assert_eq!(
-        ranked(&star([90, 50, 10], None)),
-        [LegGroup::pair(0, 2), LegGroup::pair(0, 1)],
-        "without a filter the smaller dimension ranks first"
-    );
-    assert_eq!(
-        ranked(&star([90, 10, 10], None)),
-        [LegGroup::pair(0, 1), LegGroup::pair(0, 2)],
-        "a tie on every byte count takes FROM-tree order"
-    );
-
-    let mut chain = star([90, 50, 10], None);
+    let brand = || string_equal("PART", "P_BRAND", "Brand#23");
+    let reading_brand = || star([90, 50, 10]).reading([table_col("PART", "P_BRAND")]);
+    let mut chain = star([90, 50, 10]);
     chain.conditions[1] = predicate_equal(
         table_col("PART", "P_SUPPKEY"),
         table_col("SUPPLIER", "S_SUPPKEY"),
     );
-    assert_eq!(
-        ranked(&chain),
-        [LegGroup::pair(0, 1), LegGroup::pair(1, 2)],
-        "the pair with the larger fact ranks first"
-    );
-}
-
-#[test]
-fn no_pair_is_broadcast_whose_dimension_is_over_budget_or_unbounded() {
-    let mut graph = star([500, 50, 1000], None);
-    graph.above.push(table_col("PART", "P_BRAND"));
-
-    assert_eq!(
-        graph.grouping(),
-        [],
-        "PART reads an unbounded text column, and LINEITEM, SUPPLIER's dimension, is over budget"
-    );
-}
-
-#[test]
-fn the_width_rule_applies_to_three_legs_without_aggregation() {
-    let mut reading_brand = star([90, 50, 10], None);
-    reading_brand.above.push(table_col("PART", "P_BRAND"));
-    let mut bounded = star(
-        [90, 50, 10],
-        Some(string_equal("PART", "P_BRAND", "Brand#23")),
-    );
-    bounded.above.push(table_col("PART", "P_BRAND"));
-
-    assert_eq!(reading_brand.grouping(), [LegGroup::pair(0, 2)]);
-    assert_eq!(
-        bounded.grouping(),
-        [LegGroup::pair(0, 1), LegGroup::pair(0, 2)]
-    );
-}
-
-#[test]
-fn a_join_condition_left_for_exasol_counts_as_a_dimension_read() {
-    let mut graph = star([90, 50, 10], None);
-    graph.conditions.push(predicate_equal(
+    let mut cross_dimension = star([90, 50, 10]);
+    cross_dimension.conditions.push(predicate_equal(
         table_col("PART", "P_BRAND"),
         table_col("SUPPLIER", "S_SUPPKEY"),
     ));
-
-    assert_eq!(
-        graph.grouping(),
-        [LegGroup::pair(0, 2), LegGroup::pair(1, 2)]
-    );
+    let cases = [
+        (
+            "the filtered dimension ranks first, though the other is smaller",
+            star([90, 50, 10]).filtered(Some(brand())),
+            vec![LegGroup::pair(0, 1), LegGroup::pair(0, 2)],
+        ),
+        (
+            "a filter the scan declines neither ranks nor bounds the text column Exasol reads over PART",
+            star([90, 50, 10]).declining(brand()),
+            vec![LegGroup::pair(0, 2)],
+        ),
+        (
+            "without a filter the smaller dimension ranks first",
+            star([90, 50, 10]),
+            vec![LegGroup::pair(0, 2), LegGroup::pair(0, 1)],
+        ),
+        (
+            "a tie on every byte count takes FROM-tree order",
+            star([90, 10, 10]),
+            vec![LegGroup::pair(0, 1), LegGroup::pair(0, 2)],
+        ),
+        (
+            "the pair with the larger fact ranks first",
+            chain,
+            vec![LegGroup::pair(0, 1), LegGroup::pair(1, 2)],
+        ),
+        (
+            "the width rule applies to three legs without aggregation",
+            reading_brand(),
+            vec![LegGroup::pair(0, 2)],
+        ),
+        (
+            "a literal condition bounds the text column",
+            reading_brand().filtered(Some(brand())),
+            vec![LegGroup::pair(0, 1), LegGroup::pair(0, 2)],
+        ),
+        (
+            "a join condition left for Exasol counts as a dimension read",
+            cross_dimension,
+            vec![LegGroup::pair(0, 2), LegGroup::pair(1, 2)],
+        ),
+        (
+            "PART reads unbounded text, and LINEITEM, SUPPLIER's dimension, is over budget",
+            Graph {
+                bytes: vec![500, 50, 1000],
+                ..reading_brand()
+            },
+            vec![],
+        ),
+    ];
+    for (case, graph, ranked) in cases {
+        assert_eq!(graph.grouping(), ranked, "{case}");
+    }
 }
 
 #[test]

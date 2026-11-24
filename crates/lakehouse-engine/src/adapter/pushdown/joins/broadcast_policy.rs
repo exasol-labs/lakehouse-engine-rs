@@ -5,11 +5,11 @@ use std::collections::{BTreeSet, HashSet};
 use vs_expression::ColumnNode;
 
 use super::super::request::OutputContract;
-use super::super::support::{ColumnTypes, flatten_conjuncts};
+use super::super::support::{ColumnTypes, conjoin, flatten_conjuncts};
 use super::attribution::JoinLegs;
 use super::condition_filters::join_key_legs;
-use super::plan::{JoinPlan, LegGroup};
-use super::rendering::{fan_out_holds, leg_columns_named_in};
+use super::plan::{JoinPlan, LegGroup, exasol_runs_tail};
+use super::rendering::{fan_out_holds, leg_columns_named_in, place_conditions};
 
 /// One top-level conjunct of the WHERE, and whether the scan renders it.
 pub(super) struct WhereConjunct<'a> {
@@ -75,64 +75,44 @@ fn pair_roles(graph: &JoinGraph<'_>, a: usize, b: usize) -> LegGroup {
 }
 
 fn has_own_filter(graph: &JoinGraph<'_>, leg: usize) -> bool {
-    graph
-        .conjuncts
-        .iter()
-        .any(|conjunct| conjunct.renders && graph.legs.conjunct_leg(conjunct.tree) == Some(leg))
+    graph.conjuncts.iter().any(|conjunct| {
+        conjunct.renders && fan_out_holds(graph.legs, &LegGroup::plain(leg), conjunct.tree)
+    })
 }
 
 /// The dimension is within `JOIN_BROADCAST_MAX_BYTES`, and every column Exasol reads of it over
-/// the pair is width-bounded where the width rule applies.
+/// the pair is width-bounded when Exasol stores the pair's rows before it aggregates them, joins
+/// them with another leg, or filters them.
 fn eligible(graph: &JoinGraph<'_>, pair: &LegGroup) -> bool {
     let dimension = pair.broadcast[0];
-    graph.bytes[dimension] <= graph.max_bytes
-        && (!width_rule_applies(graph)
-            || width_bounded(graph, dimension, &dimension_reads(graph, pair)))
-}
-
-/// Exasol stores the pair's rows before it aggregates them, joins them with another leg, or
-/// filters them.
-fn width_rule_applies(graph: &JoinGraph<'_>) -> bool {
-    graph.aggregates
-        || graph.bytes.len() > 2
-        || graph.conjuncts.iter().any(|conjunct| !conjunct.renders)
-}
-
-/// The dimension columns Exasol reads over the pair's fan-out: those of the clauses above it, of
-/// the other join conditions, and of the conjuncts left for Exasol's WHERE.
-fn dimension_reads(graph: &JoinGraph<'_>, pair: &LegGroup) -> ColumnTypes {
-    let pair_legs = pair.legs();
-    let is_pair_key = |conjunct: &Json| {
-        join_key_legs(conjunct, graph.legs).is_some_and(|(a, b)| pair_legs == [a, b])
-    };
-    let other_conditions = graph
-        .conditions
-        .iter()
-        .flat_map(flatten_conjuncts)
-        .filter(|conjunct| !is_pair_key(conjunct));
     let plan = JoinPlan::broadcasting(graph.bytes.len(), pair);
-    let residual = graph
-        .conjuncts
-        .iter()
-        .filter(|conjunct| {
-            !conjunct.renders
-                || !plan
-                    .fan_outs()
-                    .iter()
-                    .any(|fan_out| fan_out_holds(graph.legs, fan_out, conjunct.tree))
-        })
-        .map(|conjunct| conjunct.tree);
-    let dimension = pair.broadcast[0];
+    let declined = graph.conjuncts.iter().any(|conjunct| !conjunct.renders);
+    graph.bytes[dimension] <= graph.max_bytes
+        && (!exasol_runs_tail(plan.fan_outs().len(), graph.aggregates, declined)
+            || width_bounded(graph, dimension, &dimension_reads(graph, &plan, dimension)))
+}
+
+/// The dimension columns Exasol reads over `plan`: those of the clauses above it, of the join
+/// conditions the pair's scan does not run, and of the conjuncts left for Exasol's WHERE.
+fn dimension_reads(graph: &JoinGraph<'_>, plan: &JoinPlan, dimension: usize) -> ColumnTypes {
     if graph.output == OutputContract::WholeRow {
         return graph.columns[dimension].narrowed(|_| true);
     }
+    let filter = conjoin(graph.conjuncts.iter().map(|c| c.tree.clone()).collect());
+    let placed = place_conditions(filter.as_ref(), graph.conditions, graph.legs, plan);
+    let declined = graph
+        .conjuncts
+        .iter()
+        .filter(|conjunct| !conjunct.renders)
+        .map(|conjunct| conjunct.tree);
     leg_columns_named_in(
         graph
             .above
             .iter()
             .copied()
-            .chain(other_conditions)
-            .chain(residual),
+            .chain(placed.on.iter().flatten())
+            .chain(&placed.residual)
+            .chain(declined),
         graph.legs,
         dimension,
         graph.columns[dimension],

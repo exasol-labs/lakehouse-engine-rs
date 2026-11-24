@@ -2,12 +2,11 @@ use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
 use super::super::plan::{JoinPlan, LegGroup};
 use super::super::planning::involved_table;
-use super::super::sql_builders::{
-    build_pair_fan_out_sql, build_side_fan_out_sql, render_broadcast_join,
-};
+use super::super::sql_builders::{build_pair_fan_out_sql, build_side_fan_out_sql};
 use super::super::tests::{
     broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
-    equi_condition, join_request, legs_of, resolved_side, self_join_legs, two_scan_tuning,
+    equi_condition, join_request, legs_of, rendered_pair, resolved_side, self_join_legs,
+    two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::support::RowProjection;
@@ -36,15 +35,7 @@ fn join_condition_renders_via_translator() {
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
 
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &sides,
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = rendered_pair(&request, &sides).expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
         "each operand is qualified by its own leg's alias"
@@ -64,15 +55,8 @@ fn join_where_filter_spanning_both_sides_renders() {
     ]);
 
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("must render");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("must render");
     let filter = rendered
         .filter
         .expect("a cross-side WHERE filter must render");
@@ -908,7 +892,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_filter_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = compare(
         "predicate_greater",
@@ -916,15 +900,8 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
         date_lit("1995-01-01"),
     );
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renders")
-    .expect("an equi-join renders");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("an equi-join renders");
     let filter = rendered.filter.expect("filter renders");
     assert!(
         filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
@@ -937,22 +914,15 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_condition_with_leg_alias() {
     let condition = predicate_equal(
         aliased_col("CUSTOMER", "C", "C_CUSTKEY"),
         aliased_col("ORDERS", "O", "O_CUSTKEY"),
     );
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = rendered_pair(&request, &request_sides(&request, &detected))
+        .expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition,
         r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#
@@ -960,7 +930,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_projection_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request = selecting(
         request,
@@ -973,15 +943,8 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
         )],
     );
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renders")
-    .expect("an equi-join renders");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("an equi-join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
     match &rendered.projection[0].item {
         ProjectionItem::Expr { expr } => {
@@ -1070,15 +1033,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &c_name,
     );
 
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &sides,
-        &LegGroup::pair(1, 0),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("must render");
+    let rendered = rendered_pair(&request, &sides).expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
@@ -1118,15 +1073,14 @@ fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
         table_col("CUSTOMER", "C_SINCE"),
         table_col("LINEITEM", "L_SHIPDATE"),
     );
-    let conjuncts = [
+    let filter = and([
         customer_local.clone(),
         orders_local.clone(),
         lineitem_local.clone(),
         in_pair.clone(),
         across.clone(),
         bool_lit(true),
-    ];
-    let filter = and(conjuncts.clone());
+    ]);
     let conditions = [customer_orders.clone(), orders_lineitem.clone()];
 
     let pair = JoinPlan::broadcasting(3, &LegGroup::pair(2, 1));
@@ -1154,25 +1108,15 @@ fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
         [vec![], vec![customer_orders], vec![orders_lineitem]]
     );
     assert_eq!(
+        n_scan.local,
+        [
+            Some(customer_local),
+            Some(orders_local),
+            Some(lineitem_local)
+        ]
+    );
+    assert_eq!(
         n_scan.residual,
         Some(and([in_pair, across, bool_lit(true)]))
     );
-
-    for placement in [&placement, &n_scan] {
-        let placed: Vec<&Json> = placement
-            .local
-            .iter()
-            .chain(std::iter::once(&placement.residual))
-            .flatten()
-            .flat_map(flatten_conjuncts)
-            .collect();
-        for conjunct in &conjuncts {
-            assert_eq!(
-                placed.iter().filter(|placed| **placed == conjunct).count(),
-                1,
-                "{conjunct}"
-            );
-        }
-        assert_eq!(placed.len(), conjuncts.len());
-    }
 }

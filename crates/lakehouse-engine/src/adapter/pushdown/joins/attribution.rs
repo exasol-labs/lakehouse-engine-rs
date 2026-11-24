@@ -102,16 +102,6 @@ impl JoinLegs {
         legs
     }
 
-    /// `None` when the conjunct has no column or spans several legs; the caller then applies it
-    /// where every leg is in scope. Pruning a single-leg conjunct early is sound for an inner
-    /// join: a row failing it can never survive the join.
-    pub(super) fn conjunct_leg(&self, conjunct: &Json) -> Option<usize> {
-        match *Vec::from_iter(self.legs_referenced(conjunct)) {
-            [leg] => Some(leg),
-            _ => None,
-        }
-    }
-
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
     /// name is ambiguous once a table occurs on several legs. Apply it once, to a raw request
     /// tree: an `LHS_T{leg}` alias matches no leaf alias, so a self-join's output does not

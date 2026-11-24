@@ -44,8 +44,8 @@ use plan::broadcast_serves_window;
 pub(super) use planning::JoinWindowPlan;
 pub(super) use planning::involved_table;
 use planning::resolve_one_join_side;
-use rendering::{fan_out_filter, possible_side_column_names};
-use sql_builders::{qualified_emission, renders_in_scan};
+use rendering::{fan_out_filter, leg_column_types, possible_side_column_names, screen_pair_filter};
+use sql_builders::qualified_emission;
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
 /// leg of `join` or the request's one table, and that table declares it (#615). `declared` holds
@@ -98,12 +98,7 @@ fn empty_join_sql(
 ) -> Result<Json, UdfError> {
     let emitted = n_scan_emission(pushdown, &WherePlacement::whole(pushdown), join, sides)?;
     let legs = join.legs();
-    let col_types = ColumnTypes::per_relation(
-        sides
-            .iter()
-            .enumerate()
-            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
-    );
+    let col_types = leg_column_types(&legs, sides);
     let bound = pushdown.map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
     let scan = ScanTranslator::over(
         &col_types,
@@ -250,7 +245,7 @@ fn broadcast_candidates(
         .map(|tree| {
             Ok(WhereConjunct {
                 tree,
-                renders: renders_in_scan(tree, &legs, sides, context)?,
+                renders: screen_pair_filter(tree, &legs, sides, context)?.1.is_none(),
             })
         })
         .collect::<Result<Vec<_>, UdfError>>()?;

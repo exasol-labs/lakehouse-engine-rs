@@ -253,6 +253,34 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
     }
 }
 
+/// The scan of two-leg `request`'s pair, leg 0 the dimension, as `render_join_plan` renders it
+/// with the window in the shards. `None` when it declines or Exasol runs the tail.
+pub(super) fn rendered_pair(
+    request: &Json,
+    sides: &[ResolvedJoinSide],
+) -> Option<RenderedJoinPushdown> {
+    let (pushdown, join, context) = (
+        parsed_pushdown(request),
+        detected_join(request),
+        test_context(),
+    );
+    let legs = join.legs();
+    let plan = JoinPlan::broadcasting(2, &LegGroup::pair(1, 0));
+    let conditions = rendering::place_conditions(pushdown.filter(), &join.conditions, &legs, &plan);
+    let placement = WherePlacement::of_plan(&conditions, &plan, &legs, sides, &context)
+        .expect("a well-formed request places its WHERE");
+    sql_builders::render_in_shards(
+        &pushdown,
+        &legs,
+        sides,
+        &plan,
+        &conditions,
+        &placement,
+        &context,
+    )
+    .expect("a well-formed request renders without error")
+}
+
 /// The legs production binds for `request`: its join's legs, or its one table's.
 pub(super) fn request_legs(request: &Json) -> JoinLegs {
     match detect_join(request, &parsed_pushdown(request)).expect("a plannable request") {
@@ -261,7 +289,7 @@ pub(super) fn request_legs(request: &Json) -> JoinLegs {
     }
 }
 
-/// The select list projected as `render_broadcast_join` projects it: every column qualified
+/// The select list projected as the in-shard pair scan projects it: every column qualified
 /// through the leg binding and typed by its own leg's universe.
 pub(super) fn broadcast_projection(request: &Json) -> RowProjection {
     let join = detected_join(request);

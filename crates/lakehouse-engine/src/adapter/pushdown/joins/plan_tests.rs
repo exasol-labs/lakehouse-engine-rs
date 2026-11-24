@@ -1,7 +1,7 @@
 use super::super::tests::{customer_orders_legs, customer_orders_request, equi_condition};
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use serde_json::json;
+use serde_json::{Value as Json, json};
 
 #[test]
 fn a_broadcast_pair_takes_the_chain_position_of_its_lowest_leg() {
@@ -28,45 +28,44 @@ fn the_n_scan_holds_one_plain_fan_out_per_leg() {
     );
 }
 
-fn ordered_request(
-    select: &[(&str, &str)],
-    key: (&str, &str),
-    extra: &[(&str, Json)],
-) -> PushdownRequest {
-    let mut builder = customer_orders_request(json!({}), equi_condition()).field(
-        "orderBy",
-        json!([{
-            "type": "order_by_element",
-            "expression": table_col(key.0, key.1),
-            "isAscending": true,
-            "nullsLast": true,
-        }]),
-    );
-    for (table, column) in select {
-        builder = builder.column(table_col(table, column));
-    }
-    for (name, value) in extra {
-        builder = builder.field(name, value.clone());
-    }
-    parsed_pushdown(&builder.build().0)
-}
-
 #[test]
 fn a_two_leg_broadcast_serves_only_a_window_it_can_bind() {
-    let legs = customer_orders_legs();
-    let projected = ordered_request(&[("CUSTOMER", "C_NAME")], ("CUSTOMER", "C_NAME"), &[]);
-    let other_leg = ordered_request(&[("CUSTOMER", "C_NAME")], ("ORDERS", "O_CUSTKEY"), &[]);
-    let grouped = ordered_request(
-        &[("CUSTOMER", "C_NAME")],
-        ("ORDERS", "O_CUSTKEY"),
-        &[
-            ("aggregationType", json!("group_by")),
-            ("groupBy", json!([table_col("CUSTOMER", "C_NAME")])),
-        ],
-    );
-
-    assert!(broadcast_serves_window(&projected, &legs, 2));
-    assert!(!broadcast_serves_window(&other_leg, &legs, 2));
-    assert!(broadcast_serves_window(&grouped, &legs, 2));
-    assert!(broadcast_serves_window(&other_leg, &legs, 3));
+    let ordered = |key: Json| {
+        customer_orders_request(json!({}), equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .order_by(json!([order_by_element(key, true, true)]))
+    };
+    let other_leg = || ordered(table_col("ORDERS", "O_CUSTKEY"));
+    let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
+    // (case, request, legs, whether the broadcast serves its window)
+    let cases = [
+        (
+            "a projected sort key",
+            ordered(table_col("CUSTOMER", "C_NAME")),
+            2,
+            true,
+        ),
+        ("a sort key of the other leg", other_leg(), 2, false),
+        (
+            "beside a conjunct left for Exasol",
+            other_leg().filter(declined),
+            2,
+            false,
+        ),
+        (
+            "an aggregation",
+            other_leg().group_by(vec![table_col("CUSTOMER", "C_NAME")]),
+            2,
+            true,
+        ),
+        ("three legs", other_leg(), 3, true),
+    ];
+    for (case, request, leg_count, serves) in cases {
+        let pushdown = parsed_pushdown(&request.build().0);
+        assert_eq!(
+            broadcast_serves_window(&pushdown, &customer_orders_legs(), leg_count),
+            serves,
+            "{case}"
+        );
+    }
 }
