@@ -3475,14 +3475,34 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         "SELECT COUNT(*) FROM {T} GROUP BY ID BETWEEN 2 AND 4 OR C_BOOL",
         PathCheck::Split,
     ),
-    // A union of DOUBLEs has no exact type: only dates, timestamps, and integers unify.
+    // A union of a DOUBLE with numbers is DOUBLE.
     (
         "SELECT COUNT(*) FROM {T} GROUP BY COALESCE(C_DOUBLE, 2.5E0)",
-        PathCheck::Wrapper,
+        PathCheck::Split,
     ),
     (
         "SELECT MAX(COALESCE(C_DOUBLE, 1E300)) + 1 FROM {T}",
-        PathCheck::Wrapper,
+        PathCheck::Split,
+    ),
+    (
+        "SELECT C_BOOL, ROUND(SUM(COALESCE(C_DOUBLE, 0)), 2) FROM {T} GROUP BY C_BOOL",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY COALESCE(C_DOUBLE, 0.5)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT MAX(GREATEST(C_DOUBLE, C_DECIMAL_A)) + 1 FROM {T}",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY LEAST(C_DOUBLE, 1E1)",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT C_BOOL, MIN(CASE WHEN ID > 4 THEN C_DOUBLE ELSE 1 END) * 2 FROM {T} GROUP BY C_BOOL",
+        PathCheck::Split,
     ),
     // Each form below takes the type of the Exasol version it runs on.
     (
