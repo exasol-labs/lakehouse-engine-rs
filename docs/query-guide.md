@@ -32,7 +32,7 @@ verified against lakehouse-engine 0.60.1 on Exasol 2025.1.
 |---|---|---|
 | `d >= DATE '2024-01-01' AND d < DATE '2025-01-01'` | `YEAR(d) = 2024` | A function around a column can't skip files. |
 | `d = DATE '2024-01-02'` | `d = '2024-01-02'` | Comparing a date with text runs in Exasol. |
-| A filter on a small table of a join | Long text columns of the small tables | The engine joins one pair itself and prefers a filtered small table. Long text rules a pair out. |
+| A filter the engine can run on a small table of a join | Long text columns of the small tables | The engine joins one pair itself and prefers a small table it can filter. Long text rules a pair out. |
 | `FROM a JOIN b ON ... JOIN c ON ...` | `FROM a, c, b` where `c` doesn't join `a` | Exasol then sends each table to the engine on its own. |
 | Filters on the optional side of a `LEFT JOIN` in a `WITH` clause | The same filters in `ON` | A filter in `ON` on that side doesn't reach the engine. |
 | `JOIN` on a unique key | `IN (SELECT ...)`, `EXISTS` | The engine can't run these. |
@@ -174,15 +174,20 @@ still a broadcast join. Put a calculation on the smaller table's side.
 |---|---|
 | `ON o.customer_id = c.customer_id + 1` | `ON o.customer_id - 1 = c.customer_id` |
 
-### In a join of three or more tables, give a small table a filter
+### In a join of three or more tables, filter a small table in the engine
 
-The engine prefers the pair whose smaller table has a filter of its own, then the pair whose larger
-table is biggest. Select only short columns of the small table: a long text column rules its pair
-out.
+The engine joins one pair of tables itself. It prefers a pair whose smaller table has a filter the
+engine can run, because the join then removes rows of the larger table before they reach Exasol.
+A filter that runs in Exasol, such as `REGEXP_LIKE`, or a long text column of the small table makes
+the engine pick another pair.
 
 | Use | Avoid |
 |---|---|
-| `SELECT p.p_partkey, SUM(l.l_quantity) FROM lineitem l JOIN part p ON ... JOIN supplier s ON ... WHERE p.p_brand = 'Brand#23'` | `SELECT p.p_comment, SUM(l.l_quantity) FROM lineitem l JOIN part p ON ... JOIN supplier s ON ...` |
+| `SELECT p.p_partkey, SUM(l.l_quantity) FROM lineitem l JOIN part p ON p.p_partkey = l.l_partkey JOIN supplier s ON s.s_suppkey = l.l_suppkey WHERE p.p_brand = 'Brand#23' GROUP BY p.p_partkey` | The same query with `WHERE p.p_brand REGEXP_LIKE 'Brand#23'` |
+| | The same query with `p.p_comment` instead of `p.p_partkey` |
+
+The first query sends Exasol only the `lineitem` rows of brand 23. The others send every
+`lineitem` row.
 
 ### List comma-separated tables in join order
 
