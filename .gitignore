@@ -1,4 +1,6 @@
 /target
+# cargo-exasol-udf, installed by `make cross-udf-build`
+/.udf-tools
 **/*.so
 
 # Test environment properties

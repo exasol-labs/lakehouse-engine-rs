@@ -33,30 +33,35 @@ VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src
            Cargo.lock
 
 UDF_CARGO_VOL ?= lakehouse-engine-rs-udf-cargo-registry
+UDF_CARGO_GIT_VOL ?= lakehouse-engine-rs-udf-cargo-git
+# Outside target/: rust-cache's cleanup empties every non-profile directory there.
+UDF_TOOLS_DIR := .udf-tools
 
 # CI's E2E jobs download the .so and set REBUILD_SO=0, so a missing or stale .so
 # fails the job instead of hiding a ~15 min rebuild (#341).
 REBUILD_SO ?= 1
 
 # Runs as the host UID:GID so target/release/** is host-owned (root-owned
-# artifacts break a host `cargo clean`). The registry volume may hold root-owned
-# content, so it is chowned to the host user first.
+# artifacts break a host `cargo clean`). The registry and git volumes may hold
+# root-owned content, so they are chowned to the host user first.
 $(VS_SO): $(VS_SRCS)
 ifeq ($(REBUILD_SO),0)
 	@echo "ERROR: $@ is missing or older than its sources, and REBUILD_SO=0 forbids rebuilding it" >&2; exit 1
 else
 	docker run --rm -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
-	  $(UDF_BUILDER_IMAGE) chown -R $(shell id -u):$(shell id -g) /usr/local/cargo/registry
+	  -v $(UDF_CARGO_GIT_VOL):/usr/local/cargo/git \
+	  $(UDF_BUILDER_IMAGE) chown -R $(shell id -u):$(shell id -g) /usr/local/cargo/registry /usr/local/cargo/git
 	docker run --rm \
 	  -v $(LAKEHOUSE_ENGINE_DIR):/build/lakehouse-engine \
 	  -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
+	  -v $(UDF_CARGO_GIT_VOL):/usr/local/cargo/git \
 	  -w /build/lakehouse-engine \
 	  --user $(shell id -u):$(shell id -g) \
 	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
 	  sh -c 'cargo build --release -p lakehouse-engine \
-	    && cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet --root target/udf-tools \
-	    && PATH="$$PWD/target/udf-tools/bin:$$PATH" cargo exasol-udf validate $@'
+	    && cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet --root $(UDF_TOOLS_DIR) \
+	    && PATH="$$PWD/$(UDF_TOOLS_DIR)/bin:$$PATH" cargo exasol-udf validate $@'
 endif
 
 cross-udf-build: $(VS_SO)
