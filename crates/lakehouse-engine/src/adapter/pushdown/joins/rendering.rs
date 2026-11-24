@@ -8,13 +8,15 @@ use vs_expression::{
 };
 
 use super::super::context::PushdownContext;
+use super::super::request::OutputContract;
 use super::super::scalar_over_agg::substitute_subtrees;
 use super::super::support::{
-    ColumnTypes, Emitted, OutputContract, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
+    ColumnTypes, Emitted, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
 };
 use super::attribution::JoinLegs;
 use super::condition_filters::join_key_legs;
 use super::plan::{JoinPlan, LegGroup};
+use super::planning::ResolvedJoinSide;
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
 /// leg's type.
@@ -255,6 +257,33 @@ pub(super) fn screen_leg_filter(
     Ok(scan.screen_conjuncts(side_local, strip_table_alias))
 }
 
+/// The pair's local conjuncts, split into the scan filter and the raw conjuncts the scan
+/// declines. A filter that renders whole keeps its one rendered SQL.
+pub(super) fn screen_pair_filter(
+    local: &Json,
+    legs: &JoinLegs,
+    sides: &[ResolvedJoinSide],
+    context: &PushdownContext<'_>,
+) -> Result<(Option<String>, Option<Json>), UdfError> {
+    let col_types = leg_column_types(legs, sides);
+    let qualified = legs.qualify(local);
+    let scan = ScanTranslator::over(&col_types, context.version, &[&qualified])?;
+    if let Some(sql) = scan.filter(&qualified) {
+        return Ok((Some(sql), None));
+    }
+    Ok(scan.screen_conjuncts(local, |conjunct| legs.qualify(conjunct)))
+}
+
+/// Every leg's columns, keyed by its relation alias.
+pub(super) fn leg_column_types(legs: &JoinLegs, sides: &[ResolvedJoinSide]) -> ColumnTypes {
+    ColumnTypes::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
+    )
+}
+
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.
 pub(super) fn conjoin_filters(left: Option<Json>, right: Option<Json>) -> Option<Json> {
     match (left, right) {
@@ -296,18 +325,6 @@ pub(super) fn possible_side_column_names(
         }
     });
     names
-}
-
-/// The clauses an Exasol wrapper renders over a fan-out that already applied the WHERE.
-pub(super) fn wrapper_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
-    ["selectList", "groupBy", "orderBy", "having"]
-        .into_iter()
-        .filter_map(|clause| pushdown_req.get(clause))
-}
-
-/// The single owner of which clauses can name a source column.
-pub(super) fn referenced_clause_values(pushdown_req: &Json) -> impl Iterator<Item = &Json> {
-    wrapper_clause_values(pushdown_req).chain(pushdown_req.get("filter"))
 }
 
 /// Leg `leg`'s columns that `values` name, in declaration order. CROSS-FOLD: `full_cols` is

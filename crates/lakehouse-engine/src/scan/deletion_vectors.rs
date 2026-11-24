@@ -22,10 +22,6 @@ use url::Url;
 /// bounds from that size without re-checking it.
 const PORTABLE_MAGIC_BYTES: i32 = 4;
 
-/// Z85 packs four bytes into five characters; two chunks are the fewest yielding the magic under
-/// every accepted encoding, keeping the decoder's magic read inside the decoded payload.
-const MIN_INLINE_PAYLOAD_CHARS: usize = 10;
-
 /// Never read: persisted paths are absolute by decode time and inline bytes are the descriptor.
 const UNUSED_DECODE_PARENT: &str = "memory:///";
 
@@ -114,9 +110,8 @@ fn resolve_descriptor(
         )
     })?;
     let inline = logged.storage == DeltaDeletionVectorStorage::Inline;
-    if inline && logged.path_or_inline_dv.len() < MIN_INLINE_PAYLOAD_CHARS {
-        return Err("its inline payload is too short to carry a bitmap".to_string());
-    }
+    // The decoder checks an inline payload's length itself, but slices a persisted vector by its
+    // declared size unchecked.
     if !inline && logged.size_in_bytes < PORTABLE_MAGIC_BYTES {
         return Err(format!(
             "the log declares a size of {} bytes, smaller than the {PORTABLE_MAGIC_BYTES}-byte \

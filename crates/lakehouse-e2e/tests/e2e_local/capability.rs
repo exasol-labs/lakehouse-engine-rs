@@ -2692,7 +2692,7 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
-/// Scenario: A declined filter does not widen the wrapper's projection
+/// Scenario: The wrapper's fan-out emits only the columns the wrapper reads
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     lakehouse_vs();
@@ -2874,7 +2874,7 @@ fn declined_conjunct_mismatch(
 /// Scenario: Filter predicate is pushed into the scan spec
 /// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
 /// Scenario: A declined WHERE filter under an aggregate request is applied ahead of the aggregate
-/// Scenario: A declined filter does not widen the wrapper's projection
+/// Scenario: The wrapper's fan-out emits only the columns the wrapper reads
 #[test]
 fn e2e_declined_conjunct_keeps_the_other_conjuncts_in_the_scan() {
     lakehouse_vs();
@@ -2903,6 +2903,44 @@ fn e2e_declined_conjunct_keeps_the_other_conjuncts_in_the_scan() {
         failures.len(),
         DECLINED_CONJUNCT_CASES.len(),
         failures.join("\n")
+    );
+}
+
+/// Scenario: The wrapper's fan-out emits only the columns the wrapper reads
+#[test]
+fn e2e_a_wrapper_over_a_pushed_filter_emits_no_column_only_the_filter_reads() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+    // Two COUNT(DISTINCT)s need the wrapper, and the scan applies the whole WHERE.
+    let query = "SELECT COUNT(DISTINCT ID), COUNT(DISTINCT C_VARCHAR) FROM {T} WHERE C_DOUBLE > 0";
+    let kept = conn.query_row_count(&format!("SELECT ID FROM {NATIVE_COPY} WHERE C_DOUBLE > 0"));
+    let all = conn.query_row_count(&format!("SELECT ID FROM {NATIVE_COPY}"));
+    assert!(
+        0 < kept && kept < all,
+        "fixture precondition: the filter must keep a strict subset of the rows, got {kept} of \
+         {all}"
+    );
+
+    if let Some(failure) = native_copy_mismatch(
+        &mut conn,
+        &typed,
+        NATIVE_COPY,
+        query,
+        PathCheck::Wrapper,
+        Expect::Rows,
+    ) {
+        panic!("{failure}");
+    }
+    let plan = isolated_pushdown_statement(&mut conn, &query.replace("{T}", &typed));
+    assert!(
+        scan_spec_filter(&plan).is_some_and(|filter| filter.contains("C_DOUBLE")),
+        "the scan must apply the whole WHERE: {plan}"
+    );
+    assert!(
+        fan_out_emits(&plan).is_some_and(|emits| !emits.contains("C_DOUBLE")),
+        "the fan-out must not emit C_DOUBLE, which only the scan's filter reads: {plan}"
     );
 }
 

@@ -96,7 +96,16 @@ pub(crate) fn scan_distribute_shards<E>(files: Vec<Vec<E>>) -> Shards<E> {
 
 /// The scan's typed filter SQL, `None` when it declines.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
-    scan_over(col_types).split_where(Some(filter)).pushed()
+    WherePlacement::single_scan(scan_over(col_types), &filter_only_request(filter)).scan_filter(0)
+}
+
+/// A `SELECT *` request whose only clause is `filter`.
+pub(crate) fn filter_only_request(filter: &Json) -> PushdownRequest {
+    PushdownRequest::parse(serde_json::json!({
+        "selectListDataTypes": [],
+        "filter": filter,
+    }))
+    .expect("a filter-only request parses")
 }
 
 /// The deduplicated partial plans of a single-group select list, whatever their types.
@@ -157,7 +166,7 @@ pub(crate) const AGGREGATED: [(&str, ExasolType); 12] = [
 pub(crate) fn scan_of(request: &Json) -> ScanTranslator<'static> {
     scan_for(
         Box::leak(Box::new(first_table_column_types(request))),
-        &pd(request),
+        &parsed_pushdown(request),
     )
 }
 
@@ -167,11 +176,18 @@ pub(crate) fn scan_over(columns: &ColumnTypes) -> ScanTranslator<'_> {
     ScanTranslator::over(columns, ExasolVersion::Exasol2025, &[]).expect("no tree to check")
 }
 
-/// The translator production builds over `columns` for `pushdown_req`, through the same check.
+/// The translator production builds over `columns` for `pushdown`, through the same check.
 /// Panics on a column of the request that `columns` does not bind.
-pub(crate) fn scan_for<'c>(columns: &'c ColumnTypes, pushdown_req: &Json) -> ScanTranslator<'c> {
-    ScanTranslator::over(columns, ExasolVersion::Exasol2025, &[pushdown_req])
-        .unwrap_or_else(|error| panic!("{}", user_message(error)))
+pub(crate) fn scan_for<'c>(
+    columns: &'c ColumnTypes,
+    pushdown: &PushdownRequest,
+) -> ScanTranslator<'c> {
+    ScanTranslator::over(
+        columns,
+        ExasolVersion::Exasol2025,
+        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|error| panic!("{}", user_message(error)))
 }
 
 /// [`scan_over`] the types of `columns`. Its column map is leaked, as in [`scan_of`].
@@ -659,7 +675,11 @@ pub(super) fn project_row(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<RowProjection, UdfError> {
-    let scan = ScanTranslator::over(all_cols, ExasolVersion::Exasol2025, &[pushdown.json()])?;
+    let scan = ScanTranslator::over(
+        all_cols,
+        ExasolVersion::Exasol2025,
+        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+    )?;
     support::project_columns(pushdown, scan, &emitting(all_cols))
 }
 
@@ -715,15 +735,37 @@ pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
     PushdownRequest::parse(pd(request)).expect("the fixture declares a valid selectListDataTypes")
 }
 
+/// Every column `pushdown` names, its whole WHERE included, as the single-table dispatch
+/// derives the columns its row scan projects from.
+pub(super) fn whole_request_emission(
+    request: &Json,
+    pushdown: &PushdownRequest,
+    columns: &ColumnTypes,
+) -> Result<Emitted, UdfError> {
+    single_table_emission(request, pushdown, &WherePlacement::whole(pushdown), columns)
+}
+
+/// The placement production gives `request`'s WHERE over its first table.
+pub(super) fn single_scan_placement(request: &Json) -> WherePlacement {
+    WherePlacement::single_scan(scan_of(request), &parsed_pushdown(request))
+}
+
+/// [`parsed_pushdown`] without the request check, for the check itself.
+fn parsed_pushdown_unchecked(request: &Json) -> PushdownRequest {
+    PushdownRequest::parse(request["pushdownRequest"].clone())
+        .expect("the fixture declares a valid selectListDataTypes")
+}
+
 /// The qualified single-table wrapper over `request` once the scan declines its whole WHERE,
 /// which the wrapper then self-applies; the fan-out spec carries no filter. Asserts the decline,
 /// since a fixture whose filter renders would assert nothing.
 pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
     let pushdown = parsed_pushdown(request);
-    let scan_where = scan_of(request).split_where(pushdown.json().get("filter"));
-    let ScanWhere::Declined(declined) = scan_where else {
-        panic!("fixture precondition: the filter must decline, got {scan_where:?}");
-    };
+    let placement = WherePlacement::single_scan(scan_of(request), &pushdown);
+    assert!(
+        placement.scan_filter(0).is_none() && placement.wrapper().is_some(),
+        "fixture precondition: the filter must decline, got {placement:?}"
+    );
     joins::build_qualified_single_table_fallback_sql(
         request,
         &pushdown,
@@ -731,9 +773,9 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
-        &emitting(&first_table_column_types(request)),
+        &first_table_column_types(request),
         &unqualified_shards(vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]]),
-        Some(declined),
+        &placement,
         &test_context(),
     )
     .expect("the wrapper must render the declined predicate")
@@ -1649,7 +1691,7 @@ pub(crate) fn pd(request: &Json) -> Json {
 /// Exasol does not send. Exasol sends a request with no join for exactly one table.
 pub(crate) fn assert_exasol_sends(request: &Json) {
     let pushdown = &request["pushdownRequest"];
-    if let Ok(JoinShape::NotAJoin) = detect_join(request, pushdown) {
+    if let Ok(JoinShape::NotAJoin) = detect_join(request, &parsed_pushdown_unchecked(request)) {
         let tables = request["involvedTables"].as_array().map_or(0, Vec::len);
         assert_eq!(
             tables, 1,
@@ -1669,8 +1711,8 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
 /// The planners' request check over `request`, as `handle_pushdown` and `plan_join` run it: over
 /// the join's legs, or over the request's one table.
 pub(crate) fn request_check(request: &Json) -> Result<(), UdfError> {
-    let pushdown = &request["pushdownRequest"];
-    let (join, declared) = match detect_join(request, pushdown)? {
+    let pushdown = PushdownRequest::parse(request["pushdownRequest"].clone())?;
+    let (join, declared) = match detect_join(request, &pushdown)? {
         JoinShape::Join(join) => {
             let declared = join
                 .tables
@@ -1686,7 +1728,7 @@ pub(crate) fn request_check(request: &Json) -> Result<(), UdfError> {
     };
     ensure_columns_declared(
         request,
-        pushdown,
+        &pushdown,
         join.as_ref(),
         &declared.iter().collect::<Vec<_>>(),
     )

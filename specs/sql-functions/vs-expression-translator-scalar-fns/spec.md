@@ -40,6 +40,12 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *AND* the DataFusion-dialect rendering of every listed name MUST remain byte-identical to the preceding scenario
 * *AND* the Exasol dialect SHALL NOT impose its own arity check, because Exasol's compiler emitted a call its own engine accepts, the same rule the string-function family already follows for Exasol's three-argument `INSTR`
 
+### Scenario: FLOOR and CEIL over a DECIMAL return native values
+
+* *GIVEN* a DECIMAL column with a scale above 0 that holds positive and negative values, values one cent from an integer, and both bounds of its precision
+* *WHEN* a query projects `FLOOR` or `CEIL` of the column, or filters on either
+* *THEN* the query SHALL return the values and rows native Exasol returns
+
 ### Scenario: MOD translates to the modulo operator
 
 * *GIVEN* a VS expression node of type `function_scalar` named `MOD` with two arguments

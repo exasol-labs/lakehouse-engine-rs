@@ -2,7 +2,8 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
-use crate::adapter::pushdown::support::{InvolvedColumns, PushdownRequest};
+use crate::adapter::pushdown::request::{Clause, PushdownRequest};
+use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::relation_alias;
 use exasol_udf_sdk::error::UdfError;
 use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
@@ -122,13 +123,10 @@ impl JoinLegs {
     /// The request with its select list, WHERE, and ORDER BY qualified by leg, as a broadcast scan
     /// renders them.
     pub(super) fn qualify_request(&self, pushdown: &PushdownRequest) -> PushdownRequest {
-        let mut qualified = pushdown.json().clone();
-        for clause in ["selectList", "filter", "orderBy"] {
-            if let Some(value) = pushdown.json().get(clause) {
-                qualified[clause] = self.qualify(value);
-            }
-        }
-        pushdown.with_json(qualified)
+        pushdown.map_clauses(
+            &[Clause::SelectList, Clause::Filter, Clause::OrderBy],
+            |clause| self.qualify(clause),
+        )
     }
 
     /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`
@@ -136,23 +134,25 @@ impl JoinLegs {
     /// request column binds.
     pub(super) fn ensure_columns_declared(
         &self,
-        pushdown: &Json,
+        pushdown: &PushdownRequest,
         declared: &[&InvolvedColumns<'_>],
     ) -> Result<(), UdfError> {
         let mut failure = None;
-        walk_column_nodes(pushdown, &mut |column| {
-            if failure.is_some() {
-                return;
-            }
-            let name = column.upper_name();
-            failure = match self.leg_of(column) {
-                None => Some(unbound_column_error(column)),
-                Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
-                    Some(undeclared_column_error(&name))
+        for clause in pushdown.clauses(&Clause::ALL) {
+            walk_column_nodes(clause, &mut |column| {
+                if failure.is_some() {
+                    return;
                 }
-                Some(_) => None,
-            };
-        });
+                let name = column.upper_name();
+                failure = match self.leg_of(column) {
+                    None => Some(unbound_column_error(column)),
+                    Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
+                        Some(undeclared_column_error(&name))
+                    }
+                    Some(_) => None,
+                };
+            });
+        }
         failure.map_or(Ok(()), Err)
     }
 }

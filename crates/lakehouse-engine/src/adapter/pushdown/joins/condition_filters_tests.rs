@@ -198,9 +198,9 @@ fn filters_of_a_nested_three_leg_tree_move_to_the_top_level_filter() {
         table_ref("C"),
         bc_key(),
     );
-    assert_eq!(moved.json()["from"], expected_from);
+    assert_eq!(clauses(&moved)["from"], expected_from);
     assert_eq!(
-        moved.json()["filter"],
+        clauses(&moved)["filter"],
         and([a_filter(), c_filter(), b_filter()])
     );
 }
@@ -214,7 +214,7 @@ fn moved_filters_are_conjoined_after_the_existing_filter() {
         .expect("the condition holds a filter");
 
     assert_eq!(
-        moved.json()["filter"],
+        clauses(&moved)["filter"],
         and([b_filter(), or([a_filter(), c_filter()]), a_filter()])
     );
 }
@@ -232,10 +232,10 @@ fn several_join_equalities_stay_as_one_conjunction() {
         .expect("the condition holds a filter");
 
     assert_eq!(
-        moved.json()["from"]["condition"],
+        clauses(&moved)["from"]["condition"],
         and([ab_key(), second_key])
     );
-    assert_eq!(moved.json()["filter"], a_filter());
+    assert_eq!(clauses(&moved)["filter"], a_filter());
 }
 
 #[test]
@@ -251,8 +251,8 @@ fn a_self_join_filter_keeps_its_occurrence_alias() {
     let moved = move_condition_filters(&request(from, None), &self_join())
         .expect("the condition holds a filter");
 
-    assert_eq!(moved.json()["from"]["condition"], key);
-    assert_eq!(moved.json()["filter"], filter);
+    assert_eq!(clauses(&moved)["from"]["condition"], key);
+    assert_eq!(clauses(&moved)["filter"], filter);
 }
 
 #[test]
@@ -285,8 +285,8 @@ fn a_keyless_join_keeps_its_condition_while_another_join_moves() {
     let moved = move_condition_filters(&request(from, None), &three_legs())
         .expect("the lower condition holds a filter");
 
-    assert_eq!(moved.json()["from"]["condition"], keyless);
-    assert_eq!(moved.json()["filter"], a_filter());
+    assert_eq!(clauses(&moved)["from"]["condition"], keyless);
+    assert_eq!(clauses(&moved)["filter"], a_filter());
 }
 
 /// Scenario: The filters of a join on an outer join's null-supplying side stay in its condition
@@ -401,8 +401,13 @@ fn outer_joins_and_null_supplying_subtrees_keep_their_conditions() {
 
         let moved = move_condition_filters(&original, &three_legs());
 
-        let result = moved.as_ref().unwrap_or(&original).json();
-        assert_eq!(result["from"], expected_from, "{case}");
-        assert_eq!(result.get("filter"), expected_filter.as_ref(), "{case}");
+        let result = moved.as_ref().unwrap_or(&original);
+        assert_eq!(result.from(), Some(&expected_from), "{case}");
+        assert_eq!(result.filter(), expected_filter.as_ref(), "{case}");
     }
+}
+
+/// The clauses a condition move rewrites, as one object to assert on.
+fn clauses(pushdown: &PushdownRequest) -> Json {
+    serde_json::json!({"from": pushdown.from(), "filter": pushdown.filter()})
 }

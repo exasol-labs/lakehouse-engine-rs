@@ -1,6 +1,7 @@
 use serde_json::Value as Json;
 
-use super::super::support::{OutputContract, PushdownRequest, aggregation_type, column_node_ref};
+use super::super::request::{OutputContract, PushdownRequest};
+use super::super::support::column_node_ref;
 use super::super::topn::ParsedSortKey;
 use super::attribution::JoinLegs;
 use super::planning::{JoinWindowPlan, classify_join_window};
@@ -95,7 +96,7 @@ pub(super) fn tail_runs_in_shards(
     residual: Option<&Json>,
     pushdown: &PushdownRequest,
 ) -> bool {
-    plan.fan_outs().len() == 1 && residual.is_none() && aggregation_type(pushdown.json()).is_none()
+    plan.fan_outs().len() == 1 && residual.is_none() && pushdown.aggregation_type().is_none()
 }
 
 /// Whether a two-leg broadcast can serve the request's window, so its pair may be broadcast at
@@ -107,22 +108,20 @@ pub(super) fn broadcast_serves_window(
     legs: &JoinLegs,
     leg_count: usize,
 ) -> bool {
-    if leg_count > 2 || aggregation_type(pushdown.json()).is_some() {
+    if leg_count > 2 || pushdown.aggregation_type().is_some() {
         return true;
     }
     let qualified = legs.qualify_request(pushdown);
-    let qualified = qualified.json();
-    match classify_join_window(qualified) {
+    match classify_join_window(&qualified) {
         JoinWindowPlan::BroadcastUnservable => false,
         JoinWindowPlan::Unbounded | JoinWindowPlan::BareLimit(_) => true,
         JoinWindowPlan::Ordered { keys, .. } => {
             let projected: Vec<_> = match pushdown.output() {
                 OutputContract::WholeRow => return true,
-                OutputContract::AnyOneColumn => Vec::new(),
-                OutputContract::Items => qualified["selectList"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
+                OutputContract::AnyOneColumn | OutputContract::Items => qualified
+                    .select_items()
+                    .unwrap_or_default()
+                    .iter()
                     .filter_map(column_node_ref)
                     .collect(),
             };

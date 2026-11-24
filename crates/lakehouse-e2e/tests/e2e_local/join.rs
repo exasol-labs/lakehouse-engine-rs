@@ -12,6 +12,7 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
+use crate::fixtures::emits_clause;
 use crate::fixtures::{
     JOIN_ORACLE, assert_two_scan_join_wrapper, copy_join_tables_natively, events,
     events_labels_join, stack, vs_table,
@@ -2503,6 +2504,56 @@ fn e2e_three_table_join_on_filters_reach_their_leg_scans() {
             "the {column} ON filter must reach its own leg's scan filter: {filters:?}\n{pushed}"
         );
     }
+}
+
+/// Every fan-out `EMITS` column list in the pushed SQL, one per leg.
+fn leg_emits_clauses(pushed: &str) -> Vec<String> {
+    pushed
+        .match_indices("EMITS (")
+        .map(|(at, _)| emits_clause(&pushed[at..]))
+        .collect()
+}
+
+/// Scenario: Join conditions attach greedily by LEG set and leg-local filters push into each leg
+/// Scenario: A join of three or more legs broadcasts one pair and scans the other legs
+#[test]
+fn e2e_join_fan_out_emits_no_column_that_only_its_scan_filter_reads() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    // (WHERE, a LINEITEM column, whether the outer wrapper reads it, so the leg emits it). The
+    // scan declines a three-argument INSTR, so that conjunct is the wrapper's.
+    let cases = [
+        ("l.L_LINENUMBER = 1", "L_LINENUMBER", false),
+        ("INSTR(l.L_RETURNFLAG, 'R', 2) = 0", "L_RETURNFLAG", true),
+        (
+            "(l.L_LINENUMBER = 1 OR c.C_NAME = 'customer-02')",
+            "L_LINENUMBER",
+            true,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (filter, column, emitted) in cases {
+        let query = format!(
+            "SELECT c.C_NAME, l.L_QUANTITY FROM {{T}}.DIM_CUSTOMER c \
+             JOIN {{T}}.FACT_ORDERS o ON c.C_CUSTKEY = o.O_CUSTKEY \
+             JOIN {{T}}.FACT_LINEITEM l ON o.O_ORDERKEY = l.L_ORDERKEY WHERE {filter}"
+        );
+        failures.extend(multi_way_mismatches(&mut conn, 3, &query));
+        for vs_name in [VS_NAME, VS_NAME_LOW] {
+            let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", vs_name));
+            let legs = leg_emits_clauses(&pushed);
+            // Unquoted: a broadcast pair emits the column under its leg's prefix.
+            if legs.iter().any(|emits| emits.contains(column)) != emitted {
+                failures.push(format!(
+                    "{vs_name} `{filter}`: a fan-out must emit {column} only when the outer \
+                     WHERE reads it ({emitted}): {legs:?}\n{pushed}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Scenario: A join equality that reads several legs on one side stays in the condition

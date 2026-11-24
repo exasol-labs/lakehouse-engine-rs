@@ -39,11 +39,12 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* no golden-SQL fixture covering a rendering filter SHALL change
 * *AND* the decline path's wrapper SHALL therefore add no cost to any request the adapter can push
 
-### Scenario: A declined filter does not widen the wrapper's projection
+### Scenario: The wrapper's fan-out emits only the columns the wrapper reads
 
-* *GIVEN* a single-table `pushdown` request whose filter holds a declined conjunct
+* *GIVEN* a single-table `pushdown` request that the qualified single-table wrapper serves, such as `SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM t WHERE c > 0`, whether the scan applies all, part, or none of its filter
 * *WHEN* the adapter builds the qualified single-table wrapper
-* *THEN* the wrapper's fan-out SHALL emit only the columns that the request's select list, the wrapper's other clauses, and the declined conjuncts name, and no column because a conjunct declined
+* *THEN* the wrapper's fan-out SHALL emit only the columns that the request's select list, the wrapper's other clauses, and the wrapper's `WHERE` name, so a column that only a conjunct the scan applies names is not emitted
+* *AND* a declined conjunct SHALL add only the columns it names, never the full base row
 * *AND* the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares: the full base row in table-column order for an absent or JSON-null `selectList`, and one column for an empty one, so the route never trips Exasol's positional `04000` validation
 * *AND* for an absent or JSON-null `selectList`, the fan-out SHALL emit the full base row, because Exasol validates the result positionally against the whole row
 
@@ -74,7 +75,7 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *WHEN* the adapter builds the pushdown SQL
 * *THEN* the adapter SHALL split the filter into its top-level conjuncts, flattening nested `AND` nodes and keeping each `OR` or `NOT` node whole, and apply each conjunct exactly once, in the scan or in the wrapper's `WHERE`
 * *AND* the per-shard scan spec of the qualified single-table wrapper's fan-out SHALL carry the conjunction of the rendered conjuncts as its `filter`, and the wrapper's `WHERE` SHALL carry the conjunction of the declined conjuncts, each rendered from its original request tree in the Exasol dialect
-* *AND* the fan-out's columns SHALL follow "A declined filter does not widen the wrapper's projection", so a column that only a rendered conjunct names is not emitted
+* *AND* the fan-out's columns SHALL follow "The wrapper's fan-out emits only the columns the wrapper reads", so a column that only a rendered conjunct names is not emitted
 * *AND* the result SHALL equal native Exasol evaluation of the same query, for a row scan, an aggregate, a `GROUP BY`, a `COUNT(DISTINCT)`, and an `ORDER BY` with `LIMIT`
 * *AND* a join with a broadcast pair whose filter holds a declined conjunct SHALL split the same way, as "A broadcast join applies a declined filter conjunct in Exasol's WHERE" states
 

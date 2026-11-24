@@ -9,11 +9,11 @@ use serde_json::Value as Json;
 use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
+use super::request::{Clause, OutputContract, PushdownRequest};
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
 use super::support::{
-    ColumnTypes, Emitted, InvolvedColumns, OutputContract, PushdownRequest, aggregation_type,
-    flatten_conjuncts, project_columns, pushdown_response,
+    ColumnTypes, InvolvedColumns, flatten_conjuncts, project_columns, pushdown_response,
 };
 
 mod attribution;
@@ -23,6 +23,7 @@ mod plan;
 mod planning;
 mod rendering;
 mod sql_builders;
+mod where_placement;
 
 pub(crate) use planning::{DetectedJoin, JoinLeaf, JoinShape, ResolvedJoinSide, detect_join};
 pub(crate) use sql_builders::RenderedJoinPushdown;
@@ -35,6 +36,7 @@ pub(super) use plan::{JoinPlan, LegGroup};
 pub(super) use sql_builders::render_join_plan;
 #[cfg(test)]
 pub(super) use sql_builders::{build_pair_fan_out_sql, build_qualified_single_table_fallback_sql};
+pub(super) use where_placement::WherePlacement;
 
 use broadcast_policy::{JoinGraph, WhereConjunct, group_legs};
 use plan::broadcast_serves_window;
@@ -42,7 +44,7 @@ use plan::broadcast_serves_window;
 pub(super) use planning::JoinWindowPlan;
 pub(super) use planning::involved_table;
 use planning::resolve_one_join_side;
-use rendering::{fan_out_filter, possible_side_column_names, wrapper_clause_values};
+use rendering::{fan_out_filter, possible_side_column_names};
 use sql_builders::{qualified_emission, renders_in_scan};
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
@@ -51,7 +53,7 @@ use sql_builders::{qualified_emission, renders_in_scan};
 /// planners run it before any catalog request.
 pub(crate) fn ensure_columns_declared(
     request: &Json,
-    pushdown: &Json,
+    pushdown: &PushdownRequest,
     join: Option<&DetectedJoin>,
     declared: &[&InvolvedColumns<'_>],
 ) -> Result<(), UdfError> {
@@ -86,14 +88,15 @@ fn ensure_no_side_refuses_a_referenced_column(
 }
 
 /// The empty result of a join with a fileless side. Every column binds leg-qualified, so a name
-/// two legs share reads its own leg's type and refusal.
+/// two legs share reads its own leg's type and refusal. It evaluates the whole WHERE, so every
+/// column the WHERE names is emitted.
 fn empty_join_sql(
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    emitted: Vec<Emitted>,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
+    let emitted = n_scan_emission(pushdown, &WherePlacement::whole(pushdown), join, sides)?;
     let legs = join.legs();
     let col_types = ColumnTypes::per_relation(
         sides
@@ -101,8 +104,12 @@ fn empty_join_sql(
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let bound = pushdown.with_json(legs.qualify(pushdown.json()));
-    let scan = ScanTranslator::over(&col_types, context.version, &[bound.json()])?;
+    let bound = pushdown.map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
+    let scan = ScanTranslator::over(
+        &col_types,
+        context.version,
+        &bound.clauses(&Clause::ALL).collect::<Vec<_>>(),
+    )?;
     let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
     empty_result_sql(
         pushdown,
@@ -148,13 +155,13 @@ pub(super) async fn plan_join(
     // Before the move, whose leg lookups rely on every column binding a leg.
     ensure_columns_declared(
         request,
-        pushdown.json(),
+        pushdown,
         Some(join),
         &involved.iter().collect::<Vec<_>>(),
     )?;
     let moved = match condition_filters::move_condition_filters(pushdown, &legs) {
         Some(moved) => {
-            let JoinShape::Join(moved_join) = detect_join(request, moved.json())? else {
+            let JoinShape::Join(moved_join) = detect_join(request, &moved)? else {
                 unreachable!("moving condition filters keeps every join node");
             };
             Some((moved, moved_join))
@@ -165,8 +172,7 @@ pub(super) async fn plan_join(
         Some((moved, moved_join)) => (moved, moved_join),
         None => (pushdown, join),
     };
-    let pushdown_req = pushdown.json();
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let filter = pushdown.filter();
     // Built once for every leg, so every leg's identifier passes its rule before any catalog
     // request.
     let identifiers: Vec<&str> = join
@@ -197,10 +203,9 @@ pub(super) async fn plan_join(
     // Both before the zero-files return: a refused column must error, never yield an empty
     // result.
     ensure_no_side_refuses_a_referenced_column(request, pushdown.output(), &sides)?;
-    let emitted = n_scan_emission(pushdown, join, &sides)?;
 
     if sides.iter().any(|s| s.scan.files.is_empty()) {
-        return empty_join_sql(pushdown, join, &sides, emitted, context);
+        return empty_join_sql(pushdown, join, &sides, context);
     }
 
     let sql = render_resolved_join(pushdown, join, &sides, context)?;
@@ -239,9 +244,7 @@ fn broadcast_candidates(
     if !broadcast_serves_window(pushdown, &legs, sides.len()) {
         return Ok(Vec::new());
     }
-    let pushdown_req = pushdown.json();
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let trees: Vec<&Json> = filter.map(flatten_conjuncts).unwrap_or_default();
+    let trees: Vec<&Json> = pushdown.filter().map(flatten_conjuncts).unwrap_or_default();
     let conjuncts = trees
         .into_iter()
         .map(|tree| {
@@ -253,7 +256,7 @@ fn broadcast_candidates(
         .collect::<Result<Vec<_>, UdfError>>()?;
     let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
     let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
-    let above: Vec<&Json> = wrapper_clause_values(pushdown_req).collect();
+    let above: Vec<&Json> = pushdown.clauses(&Clause::WRAPPER).collect();
     Ok(group_legs(&JoinGraph {
         legs: &legs,
         bytes: &bytes,
@@ -262,7 +265,7 @@ fn broadcast_candidates(
         conjuncts: &conjuncts,
         above: &above,
         output: pushdown.output(),
-        aggregates: aggregation_type(pushdown_req).is_some(),
+        aggregates: pushdown.aggregation_type().is_some(),
         max_bytes: context.tuning.join_broadcast_max_bytes,
     }))
 }

@@ -149,7 +149,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     assert!(
         matches!(
             &items[1],
-            SingleGroupItem::ScalarOverAggregate { node, .. } if node == &req.json()["selectList"][1]
+            SingleGroupItem::ScalarOverAggregate { node, .. } if node == &req.select_items().expect("the request lists items")[1]
         ),
         "item 1 must be a ScalarOverAggregate at ordinal 1 carrying the verbatim node: {:?}",
         items[1]

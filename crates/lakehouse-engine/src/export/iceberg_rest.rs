@@ -118,7 +118,7 @@ impl ExportTarget for IcebergRestTarget {
 
 /// Refuses format version 3 or later, whose row lineage and encryption keys the export does not
 /// maintain, and a partition field named like a column unless it is that column's identity, which
-/// iceberg-rust cannot commit to.
+/// a commit cannot land on.
 fn refuse_unappendable(
     table: &TableIdent,
     version: FormatVersion,
@@ -132,8 +132,8 @@ fn refuse_unappendable(
             version as u8
         )));
     }
-    // iceberg-rust's commit rebinds the default spec and refuses a field named like a column unless
-    // it is that column's identity, which Spark breaks when it drops a version 1 identity field.
+    // iceberg-rust refuses such a field unless it is identity or void, and Lakekeeper refuses the
+    // void one Spark leaves in version 1 with a 409 that the commit loop retries for minutes.
     let named_like_columns: Vec<String> = spec
         .fields()
         .iter()

@@ -96,8 +96,8 @@ fn rows_wait_per_partition_until_the_budget_writes_the_largest_one_out() {
     assert_eq!(rows_by_key(&rest), HashMap::from([(Some(2), 1), (None, 1)]));
 }
 
-/// iceberg-rust's fast append refuses a data file of another spec ID or partition arity than the
-/// table's default spec.
+/// Writers use the table's default spec, and iceberg-rust's fast append refuses a data file whose
+/// partition arity differs from its spec's.
 #[test]
 fn every_data_file_carries_the_default_spec_and_a_null_per_void_field() {
     let cases = [

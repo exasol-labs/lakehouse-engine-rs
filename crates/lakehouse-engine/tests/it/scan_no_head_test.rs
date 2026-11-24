@@ -120,6 +120,7 @@ impl ObjectStore for CountingHeadStore {
                     meta,
                     range: 0..0,
                     attributes: object_store::Attributes::default(),
+                    extensions: Default::default(),
                 });
             }
             self.counts.to_inner.fetch_add(1, Ordering::SeqCst);
@@ -450,6 +451,7 @@ impl ObjectStore for RequestLoggingStore {
                 meta,
                 range: 0..0,
                 attributes: object_store::Attributes::default(),
+                extensions: Default::default(),
             });
         }
         self.inner.get_opts(location, options).await

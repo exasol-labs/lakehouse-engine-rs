@@ -230,7 +230,7 @@ async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
         "direct: must not contain secret: {text_direct}"
     );
 
-    // DataFusion 54's sort calls e.context("...") on ResourcesExhausted.
+    // DataFusion's sort calls e.context("...") on ResourcesExhausted.
     let context_wrapped = DataFusionError::ResourcesExhausted("pool limit exceeded".to_string())
         .context(format!(
             "External sort failed; secret would be bad: {secret}"

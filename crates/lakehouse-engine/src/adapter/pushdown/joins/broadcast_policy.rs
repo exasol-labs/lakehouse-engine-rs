@@ -4,7 +4,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
 use vs_expression::ColumnNode;
 
-use super::super::support::{ColumnTypes, OutputContract, flatten_conjuncts};
+use super::super::request::OutputContract;
+use super::super::support::{ColumnTypes, flatten_conjuncts};
 use super::attribution::JoinLegs;
 use super::condition_filters::join_key_legs;
 use super::plan::{JoinPlan, LegGroup};

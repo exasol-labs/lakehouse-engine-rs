@@ -7,7 +7,8 @@
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
-use super::super::support::{PushdownRequest, conjoin, flatten_conjuncts};
+use super::super::request::{Clause, PushdownRequest};
+use super::super::support::{conjoin, flatten_conjuncts};
 use super::attribution::JoinLegs;
 
 /// The two legs `conjunct` joins, lower first, when it is a join key: an `=` whose sides each read
@@ -31,22 +32,23 @@ pub(super) fn move_condition_filters(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
 ) -> Option<PushdownRequest> {
-    let mut json = pushdown.json().clone();
+    let mut from = pushdown.from()?.clone();
     let mut moved = Vec::new();
-    if let Some(from) = json.get_mut("from") {
-        split_conditions(from, false, legs, &mut moved);
-    }
+    split_conditions(&mut from, false, legs, &mut moved);
     if moved.is_empty() {
         return None;
     }
-    let mut conjuncts: Vec<Json> = json
-        .get("filter")
-        .filter(|filter| !filter.is_null())
+    let mut conjuncts: Vec<Json> = pushdown
+        .filter()
         .map(|filter| flatten_conjuncts(filter).into_iter().cloned().collect())
         .unwrap_or_default();
     conjuncts.extend(moved);
-    json["filter"] = conjoin(conjuncts).expect("at least one moved conjunct");
-    Some(pushdown.with_json(json))
+    let filter = conjoin(conjuncts).expect("at least one moved conjunct");
+    Some(
+        pushdown
+            .with_clause(Clause::From, from)
+            .with_clause(Clause::Filter, filter),
+    )
 }
 
 /// `null_supplying` is set inside an outer join's null-supplying side, where `WHERE` would also

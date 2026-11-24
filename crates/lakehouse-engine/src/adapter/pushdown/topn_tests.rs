@@ -1,8 +1,8 @@
+use super::super::joins::WherePlacement;
 use super::super::single_group_agg::single_group_merge_select;
 use super::super::support::projection_items;
 use super::super::support::{
-    AggregateMergeInputs, RowProjection, build_scan_driving_sql, order_by_present, project_columns,
-    shard_count,
+    AggregateMergeInputs, RowProjection, build_scan_driving_sql, project_columns, shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, single_group_plans};
@@ -14,7 +14,6 @@ use crate::types::exasol_type::ExasolType;
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
     let pushdown = parsed_pushdown(request);
-    let pushdown_req = pushdown.json();
     let scan = scan_of(request);
     let emitted = emitting(scan.columns());
     let projection = project_columns(&pushdown, scan, &emitted).unwrap();
@@ -23,13 +22,13 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         RowProjection::Direct(projection) => projection,
         RowProjection::Wrapped => Vec::new(),
     };
-    let limit = extract_limit(pushdown_req);
-    let has_order_by = order_by_present(pushdown_req);
+    let limit = pushdown.limit();
+    let has_order_by = !pushdown.order_by().is_empty();
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
-    let scan_where = scan.split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
-    let filter = scan_where.pushed();
+    let placement = WherePlacement::single_scan(scan, &pushdown);
+    let filter = placement.scan_filter(0);
     assert!(
-        scan_where.declined().is_none(),
+        placement.wrapper().is_none(),
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
@@ -52,11 +51,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     );
     let logical_schema = lineitem_logical_schema();
     let topn = if aggregates.is_none() {
-        detect_topn(
-            pushdown_req,
-            &projection_items(&projection),
-            &logical_schema,
-        )
+        detect_topn(&pushdown, &projection_items(&projection), &logical_schema)
     } else {
         None
     };
@@ -73,7 +68,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let mut keys = parse_order_by_keys(pushdown_req);
+        let mut keys = parse_order_by_keys(&pushdown);
         sort_by_select_items(&mut keys, &pushdown, &projection);
         extend_projection_with_sort_keys(&mut projection, &keys, &emitted)
             .expect("the fan-out emits every sort key");
@@ -110,7 +105,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             visible_count,
             &declined_sort_keys,
             limit,
-            extract_offset(pushdown_req),
+            pushdown.offset(),
         )
     } else {
         sql
@@ -176,7 +171,12 @@ fn nonzero_offset_declines_bounded_topn() {
         ProjectionItem::Column("L_EXTENDEDPRICE".into()),
     ];
     assert!(
-        detect_topn(&pd(&request), &projected, &lineitem_logical_schema()).is_none(),
+        detect_topn(
+            &parsed_pushdown(&request),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_none(),
         "a non-zero offset must decline the bounded top-N path"
     );
 
@@ -211,10 +211,18 @@ fn zero_offset_still_matches_bounded_topn_byte_identically() {
         ProjectionItem::Column("L_ORDERKEY".into()),
         ProjectionItem::Column("L_EXTENDEDPRICE".into()),
     ];
-    let matched = detect_topn(&pd(&baseline), &projected, &lineitem_logical_schema());
+    let matched = detect_topn(
+        &parsed_pushdown(&baseline),
+        &projected,
+        &lineitem_logical_schema(),
+    );
     assert!(matched.is_some(), "sanity: the baseline shape must match");
     assert_eq!(
-        detect_topn(&pd(&zero_offset), &projected, &lineitem_logical_schema()),
+        detect_topn(
+            &parsed_pushdown(&zero_offset),
+            &projected,
+            &lineitem_logical_schema()
+        ),
         matched,
         "offset 0 must match the bounded top-N exactly as an absent offset does"
     );
@@ -258,7 +266,7 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
     .build();
     assert!(
         detect_topn(
-            &pd(&request),
+            &parsed_pushdown(&request),
             &[ProjectionItem::Column("L_ORDERKEY".into())],
             &lineitem_logical_schema()
         )
@@ -457,7 +465,12 @@ fn expression_sort_key_declines_bounded_topn_and_takes_declined_path() {
         ProjectionItem::Column("L_EXTENDEDPRICE".into()),
     ];
     assert!(
-        detect_topn(&pd(&request), &projected, &lineitem_logical_schema()).is_none(),
+        detect_topn(
+            &parsed_pushdown(&request),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_none(),
         "an expression sort key must never match the bounded top-N"
     );
 
@@ -495,7 +508,11 @@ fn unsupported_order_by_shape_declines_topn() {
 
     let ok = nq4_request();
     assert_eq!(
-        detect_topn(&pd(&ok), &projected, &lineitem_logical_schema()),
+        detect_topn(
+            &parsed_pushdown(&ok),
+            &projected,
+            &lineitem_logical_schema()
+        ),
         Some(vec![SortKey {
             column: "L_EXTENDEDPRICE".into(),
             ascending: false,
@@ -509,7 +526,12 @@ fn unsupported_order_by_shape_declines_topn() {
     grouped["pushdownRequest"]["groupBy"] =
         serde_json::json!([table_col("LINEITEM", "L_ORDERKEY")]);
     assert!(
-        detect_topn(&pd(&grouped), &projected, &lineitem_logical_schema()).is_none(),
+        detect_topn(
+            &parsed_pushdown(&grouped),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_none(),
         "a GROUP BY shape must decline"
     );
 
@@ -520,7 +542,12 @@ fn unsupported_order_by_shape_declines_topn() {
         true
     )]);
     assert!(
-        detect_topn(&pd(&expr_key), &projected, &lineitem_logical_schema()).is_none(),
+        detect_topn(
+            &parsed_pushdown(&expr_key),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_none(),
         "an expression sort key must decline (ORDER_BY_EXPRESSION unadvertised)"
     );
 
@@ -530,7 +557,12 @@ fn unsupported_order_by_shape_declines_topn() {
         .unwrap()
         .remove("limit");
     assert!(
-        detect_topn(&pd(&no_limit), &projected, &lineitem_logical_schema()).is_none(),
+        detect_topn(
+            &parsed_pushdown(&no_limit),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_none(),
         "an ORDER BY without a LIMIT must decline"
     );
 }
@@ -544,7 +576,12 @@ fn json_fallback_typed_sort_key_declines_topn() {
     let request = nq4_request();
 
     assert!(
-        detect_topn(&pd(&request), &projected, &lineitem_logical_schema()).is_some(),
+        detect_topn(
+            &parsed_pushdown(&request),
+            &projected,
+            &lineitem_logical_schema()
+        )
+        .is_some(),
         "a plain in-range DECIMAL sort key must still match the top-N shape"
     );
 
@@ -576,7 +613,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
         "sanity: the chosen tag must actually be a JSON-fallback type"
     );
     assert!(
-        detect_topn(&pd(&request), &projected, &fallback_schema).is_none(),
+        detect_topn(&parsed_pushdown(&request), &projected, &fallback_schema).is_none(),
         "a JSON-fallback-typed sort key must decline the top-N path"
     );
 
@@ -590,7 +627,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
         physical_name: None,
     }];
     assert!(
-        detect_topn(&pd(&request), &projected, &missing_schema).is_none(),
+        detect_topn(&parsed_pushdown(&request), &projected, &missing_schema).is_none(),
         "a sort key absent from the logical schema must decline defensively"
     );
 }

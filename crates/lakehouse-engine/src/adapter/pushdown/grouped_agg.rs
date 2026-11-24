@@ -5,14 +5,15 @@ use vs_expression::{ColumnNode, SqlFragment};
 
 use super::context::Shards;
 
+use super::request::{AggregationType, PushdownRequest};
 use super::scalar_over_agg::{
     TypedPlans, classify_scalar_over_aggregate, fold_aggregate_plan, fold_nested_plans,
     is_aggregate_node, parse_agg_item, partial_column_type, render_scalar_over_merge,
     substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
-    AggregationType, ColumnTypes, FanOut, PushdownRequest, ScanTranslator, aggregation_type,
-    build_fan_out_inner, output_select_list, quote_ident, render_limit_offset,
+    ColumnTypes, FanOut, ScanTranslator, build_fan_out_inner, output_select_list, quote_ident,
+    render_limit_offset,
 };
 use super::topn::sort_flags;
 
@@ -86,15 +87,14 @@ pub fn detect_group_by_aggregates(
     pushdown: &PushdownRequest,
     scan: ScanTranslator<'_>,
 ) -> Option<GroupedAggregateDetection> {
-    let pushdown_req = pushdown.json();
-    if aggregation_type(pushdown_req) != Some(AggregationType::GroupBy) {
+    if pushdown.aggregation_type() != Some(AggregationType::GroupBy) {
         return None;
     }
 
-    let group_by = pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())?;
+    let group_by = pushdown.group_by();
+    if group_by.is_empty() {
+        return None;
+    }
 
     // Any group-key render failure collapses the whole result.
     let mut key_fragments = Vec::with_capacity(group_by.len());
@@ -219,11 +219,11 @@ fn group_key_column(slot: usize) -> String {
 /// Exasol does not re-sort a delegated `ORDER BY`, so the merge sorts itself, on the keys a HAVING
 /// operand reads, with no hidden output column. `None` without an `orderBy` (#198).
 pub(super) fn build_grouped_order_by_clause(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     scope: &MergeScope<'_>,
     scan: ScanTranslator<'_>,
 ) -> Option<GroupedOrderBy> {
-    let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
+    let elements = pushdown.order_by();
     if elements.is_empty() {
         return None;
     }

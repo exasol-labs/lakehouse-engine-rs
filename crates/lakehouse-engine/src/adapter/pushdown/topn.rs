@@ -2,9 +2,9 @@ use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol;
 
+use super::request::{AggregationType, PushdownRequest};
 use super::support::{
-    AggregationType, Emitted, ProjectedColumn, PushdownRequest, aggregation_type,
-    collect_all_column_names, column_node_ref, emits_ident, extract_limit, extract_offset,
+    Emitted, ProjectedColumn, collect_all_column_names, column_node_ref, emits_ident,
     render_limit_offset,
 };
 use exasol_udf_sdk::error::UdfError;
@@ -94,12 +94,12 @@ fn parse_declined_sort_key(element: &Json) -> ParsedSortKey {
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the declined paths must
 /// reproduce the global sort, one key per element.
-pub(super) fn parse_order_by_keys(pushdown_req: &Json) -> Vec<ParsedSortKey> {
-    pushdown_req
-        .get("orderBy")
-        .and_then(|v| v.as_array())
-        .map(|elements| elements.iter().map(parse_declined_sort_key).collect())
-        .unwrap_or_default()
+pub(super) fn parse_order_by_keys(pushdown: &PushdownRequest) -> Vec<ParsedSortKey> {
+    pushdown
+        .order_by()
+        .iter()
+        .map(parse_declined_sort_key)
+        .collect()
 }
 
 /// A key equal to a select-list item sorts by the column the scan emits for it, so the wrapper
@@ -110,11 +110,10 @@ pub(super) fn sort_by_select_items(
     pushdown: &PushdownRequest,
     projection: &[ProjectedColumn],
 ) {
-    let items = pushdown.select_items();
-    let elements = pushdown.json().get("orderBy").and_then(Json::as_array);
-    let (Some(items), Some(elements)) = (items, elements) else {
+    let Some(items) = pushdown.select_items() else {
         return;
     };
+    let elements = pushdown.order_by();
     if items.len() != projection.len() {
         return;
     }
@@ -150,36 +149,24 @@ pub(super) fn sort_by_select_items(
 ///   native value, so the outer merge would re-rank lexicographically and corrupt
 ///   the global top-N.
 pub(super) fn detect_topn(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     proj_cols: &[ProjectionItem],
     logical_schema: &[LogicalField],
 ) -> Option<Vec<SortKey>> {
-    extract_limit(pushdown_req)?;
-    if extract_offset(pushdown_req) != 0 {
+    pushdown.limit()?;
+    if pushdown.offset() != 0 {
         return None;
     }
 
     // Top-N over grouped results is out of scope.
-    if aggregation_type(pushdown_req) == Some(AggregationType::GroupBy) {
+    if pushdown.aggregation_type() == Some(AggregationType::GroupBy) {
         return None;
     }
-    if pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
+    if !pushdown.group_by().is_empty() || pushdown.having().is_some() {
         return None;
     }
 
-    if pushdown_req
-        .get("having")
-        .filter(|h| !h.is_null())
-        .is_some()
-    {
-        return None;
-    }
-
-    let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
+    let elements = pushdown.order_by();
     if elements.is_empty() {
         return None;
     }

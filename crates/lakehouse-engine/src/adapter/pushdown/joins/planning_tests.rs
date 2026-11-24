@@ -8,9 +8,9 @@ use crate::adapter::pushdown::test_support::*;
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
     let request = join_request(Json::Null, equi_condition());
-    let pushdown_req = pd(&request);
+    let pushdown = parsed_pushdown(&request);
 
-    let shape = detect_join(&request, &pushdown_req).expect("both legs carry an identifier note");
+    let shape = detect_join(&request, &pushdown).expect("both legs carry an identifier note");
     match shape {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
@@ -27,7 +27,8 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
 #[test]
 fn plain_single_table_request_is_not_a_join() {
     let request = nq4_request();
-    let shape = detect_join(&request, &pd(&request)).expect("not a join, no identifier lookup");
+    let shape = detect_join(&request, &parsed_pushdown(&request))
+        .expect("not a join, no identifier lookup");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
@@ -44,7 +45,8 @@ fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
         ),
     ]);
     let request = join_request(Json::Null, condition.clone());
-    match detect_join(&request, &pd(&request)).expect("a join with a non-equi conjunct is detected")
+    match detect_join(&request, &parsed_pushdown(&request))
+        .expect("a join with a non-equi conjunct is detected")
     {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
@@ -57,8 +59,8 @@ fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
 #[test]
 fn three_table_inner_join_is_unified_join() {
     let request = three_table_join_request();
-    let shape =
-        detect_join(&request, &pd(&request)).expect("every leaf carries an identifier note");
+    let shape = detect_join(&request, &parsed_pushdown(&request))
+        .expect("every leaf carries an identifier note");
     match shape {
         JoinShape::Join(join) => {
             let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
@@ -114,8 +116,11 @@ fn a_leg_without_an_identifier_note_is_err() {
         .as_object_mut()
         .unwrap()
         .remove("adapterNotes");
-    let err = detect_join(&request, &request["pushdownRequest"])
-        .expect_err("LINEITEM has no note: must be Err, not a decline");
+    let err = detect_join(
+        &request,
+        &PushdownRequest::parse(request["pushdownRequest"].clone()).expect("the request parses"),
+    )
+    .expect_err("LINEITEM has no note: must be Err, not a decline");
     let message = err.to_string();
     assert!(
         message.contains("LINEITEM") && message.contains("ALTER VIRTUAL SCHEMA ... REFRESH"),
@@ -126,8 +131,8 @@ fn a_leg_without_an_identifier_note_is_err() {
 #[test]
 fn four_table_inner_join_is_unified_join() {
     let request = nq3_join_request();
-    let shape =
-        detect_join(&request, &pd(&request)).expect("every leaf carries an identifier note");
+    let shape = detect_join(&request, &parsed_pushdown(&request))
+        .expect("every leaf carries an identifier note");
     match shape {
         JoinShape::Join(join) => {
             let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();

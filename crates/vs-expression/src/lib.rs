@@ -238,8 +238,7 @@ fn render_cast_target(target: ExasolType, dialect: Dialect) -> Result<String, Ud
 
 fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
     Ok(match target {
-        // datafusion-sql rejects a length-qualified VARCHAR (`support_varchar_with_length` is
-        // not enabled), and Arrow has no fixed-width CHAR type.
+        // An Arrow string carries no length, and Arrow has no fixed-width CHAR type.
         ExasolType::Char { .. } | ExasolType::Varchar { .. } => "VARCHAR".to_string(),
         ExasolType::Decimal(_) | ExasolType::Boolean | ExasolType::Date => target.to_string(),
         ExasolType::DoublePrecision => "DOUBLE".to_string(),

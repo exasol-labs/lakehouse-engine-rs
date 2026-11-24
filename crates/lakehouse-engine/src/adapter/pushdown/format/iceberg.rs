@@ -464,7 +464,8 @@ fn refuse_date_promotion(
 fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
     let path = delete.file_path().to_string();
-    let size = delete.file_size_in_bytes();
+    // A task planned from a manifest entry always carries the size, so the default never applies.
+    let size = delete.file_size_in_bytes().unwrap_or_default();
     match (delete.file_type(), delete.file_format()) {
         // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
         // never apply.
@@ -494,8 +495,7 @@ async fn plan_file_tasks(
     let mut scan_builder = table
         .scan()
         .with_concurrency_limit(manifest_concurrency.get())
-        .with_manifest_entry_concurrency_limit(cores)
-        .with_data_file_concurrency_limit(cores);
+        .with_manifest_entry_concurrency_limit(cores);
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
     }

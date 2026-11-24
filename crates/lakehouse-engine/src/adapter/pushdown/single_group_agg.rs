@@ -2,11 +2,12 @@ use crate::scan::spec::AggregatePlan;
 use serde_json::Value as Json;
 
 use super::grouped_agg::is_literal_selectlist_item;
+use super::request::PushdownRequest;
 use super::scalar_over_agg::{
     TypedPlans, arg_column_or_expr, classify_scalar_over_aggregate, fold_aggregate_plan,
     fold_nested_plans, parse_agg_item, render_scalar_over_merge,
 };
-use super::support::{PushdownRequest, ScanTranslator, output_select_list};
+use super::support::{ScanTranslator, output_select_list};
 use crate::types::exasol_type::ExasolType;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
@@ -36,12 +37,7 @@ pub fn detect_aggregates(
     pushdown: &PushdownRequest,
     scan: ScanTranslator<'_>,
 ) -> Option<Vec<SingleGroupItem>> {
-    let pushdown_req = pushdown.json();
-    if pushdown_req
-        .get("groupBy")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
+    if !pushdown.group_by().is_empty() {
         return None;
     }
 

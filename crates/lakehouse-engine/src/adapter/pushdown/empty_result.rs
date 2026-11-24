@@ -4,9 +4,10 @@ use serde_json::Value as Json;
 
 use super::context::PushdownContext;
 use super::joins::EmptyRelation;
+use super::request::PushdownRequest;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::support::{
-    ProjectedColumn, PushdownRequest, RowProjection, ScanTranslator, emits_ident, pushdown_response,
+    ProjectedColumn, RowProjection, ScanTranslator, emits_ident, pushdown_response,
 };
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher, so empty and
