@@ -87,7 +87,7 @@ Test code gets the same design care as production code. A test reads as the one 
 ### Exasol session client
 
 - Every suite drives Exasol through `ExaConn` in `crates/lakehouse-e2e/tests/common/exasol_ws.rs`.
-- The client sends `resultSetMaxRows` `0`, meaning no limit, unless the call site declares `capped_result_sets(n)`. A cap reaches the adapter as a pushdown `limit` that `EXPLAIN VIRTUAL` cannot see (`docs/debugging-pushdown.md`), so a test that inspects plan shape stays uncapped.
+- Exasol applies `resultSetMaxRows` to one statement only, so the client caps a result set only for a statement sent with `try_execute_capped`, and a connection carries no cap. A cap reaches the adapter as a pushdown `limit` that `EXPLAIN VIRTUAL` cannot see (`docs/debugging-pushdown.md`), so a test that inspects plan shape stays uncapped.
 - The client fetches until it holds the `numRows` that the result-set metadata reports, and fails when a fetch returns zero rows while rows remain.
 - Suites that send credential-bearing DDL connect with `connect_redacting`, whose failure messages omit the SQL and the Exasol response. The local Docker suite keeps the SQL for debugging.
 

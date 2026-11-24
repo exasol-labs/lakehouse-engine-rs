@@ -2195,7 +2195,6 @@ fn numeric_expressions_match_native_exasol() {
          FROM {T} WHERE K < 3 OR K > 2998 ORDER BY K",
         "SELECT K FROM {T} WHERE H * 3 > 9000000000000000000 AND K < 5 ORDER BY K",
         "SELECT H * 3, COUNT(*) FROM {T} GROUP BY H * 3 ORDER BY 1",
-        "SELECT AVG(W) FROM {T} WHERE K <= 50",
         "SELECT SUM(H), SUM(H * 3), AVG(H), MIN(H * 3), MAX(H * I), COUNT(DISTINCT H * 3) FROM {T}",
         "SELECT G, SUM(H * 3), SUM(I * I), SUM(W) FROM {T} WHERE K > 300 \
          GROUP BY G ORDER BY G",
@@ -2229,6 +2228,9 @@ fn numeric_expressions_match_native_exasol() {
     ] {
         assert_same_as_native(&mut conn, template, false);
     }
+    // Native AVG over DECIMAL is not correctly rounded and the split merge sums in another
+    // order, so the two agree only to a few ULPs.
+    assert_matches_native(&mut conn, "AVG(W)", "WHERE K <= 50", 0, 1e-15);
     for template in [
         "SELECT K, H * H * 100 FROM {T} WHERE K < 3",
         "SELECT K FROM {T} WHERE H * H * 100 > 0",
