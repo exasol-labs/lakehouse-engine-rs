@@ -94,11 +94,10 @@ impl JoinLegs {
 
     /// The legs whose columns `expr` reads, empty for an expression that reads no column.
     pub(super) fn legs_referenced(&self, expr: &Expr) -> BTreeSet<usize> {
-        let mut legs = BTreeSet::new();
-        expr.walk_columns(&mut |column| {
-            legs.insert(self.leg(column));
-        });
-        legs
+        expr.columns()
+            .into_iter()
+            .map(|column| self.leg(column))
+            .collect()
     }
 
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
@@ -126,22 +125,20 @@ impl JoinLegs {
         pushdown: &PushdownRequest,
         declared: &[&InvolvedColumns<'_>],
     ) -> Result<(), UdfError> {
-        let mut failure = None;
-        for tree in pushdown.expressions(&Clause::ALL) {
-            tree.walk_columns(&mut |column| {
-                if failure.is_some() {
-                    return;
-                }
+        let failure = pushdown
+            .expressions(&Clause::ALL)
+            .into_iter()
+            .flat_map(Expr::columns)
+            .find_map(|column| {
                 let name = column.upper_name();
-                failure = match self.leg_of(column) {
+                match self.leg_of(column) {
                     None => Some(unbound_column_error(column)),
                     Some(leg) if !declared.get(leg).is_some_and(|table| table.declares(&name)) => {
                         Some(undeclared_column_error(&name))
                     }
                     Some(_) => None,
-                };
+                }
             });
-        }
         failure.map_or(Ok(()), Err)
     }
 }

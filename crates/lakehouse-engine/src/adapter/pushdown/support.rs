@@ -595,19 +595,16 @@ impl<'a> ScanTranslator<'a> {
         version: ExasolVersion,
         trees: &[&Expr],
     ) -> Result<Self, UdfError> {
-        for tree in trees {
-            let mut unbound = None;
-            tree.walk_columns(&mut |column| {
-                let column = column_ref(column);
-                if unbound.is_none() && columns.get(&column).is_none() {
-                    unbound = Some(column.name);
-                }
-            });
-            if let Some(name) = unbound {
-                return Err(UdfError::User(format!(
-                    "internal adapter error: column {name} binds no column of the scanned tables"
-                )));
-            }
+        let unbound = trees
+            .iter()
+            .flat_map(|tree| tree.columns())
+            .map(column_ref)
+            .find(|column| columns.get(column).is_none());
+        if let Some(column) = unbound {
+            return Err(UdfError::User(format!(
+                "internal adapter error: column {} binds no column of the scanned tables",
+                column.name
+            )));
         }
         Ok(Self { columns, version })
     }
@@ -742,9 +739,7 @@ pub(super) fn collect_all_column_names(
     value: &Expr,
     names: &mut std::collections::HashSet<String>,
 ) {
-    value.walk_columns(&mut |column| {
-        names.insert(column.upper_name());
-    });
+    names.extend(value.columns().into_iter().map(Column::upper_name));
 }
 
 /// Callers must render their own `ORDER BY` first: Exasol rejects `OFFSET` without

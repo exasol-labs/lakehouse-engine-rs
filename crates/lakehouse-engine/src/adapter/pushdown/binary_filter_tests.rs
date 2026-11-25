@@ -39,9 +39,12 @@ fn binary_fields() -> [LogicalField; 3] {
     ]
 }
 
+fn hex_types() -> ColumnTypes {
+    declared_column_types(&HEX_COLUMNS, &binary_fields())
+}
+
 fn rendered(filter: &Json) -> String {
-    let types = declared_column_types(&HEX_COLUMNS, &binary_fields());
-    scan_filter_sql(filter, &types).expect("renders")
+    scan_filter_sql(filter, &hex_types()).expect("renders")
 }
 
 #[test]
@@ -93,33 +96,21 @@ fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
 
 #[test]
 fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
-    for literal in ["0A1B", "0a1", "", "zz"] {
-        let filter = sales_equal("B", literal);
+    let cases = [
+        sales_equal("B", "0A1B"),
+        sales_equal("B", "0a1"),
+        sales_equal("B", ""),
+        sales_equal("B", "zz"),
+        sales_equal("U", "0a"),
+        sales_equal("S", "0a"),
+    ];
+    for filter in cases {
         assert_eq!(
-            compare_binary_bytes(
-                filter.clone(),
-                &declared_column_types(&HEX_COLUMNS, &binary_fields())
-            ),
+            compare_binary_bytes(filter.clone(), &hex_types()),
             ast(&filter),
-            "{literal}"
+            "{filter}"
         );
     }
-    let wrong_width = sales_equal("U", "0a");
-    assert_eq!(
-        compare_binary_bytes(
-            wrong_width.clone(),
-            &declared_column_types(&HEX_COLUMNS, &binary_fields())
-        ),
-        ast(&wrong_width)
-    );
-    let string_column = sales_equal("S", "0a");
-    assert_eq!(
-        compare_binary_bytes(
-            string_column.clone(),
-            &declared_column_types(&HEX_COLUMNS, &binary_fields())
-        ),
-        ast(&string_column)
-    );
 }
 
 #[test]
@@ -127,10 +118,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     let equal = sales_equal("B", "0a");
     let negated = not(equal.clone());
     assert_eq!(
-        compare_binary_bytes(
-            negated.clone(),
-            &declared_column_types(&HEX_COLUMNS, &binary_fields())
-        ),
+        compare_binary_bytes(negated.clone(), &hex_types()),
         ast(&negated),
         "NOT turns the empty value's false into true, where Exasol keeps NULL"
     );
@@ -173,10 +161,7 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
         in_list(sales_col("B"), [str_lit("0a"), str_lit("0A")]),
     ]));
     assert_eq!(
-        with_binary_literals(
-            filter,
-            &declared_column_types(&HEX_COLUMNS, &binary_fields())
-        ),
+        with_binary_literals(filter, &hex_types()),
         Expr::Not(Box::new(Expr::Or(vec![
             Expr::compare(CompareOp::Equal, column("B"), binary_lit("0a1b")),
             Expr::compare(CompareOp::Equal, column("U"), fixed_binary_lit("0a0b", 2)),

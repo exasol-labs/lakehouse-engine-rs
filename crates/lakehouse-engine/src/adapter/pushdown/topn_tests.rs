@@ -737,7 +737,7 @@ fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
 
 #[test]
 fn a_declined_sort_key_the_exasol_dialect_cannot_render_fails_the_request() {
-    let pushdown = PushdownRequest::parse(serde_json::json!({
+    let pushdown = PushdownRequest::parse(&serde_json::json!({
         "selectListDataTypes": [],
         "orderBy": [order_by_element(scalar_fn("ADD", [col("ID")]), true, true)],
     }))

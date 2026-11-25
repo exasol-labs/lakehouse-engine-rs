@@ -20,7 +20,7 @@ pub use expr::{
 pub use fragment::SqlFragment;
 use json_value::{Fallback, Returning, ScanJsonValue};
 pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
-pub use parse::{invalid_field, parse_expression};
+pub use parse::{RequestNode, invalid_field, parse_expression};
 use scalar_functions::{ExasolForm, scalar_function};
 pub use scan_typing::{ColumnTypeLookup, ScanTyping, is_session_free_integer_text};
 use scan_typing::{Inferred, empty_as_null, render_integer_argument, seconds_type};
@@ -443,17 +443,10 @@ fn render_expression_inner(expr: &Expr, dialect: Dialect) -> Result<Option<Strin
             }
         }
         Expr::Compare { op, left, right } => {
-            let left = render_expression_inner(left, dialect)?;
-            let right = render_expression_inner(right, dialect)?;
-            match (left, right) {
-                (Some(l), Some(r)) => format!("({l} {} {r})", op.sql()),
-                _ => {
-                    return Err(UdfError::User(format!(
-                        "binary predicate '{}' missing operand",
-                        op.sql()
-                    )));
-                }
-            }
+            let missing = || format!("binary predicate '{}' missing operand", op.sql());
+            let left = required(left, dialect, missing)?;
+            let right = required(right, dialect, missing)?;
+            format!("({left} {} {right})", op.sql())
         }
         Expr::And(items) => render_junction(items, " AND ", "TRUE", dialect)?,
         Expr::Or(items) => render_junction(items, " OR ", "FALSE", dialect)?,
@@ -499,29 +492,20 @@ fn render_expression_inner(expr: &Expr, dialect: Dialect) -> Result<Option<Strin
             low,
             high,
         } => {
-            let target = render_expression_inner(expression, dialect)?;
-            let low = render_expression_inner(low, dialect)?;
-            let high = render_expression_inner(high, dialect)?;
-            match (target, low, high) {
-                (Some(t), Some(l), Some(h)) => format!("({t} BETWEEN {l} AND {h})"),
-                _ => {
-                    return Err(UdfError::User(
-                        "predicate_between requires expression/left/right".into(),
-                    ));
-                }
-            }
+            let missing = || "predicate_between requires expression/left/right".to_string();
+            let target = required(expression, dialect, missing)?;
+            let low = required(low, dialect, missing)?;
+            let high = required(high, dialect, missing)?;
+            format!("({target} BETWEEN {low} AND {high})")
         }
         Expr::Like {
             expression,
             pattern,
             escape,
         } => {
-            let left = render_expression_inner(expression, dialect)?;
-            let (Some(l), Some(p)) = (left, render_expression_inner(pattern, dialect)?) else {
-                return Err(UdfError::User(
-                    "predicate_like missing 'expression' or 'pattern'".into(),
-                ));
-            };
+            let missing = || "predicate_like missing 'expression' or 'pattern'".to_string();
+            let l = required(expression, dialect, missing)?;
+            let p = required(pattern, dialect, missing)?;
             match escape {
                 None => format!("({l} LIKE {p})"),
                 Some(escape) if dialect == Dialect::Exasol => {
@@ -560,23 +544,22 @@ fn render_expression_inner(expr: &Expr, dialect: Dialect) -> Result<Option<Strin
             Dialect::DataFusion => render_json_value_scan(call)?,
         },
         Expr::Cast { target, argument } => return render_cast(argument, *target, dialect),
-        Expr::Scan(ScanNode(kind)) if dialect == Dialect::DataFusion => {
-            let inner = required(kind.argument(), dialect, || {
+        Expr::Scan(ScanNode { kind, argument }) if dialect == Dialect::DataFusion => {
+            let inner = required(argument, dialect, || {
                 "a typed-pass node's argument is null".into()
             })?;
-            match kind {
-                ScanKind::IntegerText(_) => {
+            match *kind {
+                ScanKind::IntegerText => {
                     format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)")
                 }
-                ScanKind::BooleanText(_) => render_bool_to_string_case(&inner),
-                ScanKind::EmptyAsNull(_) => format!("nullif({inner}, '')"),
+                ScanKind::BooleanText => render_bool_to_string_case(&inner),
+                ScanKind::EmptyAsNull => format!("nullif({inner}, '')"),
                 ScanKind::IntegerArgument {
                     round,
                     negative_is_null,
-                    ..
-                } => render_integer_argument(*round, *negative_is_null, &inner),
-                ScanKind::Second { fraction, .. } => render_seconds(&inner, *fraction)?,
-                ScanKind::BooleanNumber(_) => {
+                } => render_integer_argument(round, negative_is_null, &inner),
+                ScanKind::Second { fraction } => render_seconds(&inner, fraction)?,
+                ScanKind::BooleanNumber => {
                     format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)")
                 }
             }

@@ -54,7 +54,7 @@ fn request(from: Json, filter: Option<Json>) -> PushdownRequest {
     if let Some(filter) = filter {
         json["filter"] = filter;
     }
-    PushdownRequest::parse(json).expect("a whole-row request")
+    PushdownRequest::parse(&json).expect("a whole-row request")
 }
 
 fn ab_key() -> Json {

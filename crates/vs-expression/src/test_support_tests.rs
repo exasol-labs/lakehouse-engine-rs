@@ -1,6 +1,7 @@
-//! Builders for Exasol pushdown-request JSON nodes: columns, literals, predicates, scalar
-//! functions, CAST, EXTRACT, CASE, JSON_VALUE, and aggregates, plus the column types the typed renderers
-//! look up. Dependent crates enable `test-support`.
+//! Builders for Exasol pushdown-request JSON nodes (columns, literals, predicates, scalar
+//! functions, CAST, EXTRACT, CASE, JSON_VALUE, and aggregates), the binary literals the adapter
+//! builds as trees, [`ast`] to parse a node, and the column types the typed renderers look up.
+//! Dependent crates enable `test-support`.
 
 use crate::exasol_type::{ExasolType, exasol_type_to_json};
 use crate::{Column, ColumnTypeLookup, Expr, Literal, LiteralKind, Scalar, parse_expression};

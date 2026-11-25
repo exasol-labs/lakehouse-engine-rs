@@ -126,7 +126,7 @@ pub(crate) fn scan_filter_sql(filter: &impl Tree, col_types: &ColumnTypes) -> Op
 /// A `SELECT *` request whose only clause is `filter`.
 pub(crate) fn filter_only_request(filter: &impl Tree) -> PushdownRequest {
     // The placeholder filter only marks the clause, which the map then replaces.
-    PushdownRequest::parse(serde_json::json!({
+    PushdownRequest::parse(&serde_json::json!({
         "selectListDataTypes": [],
         "filter": {"type": "literal_bool", "value": false},
     }))
@@ -757,7 +757,26 @@ pub(super) fn pair_plan_sql(
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
 /// returns only its JSON or whose select list a test replaced in place.
 pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
-    PushdownRequest::parse(pd(request)).expect("the fixture declares a valid selectListDataTypes")
+    PushdownRequest::parse(&pd(request)).expect("the fixture declares a valid selectListDataTypes")
+}
+
+/// The aggregate plan the planners build for the select-list `item`, `None` when it declines.
+pub(crate) fn agg_plan(item: &Json, scan: ScanTranslator<'_>) -> Option<AggregatePlan> {
+    super::scalar_over_agg::parse_agg_item(&ast(item), scan)
+}
+
+/// The join shape `handle_pushdown` detects in `request`.
+pub(crate) fn join_shape(request: &Json) -> JoinShape {
+    detect_join(&adapter_request(request), &parsed_pushdown(request))
+        .expect("every leg carries an identifier note")
+}
+
+/// The join `handle_pushdown` detects in `request`, which must be one.
+pub(crate) fn detected_join(request: &Json) -> DetectedJoin {
+    match join_shape(request) {
+        JoinShape::Join(join) => join,
+        JoinShape::NotAJoin => panic!("expected a join, got a single-table request"),
+    }
 }
 
 /// Every column `pushdown` names, its whole WHERE included, as the single-table dispatch
@@ -811,7 +830,7 @@ pub(super) fn project_first_table(
     pushdown_req: &Json,
 ) -> Result<RowProjection, UdfError> {
     project_row(
-        &PushdownRequest::parse(pushdown_req.clone())?,
+        &PushdownRequest::parse(pushdown_req)?,
         &first_table_column_types(request),
     )
 }

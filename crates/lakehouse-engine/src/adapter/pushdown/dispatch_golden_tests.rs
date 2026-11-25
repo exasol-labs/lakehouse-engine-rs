@@ -4,10 +4,10 @@
 
 use super::test_support::{
     NO_COLUMNS, PushdownRequestBuilder, adapter_request, agg_item, agg_item_expr, column_types,
-    count_star, dispatch_base, dispatch_context, float_div, n_scan_sql_over, pair_plan_sql,
-    parsed_pushdown, projected_columns, pushdown_request, request_typed, resolved_table, round_of,
-    sample_storage, scan_for, test_context, unqualified_shards, whole_request_emission,
-    with_identifier_notes,
+    count_star, detected_join, dispatch_base, dispatch_context, float_div, n_scan_sql_over,
+    pair_plan_sql, parsed_pushdown, projected_columns, pushdown_request, request_typed,
+    resolved_table, round_of, sample_storage, scan_for, test_context, unqualified_shards,
+    whole_request_emission, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -761,15 +761,6 @@ fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
     )
 }
 
-fn two_table_detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(&adapter_request(request), &parsed_pushdown(request))
-        .expect("two-table join must be detected")
-    {
-        JoinShape::Join(join) => join,
-        other => panic!("expected a detected join, got {other:?}"),
-    }
-}
-
 fn resolved_customer_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -832,7 +823,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 
     let (request, _) = two_table_join_request(None);
-    let join = two_table_detected_join(&request);
+    let join = detected_join(&request);
     let sides = request_typed(
         &request,
         &[resolved_customer_side(), resolved_orders_side()],
@@ -876,7 +867,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
 
     let renderable_filter = string_equal("CUSTOMER", "C_NAME", "ACME");
     let (request, _) = two_table_join_request(Some(renderable_filter));
-    let join = two_table_detected_join(&request);
+    let join = detected_join(&request);
     let sides = request_typed(
         &request,
         &[resolved_customer_side(), resolved_orders_side()],

@@ -110,7 +110,7 @@ pub(crate) async fn handle_pushdown(
     catalog: &CatalogProps,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
-    let pushdown = context.clock.fold(request.pushdown().clone())?;
+    let pushdown = context.clock.fold(request.pushdown())?;
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.

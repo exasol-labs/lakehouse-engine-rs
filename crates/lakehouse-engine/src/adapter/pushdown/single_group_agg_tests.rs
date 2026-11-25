@@ -744,7 +744,7 @@ fn parse_agg_item_recognises_stat_functions() {
         ("VAR_POP", AggKind::VarPop),
     ] {
         let item = agg_item(name, Some("AMOUNT"), false);
-        let plan = parse_agg_item(&ast(&item), typed_scan(&AGGREGATED))
+        let plan = agg_plan(&item, typed_scan(&AGGREGATED))
             .unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
         assert_eq!(
             plan.kind, *expected_kind,
@@ -768,7 +768,7 @@ fn stat_aggregate_over_expression_argument_declines() {
             "the scan computes STDDEV({arg}), so only the stat rule may decline it"
         );
         assert!(
-            parse_agg_item(&ast(&item), scan).is_none(),
+            agg_plan(&item, scan).is_none(),
             "STDDEV over a non-column argument must decline: {arg}"
         );
         assert!(

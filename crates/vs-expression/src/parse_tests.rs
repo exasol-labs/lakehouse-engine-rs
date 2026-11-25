@@ -69,6 +69,10 @@ fn a_malformed_node_fails_naming_its_field() {
             "the pushdown request's filter.name is missing",
         ),
         (
+            json!({"type": "function_scalar", "arguments": [col("A")]}),
+            "the pushdown request's filter.name is missing",
+        ),
+        (
             json!({"type": "predicate_equal", "left": col("A")}),
             "the pushdown request's filter.right is missing",
         ),

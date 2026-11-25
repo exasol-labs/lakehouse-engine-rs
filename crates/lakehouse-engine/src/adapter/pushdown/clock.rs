@@ -58,23 +58,19 @@ impl StatementClock {
     /// Exasol shows a projected TSTZ value in the session zone, so a select-list item it types
     /// TSTZ keeps the UTC instant, which the Exasol dialect converts into `SESSIONTIMEZONE`.
     /// Everywhere else a TSTZ value compares as the plain wall clock of the folding zone.
-    pub(super) fn fold(&self, pushdown: PushdownRequest) -> Result<PushdownRequest, UdfError> {
+    pub(super) fn fold(&self, pushdown: &PushdownRequest) -> Result<PushdownRequest, UdfError> {
+        let keep_instant = |tstz| Ok(tstz_literal(tstz));
+        let wall_clock = |tstz| self.wall_clock_literal(tstz);
         pushdown.try_map_expressions(&Clause::ALL, |clause, index, tree| {
-            match (clause, pushdown.select_type(index)) {
-                (Clause::SelectList, Some(ExasolType::TimestampWithLocalTimeZone { .. })) => {
-                    self.walk(tree, &|tstz| Ok(tstz_literal(tstz)))
-                }
-                _ => self.walk(tree, &|tstz| self.wall_clock_literal(tstz)),
-            }
+            let tstz: &dyn Fn(Tstz) -> Result<Expr, UdfError> =
+                match (clause, pushdown.select_type(index)) {
+                    (Clause::SelectList, Some(ExasolType::TimestampWithLocalTimeZone { .. })) => {
+                        &keep_instant
+                    }
+                    _ => &wall_clock,
+                };
+            tree.try_rewrite(&mut |node| self.folded(node, tstz))
         })
-    }
-
-    fn walk(
-        &self,
-        node: &mut Expr,
-        tstz: &dyn Fn(Tstz) -> Result<Expr, UdfError>,
-    ) -> Result<(), UdfError> {
-        node.try_rewrite(&mut |node| self.folded(node, tstz))
     }
 
     /// The literal in place of `node`, `None` for a node that is no clock call or TSTZ literal.

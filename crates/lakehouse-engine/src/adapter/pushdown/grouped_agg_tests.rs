@@ -1,7 +1,7 @@
 use super::super::detect_aggregates;
 use super::super::joins::build_qualified_single_table_fallback_sql;
 use super::super::scalar_over_agg::merge_select_items;
-use super::super::support::{SCAN_UDF_NAME, involved_columns, shard_count};
+use super::super::support::{SCAN_UDF_NAME, shard_count};
 use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, CommonScanSpec, ScanStorage};
@@ -12,10 +12,8 @@ use vs_expression::SqlFragment;
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = agg_item("SUM", Some("x"), false);
-    let plans = vec![
-        parse_agg_item(&ast(&sum_node), typed_scan(&AGGREGATED))
-            .expect("SUM(x) must parse to a plan"),
-    ];
+    let plans =
+        vec![agg_plan(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan")];
     let node = cast_to(
         ExasolType::Char {
             size: 20,
@@ -49,10 +47,8 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = agg_item("SUM", Some("x"), false);
-    let plans = vec![
-        parse_agg_item(&ast(&sum_node), typed_scan(&AGGREGATED))
-            .expect("SUM(x) must parse to a plan"),
-    ];
+    let plans =
+        vec![agg_plan(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan")];
     let char_type = ExasolType::Char {
         size: 20,
         ascii: true,
@@ -1518,7 +1514,6 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     );
 
     let parsed = adapter_request(&request);
-    let all_cols = involved_columns(parsed.involved_tables().first()).types;
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
@@ -1527,7 +1522,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         &parsed,
         &pushdown,
         fan_out_spec,
-        &column_types(&all_cols),
+        &first_table_column_types(&request),
         &unqualified_shards(vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]]),
         &single_scan_placement(&request),
         &test_context(),
@@ -2310,14 +2305,14 @@ fn numeric_aggregates_split_only_over_double_and_decimal_columns() {
         };
         for name in ["SUM", "AVG", "STDDEV", "VAR_POP"] {
             assert_eq!(
-                parse_agg_item(&ast(&agg_item(name, Some("X"), false)), scan).is_some(),
+                agg_plan(&agg_item(name, Some("X"), false), scan).is_some(),
                 numeric,
                 "{name} over {exa_type}"
             );
         }
         for name in ["MIN", "MAX", "COUNT"] {
             assert!(
-                parse_agg_item(&ast(&agg_item(name, Some("X"), false)), scan).is_some(),
+                agg_plan(&agg_item(name, Some("X"), false), scan).is_some(),
                 "{name} over {exa_type} needs no numeric type"
             );
         }
@@ -2336,12 +2331,12 @@ fn numeric_aggregates_over_a_text_or_boolean_expression_decline() {
     ];
     for argument in cases {
         let sum = agg_item_expr("SUM", argument.clone(), false);
-        assert!(parse_agg_item(&ast(&sum), scan).is_none(), "{sum}");
+        assert!(agg_plan(&sum, scan).is_none(), "{sum}");
         let avg = agg_item_expr("AVG", argument, false);
-        assert!(parse_agg_item(&ast(&avg), scan).is_none(), "{avg}");
+        assert!(agg_plan(&avg, scan).is_none(), "{avg}");
     }
     let number = agg_item_expr("SUM", scalar_fn("MULT", [col("I"), col("I")]), false);
-    assert!(parse_agg_item(&ast(&number), scan).is_some(), "{number}");
+    assert!(agg_plan(&number, scan).is_some(), "{number}");
 }
 
 /// The types Exasol declares for a select list of only keys and aggregates: each one's own type.

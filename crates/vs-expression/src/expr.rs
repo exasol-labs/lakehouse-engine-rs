@@ -5,6 +5,8 @@
 //! `basis`, `escapeChar`, `expression`, `left`, `pattern`, `results`, `right`), the order the
 //! golden fixtures pin for the emitted columns and aggregate slots.
 
+use std::convert::Infallible;
+
 use crate::exasol_type::ExasolType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,58 +284,93 @@ pub struct AggregateCall {
 
 /// A node the typed pass writes. Only this crate builds or reads one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanNode(pub(crate) ScanKind);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScanKind {
-    /// An integer operand converted to text.
-    IntegerText(Box<Expr>),
-    /// A boolean operand converted to Exasol's `TRUE`/`FALSE`.
-    BooleanText(Box<Expr>),
-    /// A boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
-    /// (apache/datafusion#16797).
-    BooleanNumber(Box<Expr>),
-    /// A string function's numeric argument as the `Int64` DataFusion requires, rounded as Exasol
-    /// rounds it.
-    IntegerArgument {
-        argument: Box<Expr>,
-        round: bool,
-        negative_is_null: bool,
-    },
-    /// The seconds of its argument with `fraction` fractional digits.
-    Second { argument: Box<Expr>, fraction: u8 },
-    /// Its text argument with an empty string read as NULL, because Exasol has no empty string
-    /// and DataFusion keeps one as a value (#203).
-    EmptyAsNull(Box<Expr>),
+pub struct ScanNode {
+    pub(crate) kind: ScanKind,
+    pub(crate) argument: Box<Expr>,
 }
 
-impl ScanKind {
-    pub(crate) fn argument(&self) -> &Expr {
-        match self {
-            Self::IntegerText(argument)
-            | Self::BooleanText(argument)
-            | Self::BooleanNumber(argument)
-            | Self::EmptyAsNull(argument)
-            | Self::IntegerArgument { argument, .. }
-            | Self::Second { argument, .. } => argument,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanKind {
+    /// An integer operand converted to text.
+    IntegerText,
+    /// A boolean operand converted to Exasol's `TRUE`/`FALSE`.
+    BooleanText,
+    /// A boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
+    /// (apache/datafusion#16797).
+    BooleanNumber,
+    /// A string function's numeric argument as the `Int64` DataFusion requires, rounded as Exasol
+    /// rounds it.
+    IntegerArgument { round: bool, negative_is_null: bool },
+    /// The seconds of its argument with `fraction` fractional digits.
+    Second { fraction: u8 },
+    /// Its text argument with an empty string read as NULL, because Exasol has no empty string
+    /// and DataFusion keeps one as a value (#203).
+    EmptyAsNull,
+}
 
-    pub(crate) fn argument_mut(&mut self) -> &mut Expr {
-        match self {
-            Self::IntegerText(argument)
-            | Self::BooleanText(argument)
-            | Self::BooleanNumber(argument)
-            | Self::EmptyAsNull(argument)
-            | Self::IntegerArgument { argument, .. }
-            | Self::Second { argument, .. } => argument,
+/// The children of `$node` as `&` or, given `mut`, `&mut` references: one definition, so the
+/// shared and the mutable walks visit the same children in the same order.
+macro_rules! children_of {
+    ($node:expr $(, $m:tt)?) => {{
+        let mut children = Vec::new();
+        match $node {
+            Expr::Literal(_) | Expr::Column(_) => {}
+            Expr::Compare { left, right, .. } => children.extend([&$($m)? **left, &$($m)? **right]),
+            Expr::And(items) | Expr::Or(items) => children.extend(items),
+            Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                children.push(&$($m)? **inner);
+            }
+            Expr::InList { expression, values } => {
+                children.extend(values);
+                children.push(&$($m)? **expression);
+            }
+            Expr::Between {
+                expression,
+                low,
+                high,
+            } => children.extend([&$($m)? **expression, &$($m)? **low, &$($m)? **high]),
+            Expr::Like {
+                expression,
+                pattern,
+                escape,
+            } => {
+                if let Some(escape) = escape {
+                    children.push(&$($m)? **escape);
+                }
+                children.extend([&$($m)? **expression, &$($m)? **pattern]);
+            }
+            Expr::Scalar(call) => children.extend(&$($m)? call.arguments),
+            Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
+                children.push(&$($m)? **argument);
+            }
+            Expr::Case(case) => {
+                children.extend(&$($m)? case.whens);
+                if let Some(basis) = &$($m)? case.basis {
+                    children.push(&$($m)? **basis);
+                }
+                children.extend(&$($m)? case.results);
+            }
+            Expr::JsonValue(call) => {
+                children.extend([&$($m)? *call.document, &$($m)? *call.path]);
+                for behavior in [&$($m)? call.on_empty, &$($m)? call.on_error] {
+                    if let Some(JsonBehavior::Default(expression)) = behavior {
+                        children.push(&$($m)? **expression);
+                    }
+                }
+            }
+            Expr::Aggregate(call) => children.extend(&$($m)? call.arguments),
+            Expr::Scan(scan) => children.push(&$($m)? *scan.argument),
         }
-    }
+        children
+    }};
 }
 
 impl Expr {
-    pub(crate) fn scan(kind: ScanKind) -> Self {
-        Self::Scan(ScanNode(kind))
+    pub(crate) fn scan(kind: ScanKind, argument: Expr) -> Self {
+        Self::Scan(ScanNode {
+            kind,
+            argument: Box::new(argument),
+        })
     }
 
     pub fn compare(op: CompareOp, left: Expr, right: Expr) -> Self {
@@ -375,119 +412,24 @@ impl Expr {
 
     /// The child expressions in the alphabetical order of their wire keys (see the module doc).
     pub fn children(&self) -> Vec<&Expr> {
-        let mut children = Vec::new();
-        match self {
-            Self::Literal(_) | Self::Column(_) => {}
-            Self::Compare { left, right, .. } => children.extend([&**left, &**right]),
-            Self::And(items) | Self::Or(items) => children.extend(items),
-            Self::Not(inner) | Self::IsNull(inner) | Self::IsNotNull(inner) => {
-                children.push(&**inner);
-            }
-            Self::InList { expression, values } => {
-                children.extend(values);
-                children.push(&**expression);
-            }
-            Self::Between {
-                expression,
-                low,
-                high,
-            } => children.extend([&**expression, &**low, &**high]),
-            Self::Like {
-                expression,
-                pattern,
-                escape,
-            } => {
-                children.extend(escape.as_deref());
-                children.extend([&**expression, &**pattern]);
-            }
-            Self::Scalar(call) => children.extend(&call.arguments),
-            Self::Extract { argument, .. } | Self::Cast { argument, .. } => {
-                children.push(&**argument);
-            }
-            Self::Case(case) => {
-                children.extend(&case.whens);
-                children.extend(case.basis.as_deref());
-                children.extend(&case.results);
-            }
-            Self::JsonValue(call) => {
-                children.extend([&*call.document, &*call.path]);
-                for behavior in [&call.on_empty, &call.on_error] {
-                    if let Some(JsonBehavior::Default(expression)) = behavior {
-                        children.push(&**expression);
-                    }
-                }
-            }
-            Self::Aggregate(call) => children.extend(&call.arguments),
-            Self::Scan(ScanNode(kind)) => children.push(kind.argument()),
-        }
-        children
+        children_of!(self)
     }
 
     /// [`Self::children`], mutable.
     fn children_mut(&mut self) -> Vec<&mut Expr> {
-        let mut children: Vec<&mut Expr> = Vec::new();
+        children_of!(self, mut)
+    }
+
+    /// Every column node at any depth, pre-order.
+    pub fn columns(&self) -> Vec<&Column> {
         match self {
-            Self::Literal(_) | Self::Column(_) => {}
-            Self::Compare { left, right, .. } => children.extend([&mut **left, &mut **right]),
-            Self::And(items) | Self::Or(items) => children.extend(items),
-            Self::Not(inner) | Self::IsNull(inner) | Self::IsNotNull(inner) => {
-                children.push(&mut **inner);
-            }
-            Self::InList { expression, values } => {
-                children.extend(values);
-                children.push(&mut **expression);
-            }
-            Self::Between {
-                expression,
-                low,
-                high,
-            } => children.extend([&mut **expression, &mut **low, &mut **high]),
-            Self::Like {
-                expression,
-                pattern,
-                escape,
-            } => {
-                children.extend(escape.as_deref_mut());
-                children.extend([&mut **expression, &mut **pattern]);
-            }
-            Self::Scalar(call) => children.extend(&mut call.arguments),
-            Self::Extract { argument, .. } | Self::Cast { argument, .. } => {
-                children.push(&mut **argument);
-            }
-            Self::Case(case) => {
-                children.extend(&mut case.whens);
-                children.extend(case.basis.as_deref_mut());
-                children.extend(&mut case.results);
-            }
-            Self::JsonValue(call) => {
-                children.extend([&mut *call.document, &mut *call.path]);
-                for behavior in [&mut call.on_empty, &mut call.on_error] {
-                    if let Some(JsonBehavior::Default(expression)) = behavior {
-                        children.push(&mut **expression);
-                    }
-                }
-            }
-            Self::Aggregate(call) => children.extend(&mut call.arguments),
-            Self::Scan(ScanNode(kind)) => children.push(kind.argument_mut()),
+            Self::Column(column) => vec![column],
+            _ => self
+                .children()
+                .into_iter()
+                .flat_map(Expr::columns)
+                .collect(),
         }
-        children
-    }
-
-    /// Visits every node, pre-order.
-    pub fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
-        f(self);
-        for child in self.children() {
-            child.walk(f);
-        }
-    }
-
-    /// Visits every column node at any depth.
-    pub fn walk_columns<'a>(&'a self, f: &mut impl FnMut(&'a Column)) {
-        self.walk(&mut |node| {
-            if let Self::Column(column) = node {
-                f(column);
-            }
-        });
     }
 
     /// Whether `predicate` holds for any node at any depth.
@@ -502,21 +444,9 @@ impl Expr {
     /// Copies the tree, replacing each subtree for which `substitute` returns `Some`; the walk
     /// does not descend into a replaced subtree.
     pub fn substitute(&self, substitute: &mut impl FnMut(&Expr) -> Option<Expr>) -> Expr {
-        if let Some(replaced) = substitute(self) {
-            return replaced;
-        }
         let mut copy = self.clone();
-        copy.substitute_children(substitute);
+        let Ok(()) = copy.try_rewrite(&mut |node| Ok::<_, Infallible>(substitute(node)));
         copy
-    }
-
-    fn substitute_children(&mut self, substitute: &mut impl FnMut(&Expr) -> Option<Expr>) {
-        for child in self.children_mut() {
-            match substitute(child) {
-                Some(replaced) => *child = replaced,
-                None => child.substitute_children(substitute),
-            }
-        }
     }
 
     /// Fallible in-place rewrite of every node, pre-order: `rewrite` returns the node in place of

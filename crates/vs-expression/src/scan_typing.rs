@@ -239,10 +239,7 @@ impl Seconds {
             Self::OfDate(_) if fraction > 0 => cast_node(ExasolType::timestamp(fraction), argument),
             _ => argument,
         };
-        Expr::scan(ScanKind::Second {
-            argument: Box::new(argument),
-            fraction,
-        })
+        Expr::scan(ScanKind::Second { fraction }, argument)
     }
 }
 
@@ -279,128 +276,90 @@ enum Field {
 /// holds the rest: an IN list or the WHEN values.
 const COMPARED_FIELDS: [Field; 4] = [Field::Expression, Field::Left, Field::Right, Field::Basis];
 
+/// The typed children of `$node` with their field and index, as `&` or, given `mut`, `&mut`
+/// references: one definition, so [`typed_children`] and [`slot`] address the same children.
+macro_rules! typed_children_of {
+    ($node:expr $(, $m:tt)?) => {{
+        let mut children = Vec::new();
+        match $node {
+            Expr::Literal(_) | Expr::Column(_) => {}
+            Expr::And(items) | Expr::Or(items) => {
+                children.extend(indexed(Field::Expressions, items));
+            }
+            Expr::Scalar(call) => children.extend(indexed(Field::Arguments, &$($m)? call.arguments)),
+            Expr::Aggregate(call) => {
+                children.extend(indexed(Field::Arguments, &$($m)? call.arguments));
+            }
+            Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
+                children.extend(indexed(Field::Arguments, [&$($m)? **argument]));
+            }
+            Expr::Scan(scan) => children.extend(indexed(Field::Arguments, [&$($m)? *scan.argument])),
+            Expr::JsonValue(call) => children.extend(indexed(
+                Field::Arguments,
+                [&$($m)? *call.document, &$($m)? *call.path],
+            )),
+            Expr::Case(case) => {
+                children.extend(indexed(Field::Arguments, &$($m)? case.whens));
+                children.extend(indexed(Field::Results, &$($m)? case.results));
+                if let Some(basis) = &$($m)? case.basis {
+                    children.push((Field::Basis, None, &$($m)? **basis));
+                }
+            }
+            Expr::InList { expression, values } => {
+                children.extend(indexed(Field::Arguments, values));
+                children.push((Field::Expression, None, &$($m)? **expression));
+            }
+            Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                children.push((Field::Expression, None, &$($m)? **inner));
+            }
+            Expr::Between {
+                expression,
+                low,
+                high,
+            } => children.extend([
+                (Field::Expression, None, &$($m)? **expression),
+                (Field::Left, None, &$($m)? **low),
+                (Field::Right, None, &$($m)? **high),
+            ]),
+            Expr::Like {
+                expression,
+                pattern,
+                ..
+            } => children.extend([
+                (Field::Expression, None, &$($m)? **expression),
+                (Field::Pattern, None, &$($m)? **pattern),
+            ]),
+            Expr::Compare { left, right, .. } => children.extend([
+                (Field::Left, None, &$($m)? **left),
+                (Field::Right, None, &$($m)? **right),
+            ]),
+        }
+        children
+    }};
+}
+
+fn indexed<T>(
+    field: Field,
+    items: impl IntoIterator<Item = T>,
+) -> impl Iterator<Item = (Field, Option<usize>, T)> {
+    items
+        .into_iter()
+        .enumerate()
+        .map(move |(i, item)| (field, Some(i), item))
+}
+
 /// Each typed child of `node` with its field and its index in an array field, the array fields
 /// first.
 fn typed_children(node: &Expr) -> Vec<(Field, Option<usize>, &Expr)> {
-    fn array<'e>(field: Field, items: &[&'e Expr]) -> Vec<(Field, Option<usize>, &'e Expr)> {
-        items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| (field, Some(i), *item))
-            .collect()
-    }
-    fn refs(items: &[Expr]) -> Vec<&Expr> {
-        items.iter().collect()
-    }
-    match node {
-        Expr::Literal(_) | Expr::Column(_) => Vec::new(),
-        Expr::And(items) | Expr::Or(items) => array(Field::Expressions, &refs(items)),
-        Expr::Scalar(ScalarCall { arguments, .. }) => array(Field::Arguments, &refs(arguments)),
-        Expr::Aggregate(call) => array(Field::Arguments, &refs(&call.arguments)),
-        Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
-            array(Field::Arguments, &[argument])
-        }
-        Expr::Scan(scan) => array(Field::Arguments, &[scan.0.argument()]),
-        Expr::JsonValue(call) => array(Field::Arguments, &[&call.document, &call.path]),
-        Expr::Case(case) => {
-            let mut children = array(Field::Arguments, &refs(&case.whens));
-            children.extend(array(Field::Results, &refs(&case.results)));
-            children.extend(
-                case.basis
-                    .as_deref()
-                    .map(|basis| (Field::Basis, None, basis)),
-            );
-            children
-        }
-        Expr::InList { expression, values } => {
-            let mut children = array(Field::Arguments, &refs(values));
-            children.push((Field::Expression, None, expression));
-            children
-        }
-        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            vec![(Field::Expression, None, inner)]
-        }
-        Expr::Between {
-            expression,
-            low,
-            high,
-        } => vec![
-            (Field::Expression, None, expression),
-            (Field::Left, None, low),
-            (Field::Right, None, high),
-        ],
-        Expr::Like {
-            expression,
-            pattern,
-            ..
-        } => vec![
-            (Field::Expression, None, expression),
-            (Field::Pattern, None, pattern),
-        ],
-        Expr::Compare { left, right, .. } => {
-            vec![(Field::Left, None, left), (Field::Right, None, right)]
-        }
-    }
+    typed_children_of!(node)
 }
 
 /// The typed child of `node` at `field` and `index`, as [`typed_children`] lists it.
 fn slot(node: &mut Expr, field: Field, index: Option<usize>) -> Option<&mut Expr> {
-    let i = index.unwrap_or(0);
-    match field {
-        Field::Expressions => match node {
-            Expr::And(items) | Expr::Or(items) => items.get_mut(i),
-            _ => None,
-        },
-        Field::Arguments => match node {
-            Expr::Scalar(ScalarCall { arguments, .. }) => arguments.get_mut(i),
-            Expr::Aggregate(call) => call.arguments.get_mut(i),
-            Expr::Case(case) => case.whens.get_mut(i),
-            Expr::InList { values, .. } => values.get_mut(i),
-            Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
-                (i == 0).then_some(&mut **argument)
-            }
-            Expr::Scan(scan) => (i == 0).then(|| scan.0.argument_mut()),
-            Expr::JsonValue(call) => match i {
-                0 => Some(&mut *call.document),
-                1 => Some(&mut *call.path),
-                _ => None,
-            },
-            _ => None,
-        },
-        Field::Results => match node {
-            Expr::Case(case) => case.results.get_mut(i),
-            _ => None,
-        },
-        Field::Basis => match node {
-            Expr::Case(case) => case.basis.as_deref_mut(),
-            _ => None,
-        },
-        Field::Expression => match node {
-            Expr::InList { expression, .. }
-            | Expr::Between { expression, .. }
-            | Expr::Like { expression, .. }
-            | Expr::Not(expression)
-            | Expr::IsNull(expression)
-            | Expr::IsNotNull(expression) => Some(&mut **expression),
-            _ => None,
-        },
-        Field::Pattern => match node {
-            Expr::Like { pattern, .. } => Some(&mut **pattern),
-            _ => None,
-        },
-        Field::Left => match node {
-            Expr::Between { low: operand, .. } | Expr::Compare { left: operand, .. } => {
-                Some(&mut **operand)
-            }
-            _ => None,
-        },
-        Field::Right => match node {
-            Expr::Between { high: operand, .. } | Expr::Compare { right: operand, .. } => {
-                Some(&mut **operand)
-            }
-            _ => None,
-        },
-    }
+    typed_children_of!(node, mut)
+        .into_iter()
+        .find(|(f, i, _)| (*f, *i) == (field, index))
+        .map(|(_, _, child)| child)
 }
 
 /// Replaces the typed child at `field` and `index` of `node` with `rewrite`'s result.
@@ -415,12 +374,19 @@ fn rewrite_slot<E>(
     Ok(())
 }
 
-pub(crate) fn decline(reason: String) -> UdfError {
-    UdfError::User(format!("the scan cannot compute this expression: {reason}"))
+/// [`rewrite_slot`] for a rewrite that cannot fail.
+fn replace_slot(
+    node: &mut Expr,
+    field: Field,
+    index: Option<usize>,
+    rewrite: impl FnOnce(Expr) -> Expr,
+) {
+    let child = slot(node, field, index).expect("a typed child the node holds");
+    *child = rewrite(take(child));
 }
 
-fn wrap(kind: fn(Box<Expr>) -> ScanKind, argument: Expr) -> Expr {
-    Expr::scan(kind(Box::new(argument)))
+pub(crate) fn decline(reason: String) -> UdfError {
+    UdfError::User(format!("the scan cannot compute this expression: {reason}"))
 }
 
 /// `node` converted to text implicitly, as a LIKE operand, a `||` operand, or a string-function
@@ -429,9 +395,9 @@ fn to_text(node: Expr, ty: Inferred) -> Result<Expr, UdfError> {
     if ty.is_text() || ty == Inferred::Null {
         Ok(node)
     } else if ty.is_integer() {
-        Ok(wrap(ScanKind::IntegerText, node))
+        Ok(Expr::scan(ScanKind::IntegerText, node))
     } else if ty == BOOLEAN {
-        Ok(wrap(ScanKind::BooleanText, node))
+        Ok(Expr::scan(ScanKind::BooleanText, node))
     } else {
         Err(decline(format!(
             "converting {} to text depends on the session's NLS settings",
@@ -471,11 +437,13 @@ fn to_integer_argument(
             short(&node)
         )));
     };
-    Ok(Expr::scan(ScanKind::IntegerArgument {
-        argument: Box::new(node),
-        round,
-        negative_is_null: arg.negative_is_null,
-    }))
+    Ok(Expr::scan(
+        ScanKind::IntegerArgument {
+            round,
+            negative_is_null: arg.negative_is_null,
+        },
+        node,
+    ))
 }
 
 /// The DataFusion SQL of an integer-argument node over its rendered argument.
@@ -589,12 +557,12 @@ fn cast_to_text(
         if integer_text_width(ty.integer_precision()) > size {
             return refuse("may not fit the integer's text");
         }
-        Ok(wrap(ScanKind::IntegerText, source))
+        Ok(Expr::scan(ScanKind::IntegerText, source))
     } else if ty == BOOLEAN {
         if size < 5 {
             return refuse("may not fit FALSE");
         }
-        Ok(wrap(ScanKind::BooleanText, source))
+        Ok(Expr::scan(ScanKind::BooleanText, source))
     } else {
         refuse("depends on the session's NLS settings")
     }
@@ -688,8 +656,7 @@ impl<'a> ScanTyping<'a> {
         })?;
         let mut out = node.clone();
         for (field, index, typed) in rewritten {
-            rewrite_slot(&mut out, field, index, |_| Ok::<_, Infallible>(typed))
-                .unwrap_or_else(|never| match never {});
+            replace_slot(&mut out, field, index, |_| typed);
         }
         let ty = self.node_type(node, &children);
         self.rewrite_for_scan(node, &mut out, &children, ty)?;
@@ -909,7 +876,7 @@ enum Position {
 /// `typed`, the rewrite of an operand, with a string column's empty strings read as NULL.
 pub(crate) fn empty_as_null(typed: Expr, ty: Inferred) -> Expr {
     if matches!(typed, Expr::Column(_)) && ty.is_text() {
-        wrap(ScanKind::EmptyAsNull, typed)
+        Expr::scan(ScanKind::EmptyAsNull, typed)
     } else {
         typed
     }
@@ -1094,7 +1061,7 @@ fn rewrite_scalar_function(
         ResultRule::Truncated if args.get(1) == Some(&DATE) => {
             *out = cast_node(ExasolType::Date, take(out));
         }
-        ResultRule::Text => *out = wrap(ScanKind::EmptyAsNull, take(out)),
+        ResultRule::Text => *out = Expr::scan(ScanKind::EmptyAsNull, take(out)),
         _ => {}
     }
     Ok(())
@@ -1139,10 +1106,9 @@ fn check_date_addition(
         )));
     };
     if count == BOOLEAN {
-        rewrite_slot(out, Field::Arguments, Some(1), |count| {
-            Ok::<_, Infallible>(wrap(ScanKind::BooleanNumber, count))
-        })
-        .unwrap_or_else(|never| match never {});
+        replace_slot(out, Field::Arguments, Some(1), |count| {
+            Expr::scan(ScanKind::BooleanNumber, count)
+        });
     } else if !count.is_numeric() {
         return Err(decline(format!(
             "a date addition count that is not a number: {}",
@@ -1150,10 +1116,9 @@ fn check_date_addition(
         )));
     }
     refuse_constant_count_beyond_scan_limit(call)?;
-    rewrite_slot(out, Field::Arguments, Some(0), |first| {
-        Ok::<_, Infallible>(cast_node(cast_target, first))
-    })
-    .unwrap_or_else(|never| match never {});
+    replace_slot(out, Field::Arguments, Some(0), |first| {
+        cast_node(cast_target, first)
+    });
     Ok(())
 }
 
@@ -1326,20 +1291,17 @@ fn compare_without_session_parse(
             short(node)
         )));
     }
-    let to_number = |operand: Expr| {
-        Ok::<_, Infallible>(match operand.as_string_literal() {
-            Some(digits) => integer_literal(digits),
-            None => operand,
-        })
+    let to_number = |operand: Expr| match operand.as_string_literal() {
+        Some(digits) => integer_literal(digits),
+        None => operand,
     };
     for field in COMPARED_FIELDS {
         if children.one(field).is_some() {
-            rewrite_slot(out, field, None, to_number).unwrap_or_else(|never| match never {});
+            replace_slot(out, field, None, to_number);
         }
     }
     for i in 0..children.of(Field::Arguments).len() {
-        rewrite_slot(out, Field::Arguments, Some(i), to_number)
-            .unwrap_or_else(|never| match never {});
+        replace_slot(out, Field::Arguments, Some(i), to_number);
     }
     Ok(())
 }
@@ -1366,7 +1328,7 @@ fn compare_booleans_as_numbers(
         )));
     }
     rewrite_operands(out, children, BOOLEAN, |operand| {
-        wrap(ScanKind::BooleanNumber, operand)
+        Expr::scan(ScanKind::BooleanNumber, operand)
     });
     Ok(())
 }
@@ -1389,16 +1351,14 @@ fn rewrite_operands(
     ty: Inferred,
     rewrite: impl Fn(Expr) -> Expr,
 ) {
-    let rewrite = |operand| Ok::<_, Infallible>(rewrite(operand));
     for field in COMPARED_FIELDS {
         if children.one(field) == Some(ty) {
-            rewrite_slot(out, field, None, rewrite).unwrap_or_else(|never| match never {});
+            replace_slot(out, field, None, &rewrite);
         }
     }
     for (i, operand) in children.of(Field::Arguments).iter().enumerate() {
         if *operand == ty {
-            rewrite_slot(out, Field::Arguments, Some(i), rewrite)
-                .unwrap_or_else(|never| match never {});
+            replace_slot(out, Field::Arguments, Some(i), &rewrite);
         }
     }
 }
@@ -1557,10 +1517,7 @@ fn unify_branches(
     let cast_branches = |out: &mut Expr, target: ExasolType, keep: &dyn Fn(Inferred) -> bool| {
         for (i, branch) in branches.iter().enumerate() {
             if keep(*branch) {
-                rewrite_slot(out, field, Some(i), |branch| {
-                    Ok::<_, Infallible>(cast_node(target, branch))
-                })
-                .unwrap_or_else(|never| match never {});
+                replace_slot(out, field, Some(i), |branch| cast_node(target, branch));
             }
         }
     };
@@ -1615,7 +1572,7 @@ fn rewrite_cast(out: &mut Expr, args: &[Inferred]) -> Result<(), UdfError> {
                     short(argument)
                 )));
             }
-            **argument = wrap(ScanKind::BooleanNumber, take(argument));
+            **argument = Expr::scan(ScanKind::BooleanNumber, take(argument));
         }
         _ => cast_from_text(argument, source_type, target)?,
     }

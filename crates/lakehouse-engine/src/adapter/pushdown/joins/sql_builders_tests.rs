@@ -1,10 +1,10 @@
-use super::super::planning::{JoinLeaf, JoinShape, classify_join_window, detect_join};
+use super::super::planning::{JoinLeaf, JoinShape, classify_join_window};
 use super::super::render_resolved_join;
 use super::super::rendering::LegNaming;
 use super::super::tests::{
     broadcast_projection, built_join, customer_orders_request, customer_orders_request_declaring,
-    customer_orders_request_over, customer_orders_sides, detected_join, equi_condition,
-    join_request, legs_from_leaves, nq3_join_request, rendered_pair, request_legs, resolved_side,
+    customer_orders_request_over, customer_orders_sides, equi_condition, join_request,
+    legs_from_leaves, nq3_join_request, rendered_pair, request_legs, resolved_side,
     self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
@@ -346,12 +346,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
 #[test]
 fn n_scan_produces_qualified_n_scan_wrapper() {
     let request = three_table_join_request();
-    let multi = match detect_join(&adapter_request(&request), &parsed_pushdown(&request))
-        .expect("detected join shape")
-    {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
@@ -393,12 +388,7 @@ fn n_scan_produces_qualified_n_scan_wrapper() {
 #[test]
 fn n_scan_for_q1_shape_supplier_nation_region() {
     let request = q1_join_request();
-    let multi = match detect_join(&adapter_request(&request), &parsed_pushdown(&request))
-        .expect("detected join shape")
-    {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 10)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
@@ -431,12 +421,7 @@ fn n_scan_for_q1_shape_supplier_nation_region() {
 #[test]
 fn n_scan_for_nq3_shape_part_partsupp_supplier_nation() {
     let request = nq3_join_request();
-    let multi = match detect_join(&adapter_request(&request), &parsed_pushdown(&request))
-        .expect("detected join shape")
-    {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("PART", vec![("s3://w/p-0.parquet", 10)]),
         resolved_side("PARTSUPP", vec![("s3://w/ps-0.parquet", 40)]),
@@ -520,12 +505,7 @@ fn n_scan_renders_qualified_when_three_tables_share_column_name() {
             ("TAGS", "lh.tags"),
         ],
     );
-    let multi = match detect_join(&adapter_request(&request), &parsed_pushdown(&request))
-        .expect("detected join shape")
-    {
-        JoinShape::Join(m) => m,
-        other => panic!("expected Join, got {other:?}"),
-    };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
@@ -2153,11 +2133,10 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
     let events = emitting(&column_types(&events_columns()));
     let (pushdown, legs) = planned(request);
-    let leg_count =
-        match detect_join(&adapter_request(request), &pushdown).expect("a plannable request") {
-            JoinShape::Join(join) => join.tables.len(),
-            JoinShape::NotAJoin => 1,
-        };
+    let leg_count = match join_shape(request) {
+        JoinShape::Join(join) => join.tables.len(),
+        JoinShape::NotAJoin => 1,
+    };
     outer_wrapper_clauses(
         &pushdown,
         &legs,

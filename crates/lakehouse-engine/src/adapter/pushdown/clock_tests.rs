@@ -11,14 +11,6 @@ use vs_expression::test_support::{
     table_col, timestamp_lit,
 };
 
-/// The operands of the comparison `tree`.
-fn operands(tree: &Expr) -> (&Expr, &Expr) {
-    match tree {
-        Expr::Compare { left, right, .. } => (left, right),
-        other => panic!("not a comparison: {other:?}"),
-    }
-}
-
 /// 2024-01-15 23:30:45.123456789 UTC: 18:30 on the 15th in New York (`TZ`), 08:30 on the 16th
 /// in Tokyo (`SESSION_TIME_ZONE`), so each folded value shows the zone it was folded in.
 fn instant() -> DateTime<Utc> {
@@ -50,15 +42,20 @@ fn ts() -> Json {
     numbered_col("T", 1, "TS")
 }
 
-/// The request's filter after `clock` folds `ts < right`.
+fn ts_before(right: Json) -> Json {
+    compare("predicate_less", ts(), right)
+}
+
+/// `right` as `clock` folds it in the filter `ts < right`.
 fn folded_filter(clock: &StatementClock, right: Json) -> Result<Expr, UdfError> {
     let pushdown = pushdown_request("T", &columns())
-        .filter(compare("predicate_less", ts(), right))
+        .filter(ts_before(right))
         .build_pushdown();
-    let folded = clock.fold(pushdown)?;
-    Ok(operands(folded.filter().expect("the filter stays"))
-        .1
-        .clone())
+    let folded = clock.fold(&pushdown)?;
+    match folded.filter() {
+        Some(Expr::Compare { right, .. }) => Ok(*right.clone()),
+        other => panic!("the comparison stays: {other:?}"),
+    }
 }
 
 #[test]
@@ -127,18 +124,14 @@ fn tstz_values_fold_to_the_wall_clock_outside_tstz_select_items() {
         .item(scalar_fn("CURRENT_TIMESTAMP", []), tstz)
         .item(tstz_lit("2024-03-01 09:00:00.000"), tstz)
         .item(scalar_fn("LOCALTIMESTAMP", []), ExasolType::timestamp(3))
-        .filter(compare(
-            "predicate_less",
-            ts(),
-            tstz_lit("2024-03-01 09:00:00.000"),
-        ))
+        .filter(ts_before(tstz_lit("2024-03-01 09:00:00.000")))
         .field(
             "having",
             compare("predicate_less", scalar_fn("CURRENT_TIMESTAMP", []), ts()),
         )
         .build_pushdown();
 
-    let folded = tokyo_clock().fold(pushdown).expect("the request folds");
+    let folded = tokyo_clock().fold(&pushdown).expect("the request folds");
 
     assert_eq!(
         folded.select_items().expect("a select list"),
@@ -149,12 +142,16 @@ fn tstz_values_fold_to_the_wall_clock_outside_tstz_select_items() {
         ]
     );
     assert_eq!(
-        *operands(folded.filter().expect("the filter stays")).1,
-        ast(&timestamp_lit("2024-03-01 18:00:00.000"))
+        folded.filter(),
+        Some(&ast(&ts_before(timestamp_lit("2024-03-01 18:00:00.000"))))
     );
     assert_eq!(
-        *operands(folded.having().expect("the HAVING stays")).0,
-        ast(&timestamp_lit("2024-01-16 08:30:45.123"))
+        folded.having(),
+        Some(&ast(&compare(
+            "predicate_less",
+            timestamp_lit("2024-01-16 08:30:45.123"),
+            ts()
+        )))
     );
 }
 
@@ -193,7 +190,7 @@ fn a_folded_clock_sort_key_is_dropped() {
         )
         .build_pushdown();
 
-    let folded = tokyo_clock().fold(pushdown).expect("the request folds");
+    let folded = tokyo_clock().fold(&pushdown).expect("the request folds");
 
     assert_eq!(
         folded.order_by(),
@@ -207,18 +204,15 @@ fn a_folded_clock_sort_key_is_dropped() {
 
 #[test]
 fn tstz_values_fold_in_a_join_condition_and_an_aggregate_argument() {
+    let max_ts_before = |right| {
+        let ts_before = compare("predicate_less", table_col("T", "TS"), right);
+        agg_item_expr("MAX", ts_before, false)
+    };
+    let join_on = |right| predicate_equal(table_col("T", "TS"), right);
     let (request, _) = pushdown_request("T", &columns())
         .table("U", &columns())
         .item(
-            agg_item_expr(
-                "MAX",
-                compare(
-                    "predicate_less",
-                    table_col("T", "TS"),
-                    scalar_fn("CURRENT_TIMESTAMP", []),
-                ),
-                false,
-            ),
+            max_ts_before(scalar_fn("CURRENT_TIMESTAMP", [])),
             ExasolType::Boolean,
         )
         .field(
@@ -226,26 +220,28 @@ fn tstz_values_fold_in_a_join_condition_and_an_aggregate_argument() {
             inner_join(
                 table_ref("T"),
                 table_ref("U"),
-                predicate_equal(table_col("T", "TS"), tstz_lit("2024-03-01 09:00:00.000")),
+                join_on(tstz_lit("2024-03-01 09:00:00.000")),
             ),
         )
         .build();
 
     let folded = tokyo_clock()
-        .fold(parsed_pushdown(&request))
+        .fold(&parsed_pushdown(&request))
         .expect("the request folds");
     let Some(FromClause::Join { condition, .. }) = folded.from() else {
         panic!("the join stays: {:?}", folded.from());
     };
     assert_eq!(
-        *operands(condition).1,
-        ast(&timestamp_lit("2024-03-01 18:00:00.000"))
+        *condition,
+        ast(&join_on(timestamp_lit("2024-03-01 18:00:00.000")))
     );
-    let Expr::Aggregate(max) = &folded.select_items().expect("a select list")[0] else {
-        panic!("the MAX stays");
-    };
     assert_eq!(
-        *operands(&max.arguments[0]).1,
-        ast(&timestamp_lit("2024-01-16 08:30:45.123"))
+        folded.select_items(),
+        Some(
+            [ast(&max_ts_before(timestamp_lit(
+                "2024-01-16 08:30:45.123"
+            )))]
+            .as_slice()
+        )
     );
 }

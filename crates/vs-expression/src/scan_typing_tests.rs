@@ -2173,7 +2173,7 @@ fn every_typed_child_resolves_through_slot() {
         ast(&between(col("A"), num_lit(1), num_lit(2))),
         ast(&like(col("A"), "x%")),
         ast(&predicate_equal(col("A"), col("B"))),
-        wrap(ScanKind::BooleanNumber, ast(&col("A"))),
+        Expr::scan(ScanKind::BooleanNumber, ast(&col("A"))),
     ];
     for node in nodes {
         let children = typed_children(&node);

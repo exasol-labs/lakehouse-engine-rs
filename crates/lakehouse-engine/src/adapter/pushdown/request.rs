@@ -5,8 +5,8 @@
 
 use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
-use serde_json::{Map, Value as Json};
-use vs_expression::{Expr, Literal, invalid_field, parse_expression};
+use serde_json::Value as Json;
+use vs_expression::{Expr, Literal, RequestNode, invalid_field};
 
 /// One `involvedTables` entry: a virtual table the pushed query reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,21 +35,13 @@ pub(crate) struct AdapterRequest {
 
 impl AdapterRequest {
     pub(crate) fn parse(request: &Json) -> Result<Self, UdfError> {
-        let pushdown = PushdownRequest::parse(
-            request
-                .get("pushdownRequest")
-                .cloned()
-                .unwrap_or(Json::Null),
-        )?;
-        let involved_tables = match request.get("involvedTables") {
-            None | Some(Json::Null) => Vec::new(),
-            Some(Json::Array(tables)) => tables
-                .iter()
-                .enumerate()
-                .map(|(i, table)| involved_table(table, &format!("involvedTables[{i}]")))
-                .collect::<Result<_, _>>()?,
-            Some(_) => return Err(invalid_field("involvedTables", "is not an array")),
-        };
+        let pushdown =
+            PushdownRequest::parse(request.get("pushdownRequest").unwrap_or(&Json::Null))?;
+        let involved_tables = RequestNode::object(request, "")?
+            .objects("involvedTables")?
+            .iter()
+            .map(involved_table)
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             involved_tables,
             pushdown,
@@ -70,28 +62,22 @@ impl AdapterRequest {
     }
 }
 
-fn involved_table(table: &Json, path: &str) -> Result<InvolvedTable, UdfError> {
-    let fields = object(table, path)?;
-    let name = text(fields, path, "name")?;
-    let columns = match fields.get("columns") {
-        None | Some(Json::Null) => Vec::new(),
-        Some(Json::Array(columns)) => columns
+fn involved_table(table: &RequestNode) -> Result<InvolvedTable, UdfError> {
+    Ok(InvolvedTable {
+        name: table.text("name")?.to_string(),
+        adapter_notes: note(table),
+        columns: table
+            .objects("columns")?
             .iter()
             .filter_map(involved_column)
             .collect::<Result<_, _>>()?,
-        Some(_) => return Err(invalid_field(&format!("{path}.columns"), "is not an array")),
-    };
-    Ok(InvolvedTable {
-        name,
-        adapter_notes: note(fields),
-        columns,
     })
 }
 
 /// `None` for a column without a name, which no clause can reference. A missing or invalid
 /// `dataType` fails the request: the adapter declared every column itself, so no defaulted type
 /// may stand in for it.
-fn involved_column(column: &Json) -> Option<Result<InvolvedColumn, UdfError>> {
+fn involved_column(column: &RequestNode) -> Option<Result<InvolvedColumn, UdfError>> {
     let name = column.get("name")?.as_str()?;
     let parsed = column
         .get("dataType")
@@ -100,14 +86,13 @@ fn involved_column(column: &Json) -> Option<Result<InvolvedColumn, UdfError>> {
         .map(|data_type| InvolvedColumn {
             name: name.to_string(),
             data_type,
-            adapter_notes: column.as_object().and_then(note),
+            adapter_notes: note(column),
         });
     Some(parsed)
 }
 
-fn note(fields: &Map<String, Json>) -> Option<String> {
-    fields
-        .get("adapterNotes")
+fn note(node: &RequestNode) -> Option<String> {
+    node.get("adapterNotes")
         .and_then(Json::as_str)
         .map(str::to_string)
 }
@@ -251,7 +236,7 @@ pub struct PushdownRequest {
 impl PushdownRequest {
     /// Exasol sends an aggregating request at least a `literal_null` item (#627, verified live),
     /// so `[]` beside `aggregationType` fails like any other malformed select list.
-    pub fn parse(json: Json) -> Result<Self, UdfError> {
+    pub fn parse(json: &Json) -> Result<Self, UdfError> {
         let entries = json
             .get("selectListDataTypes")
             .and_then(Json::as_array)
@@ -262,6 +247,7 @@ impl PushdownRequest {
                         .into(),
                 )
             })?;
+        let node = RequestNode::object(json, "")?;
         let select_types = entries
             .iter()
             .enumerate()
@@ -274,22 +260,19 @@ impl PushdownRequest {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let aggregation_type = match present(&json, "aggregationType") {
+        let aggregation_type = match node.optional_text("aggregationType")? {
             None => None,
-            Some(Json::String(kind)) => match kind.as_str() {
-                "single_group" => Some(AggregationType::SingleGroup),
-                "group_by" => Some(AggregationType::GroupBy),
-                other => {
-                    return Err(invalid_field(
-                        "aggregationType",
-                        &format!("names the aggregation type {other}"),
-                    ));
-                }
-            },
-            Some(_) => return Err(invalid_field("aggregationType", "is not a string")),
+            Some("single_group") => Some(AggregationType::SingleGroup),
+            Some("group_by") => Some(AggregationType::GroupBy),
+            Some(other) => {
+                return Err(node.invalid(
+                    "aggregationType",
+                    &format!("names the aggregation type {other}"),
+                ));
+            }
         };
-        let (output, select_list) = match json.get("selectList") {
-            None | Some(Json::Null) => (OutputContract::WholeRow, Vec::new()),
+        let (output, select_list) = match node.get("selectList") {
+            None => (OutputContract::WholeRow, Vec::new()),
             Some(Json::Array(items)) if items.is_empty() => {
                 if aggregation_type.is_some() {
                     return Err(UdfError::User(
@@ -298,57 +281,35 @@ impl PushdownRequest {
                 }
                 (OutputContract::AnyOneColumn, Vec::new())
             }
-            Some(Json::Array(items)) => {
-                if items.len() != select_types.len() {
-                    return Err(UdfError::User(format!(
-                        "the pushdown request declares {} selectListDataTypes entries for {} selectList items",
-                        select_types.len(),
-                        items.len()
-                    )));
-                }
-                (OutputContract::Items, expressions(items, "selectList")?)
+            Some(Json::Array(items)) if items.len() != select_types.len() => {
+                return Err(UdfError::User(format!(
+                    "the pushdown request declares {} selectListDataTypes entries for {} selectList items",
+                    select_types.len(),
+                    items.len()
+                )));
             }
-            Some(_) => {
-                return Err(UdfError::User(
-                    "the pushdown request's selectList is neither an array nor absent".into(),
-                ));
-            }
+            Some(_) => (OutputContract::Items, node.list("selectList")?),
         };
-        let limit = present(&json, "limit")
-            .map(|limit| object(limit, "limit"))
-            .transpose()?;
+        let limit = node.optional_field("limit")?;
+        let limit_field = |key| limit.as_ref().map(|limit| limit.whole_number(key));
         let mut request = Self {
-            from: present(&json, "from")
-                .map(|from| parse_from(from, "from"))
+            from: node
+                .optional_field("from")?
+                .map(|from| parse_from(&from))
                 .transpose()?,
             select_list,
             select_types,
             output,
-            filter: optional_expression(&json, "filter")?,
-            group_by: match present(&json, "groupBy") {
-                None => Vec::new(),
-                Some(Json::Array(keys)) => expressions(keys, "groupBy")?,
-                Some(_) => return Err(invalid_field("groupBy", "is not an array")),
-            },
-            having: optional_expression(&json, "having")?,
-            order_by: match present(&json, "orderBy") {
-                None => Vec::new(),
-                Some(Json::Array(elements)) => elements
-                    .iter()
-                    .enumerate()
-                    .map(|(i, element)| sort_element(element, &format!("orderBy[{i}]")))
-                    .collect::<Result<_, _>>()?,
-                Some(_) => return Err(invalid_field("orderBy", "is not an array")),
-            },
-            limit: limit
-                .map(|limit| whole_number(limit, "limit", "numElements"))
-                .transpose()?
-                .flatten(),
-            offset: limit
-                .map(|limit| whole_number(limit, "limit", "offset"))
-                .transpose()?
-                .flatten()
-                .unwrap_or(0),
+            filter: node.optional_child("filter")?,
+            group_by: node.list("groupBy")?,
+            having: node.optional_child("having")?,
+            order_by: node
+                .objects("orderBy")?
+                .iter()
+                .map(sort_element)
+                .collect::<Result<_, _>>()?,
+            limit: limit_field("numElements").transpose()?.flatten(),
+            offset: limit_field("offset").transpose()?.flatten().unwrap_or(0),
             aggregation_type,
         };
         request.drop_constant_sort_keys();
@@ -526,120 +487,45 @@ impl PushdownRequest {
     }
 }
 
-/// A key's value, a JSON null counting as absent.
-fn present<'a>(json: &'a Json, key: &str) -> Option<&'a Json> {
-    json.get(key).filter(|value| !value.is_null())
-}
-
-fn object<'a>(node: &'a Json, path: &str) -> Result<&'a Map<String, Json>, UdfError> {
-    node.as_object()
-        .ok_or_else(|| invalid_field(path, "is not an object"))
-}
-
-fn text(fields: &Map<String, Json>, path: &str, key: &str) -> Result<String, UdfError> {
-    match fields.get(key) {
-        Some(Json::String(value)) => Ok(value.clone()),
-        None | Some(Json::Null) => Err(invalid_field(&format!("{path}.{key}"), "is missing")),
-        Some(_) => Err(invalid_field(&format!("{path}.{key}"), "is not a string")),
-    }
-}
-
-/// `None` when the key is absent.
-fn whole_number(
-    fields: &Map<String, Json>,
-    path: &str,
-    key: &str,
-) -> Result<Option<u64>, UdfError> {
-    match fields.get(key) {
-        None | Some(Json::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| invalid_field(&format!("{path}.{key}"), "is not a whole number")),
-    }
-}
-
-fn flag(fields: &Map<String, Json>, path: &str, key: &str) -> Result<bool, UdfError> {
-    match fields.get(key) {
-        Some(Json::Bool(value)) => Ok(*value),
-        None | Some(Json::Null) => Err(invalid_field(&format!("{path}.{key}"), "is missing")),
-        Some(_) => Err(invalid_field(&format!("{path}.{key}"), "is not a boolean")),
-    }
-}
-
-fn expressions(items: &[Json], path: &str) -> Result<Vec<Expr>, UdfError> {
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| parse_expression(item, &format!("{path}[{i}]")))
-        .collect()
-}
-
-fn optional_expression(json: &Json, key: &str) -> Result<Option<Expr>, UdfError> {
-    present(json, key)
-        .map(|node| parse_expression(node, key))
-        .transpose()
-}
-
-fn sort_element(element: &Json, path: &str) -> Result<SortElement, UdfError> {
-    let fields = object(element, path)?;
-    let expression = fields
-        .get("expression")
-        .filter(|node| !node.is_null())
-        .ok_or_else(|| invalid_field(&format!("{path}.expression"), "is missing"))?;
+fn sort_element(element: &RequestNode) -> Result<SortElement, UdfError> {
     Ok(SortElement {
-        expression: parse_expression(expression, &format!("{path}.expression"))?,
-        ascending: flag(fields, path, "isAscending")?,
-        nulls_last: flag(fields, path, "nullsLast")?,
+        expression: element.child("expression")?,
+        ascending: element.flag("isAscending")?,
+        nulls_last: element.flag("nullsLast")?,
     })
 }
 
-fn parse_from(node: &Json, path: &str) -> Result<FromClause, UdfError> {
-    let fields = object(node, path)?;
-    match fields.get("type").and_then(Json::as_str) {
-        Some("table") => Ok(FromClause::Table {
-            name: text(fields, path, "name")?,
-            alias: match fields.get("alias") {
-                None | Some(Json::Null) => None,
-                Some(Json::String(alias)) => Some(alias.clone()),
-                Some(_) => return Err(invalid_field(&format!("{path}.alias"), "is not a string")),
-            },
+fn parse_from(node: &RequestNode) -> Result<FromClause, UdfError> {
+    match node.text("type")? {
+        "table" => Ok(FromClause::Table {
+            name: node.text("name")?.to_string(),
+            alias: node.optional_text("alias")?.map(str::to_string),
         }),
-        Some("join") => {
-            let kind = match text(fields, path, "join_type")?.as_str() {
+        "join" => {
+            let kind = match node.text("join_type")? {
                 "inner" => JoinKind::Inner,
                 "left_outer" => JoinKind::LeftOuter,
                 "right_outer" => JoinKind::RightOuter,
                 "full_outer" => JoinKind::FullOuter,
                 other => {
-                    return Err(invalid_field(
-                        &format!("{path}.join_type"),
+                    return Err(node.invalid(
+                        "join_type",
                         &format!("names the join type {other}, which the adapter does not plan"),
                     ));
                 }
             };
-            let side = |key: &str| {
-                let side = fields
-                    .get(key)
-                    .ok_or_else(|| invalid_field(&format!("{path}.{key}"), "is missing"))?;
-                parse_from(side, &format!("{path}.{key}")).map(Box::new)
-            };
-            let condition = fields
-                .get("condition")
-                .filter(|node| !node.is_null())
-                .ok_or_else(|| invalid_field(&format!("{path}.condition"), "is missing"))?;
+            let side = |key| parse_from(&node.field(key)?).map(Box::new);
             Ok(FromClause::Join {
                 kind,
                 left: side("left")?,
                 right: side("right")?,
-                condition: parse_expression(condition, &format!("{path}.condition"))?,
+                condition: node.child("condition")?,
             })
         }
-        Some(other) => Err(invalid_field(
-            &format!("{path}.type"),
+        other => Err(node.invalid(
+            "type",
             &format!("names the FROM node type {other}, which the adapter does not plan"),
         )),
-        None => Err(invalid_field(&format!("{path}.type"), "is missing")),
     }
 }
 

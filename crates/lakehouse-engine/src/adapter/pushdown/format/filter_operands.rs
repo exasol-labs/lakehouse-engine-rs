@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use vs_expression::{CompareOp, Expr, LiteralKind, Scalar};
+use vs_expression::{CompareOp, Expr, Scalar};
 
 pub(super) fn holds(op: CompareOp, ordering: Ordering) -> bool {
     match op {
@@ -37,14 +37,6 @@ pub(super) fn comparison_operands<'a>(
         return Some((column, right, comparison));
     }
     Some((column_name(right)?, left, comparison.mirrored()))
-}
-
-/// `None` when empty, since an empty IN would prune every file.
-pub(super) fn in_operands<'a>(
-    expression: &'a Expr,
-    values: &'a [Expr],
-) -> Option<(&'a str, &'a [Expr])> {
-    Some((column_name(expression)?, operands(values)?))
 }
 
 /// A pruning predicate implied by the filter node it translates. Only an exact one may be negated,
@@ -138,20 +130,15 @@ pub(super) fn like_operands<'a>(
     pattern: &Expr,
     escape: Option<&Expr>,
 ) -> Option<(&'a str, LikePattern)> {
-    fn string(literal: &Expr) -> Option<&str> {
-        let literal = literal.as_literal()?;
-        (literal.kind == LiteralKind::String).then_some(())?;
-        literal.value.as_str()
-    }
     let escape = match escape {
         None => DEFAULT_LIKE_ESCAPE,
         Some(escape) => {
-            let mut chars = string(escape)?.chars();
+            let mut chars = escape.as_string_literal()?.chars();
             let escape = chars.next()?;
             chars.next().is_none().then_some(escape)?
         }
     };
-    let pattern = LikePattern::parse(string(pattern)?, escape)?;
+    let pattern = LikePattern::parse(pattern.as_string_literal()?, escape)?;
     Some((column_name(expression)?, pattern))
 }
 

@@ -120,11 +120,7 @@ fn raw_bytes(column: &ColumnRef) -> Expr {
 /// Only lowercase hex of whole bytes names a byte string: Exasol compares text case-sensitively,
 /// and the column never renders an uppercase digit. An empty string is Exasol's NULL.
 fn byte_literal(node: &Expr, layout: BinaryLayout) -> Option<Expr> {
-    let literal = node.as_literal()?;
-    if literal.kind != LiteralKind::String {
-        return None;
-    }
-    let digits = literal.value.as_str()?;
+    let digits = node.as_string_literal()?;
     if digits.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }

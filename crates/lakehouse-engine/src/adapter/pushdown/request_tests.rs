@@ -1,12 +1,18 @@
 use super::*;
+use crate::adapter::pushdown::test_support::user_message;
 use serde_json::json;
 
-fn request(fields: Json) -> PushdownRequest {
-    let mut json = json!({"selectListDataTypes": []});
+/// `base` with each of `fields` set.
+fn with(mut base: Json, fields: Json) -> Json {
     for (key, value) in fields.as_object().expect("fields are an object") {
-        json[key] = value.clone();
+        base[key] = value.clone();
     }
-    PushdownRequest::parse(json).expect("the fixture parses")
+    base
+}
+
+fn request(fields: Json) -> PushdownRequest {
+    PushdownRequest::parse(&with(json!({"selectListDataTypes": []}), fields))
+        .expect("the fixture parses")
 }
 
 #[test]
@@ -41,25 +47,15 @@ fn a_json_null_clause_is_an_absent_clause() {
 fn a_malformed_request_fails_naming_its_field() {
     let column = json!({"type": "column", "name": "ID", "tableName": "T"});
     let table = json!({"type": "table", "name": "T"});
+    let pushdown = |fields: Json| {
+        let pushdown = with(json!({"selectListDataTypes": [], "from": table}), fields);
+        json!({"pushdownRequest": pushdown})
+    };
     let join = |fields: Json| {
-        let mut join = json!({
+        let join = json!({
             "type": "join", "join_type": "inner", "left": table, "right": table, "condition": column,
         });
-        for (key, value) in fields.as_object().expect("fields are an object") {
-            if value.is_null() {
-                join.as_object_mut().expect("a join").remove(key);
-            } else {
-                join[key] = value.clone();
-            }
-        }
-        json!({"pushdownRequest": {"selectListDataTypes": [], "from": join}})
-    };
-    let pushdown = |fields: Json| {
-        let mut pushdown = json!({"selectListDataTypes": [], "from": table});
-        for (key, value) in fields.as_object().expect("fields are an object") {
-            pushdown[key] = value.clone();
-        }
-        json!({"pushdownRequest": pushdown})
+        pushdown(json!({"from": with(join, fields)}))
     };
     let sort = |element: Json| pushdown(json!({"orderBy": [element]}));
     let cases = [
@@ -135,22 +131,7 @@ fn a_malformed_request_fails_naming_its_field() {
         ),
     ];
     for (request, expected) in cases {
-        match AdapterRequest::parse(&request) {
-            Err(UdfError::User(message)) => assert_eq!(message, expected, "{request}"),
-            other => panic!("{request} must fail with {expected:?}, got {other:?}"),
-        }
-    }
-}
-
-/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
-#[test]
-fn an_invalid_select_list_type_fails_naming_its_entry() {
-    let request = json!({"selectListDataTypes": [{"type": "DECIMAL", "precision": 18, "scale": 0}, {"type": "char", "size": 2001}]});
-    match PushdownRequest::parse(request) {
-        Err(UdfError::User(message)) => assert!(
-            message.starts_with("the pushdown request's selectListDataTypes[1] is invalid: "),
-            "{message}"
-        ),
-        other => panic!("the second entry must fail, got {other:?}"),
+        let error = AdapterRequest::parse(&request).expect_err(&format!("{request} must fail"));
+        assert_eq!(user_message(error), expected, "{request}");
     }
 }

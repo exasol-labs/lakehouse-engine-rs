@@ -669,27 +669,6 @@ fn exasol_dialect_renders_a_varchar_ascii_target() {
 }
 
 #[test]
-fn renders_cast_nested_function_scalar_defensive() {
-    let expr = json!({
-        "type": "function_scalar",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "VARCHAR", "size": 100}
-    });
-    assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
-}
-
-#[test]
-fn unsupported_node_returns_error() {
-    let expr = json!({"type": "fn_sum", "operands": []});
-    let err = render_expression(&expr).unwrap_err();
-    assert!(
-        err.to_string().contains("fn_sum"),
-        "error must name the unsupported type: {err}"
-    );
-}
-
-#[test]
 fn a_null_scan_filter_renders_as_false() {
     for filter in [bool_lit(false), null_lit()] {
         assert_eq!(scan_filter(&filter).unwrap(), "FALSE");
@@ -1042,28 +1021,13 @@ fn renders_concat_single_argument() {
 }
 
 #[test]
-fn concat_without_a_renderable_argument_errors_in_the_datafusion_dialect() {
-    let cases = [
-        (
-            json!({"type": "function_scalar", "name": "CONCAT"}),
-            "function_scalar CONCAT requires at least 1 argument, got 0",
-        ),
-        (
-            scalar_fn("CONCAT", []),
-            "function_scalar CONCAT requires at least 1 argument, got 0",
-        ),
-        (
-            scalar_fn("CONCAT", [col("a"), Json::Null]),
-            "the pushdown request's expression.arguments[1] is not an expression node",
-        ),
-    ];
-    for (expr, expected) in cases {
-        assert_eq!(
-            render_expression(&expr).unwrap_err().to_string(),
-            expected,
-            "{expr}"
-        );
-    }
+fn concat_without_arguments_errors_in_the_datafusion_dialect() {
+    assert_eq!(
+        render_expression(&scalar_fn("CONCAT", []))
+            .unwrap_err()
+            .to_string(),
+        "function_scalar CONCAT requires at least 1 argument, got 0"
+    );
 }
 
 #[test]
@@ -1156,29 +1120,18 @@ fn renders_nested_greatest_guard_referencing_the_inner_case_twice() {
 }
 
 #[test]
-fn renders_greatest_least_empty_argument_list_errors() {
+fn greatest_and_least_without_arguments_error() {
     for name in ["GREATEST", "LEAST"] {
-        let expr = scalar_fn(name, []);
-        assert!(
-            render_expression(&expr).is_err(),
-            "{name} empty args must raise"
-        );
-    }
-}
-
-#[test]
-fn greatest_least_without_arguments_key_errors() {
-    for name in ["GREATEST", "LEAST"] {
-        let expr = json!({
-            "type": "function_scalar",
-            "name": name
-        });
-        let err = render_expression(&expr)
-            .expect_err(&format!("{name} without arguments key must raise"));
-        assert!(
-            err.to_string().contains("requires at least 1 argument"),
-            "{name} error should name its missing arguments, got: {err}"
-        );
+        for expr in [
+            scalar_fn(name, []),
+            json!({"type": "function_scalar", "name": name}),
+        ] {
+            assert_eq!(
+                render_expression(&expr).unwrap_err().to_string(),
+                format!("function_scalar {name} requires at least 1 argument"),
+                "{expr}"
+            );
+        }
     }
 }
 
@@ -1478,17 +1431,6 @@ fn regexp_scalar_functions_decline_in_the_datafusion_dialect() {
 }
 
 #[test]
-fn regexp_like_predicate_declines_in_the_datafusion_dialect() {
-    let expr = json!({
-        "type": "predicate_like_regexp",
-        "expression": col("name"),
-        "pattern": str_lit("^A.*")
-    });
-    let expected = "the pushdown request's expression.type names the node type predicate_like_regexp, which the adapter does not translate";
-    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
-    assert!(scan_filter(&expr).is_err());
-}
-#[test]
 fn bitwise_operator_functions_fall_through() {
     // Exasol's bit functions use an unsigned 64-bit domain: DataFusion's bitwise operators
     // are signed (`>>` sign-extends) and the rest have no builtin (#108).
@@ -1523,8 +1465,8 @@ fn bitwise_operator_functions_fall_through() {
 
 #[test]
 fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
-    // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
-    // declaration checked before `arguments`, and a missing `name`.
+    // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup and
+    // declaration checked before `arguments`.
     let cases = [
         ("SUBSTRING", scalar_fn("SUBSTRING", [col("a")])),
         ("SOUNDEX", scalar_fn("SOUNDEX", [col("a")])),
@@ -1534,12 +1476,6 @@ fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
             json!({"type": "function_scalar", "name": "SUBSTRING"}),
         ),
     ];
-    assert_eq!(
-        render_expression(&json!({"type": "function_scalar", "arguments": [col("a")]}))
-            .unwrap_err()
-            .to_string(),
-        "the pushdown request's expression.name is missing"
-    );
     for (declined_name, expr) in cases {
         let expected = format!("unsupported scalar function: {declined_name}");
         assert_eq!(

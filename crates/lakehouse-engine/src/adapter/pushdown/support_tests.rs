@@ -2299,7 +2299,9 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "an invalid entry",
             one_item().select_list_data_types(Some(serde_json::json!([invalid_entry]))),
-            Err(invalid_entry.to_string()),
+            Err(format!(
+                "selectListDataTypes[0] is invalid: invalid Exasol dataType {invalid_entry}"
+            )),
         ),
         (
             "more entries than items",
@@ -2337,7 +2339,7 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "a selectList that is no array",
             pushdown_request("T", &columns).field("selectList", "*"),
-            Err("neither an array nor absent".into()),
+            Err("selectList is not an array".into()),
         ),
         (
             "an empty selectList beside an aggregationType",
@@ -2349,7 +2351,7 @@ fn select_list_data_types_check_answers_per_request_shape() {
     ];
     for (shape, request, expected) in cases {
         // Unchecked: several shapes are ones Exasol never sends, which the parse must refuse.
-        let parsed = PushdownRequest::parse(request.build_unchecked().0["pushdownRequest"].clone())
+        let parsed = PushdownRequest::parse(&request.build_unchecked().0["pushdownRequest"])
             .map(|parsed| (parsed.output(), parsed.select_types().to_vec()));
         match (parsed, expected) {
             (Ok(parsed), Ok(expected)) => assert_eq!(parsed, expected, "{shape}"),

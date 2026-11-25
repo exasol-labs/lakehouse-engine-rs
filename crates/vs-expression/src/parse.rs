@@ -12,7 +12,7 @@ use crate::expr::{
 
 /// The node at `path` of the pushdown request, such as `filter` or `selectList[2]`.
 pub fn parse_expression(node: &Json, path: &str) -> Result<Expr, UdfError> {
-    Node::at(node, path)?.expr()
+    RequestNode::at(node, path)?.expr()
 }
 
 /// A malformed request: what is wrong with the field at `path`.
@@ -20,39 +20,55 @@ pub fn invalid_field(path: &str, problem: &str) -> UdfError {
     UdfError::User(format!("the pushdown request's {path} {problem}"))
 }
 
-/// One JSON object of the request and where it sits.
-struct Node<'a> {
+/// One JSON object of the request and where it sits; every field it reads fails naming its path.
+/// The request root sits at the empty path, so its fields read by their bare key.
+pub struct RequestNode<'a> {
     map: &'a Map<String, Json>,
-    path: &'a str,
+    path: String,
 }
 
-impl<'a> Node<'a> {
-    fn at(node: &'a Json, path: &'a str) -> Result<Self, UdfError> {
+impl<'a> RequestNode<'a> {
+    fn at(node: &'a Json, path: &str) -> Result<Self, UdfError> {
+        Self::of(node, path, "is not an expression node")
+    }
+
+    /// The object `node` at `path`, such as `from` or `orderBy[0]`.
+    pub fn object(node: &'a Json, path: &str) -> Result<Self, UdfError> {
+        Self::of(node, path, "is not an object")
+    }
+
+    fn of(node: &'a Json, path: &str, problem: &str) -> Result<Self, UdfError> {
         match node {
-            Json::Object(map) => Ok(Self { map, path }),
-            _ => Err(invalid_field(path, "is not an expression node")),
+            Json::Object(map) => Ok(Self {
+                map,
+                path: path.to_string(),
+            }),
+            _ => Err(invalid_field(path, problem)),
         }
     }
 
     fn field_path(&self, key: &str) -> String {
-        format!("{}.{key}", self.path)
+        match self.path.as_str() {
+            "" => key.to_string(),
+            path => format!("{path}.{key}"),
+        }
     }
 
-    fn invalid(&self, key: &str, problem: &str) -> UdfError {
+    pub fn invalid(&self, key: &str, problem: &str) -> UdfError {
         invalid_field(&self.field_path(key), problem)
     }
 
     /// `None` for an absent or JSON-null field.
-    fn get(&self, key: &str) -> Option<&'a Json> {
+    pub fn get(&self, key: &str) -> Option<&'a Json> {
         self.map.get(key).filter(|value| !value.is_null())
     }
 
-    fn text(&self, key: &str) -> Result<&'a str, UdfError> {
+    pub fn text(&self, key: &str) -> Result<&'a str, UdfError> {
         self.optional_text(key)?
             .ok_or_else(|| self.invalid(key, "is missing"))
     }
 
-    fn optional_text(&self, key: &str) -> Result<Option<&'a str>, UdfError> {
+    pub fn optional_text(&self, key: &str) -> Result<Option<&'a str>, UdfError> {
         match self.get(key) {
             None => Ok(None),
             Some(Json::String(text)) => Ok(Some(text)),
@@ -60,7 +76,47 @@ impl<'a> Node<'a> {
         }
     }
 
-    fn child(&self, key: &str) -> Result<Expr, UdfError> {
+    pub fn flag(&self, key: &str) -> Result<bool, UdfError> {
+        match self.get(key) {
+            None => Err(self.invalid(key, "is missing")),
+            Some(Json::Bool(value)) => Ok(*value),
+            Some(_) => Err(self.invalid(key, "is not a boolean")),
+        }
+    }
+
+    /// `None` when the field is absent.
+    pub fn whole_number(&self, key: &str) -> Result<Option<u64>, UdfError> {
+        self.get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| self.invalid(key, "is not a whole number"))
+            })
+            .transpose()
+    }
+
+    /// The object at `key`, which must be present.
+    pub fn field(&self, key: &str) -> Result<Self, UdfError> {
+        self.optional_field(key)?
+            .ok_or_else(|| self.invalid(key, "is missing"))
+    }
+
+    pub fn optional_field(&self, key: &str) -> Result<Option<Self>, UdfError> {
+        self.get(key)
+            .map(|value| Self::object(value, &self.field_path(key)))
+            .transpose()
+    }
+
+    /// The objects of the array at `key`; an absent array is empty.
+    pub fn objects(&self, key: &str) -> Result<Vec<Self>, UdfError> {
+        self.array(key)?
+            .iter()
+            .enumerate()
+            .map(|(i, item)| Self::object(item, &format!("{}[{i}]", self.field_path(key))))
+            .collect()
+    }
+
+    pub fn child(&self, key: &str) -> Result<Expr, UdfError> {
         let value = self
             .get(key)
             .ok_or_else(|| self.invalid(key, "is missing"))?;
@@ -71,24 +127,27 @@ impl<'a> Node<'a> {
         self.child(key).map(Box::new)
     }
 
-    fn optional_child(&self, key: &str) -> Result<Option<Box<Expr>>, UdfError> {
+    pub fn optional_child(&self, key: &str) -> Result<Option<Expr>, UdfError> {
         self.get(key)
-            .map(|value| parse_expression(value, &self.field_path(key)).map(Box::new))
+            .map(|value| parse_expression(value, &self.field_path(key)))
             .transpose()
     }
 
-    /// An absent array is empty.
-    fn list(&self, key: &str) -> Result<Vec<Expr>, UdfError> {
-        let items = match self.get(key) {
-            None => return Ok(Vec::new()),
-            Some(Json::Array(items)) => items,
-            Some(_) => return Err(self.invalid(key, "is not an array")),
-        };
-        items
+    /// The expressions of the array at `key`; an absent array is empty.
+    pub fn list(&self, key: &str) -> Result<Vec<Expr>, UdfError> {
+        self.array(key)?
             .iter()
             .enumerate()
             .map(|(i, item)| parse_expression(item, &format!("{}[{i}]", self.field_path(key))))
             .collect()
+    }
+
+    fn array(&self, key: &str) -> Result<&'a [Json], UdfError> {
+        match self.get(key) {
+            None => Ok(&[]),
+            Some(Json::Array(items)) => Ok(items),
+            Some(_) => Err(self.invalid(key, "is not an array")),
+        }
     }
 
     fn required_list(&self, key: &str) -> Result<Vec<Expr>, UdfError> {
@@ -145,7 +204,7 @@ impl<'a> Node<'a> {
             "predicate_like" => Expr::Like {
                 expression: self.boxed("expression")?,
                 pattern: self.boxed("pattern")?,
-                escape: self.optional_child("escapeChar")?,
+                escape: self.optional_child("escapeChar")?.map(Box::new),
             },
             "function_scalar" => self.scalar()?,
             "function_scalar_cast" => self.cast()?,
@@ -202,7 +261,7 @@ impl<'a> Node<'a> {
 
     fn case(&self) -> Result<Expr, UdfError> {
         let case = CaseExpr {
-            basis: self.optional_child("basis")?,
+            basis: self.optional_child("basis")?.map(Box::new),
             whens: self.required_list("arguments")?,
             results: self.required_list("results")?,
         };
@@ -240,7 +299,7 @@ impl<'a> Node<'a> {
             return Ok(None);
         };
         let path = self.field_path(key);
-        let behavior = Node::at(value, &path)?;
+        let behavior = RequestNode::at(value, &path)?;
         Ok(Some(match behavior.text("type")? {
             "NULL" => JsonBehavior::Null,
             "ERROR" => JsonBehavior::Error,

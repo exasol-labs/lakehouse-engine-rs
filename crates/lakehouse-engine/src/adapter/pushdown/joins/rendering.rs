@@ -286,11 +286,12 @@ fn collect_leg_column_names(
     leg: usize,
     out: &mut std::collections::HashSet<String>,
 ) {
-    expr.walk_columns(&mut |column| {
-        if legs.leg(column) == leg {
-            out.insert(column.ascii_upper_name());
-        }
-    });
+    out.extend(
+        expr.columns()
+            .into_iter()
+            .filter(|column| legs.leg(column) == leg)
+            .map(Column::ascii_upper_name),
+    );
 }
 
 /// Keyed on table name, not leg: its caller checks format-reader refusals, which belong to
@@ -299,19 +300,18 @@ pub(super) fn possible_side_column_names(
     pushdown: &PushdownRequest,
     table_name: &str,
 ) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    for tree in pushdown.expressions(&Clause::ALL) {
-        tree.walk_columns(&mut |column| {
-            if column
+    pushdown
+        .expressions(&Clause::ALL)
+        .into_iter()
+        .flat_map(Expr::columns)
+        .filter(|column| {
+            column
                 .table_name
                 .as_deref()
                 .is_some_and(|tn| tn.eq_ignore_ascii_case(table_name))
-            {
-                names.insert(column.ascii_upper_name());
-            }
-        });
-    }
-    names
+        })
+        .map(Column::ascii_upper_name)
+        .collect()
 }
 
 /// Leg `leg`'s columns that `values` name, in declaration order. CROSS-FOLD: `full_cols` is

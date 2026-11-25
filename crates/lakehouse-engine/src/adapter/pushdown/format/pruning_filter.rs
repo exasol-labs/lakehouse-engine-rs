@@ -7,7 +7,7 @@ use vs_expression::{CompareOp, Expr};
 
 use super::filter_operands::{
     LikeBound, LikePattern, Translated, column_name, comparison_operands, fold_and, fold_or,
-    in_operands, like_operands, operands,
+    like_operands, operands,
 };
 use super::literal::exact_literal;
 
@@ -98,8 +98,8 @@ impl<C: Clone> PruningFilter<C> {
                 }
             }
             Expr::InList { expression, values } => {
-                let (column, arguments) = in_operands(expression, values)?;
-                let (column, data_type) = resolve(column)?;
+                let arguments = operands(values)?;
+                let (column, data_type) = resolve(column_name(expression)?)?;
                 let data_type = data_type?;
                 Self::InList {
                     literals: arguments
