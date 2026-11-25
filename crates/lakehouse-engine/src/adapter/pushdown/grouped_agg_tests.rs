@@ -6,13 +6,15 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, CommonScanSpec, ScanStorage};
 use crate::scan::test_support::WithFiles;
+use serde_json::Value as Json;
 use vs_expression::SqlFragment;
 
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = agg_item("SUM", Some("x"), false);
     let plans = vec![
-        parse_agg_item(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan"),
+        parse_agg_item(&ast(&sum_node), typed_scan(&AGGREGATED))
+            .expect("SUM(x) must parse to a plan"),
     ];
     let node = cast_to(
         ExasolType::Char {
@@ -22,7 +24,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         sum_node,
     );
     let sql = render_scalar_over_merge(
-        &node,
+        &ast(&node),
         &plans,
         &merge_select_items(&plans),
         typed_scan(&AGGREGATED),
@@ -48,7 +50,8 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = agg_item("SUM", Some("x"), false);
     let plans = vec![
-        parse_agg_item(&sum_node, typed_scan(&AGGREGATED)).expect("SUM(x) must parse to a plan"),
+        parse_agg_item(&ast(&sum_node), typed_scan(&AGGREGATED))
+            .expect("SUM(x) must parse to a plan"),
     ];
     let char_type = ExasolType::Char {
         size: 20,
@@ -56,7 +59,7 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     };
     let node = cast_to(char_type, cast_to(char_type, sum_node));
     let sql = render_scalar_over_merge(
-        &node,
+        &ast(&node),
         &plans,
         &merge_select_items(&plans),
         typed_scan(&AGGREGATED),
@@ -391,7 +394,7 @@ fn having_over_merge(
         aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
-    render_having_over_merge(node, &scope, scan_over(col_types))
+    render_having_over_merge(&ast(node), &scope, scan_over(col_types))
 }
 
 /// A HAVING over `plans` alone, each merged by its uncast partial merge, with no group key.
@@ -407,7 +410,7 @@ fn having_over_plans(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
         aggregates: &aggregates,
         group_keys: &[],
     };
-    render_having_over_merge(node, &scope, typed_scan(&AGGREGATED))
+    render_having_over_merge(&ast(node), &scope, typed_scan(&AGGREGATED))
 }
 
 #[test]
@@ -542,7 +545,7 @@ fn detect_group_by_mixed_select_falls_back() {
     .count_star()
     .build_scanned();
     assert!(
-        scan.expression(&year).is_some(),
+        scan.expression(&ast(&year)).is_some(),
         "the scan computes YEAR(TS), so only the select-list rule may decline it"
     );
     assert!(
@@ -1514,15 +1517,14 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         "a nested COUNT(DISTINCT) must decline the grouped partial/merge path"
     );
 
-    let all_cols = involved_columns(&request, |tables| tables.first())
-        .unwrap()
-        .types;
+    let parsed = adapter_request(&request);
+    let all_cols = involved_columns(parsed.involved_tables().first()).types;
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
     let sql = build_qualified_single_table_fallback_sql(
-        &request,
+        &parsed,
         &pushdown,
         fan_out_spec,
         &column_types(&all_cols),
@@ -2252,7 +2254,7 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
         [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
     );
     assert!(
-        classify_scalar_over_aggregate(&sqrt_over_stat, typed_scan(&AGGREGATED)).is_none(),
+        classify_scalar_over_aggregate(&ast(&sqrt_over_stat), typed_scan(&AGGREGATED)).is_none(),
         "a scalar wrapping a stat aggregate over an expression must not classify"
     );
 
@@ -2308,14 +2310,14 @@ fn numeric_aggregates_split_only_over_double_and_decimal_columns() {
         };
         for name in ["SUM", "AVG", "STDDEV", "VAR_POP"] {
             assert_eq!(
-                parse_agg_item(&agg_item(name, Some("X"), false), scan).is_some(),
+                parse_agg_item(&ast(&agg_item(name, Some("X"), false)), scan).is_some(),
                 numeric,
                 "{name} over {exa_type}"
             );
         }
         for name in ["MIN", "MAX", "COUNT"] {
             assert!(
-                parse_agg_item(&agg_item(name, Some("X"), false), scan).is_some(),
+                parse_agg_item(&ast(&agg_item(name, Some("X"), false)), scan).is_some(),
                 "{name} over {exa_type} needs no numeric type"
             );
         }
@@ -2334,12 +2336,12 @@ fn numeric_aggregates_over_a_text_or_boolean_expression_decline() {
     ];
     for argument in cases {
         let sum = agg_item_expr("SUM", argument.clone(), false);
-        assert!(parse_agg_item(&sum, scan).is_none(), "{sum}");
+        assert!(parse_agg_item(&ast(&sum), scan).is_none(), "{sum}");
         let avg = agg_item_expr("AVG", argument, false);
-        assert!(parse_agg_item(&avg, scan).is_none(), "{avg}");
+        assert!(parse_agg_item(&ast(&avg), scan).is_none(), "{avg}");
     }
     let number = agg_item_expr("SUM", scalar_fn("MULT", [col("I"), col("I")]), false);
-    assert!(parse_agg_item(&number, scan).is_some(), "{number}");
+    assert!(parse_agg_item(&ast(&number), scan).is_some(), "{number}");
 }
 
 /// The types Exasol declares for a select list of only keys and aggregates: each one's own type.

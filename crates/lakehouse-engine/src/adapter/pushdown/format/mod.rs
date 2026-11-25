@@ -8,7 +8,7 @@ use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogTable, ColumnSourceType, ConnectionCreds, StorageBackend, redact_error_text,
 };
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::tables::catalog_identifier_string;
@@ -24,7 +24,7 @@ mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
 mod delta_table;
-pub(super) mod filter_json;
+pub(super) mod filter_operands;
 mod iceberg;
 mod iceberg_predicate;
 mod literal;
@@ -126,9 +126,9 @@ impl ResolvedScan {
     pub async fn resolve(
         table: &dyn LoadedTable,
         declared: DeclaredSchema,
-        filter_json: Option<&Json>,
+        filter: Option<&Expr>,
     ) -> Result<Self, UdfError> {
-        let planned = table.prune(&declared, filter_json).await?;
+        let planned = table.prune(&declared, filter).await?;
         Ok(Self::new(declared, planned))
     }
 
@@ -169,7 +169,7 @@ pub trait LoadedTable: Send + Sync {
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
-        filter_json: Option<&'a Json>,
+        filter: Option<&'a Expr>,
     ) -> UdfFuture<'a, PlannedFiles>;
 }
 

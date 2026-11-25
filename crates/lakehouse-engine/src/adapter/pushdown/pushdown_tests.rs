@@ -707,7 +707,7 @@ fn dispatch_with(
 ) -> Result<Json, UdfError> {
     let pushdown = PushdownRequest::parse(pd(request))?;
     build_dispatch_sql(
-        request,
+        &AdapterRequest::parse(request)?,
         &pushdown,
         projection,
         // The dispatcher's own emission, so the wrapper routes build the fan-out it builds.
@@ -1680,7 +1680,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let pushdown = parsed_pushdown(&request);
     let columns = column_types(&guard_col_types());
     let result = build_dispatch_sql(
-        &request,
+        &adapter_request(&request),
         &pushdown,
         projection,
         &emitting(&columns),

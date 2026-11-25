@@ -4,13 +4,15 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
+use serde_json::Value as Json;
 
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
     let request = join_request(Json::Null, equi_condition());
     let pushdown = parsed_pushdown(&request);
 
-    let shape = detect_join(&request, &pushdown).expect("both legs carry an identifier note");
+    let shape = detect_join(&adapter_request(&request), &pushdown)
+        .expect("both legs carry an identifier note");
     match shape {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
@@ -18,7 +20,7 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
             assert_eq!(join.tables[1].table_name, "ORDERS");
             assert_eq!(join.tables[0].table_identifier, "lh.customer");
             assert_eq!(join.tables[1].table_identifier, "lh.orders");
-            assert_eq!(join.conditions, vec![equi_condition()]);
+            assert_eq!(join.conditions, vec![ast(&equi_condition())]);
         }
         other => panic!("expected Join, got {other:?}"),
     }
@@ -27,7 +29,7 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
 #[test]
 fn plain_single_table_request_is_not_a_join() {
     let request = nq4_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
+    let shape = detect_join(&adapter_request(&request), &parsed_pushdown(&request))
         .expect("not a join, no identifier lookup");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
@@ -45,12 +47,12 @@ fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
         ),
     ]);
     let request = join_request(Json::Null, condition.clone());
-    match detect_join(&request, &parsed_pushdown(&request))
+    match detect_join(&adapter_request(&request), &parsed_pushdown(&request))
         .expect("a join with a non-equi conjunct is detected")
     {
         JoinShape::Join(join) => {
             assert_eq!(join.tables.len(), 2);
-            assert_eq!(join.conditions, vec![condition]);
+            assert_eq!(join.conditions, vec![ast(&condition)]);
         }
         other => panic!("expected Join, got {other:?}"),
     }
@@ -59,7 +61,7 @@ fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
 #[test]
 fn three_table_inner_join_is_unified_join() {
     let request = three_table_join_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
+    let shape = detect_join(&adapter_request(&request), &parsed_pushdown(&request))
         .expect("every leaf carries an identifier note");
     match shape {
         JoinShape::Join(join) => {
@@ -117,7 +119,7 @@ fn a_leg_without_an_identifier_note_is_err() {
         .unwrap()
         .remove("adapterNotes");
     let err = detect_join(
-        &request,
+        &adapter_request(&request),
         &PushdownRequest::parse(request["pushdownRequest"].clone()).expect("the request parses"),
     )
     .expect_err("LINEITEM has no note: must be Err, not a decline");
@@ -131,7 +133,7 @@ fn a_leg_without_an_identifier_note_is_err() {
 #[test]
 fn four_table_inner_join_is_unified_join() {
     let request = nq3_join_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
+    let shape = detect_join(&adapter_request(&request), &parsed_pushdown(&request))
         .expect("every leaf carries an identifier note");
     match shape {
         JoinShape::Join(join) => {

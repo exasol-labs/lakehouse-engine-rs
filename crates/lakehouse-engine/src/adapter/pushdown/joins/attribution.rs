@@ -1,12 +1,11 @@
-use serde_json::Value as Json;
 use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
-use crate::adapter::pushdown::request::{Clause, PushdownRequest};
+use crate::adapter::pushdown::request::{AdapterRequest, Clause, PushdownRequest};
 use crate::adapter::pushdown::support::InvolvedColumns;
 use crate::scan::spec::relation_alias;
 use exasol_udf_sdk::error::UdfError;
-use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
+use vs_expression::{Column, Expr};
 
 /// The invariant every leg lookup after [`JoinLegs::ensure_columns_declared`] relies on.
 const BOUND: &str = "ensure_columns_declared binds every column of the request to one leg";
@@ -49,12 +48,12 @@ impl JoinLegs {
     }
 
     /// The request's one table is leg 0: Exasol sends a request with no join for one table.
-    pub(super) fn for_single_scan(request: &Json) -> Self {
+    pub(super) fn for_single_scan(request: &AdapterRequest) -> Self {
         let keys = request
-            .pointer("/involvedTables/0/name")
-            .and_then(Json::as_str)
-            .map(|name| LegKey {
-                table_name: name.to_string(),
+            .involved_tables()
+            .first()
+            .map(|table| LegKey {
+                table_name: table.name.clone(),
                 table_alias: None,
                 leg: 0,
             })
@@ -69,15 +68,15 @@ impl JoinLegs {
 
     /// The leg of a column of the request. Panics on a column that [`Self::ensure_columns_declared`]
     /// would have rejected.
-    pub(super) fn leg(&self, column: ColumnNode<'_>) -> usize {
+    pub(super) fn leg(&self, column: &Column) -> usize {
         self.leg_of(column).expect(BOUND)
     }
 
     /// The sole answer to leg identity; no other module reads `tableName` for it. `None` only for
     /// a request Exasol does not send: a column with no `tableName`, a `tableName` the query does
     /// not read, or a self-join `tableAlias` that names no occurrence.
-    fn leg_of(&self, column: ColumnNode<'_>) -> Option<usize> {
-        let table_name = column.table_name?;
+    fn leg_of(&self, column: &Column) -> Option<usize> {
+        let table_name = column.table_name.as_deref()?;
         let matching: Vec<&LegKey> = self
             .keys
             .iter()
@@ -89,14 +88,14 @@ impl JoinLegs {
         }
         matching
             .iter()
-            .find(|key| key.table_alias.as_deref() == column.table_alias)
+            .find(|key| key.table_alias == column.table_alias)
             .map(|key| key.leg)
     }
 
     /// The legs whose columns `expr` reads, empty for an expression that reads no column.
-    pub(super) fn legs_referenced(&self, expr: &Json) -> BTreeSet<usize> {
+    pub(super) fn legs_referenced(&self, expr: &Expr) -> BTreeSet<usize> {
         let mut legs = BTreeSet::new();
-        walk_column_nodes(expr, &mut |column| {
+        expr.walk_columns(&mut |column| {
             legs.insert(self.leg(column));
         });
         legs
@@ -106,16 +105,16 @@ impl JoinLegs {
     /// name is ambiguous once a table occurs on several legs. Apply it once, to a raw request
     /// tree: an `LHS_T{leg}` alias matches no leaf alias, so a self-join's output does not
     /// qualify again.
-    pub(super) fn qualify(&self, expr: &Json) -> Json {
-        rewrite_table_aliases(expr, &mut |column| self.leg_alias(self.leg(column)))
+    pub(super) fn qualify(&self, expr: &Expr) -> Expr {
+        expr.with_table_aliases(&mut |column| self.leg_alias(self.leg(column)))
     }
 
     /// The request with its select list, WHERE, and ORDER BY qualified by leg, as a broadcast scan
     /// renders them.
     pub(super) fn qualify_request(&self, pushdown: &PushdownRequest) -> PushdownRequest {
-        pushdown.map_clauses(
+        pushdown.map_expressions(
             &[Clause::SelectList, Clause::Filter, Clause::OrderBy],
-            |clause| self.qualify(clause),
+            |tree| self.qualify(tree),
         )
     }
 
@@ -128,8 +127,8 @@ impl JoinLegs {
         declared: &[&InvolvedColumns<'_>],
     ) -> Result<(), UdfError> {
         let mut failure = None;
-        for clause in pushdown.clauses(&Clause::ALL) {
-            walk_column_nodes(clause, &mut |column| {
+        for tree in pushdown.expressions(&Clause::ALL) {
+            tree.walk_columns(&mut |column| {
                 if failure.is_some() {
                     return;
                 }
@@ -148,10 +147,11 @@ impl JoinLegs {
 }
 
 /// Binding the column to some table anyway could return another table's values.
-fn unbound_column_error(column: ColumnNode<'_>) -> UdfError {
-    let table = column.table_name.unwrap_or_default();
+fn unbound_column_error(column: &Column) -> UdfError {
+    let table = column.table_name.as_deref().unwrap_or_default();
     let alias = column
         .table_alias
+        .as_deref()
         .map_or_else(|| "no alias".to_string(), |alias| format!("alias {alias}"));
     UdfError::User(format!(
         "the pushdown request names column {} of table {table} with {alias}, which binds no \

@@ -26,12 +26,36 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vs_expression::ExasolVersion;
 // Named, not globbed: a local helper of the same name would silently shadow a glob import.
+use vs_expression::Expr;
+pub(crate) use vs_expression::test_support::ast;
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
     cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
     is_null, like, like_escape, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
     scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
+
+/// A tree a test passes in: a JSON node, parsed as the adapter parses it, or an AST.
+pub(crate) trait Tree {
+    fn tree(&self) -> Expr;
+}
+
+impl Tree for Json {
+    fn tree(&self) -> Expr {
+        ast(self)
+    }
+}
+
+impl Tree for Expr {
+    fn tree(&self) -> Expr {
+        self.clone()
+    }
+}
+
+/// `request` as the adapter parses it. Panics on a fixture that does not parse.
+pub(crate) fn adapter_request(request: &Json) -> AdapterRequest {
+    AdapterRequest::parse(request).unwrap_or_else(|error| panic!("{}", user_message(error)))
+}
 
 /// The context the unit tests plan with: one node and one thread, unqualified UDFs, Exasol 2025.
 pub(crate) fn test_context() -> PushdownContext<'static> {
@@ -95,17 +119,19 @@ pub(crate) fn scan_distribute_shards<E>(files: Vec<Vec<E>>) -> Shards<E> {
 }
 
 /// The scan's typed filter SQL, `None` when it declines.
-pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
+pub(crate) fn scan_filter_sql(filter: &impl Tree, col_types: &ColumnTypes) -> Option<String> {
     WherePlacement::single_scan(scan_over(col_types), &filter_only_request(filter)).scan_filter(0)
 }
 
 /// A `SELECT *` request whose only clause is `filter`.
-pub(crate) fn filter_only_request(filter: &Json) -> PushdownRequest {
+pub(crate) fn filter_only_request(filter: &impl Tree) -> PushdownRequest {
+    // The placeholder filter only marks the clause, which the map then replaces.
     PushdownRequest::parse(serde_json::json!({
         "selectListDataTypes": [],
-        "filter": filter,
+        "filter": {"type": "literal_bool", "value": false},
     }))
     .expect("a filter-only request parses")
+    .map_expressions(&[Clause::Filter], |_| filter.tree())
 }
 
 /// The deduplicated partial plans of a single-group select list, whatever their types.
@@ -185,7 +211,7 @@ pub(crate) fn scan_for<'c>(
     ScanTranslator::over(
         columns,
         ExasolVersion::Exasol2025,
-        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+        &pushdown.expressions(&Clause::ALL),
     )
     .unwrap_or_else(|error| panic!("{}", user_message(error)))
 }
@@ -529,9 +555,7 @@ fn involved_of<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> support::InvolvedC
 /// column.
 pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
     column_types(
-        &support::involved_columns(request, |tables| tables.first())
-            .unwrap()
-            .types,
+        &support::involved_columns(adapter_request(request).involved_tables().first()).types,
     )
 }
 
@@ -541,10 +565,11 @@ pub(crate) fn request_typed(
     request: &Json,
     sides: &[joins::ResolvedJoinSide],
 ) -> Vec<joins::ResolvedJoinSide> {
+    let request = adapter_request(request);
     sides
         .iter()
         .map(|side| {
-            let involved = joins::involved_table(request, &side.table_name).unwrap();
+            let involved = joins::involved_table(&request, &side.table_name);
             joins::ResolvedJoinSide {
                 column_types: ColumnTypes::of(
                     &involved,
@@ -678,7 +703,7 @@ pub(super) fn project_row(
     let scan = ScanTranslator::over(
         all_cols,
         ExasolVersion::Exasol2025,
-        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+        &pushdown.expressions(&Clause::ALL),
     )?;
     support::project_columns(pushdown, scan, &emitting(all_cols))
 }
@@ -742,18 +767,17 @@ pub(super) fn whole_request_emission(
     pushdown: &PushdownRequest,
     columns: &ColumnTypes,
 ) -> Result<Emitted, UdfError> {
-    single_table_emission(request, pushdown, &WherePlacement::whole(pushdown), columns)
+    single_table_emission(
+        &adapter_request(request),
+        pushdown,
+        &WherePlacement::whole(pushdown),
+        columns,
+    )
 }
 
 /// The placement production gives `request`'s WHERE over its first table.
 pub(super) fn single_scan_placement(request: &Json) -> WherePlacement {
     WherePlacement::single_scan(scan_of(request), &parsed_pushdown(request))
-}
-
-/// [`parsed_pushdown`] without the request check, for the check itself.
-fn parsed_pushdown_unchecked(request: &Json) -> PushdownRequest {
-    PushdownRequest::parse(request["pushdownRequest"].clone())
-        .expect("the fixture declares a valid selectListDataTypes")
 }
 
 /// The qualified single-table wrapper over `request` once the scan declines its whole WHERE,
@@ -767,7 +791,7 @@ pub(crate) fn declined_filter_wrapper_sql(request: &Json) -> String {
         "fixture precondition: the filter must decline, got {placement:?}"
     );
     joins::build_qualified_single_table_fallback_sql(
-        request,
+        &adapter_request(request),
         &pushdown,
         CommonScanSpec {
             storage: ScanStorage::Inline(sample_storage()),
@@ -1002,7 +1026,8 @@ pub(crate) async fn resolve_from_notes<L: LoadedTable>(
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let declared = notes.declared_schema()?;
-    ResolvedScan::resolve(&load.await?, declared, filter_json).await
+    let filter = filter_json.map(ast);
+    ResolvedScan::resolve(&load.await?, declared, filter.as_ref()).await
 }
 
 /// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.
@@ -1459,7 +1484,7 @@ pub(crate) async fn pushdown_over(
         ..base
     };
     handle_pushdown(
-        request,
+        &AdapterRequest::parse(request)?,
         &statement,
         &PermissionCheck::Off,
         &catalog,
@@ -1691,7 +1716,9 @@ pub(crate) fn pd(request: &Json) -> Json {
 /// Exasol does not send. Exasol sends a request with no join for exactly one table.
 pub(crate) fn assert_exasol_sends(request: &Json) {
     let pushdown = &request["pushdownRequest"];
-    if let Ok(JoinShape::NotAJoin) = detect_join(request, &parsed_pushdown_unchecked(request)) {
+    if let Ok(parsed) = AdapterRequest::parse(request)
+        && let Ok(JoinShape::NotAJoin) = detect_join(&parsed, parsed.pushdown())
+    {
         let tables = request["involvedTables"].as_array().map_or(0, Vec::len);
         assert_eq!(
             tables, 1,
@@ -1711,24 +1738,25 @@ pub(crate) fn assert_exasol_sends(request: &Json) {
 /// The planners' request check over `request`, as `handle_pushdown` and `plan_join` run it: over
 /// the join's legs, or over the request's one table.
 pub(crate) fn request_check(request: &Json) -> Result<(), UdfError> {
-    let pushdown = PushdownRequest::parse(request["pushdownRequest"].clone())?;
-    let (join, declared) = match detect_join(request, &pushdown)? {
+    let request = AdapterRequest::parse(request)?;
+    let pushdown = request.pushdown();
+    let (join, declared) = match detect_join(&request, pushdown)? {
         JoinShape::Join(join) => {
             let declared = join
                 .tables
                 .iter()
-                .map(|leaf| joins::involved_table(request, &leaf.table_name))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|leaf| joins::involved_table(&request, &leaf.table_name))
+                .collect::<Vec<_>>();
             (Some(join), declared)
         }
         JoinShape::NotAJoin => (
             None,
-            vec![support::involved_columns(request, |tables| tables.first())?],
+            vec![support::involved_columns(request.involved_tables().first())],
         ),
     };
     ensure_columns_declared(
-        request,
-        &pushdown,
+        &request,
+        pushdown,
         join.as_ref(),
         &declared.iter().collect::<Vec<_>>(),
     )

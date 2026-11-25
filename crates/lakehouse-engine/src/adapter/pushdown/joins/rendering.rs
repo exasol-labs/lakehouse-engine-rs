@@ -1,18 +1,11 @@
 use crate::scan::spec::{ColumnRef, ProjectionItem, relation_alias};
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
-use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ScanTyping, render_expression_exasol, strip_table_alias,
-    walk_column_nodes,
-};
+use vs_expression::{Column, ColumnTypeLookup, Expr, ScanTyping, render_expression_exasol};
 
 use super::super::context::PushdownContext;
-use super::super::request::OutputContract;
-use super::super::scalar_over_agg::substitute_subtrees;
-use super::super::support::{
-    ColumnTypes, Emitted, ScanTranslator, conjoin, flatten_conjuncts, quote_ident,
-};
+use super::super::request::{Clause, OutputContract, PushdownRequest};
+use super::super::support::{ColumnTypes, Emitted, ScanTranslator, quote_ident};
 use super::attribution::JoinLegs;
 use super::condition_filters::join_key_legs;
 use super::plan::{JoinPlan, LegGroup};
@@ -26,8 +19,8 @@ struct LegColumnTypes<'a> {
 }
 
 impl ColumnTypeLookup for LegColumnTypes<'_> {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        let leg = self.legs.leg(ColumnNode::parse(column)?);
+    fn column_type(&self, column: &Column) -> Option<ExasolType> {
+        let leg = self.legs.leg(column);
         self.cols_per_leg.get(leg)?.column_type(column)
     }
 }
@@ -35,7 +28,7 @@ impl ColumnTypeLookup for LegColumnTypes<'_> {
 /// A qualified-wrapper select item's type, read from the raw request node, whose columns still
 /// name their own tables.
 pub(super) fn select_item_type(
-    item: &Json,
+    item: &Expr,
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
     context: &PushdownContext<'_>,
@@ -94,12 +87,11 @@ impl LegNaming {
     }
 
     /// `expr` in the Exasol dialect, each column named as its leg's.
-    pub(super) fn render(&self, expr: &Json, legs: &JoinLegs) -> String {
-        let named = substitute_subtrees(expr, &mut |subtree| {
-            let column = ColumnNode::parse(subtree)?;
+    pub(super) fn render(&self, expr: &Expr, legs: &JoinLegs) -> Result<String, UdfError> {
+        let named = expr.map_columns(&mut |column| {
             let leg = &self.per_leg[legs.leg(column)];
             let name = leg.column_name(&column.upper_name());
-            Some(ColumnNode::to_json(&name, None, leg.relation.as_deref()))
+            Column::aliased(name, leg.relation.as_deref())
         });
         render_expression_exasol(&named)
     }
@@ -123,9 +115,10 @@ impl LegName {
     }
 }
 
-fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
-    conjoin(
-        flatten_conjuncts(filter)
+fn partition_conjuncts(filter: &Expr, keep: impl Fn(&Expr) -> bool) -> Option<Expr> {
+    Expr::conjoin(
+        filter
+            .conjuncts()
             .into_iter()
             .filter(|&c| keep(c))
             .cloned()
@@ -135,14 +128,14 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 
 /// The conjuncts that read only leg `leg`, raw, for that leg's file pruning: pruning by them is
 /// sound for an inner join, even when the scan declines one.
-pub(super) fn fan_out_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
+pub(super) fn fan_out_filter(filter: &Expr, legs: &JoinLegs, leg: usize) -> Option<Expr> {
     partition_conjuncts(filter, |c| fan_out_holds(legs, &LegGroup::plain(leg), c))
 }
 
 /// Whether the scan of `fan_out` can apply the WHERE conjunct `conjunct`: every leg it reads lies
 /// in the fan-out. A conjunct that reads no column holds for every row or none, so a broadcast
 /// scan applies it, as the two-leg broadcast always has, and the N-scan leaves it to Exasol.
-pub(super) fn fan_out_holds(legs: &JoinLegs, fan_out: &LegGroup, conjunct: &Json) -> bool {
+pub(super) fn fan_out_holds(legs: &JoinLegs, fan_out: &LegGroup, conjunct: &Expr) -> bool {
     let read = legs.legs_referenced(conjunct);
     match read.is_empty() {
         true => !fan_out.is_plain(),
@@ -155,25 +148,25 @@ pub(super) fn fan_out_holds(legs: &JoinLegs, fan_out: &LegGroup, conjunct: &Json
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ConditionPlacement {
     /// The broadcast pair's join keys, which its join block runs. `None` without a pair.
-    pub pair_keys: Option<Json>,
+    pub pair_keys: Option<Expr>,
     /// Per chain position, the join conditions its `ON` runs.
-    pub on: Vec<Vec<Json>>,
+    pub on: Vec<Vec<Expr>>,
     /// Per fan-out, the WHERE conjuncts whose legs all lie in it.
-    pub local: Vec<Option<Json>>,
+    pub local: Vec<Option<Expr>>,
     /// The WHERE conjuncts no fan-out holds, which Exasol's WHERE runs.
-    pub residual: Option<Json>,
+    pub residual: Option<Expr>,
 }
 
 /// A condition that holds a pair key and something else splits, and the rest keeps its own join
 /// point. Every other condition stays whole, so the N-scan renders each as written.
 pub(super) fn place_conditions(
-    filter: Option<&Json>,
-    conditions: &[Json],
+    filter: Option<&Expr>,
+    conditions: &[Expr],
     legs: &JoinLegs,
     plan: &JoinPlan,
 ) -> ConditionPlacement {
     let pair = plan.fan_outs().iter().find(|fan_out| !fan_out.is_plain());
-    let is_pair_key = |conjunct: &Json| {
+    let is_pair_key = |conjunct: &Expr| {
         pair.is_some_and(|pair| {
             join_key_legs(conjunct, legs).is_some_and(|(a, b)| pair.legs() == [a, b])
         })
@@ -181,7 +174,8 @@ pub(super) fn place_conditions(
     let mut pair_keys = Vec::new();
     let mut chained = Vec::new();
     for condition in conditions {
-        let (keys, rest): (Vec<&Json>, Vec<&Json>) = flatten_conjuncts(condition)
+        let (keys, rest): (Vec<&Expr>, Vec<&Expr>) = condition
+            .conjuncts()
             .into_iter()
             .partition(|conjunct| is_pair_key(conjunct));
         match (keys.is_empty(), rest.is_empty()) {
@@ -189,7 +183,7 @@ pub(super) fn place_conditions(
             (false, true) => pair_keys.push(condition.clone()),
             (false, false) => {
                 pair_keys.extend(keys.into_iter().cloned());
-                chained.extend(conjoin(rest.into_iter().cloned().collect()));
+                chained.extend(Expr::conjoin(rest.into_iter().cloned().collect()));
             }
         }
     }
@@ -226,10 +220,10 @@ pub(super) fn place_conditions(
         })
     });
     ConditionPlacement {
-        pair_keys: conjoin(pair_keys),
+        pair_keys: Expr::conjoin(pair_keys),
         on,
         local,
-        residual: conjoin_filters(structural, conjoin(unattached)),
+        residual: conjoin_filters(structural, Expr::conjoin(unattached)),
     }
 }
 
@@ -237,27 +231,27 @@ pub(super) fn place_conditions(
 /// leg's own columns, so one declined conjunct costs only itself. `Err` as
 /// [`ScanTranslator::over`].
 pub(super) fn screen_leg_filter(
-    side_local: &Json,
+    side_local: &Expr,
     col_types: &ColumnTypes,
     context: &PushdownContext<'_>,
-) -> Result<(Option<String>, Option<Json>), UdfError> {
+) -> Result<(Option<String>, Option<Expr>), UdfError> {
     // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
     let scan = ScanTranslator::over(
         col_types,
         context.version,
-        &[&strip_table_alias(side_local)],
+        &[&side_local.strip_table_alias()],
     )?;
-    Ok(scan.screen_conjuncts(side_local, strip_table_alias))
+    Ok(scan.screen_conjuncts(side_local, Expr::strip_table_alias))
 }
 
 /// The pair's local conjuncts, split into the scan filter and the raw conjuncts the scan
 /// declines. A filter that renders whole keeps its one rendered SQL.
 pub(super) fn screen_pair_filter(
-    local: &Json,
+    local: &Expr,
     legs: &JoinLegs,
     sides: &[ResolvedJoinSide],
     context: &PushdownContext<'_>,
-) -> Result<(Option<String>, Option<Json>), UdfError> {
+) -> Result<(Option<String>, Option<Expr>), UdfError> {
     let col_types = leg_column_types(legs, sides);
     let qualified = legs.qualify(local);
     let scan = ScanTranslator::over(&col_types, context.version, &[&qualified])?;
@@ -278,24 +272,21 @@ pub(super) fn leg_column_types(legs: &JoinLegs, sides: &[ResolvedJoinSide]) -> C
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.
-pub(super) fn conjoin_filters(left: Option<Json>, right: Option<Json>) -> Option<Json> {
+pub(super) fn conjoin_filters(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> {
     match (left, right) {
-        (Some(l), Some(r)) => Some(serde_json::json!({
-            "type": "predicate_and",
-            "expressions": [l, r],
-        })),
+        (Some(l), Some(r)) => Some(Expr::And(vec![l, r])),
         (l, r) => l.or(r),
     }
 }
 
 /// Leg-keyed, not name-keyed: self-join occurrences share one `tableName`.
 fn collect_leg_column_names(
-    expr: &Json,
+    expr: &Expr,
     legs: &JoinLegs,
     leg: usize,
     out: &mut std::collections::HashSet<String>,
 ) {
-    walk_column_nodes(expr, &mut |column| {
+    expr.walk_columns(&mut |column| {
         if legs.leg(column) == leg {
             out.insert(column.ascii_upper_name());
         }
@@ -305,25 +296,28 @@ fn collect_leg_column_names(
 /// Keyed on table name, not leg: its caller checks format-reader refusals, which belong to
 /// the table. Over-charging every occurrence is the fail-safe direction.
 pub(super) fn possible_side_column_names(
-    expr: &Json,
+    pushdown: &PushdownRequest,
     table_name: &str,
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    walk_column_nodes(expr, &mut |column| {
-        if column
-            .table_name
-            .is_some_and(|tn| tn.eq_ignore_ascii_case(table_name))
-        {
-            names.insert(column.ascii_upper_name());
-        }
-    });
+    for tree in pushdown.expressions(&Clause::ALL) {
+        tree.walk_columns(&mut |column| {
+            if column
+                .table_name
+                .as_deref()
+                .is_some_and(|tn| tn.eq_ignore_ascii_case(table_name))
+            {
+                names.insert(column.ascii_upper_name());
+            }
+        });
+    }
     names
 }
 
 /// Leg `leg`'s columns that `values` name, in declaration order. CROSS-FOLD: `full_cols` is
 /// Unicode-uppercased and `names` ASCII-uppercased; fix a divergence where names are declared.
 pub(super) fn leg_columns_named_in<'a>(
-    values: impl IntoIterator<Item = &'a Json>,
+    values: impl IntoIterator<Item = &'a Expr>,
     legs: &JoinLegs,
     leg: usize,
     full_cols: &ColumnTypes,
@@ -341,7 +335,7 @@ pub(super) fn leg_columns_named_in<'a>(
 /// which may hold a refused column.
 pub(super) fn fan_out_emission(
     output: OutputContract,
-    above: &[&Json],
+    above: &[&Expr],
     legs: &JoinLegs,
     scanned: &[(usize, &ColumnTypes)],
     prefer: &ColumnTypes,
@@ -367,7 +361,7 @@ pub(super) fn fan_out_emission(
 /// [`fan_out_emission`] of a fan-out that scans the one leg `leg`.
 pub(super) fn leg_emission(
     output: OutputContract,
-    above: &[&Json],
+    above: &[&Expr],
     legs: &JoinLegs,
     leg: usize,
     cols: &ColumnTypes,

@@ -1,5 +1,5 @@
 use super::super::request::{OutputContract, PushdownRequest};
-use super::super::support::column_node_ref;
+use super::super::support::column_ref;
 use super::super::topn::ParsedSortKey;
 use super::attribution::JoinLegs;
 use super::planning::{JoinWindowPlan, classify_join_window};
@@ -116,7 +116,7 @@ pub(super) fn broadcast_serves_window(
                     .select_items()
                     .unwrap_or_default()
                     .iter()
-                    .filter_map(column_node_ref)
+                    .filter_map(|item| item.as_column().map(column_ref))
                     .collect(),
             };
             keys.iter().all(

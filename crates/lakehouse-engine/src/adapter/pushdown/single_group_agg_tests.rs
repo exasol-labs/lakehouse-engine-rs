@@ -744,7 +744,7 @@ fn parse_agg_item_recognises_stat_functions() {
         ("VAR_POP", AggKind::VarPop),
     ] {
         let item = agg_item(name, Some("AMOUNT"), false);
-        let plan = parse_agg_item(&item, typed_scan(&AGGREGATED))
+        let plan = parse_agg_item(&ast(&item), typed_scan(&AGGREGATED))
             .unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
         assert_eq!(
             plan.kind, *expected_kind,
@@ -764,11 +764,11 @@ fn stat_aggregate_over_expression_argument_declines() {
             .item(item.clone(), ExasolType::WIDEST_VARCHAR)
             .build_scanned();
         assert!(
-            scan.expression(&item).is_some(),
+            scan.expression(&ast(&item)).is_some(),
             "the scan computes STDDEV({arg}), so only the stat rule may decline it"
         );
         assert!(
-            parse_agg_item(&item, scan).is_none(),
+            parse_agg_item(&ast(&item), scan).is_none(),
             "STDDEV over a non-column argument must decline: {arg}"
         );
         assert!(
@@ -781,7 +781,7 @@ fn stat_aggregate_over_expression_argument_declines() {
 #[test]
 fn stat_aggregate_over_bare_column_still_parses() {
     let plan = parse_agg_item(
-        &agg_item("STDDEV", Some("SCORE"), false),
+        &ast(&agg_item("STDDEV", Some("SCORE"), false)),
         typed_scan(&AGGREGATED),
     )
     .expect("STDDEV over a bare column must still parse");

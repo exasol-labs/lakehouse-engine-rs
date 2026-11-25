@@ -3,7 +3,7 @@
 //! look up. Dependent crates enable `test-support`.
 
 use crate::exasol_type::{ExasolType, exasol_type_to_json};
-use crate::{ColumnNode, ColumnTypeLookup};
+use crate::{Column, ColumnTypeLookup, Expr, Literal, LiteralKind, Scalar, parse_expression};
 use serde_json::{Map, Value as Json, json};
 
 /// Column types by name, matched case-insensitively. The default knows no column.
@@ -25,18 +25,34 @@ pub fn ascii_varchar(size: u32) -> ExasolType {
 }
 
 impl ColumnTypeLookup for TypedColumns {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        let name = column.get("name")?.as_str()?.to_uppercase();
+    fn column_type(&self, column: &Column) -> Option<ExasolType> {
+        let name = column.name.to_uppercase();
         self.0.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
     }
 }
 
+/// The typed expression of a request node, which must parse.
+pub fn ast(node: &Json) -> Expr {
+    parse_expression(node, "expression").expect("a well-formed expression node")
+}
+
+fn column_node(name: &str, table_name: Option<&str>, table_alias: Option<&str>) -> Json {
+    let mut node = json!({"type": "column", "name": name});
+    if let Some(table) = table_name {
+        node["tableName"] = Json::String(table.to_string());
+    }
+    if let Some(alias) = table_alias {
+        node["tableAlias"] = Json::String(alias.to_string());
+    }
+    node
+}
+
 pub fn col(name: &str) -> Json {
-    ColumnNode::to_json(name, None, None)
+    column_node(name, None, None)
 }
 
 pub fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
-    ColumnNode::to_json(name, Some(table), alias)
+    column_node(name, Some(table), alias)
 }
 
 pub fn table_col(table: &str, name: &str) -> Json {
@@ -56,7 +72,7 @@ pub fn numbered_col(table: &str, column_nr: u32, name: &str) -> Json {
 
 /// A column node qualified by its relation alias only, as a rewritten join leg writes it.
 pub fn alias_col(alias: &str, name: &str) -> Json {
-    ColumnNode::to_json(name, None, Some(alias))
+    column_node(name, None, Some(alias))
 }
 
 pub fn lit(kind: &str, value: impl Into<Json>) -> Json {
@@ -88,16 +104,20 @@ pub fn timestamp_lit(value: &str) -> Json {
 }
 
 /// A hex literal retyped as bytes, as the binary-filter rewrite writes it.
-pub fn binary_lit(hex: &str) -> Json {
-    lit("literal_binary", hex)
+/// Exasol never sends one, so it is built as a tree, not parsed from a node.
+pub fn binary_lit(hex: &str) -> Expr {
+    Expr::Literal(Literal::new(
+        LiteralKind::Binary { width: None },
+        Scalar::String(hex.into()),
+    ))
 }
 
 /// [`binary_lit`] for a fixed-length binary column `width` bytes wide.
-pub fn fixed_binary_lit(hex: &str, width: usize) -> Json {
-    node(
-        "literal_binary",
-        [("value", hex.into()), ("width", width.into())],
-    )
+pub fn fixed_binary_lit(hex: &str, width: u64) -> Expr {
+    Expr::Literal(Literal::new(
+        LiteralKind::Binary { width: Some(width) },
+        Scalar::String(hex.into()),
+    ))
 }
 
 pub fn compare(kind: &str, left: Json, right: Json) -> Json {

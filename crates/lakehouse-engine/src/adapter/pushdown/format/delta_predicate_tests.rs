@@ -1,15 +1,16 @@
 use super::*;
 use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
-    and, binary_lit, bool_lit, by_name, col, date_lit, in_list, is_not_null, is_null, like, not,
-    num_lit, or, predicate_equal, str_lit, timestamp_lit,
+    and, ast, binary_lit, bool_lit, by_name, col, date_lit, in_list, is_not_null, is_null, like,
+    not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
-use serde_json::json;
+use serde_json::{Value as Json, json};
+use vs_expression::{CompareOp, Expr};
 
 /// `literal` converted as the parse converts it for a column of `primitive`, then made a scalar.
 fn literal_to_scalar(literal: &Json, primitive: &PrimitiveType) -> Option<Scalar> {
-    scalar(&exact_literal(literal, &arrow_type(primitive)?)?)
+    scalar(&exact_literal(&ast(literal), &arrow_type(primitive)?)?)
 }
 
 fn test_schema() -> StructType {
@@ -22,7 +23,7 @@ fn test_schema() -> StructType {
 
 /// `node` translated against [`test_schema`].
 fn translate(node: &Json) -> Option<Predicate> {
-    to_delta_predicate(node, &by_name(&test_schema()))
+    to_delta_predicate(&ast(node), &by_name(&test_schema()))
 }
 
 #[test]
@@ -226,7 +227,7 @@ fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
     let on_b = predicate_equal(col("B"), num_lit(7));
 
     assert_eq!(
-        to_delta_predicate(&on_a, &columns),
+        to_delta_predicate(&ast(&on_a), &columns),
         Some(Predicate::eq(
             Expression::column(["b"]),
             Expression::literal(7i32)
@@ -234,7 +235,7 @@ fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
         "the declared column binds to the field it is paired with, under that field's name"
     );
     assert_eq!(
-        to_delta_predicate(&on_b, &columns),
+        to_delta_predicate(&ast(&on_b), &columns),
         None,
         "a column no declared pair names constrains nothing"
     );
@@ -251,14 +252,17 @@ fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
     let equal_to = |literal: Json| predicate_equal(col("B"), literal);
 
     assert_eq!(
-        to_delta_predicate(&equal_to(binary_lit("00abff")), &by_name(&schema)),
+        to_delta_predicate(
+            &Expr::compare(CompareOp::Equal, ast(&col("B")), binary_lit("00abff")),
+            &by_name(&schema)
+        ),
         Some(Predicate::eq(
             Expression::column(["b"]),
             Expression::literal(Scalar::Binary(vec![0x00, 0xab, 0xff]))
         ))
     );
     assert_eq!(
-        to_delta_predicate(&equal_to(str_lit("00abff")), &by_name(&schema)),
+        to_delta_predicate(&ast(&equal_to(str_lit("00abff"))), &by_name(&schema)),
         None,
         "only the retyped literal names bytes"
     );
@@ -270,7 +274,7 @@ fn translate_on_text(node: &Json) -> Option<Predicate> {
         DataType::Primitive(PrimitiveType::String),
     )])
     .expect("schema with one string field must build");
-    to_delta_predicate(node, &by_name(&schema))
+    to_delta_predicate(&ast(node), &by_name(&schema))
 }
 
 fn on_s(compare: fn(Expression, Expression) -> Predicate, value: &str) -> Predicate {

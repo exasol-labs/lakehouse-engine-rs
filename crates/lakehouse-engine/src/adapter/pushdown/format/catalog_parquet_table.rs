@@ -9,7 +9,7 @@ use lakehouse_catalog::{
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::parquet_directory_table::file_entry;
 use super::partition_predicate::PartitionPredicate;
@@ -216,12 +216,12 @@ impl LoadedTable for CatalogParquetTable {
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
-        filter_json: Option<&'a Json>,
+        filter: Option<&'a Expr>,
     ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let partition_columns = &declared.partition_columns;
             let predicate = PartitionPredicate::from_filter(
-                filter_json,
+                filter,
                 &partition_column_types(&declared.logical_schema, partition_columns),
             );
             let keep = move |values: &_| predicate.keeps(values);

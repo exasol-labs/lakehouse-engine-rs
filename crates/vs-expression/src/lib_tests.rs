@@ -2,10 +2,19 @@ use super::*;
 use crate::ExasolVersion;
 use crate::scalar_functions::{SCALAR_FUNCTIONS, ScalarFunction};
 use crate::test_support::*;
-use serde_json::json;
+use serde_json::{Value as Json, json};
+
+fn render_expression(node: &Json) -> Result<String, UdfError> {
+    crate::render_expression(&parse_expression(node, "expression")?)
+}
+
+fn render_expression_exasol(node: &Json) -> String {
+    crate::render_expression_exasol(&ast(node)).expect("the Exasol dialect renders the node")
+}
 
 fn scan_filter(filter: &Json) -> Result<String, UdfError> {
-    ScanTyping::new(&typed_columns::<&str>(&[]), ExasolVersion::Exasol2025).render_filter(filter)
+    ScanTyping::new(&typed_columns::<&str>(&[]), ExasolVersion::Exasol2025)
+        .render_filter(&parse_expression(filter, "filter")?)
 }
 
 /// Exasol's `CAST("X" AS data_type)` node.
@@ -26,7 +35,7 @@ fn typed_scan(expr: &Json) -> Result<String, UdfError> {
         ("n", ExasolType::decimal(18, 0)),
     ]);
     ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-        .render_expression(expr)
+        .render_expression(&ast(expr))
         .map(|fragment| fragment.sql)
 }
 
@@ -1037,7 +1046,7 @@ fn concat_without_a_renderable_argument_errors_in_the_datafusion_dialect() {
     let cases = [
         (
             json!({"type": "function_scalar", "name": "CONCAT"}),
-            "function_scalar CONCAT missing 'arguments'",
+            "function_scalar CONCAT requires at least 1 argument, got 0",
         ),
         (
             scalar_fn("CONCAT", []),
@@ -1045,7 +1054,7 @@ fn concat_without_a_renderable_argument_errors_in_the_datafusion_dialect() {
         ),
         (
             scalar_fn("CONCAT", [col("a"), Json::Null]),
-            "CONCAT argument rendered to null",
+            "the pushdown request's expression.arguments[1] is not an expression node",
         ),
     ];
     for (expr, expected) in cases {
@@ -1167,8 +1176,8 @@ fn greatest_least_without_arguments_key_errors() {
         let err = render_expression(&expr)
             .expect_err(&format!("{name} without arguments key must raise"));
         assert!(
-            err.to_string().contains("missing 'arguments'"),
-            "{name} error should mention missing 'arguments', got: {err}"
+            err.to_string().contains("requires at least 1 argument"),
+            "{name} error should name its missing arguments, got: {err}"
         );
     }
 }
@@ -1423,7 +1432,7 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     );
     assert!(
         ScanTyping::new(&microsecond_ts(), ExasolVersion::Exasol2025)
-            .render_expression(&expr)
+            .render_expression(&ast(&expr))
             .is_err(),
         "SECOND(ts, 3) must decline even where the typed pass knows the argument's precision"
     );
@@ -1475,7 +1484,7 @@ fn regexp_like_predicate_declines_in_the_datafusion_dialect() {
         "expression": col("name"),
         "pattern": str_lit("^A.*")
     });
-    let expected = "unsupported expression node type: predicate_like_regexp";
+    let expected = "the pushdown request's expression.type names the node type predicate_like_regexp, which the adapter does not translate";
     assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
     assert!(scan_filter(&expr).is_err());
 }
@@ -1524,11 +1533,13 @@ fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
             "SUBSTRING",
             json!({"type": "function_scalar", "name": "SUBSTRING"}),
         ),
-        (
-            "",
-            json!({"type": "function_scalar", "arguments": [col("a")]}),
-        ),
     ];
+    assert_eq!(
+        render_expression(&json!({"type": "function_scalar", "arguments": [col("a")]}))
+            .unwrap_err()
+            .to_string(),
+        "the pushdown request's expression.name is missing"
+    );
     for (declined_name, expr) in cases {
         let expected = format!("unsupported scalar function: {declined_name}");
         assert_eq!(
@@ -2417,12 +2428,12 @@ fn a_binary_literal_renders_only_as_hex() {
     let variable = binary_lit("0a1b");
     let fixed = fixed_binary_lit("0a1b", 2);
 
-    assert_eq!(render_expression(&variable).unwrap(), "X'0a1b'");
+    assert_eq!(crate::render_expression(&variable).unwrap(), "X'0a1b'");
     assert_eq!(
-        render_expression(&fixed).unwrap(),
+        crate::render_expression(&fixed).unwrap(),
         "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
     );
-    assert!(render_expression(&binary_lit("0a'")).is_err());
+    assert!(crate::render_expression(&binary_lit("0a'")).is_err());
 }
 
 const DATE_ADDITIONS: [(&str, &str); 4] = [
@@ -2445,7 +2456,7 @@ fn date_addition_renders_scan_function_calls() {
         let date_column = scalar_fn(exasol_name, [col("d"), num_lit(2)]);
         assert_eq!(
             ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-                .render_expression(&date_column)
+                .render_expression(&ast(&date_column))
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(\"D\" AS DATE), 2)"),
@@ -2454,7 +2465,7 @@ fn date_addition_renders_scan_function_calls() {
         let timestamp_column = scalar_fn(exasol_name, [col("ts"), num_lit(2)]);
         assert_eq!(
             ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-                .render_expression(&timestamp_column)
+                .render_expression(&ast(&timestamp_column))
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(\"TS\" AS TIMESTAMP(6)), 2)"),
@@ -2463,7 +2474,7 @@ fn date_addition_renders_scan_function_calls() {
         let date_literal = scalar_fn(exasol_name, [date_lit("2024-02-28"), num_lit(1)]);
         assert_eq!(
             ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-                .render_expression(&date_literal)
+                .render_expression(&ast(&date_literal))
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(DATE '2024-02-28' AS DATE), 1)"),
@@ -2475,7 +2486,7 @@ fn date_addition_renders_scan_function_calls() {
         );
         assert_eq!(
             ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-                .render_expression(&timestamp_literal)
+                .render_expression(&ast(&timestamp_literal))
                 .unwrap()
                 .sql,
             format!(
@@ -2489,7 +2500,7 @@ fn date_addition_renders_scan_function_calls() {
         );
         assert_eq!(
             ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-                .render_expression(&cast)
+                .render_expression(&ast(&cast))
                 .unwrap()
                 .sql,
             format!("{scan_name}(CAST(CAST(\"TS\" AS DATE) AS DATE), 1)"),
@@ -2502,7 +2513,7 @@ fn date_addition_renders_scan_function_calls() {
     );
     assert_eq!(
         ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-            .render_expression(&nested)
+            .render_expression(&ast(&nested))
             .unwrap()
             .sql,
         "vs_add_hours(CAST(vs_add_days(CAST(\"D\" AS DATE), 1) AS DATE), 2)"
@@ -2513,7 +2524,7 @@ fn date_addition_renders_scan_function_calls() {
     );
     assert_eq!(
         ScanTyping::new(&columns, ExasolVersion::Exasol2025)
-            .render_expression(&over_a_timestamp_result)
+            .render_expression(&ast(&over_a_timestamp_result))
             .unwrap()
             .sql,
         "vs_add_days(CAST(vs_add_hours(CAST(\"D\" AS DATE), 1) AS TIMESTAMP(6)), 2)"

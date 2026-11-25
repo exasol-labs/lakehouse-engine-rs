@@ -1,28 +1,29 @@
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 
-mod column_node;
 mod datetime_format;
 pub mod exasol_type;
+mod expr;
 mod fragment;
 mod json_value;
+mod parse;
 mod scalar_functions;
 mod scan_typing;
 pub mod timestamp;
 mod version;
-pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-use datetime_format::{FormatTarget, format_literal, strftime_pattern};
-use exasol_type::{ExasolType, exasol_type_from_json};
-pub use fragment::SqlFragment;
-use json_value::{Fallback, JsonValueCall, Returning};
-pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
-use scalar_functions::{ExasolForm, scalar_function};
-use scan_typing::{
-    BOOLEAN_NUMBER_NODE, BOOLEAN_TEXT_NODE, EMPTY_AS_NULL_NODE, INTEGER_ARGUMENT_NODE,
-    INTEGER_TEXT_NODE, Inferred, SECOND_NODE, empty_as_null, render_integer_argument,
-    second_fraction, seconds_type, timestamp_digits,
+use datetime_format::{FormatTarget, strftime_pattern};
+use exasol_type::ExasolType;
+use expr::ScanKind;
+pub use expr::{
+    AggregateCall, CaseExpr, Column, CompareOp, Expr, JsonBehavior, JsonValueCall, Literal,
+    LiteralKind, Scalar, ScalarCall, ScanNode,
 };
+pub use fragment::SqlFragment;
+use json_value::{Fallback, Returning, ScanJsonValue};
+pub use json_value::{JSON_VALUE_BOOLEAN_FN, JSON_VALUE_TEXT_FN, JsonPathStep, parse_json_path};
+pub use parse::{invalid_field, parse_expression};
+use scalar_functions::{ExasolForm, scalar_function};
 pub use scan_typing::{ColumnTypeLookup, ScanTyping, is_session_free_integer_text};
+use scan_typing::{Inferred, empty_as_null, render_integer_argument, seconds_type};
 use timestamp::{TimestampLiteral, TimestampUnit};
 pub use version::ExasolVersion;
 
@@ -44,47 +45,30 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn binary_op(kind: &str) -> Option<&'static str> {
-    match kind {
-        "predicate_equal" => Some("="),
-        "predicate_notequal" => Some("<>"),
-        "predicate_less" => Some("<"),
-        "predicate_lessequal" => Some("<="),
-        "predicate_greater" => Some(">"),
-        "predicate_greaterequal" => Some(">="),
-        _ => None,
-    }
-}
-
 /// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
 /// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
     format!("(CASE {bool_expr} WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)")
 }
 
-fn quote_literal(value: Option<&Json>) -> String {
+fn quote_literal(value: &Scalar) -> String {
     match value {
-        None | Some(Json::Null) => "NULL".to_string(),
-        Some(Json::String(s)) => format!("'{}'", sql_escape(s)),
-        Some(other) => format!("'{}'", sql_escape(&json_scalar_to_string(other))),
+        Scalar::Null => "NULL".to_string(),
+        other => format!("'{}'", sql_escape(&other.text())),
     }
 }
 
 /// DataFusion's `LIKE` accepts only `\` as its escape (apache/datafusion#13291), so a pattern written
 /// with another escape is rewritten to it. `None` unless both are string literals and the escape is
 /// one character that never ends the pattern.
-fn backslash_escaped_pattern(pattern: &Json, escape: &Json) -> Option<String> {
-    fn string(node: &Json) -> Option<&str> {
-        (node.get("type")?.as_str()? == "literal_string").then_some(())?;
-        node.get("value")?.as_str()
-    }
-    let mut escape_chars = string(escape)?.chars();
+fn backslash_escaped_pattern(pattern: &Expr, escape: &Expr) -> Option<String> {
+    let mut escape_chars = escape.as_string_literal()?.chars();
     let escape = escape_chars.next()?;
     if escape_chars.next().is_some() {
         return None;
     }
     let mut rewritten = String::new();
-    let mut chars = string(pattern)?.chars();
+    let mut chars = pattern.as_string_literal()?.chars();
     while let Some(c) = chars.next() {
         match c {
             c if c == escape => {
@@ -101,15 +85,15 @@ fn backslash_escaped_pattern(pattern: &Json, escape: &Json) -> Option<String> {
 /// Shared by `literal_timestamp` and `literal_timestamp_utc` so they cannot drift.
 /// Exasol's literal format has no offset field (22018 on `+00:00`), and
 /// `TIMESTAMP NULL` is a syntax error (42000), so NULL renders bare.
-fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
+fn render_exasol_timestamp_literal(value: &Scalar) -> String {
     match value {
-        None | Some(Json::Null) => "NULL".to_string(),
-        Some(v) => format!("TIMESTAMP {}", quote_literal(Some(v))),
+        Scalar::Null => "NULL".to_string(),
+        v => format!("TIMESTAMP {}", quote_literal(v)),
     }
 }
 
-fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
-    match value.and_then(Json::as_str).map(TimestampLiteral) {
+fn timestamp_literal_unit(value: &Scalar) -> &'static str {
+    match value.as_str().map(TimestampLiteral) {
         Some(literal) if !literal.fits(TimestampUnit::Microsecond) => "Nanosecond",
         _ => "Microsecond",
     }
@@ -119,10 +103,10 @@ fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
 /// session-local (verified live). A bare TSTZ cast keeps 3 fractional digits, so a longer value
 /// names its precision; Exasol 8 never sends more than 3 and has no precision syntax.
-fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
+fn render_exasol_tstz_literal(value: &Scalar) -> String {
     match value {
-        None | Some(Json::Null) => "NULL".to_string(),
-        Some(v) => {
+        Scalar::Null => "NULL".to_string(),
+        v => {
             let digits = v
                 .as_str()
                 .map_or(0, |s| TimestampLiteral(s).type_precision());
@@ -137,29 +121,13 @@ fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
     }
 }
 
-fn json_scalar_to_string(value: &Json) -> String {
-    match value {
-        Json::String(s) => s.clone(),
-        Json::Number(n) => n.to_string(),
-        Json::Bool(b) => b.to_string(),
-        Json::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
 /// Exasol's `IN`/`NOT IN` ignores NULL list entries, while DataFusion's
 /// three-valued logic would empty the result.
-fn is_null_literal(arg: &Json) -> bool {
-    match arg.get("type").and_then(|t| t.as_str()) {
-        Some("literal_null") => true,
-        Some(t) if t.starts_with("literal_") => {
-            matches!(arg.get("value"), None | Some(Json::Null))
-        }
-        _ => false,
-    }
+fn is_null_literal(arg: &Expr) -> bool {
+    arg.as_literal().is_some_and(Literal::is_null)
 }
 
-fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError> {
+fn render_args(args: &[Expr], dialect: Dialect) -> Result<Vec<String>, UdfError> {
     args.iter()
         .enumerate()
         .map(|(i, arg)| {
@@ -174,7 +142,7 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
 /// typed pass knows.
 fn render_to_datetime(
     target: FormatTarget,
-    args: Option<&Vec<Json>>,
+    args: &[Expr],
     digits: Option<u8>,
     dialect: Dialect,
 ) -> Result<Option<String>, UdfError> {
@@ -182,9 +150,7 @@ fn render_to_datetime(
         FormatTarget::Date => "TO_DATE",
         FormatTarget::Timestamp => "TO_TIMESTAMP",
     };
-    let args =
-        args.ok_or_else(|| UdfError::User(format!("function_scalar {node} missing 'arguments'")))?;
-    match args.as_slice() {
+    match args {
         [] => Err(UdfError::User(format!(
             "function_scalar {node} requires at least 1 argument"
         ))),
@@ -192,11 +158,12 @@ fn render_to_datetime(
             "function_scalar {node} without a format parses by the session's NLS settings"
         ))),
         [source, format] => {
-            let pattern = format_literal(format)
+            let pattern = format
+                .as_string_literal()
                 .and_then(|model| strftime_pattern(model, target))
                 .ok_or_else(|| {
                     UdfError::User(format!(
-                        "function_scalar {node} format {format} is not a string literal with an exact strftime equivalent"
+                        "function_scalar {node} format {format:?} is not a string literal with an exact strftime equivalent"
                     ))
                 })?;
             let source = render_conversion_source(node, source, dialect)?;
@@ -220,7 +187,7 @@ fn render_to_datetime(
 
 fn render_conversion_source(
     function: &str,
-    source: &Json,
+    source: &Expr,
     dialect: Dialect,
 ) -> Result<String, UdfError> {
     render_expression_inner(source, dialect)?
@@ -327,58 +294,48 @@ pub const ADD_MINUTES_FN: &str = "vs_add_minutes";
 pub const TO_TIMESTAMP_FN: &str = "vs_to_timestamp";
 
 fn render_cast(
-    args: Option<&Vec<Json>>,
-    data_type: Option<&Json>,
+    argument: &Expr,
+    target: ExasolType,
     dialect: Dialect,
 ) -> Result<Option<String>, UdfError> {
-    let args = args.ok_or_else(|| UdfError::User("CAST missing 'arguments'".into()))?;
-    if args.is_empty() {
-        return Err(UdfError::User("CAST requires 1 argument".into()));
-    }
-    let inner = render_expression_inner(&args[0], dialect)?
+    let inner = render_expression_inner(argument, dialect)?
         .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
-    let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
-    let target = exasol_type_from_json(data_type)?;
     let target_type = render_cast_target(target, dialect)?;
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
-fn json_value_operand(node: &Json, dialect: Dialect) -> Result<String, UdfError> {
+fn json_value_operand(node: &Expr, dialect: Dialect) -> Result<String, UdfError> {
     render_expression_inner(node, dialect)?
         .ok_or_else(|| UdfError::User("JSON_VALUE operand is null".into()))
 }
 
 /// Every clause Exasol sent, so Exasol computes the forms the scan declines.
-fn render_json_value_exasol(expr: &Json) -> Result<String, UdfError> {
-    let operand = |node: &Json| json_value_operand(node, Dialect::Exasol);
-    let args = expr
-        .get("arguments")
-        .and_then(Json::as_array)
-        .filter(|args| args.len() == 2)
-        .ok_or_else(|| UdfError::User("JSON_VALUE takes a document and a path".into()))?;
-    let mut sql = format!("JSON_VALUE({}, {}", operand(&args[0])?, operand(&args[1])?);
-    if let Some(data_type) = expr.get("returningDataType") {
-        sql.push_str(&format!(" RETURNING {}", exasol_type_from_json(data_type)?));
+fn render_json_value_exasol(call: &JsonValueCall) -> Result<String, UdfError> {
+    let operand = |node: &Expr| json_value_operand(node, Dialect::Exasol);
+    let mut sql = format!(
+        "JSON_VALUE({}, {}",
+        operand(&call.document)?,
+        operand(&call.path)?
+    );
+    if let Some(data_type) = call.returning {
+        sql.push_str(&format!(" RETURNING {data_type}"));
     }
-    for (field, clause) in [("emptyBehavior", "EMPTY"), ("errorBehavior", "ERROR")] {
-        let Some(behavior) = expr.get(field) else {
+    for (behavior, clause) in [(&call.on_empty, "EMPTY"), (&call.on_error, "ERROR")] {
+        let Some(behavior) = behavior else {
             continue;
         };
-        let rendered = match behavior.get("type").and_then(Json::as_str) {
-            Some("DEFAULT") => format!(
-                "DEFAULT {}",
-                operand(behavior.get("expression").unwrap_or(&Json::Null))?
-            ),
-            Some(kind @ ("NULL" | "ERROR")) => kind.to_string(),
-            _ => return Err(UdfError::User(format!("JSON_VALUE behavior {behavior}"))),
+        let rendered = match behavior {
+            JsonBehavior::Default(expression) => format!("DEFAULT {}", operand(expression)?),
+            JsonBehavior::Null => "NULL".to_string(),
+            JsonBehavior::Error => "ERROR".to_string(),
         };
         sql.push_str(&format!(" {rendered} ON {clause}"));
     }
     Ok(sql + ")")
 }
 
-fn render_json_value_scan(expr: &Json) -> Result<String, UdfError> {
-    let call = JsonValueCall::parse(expr)?;
+fn render_json_value_scan(call: &JsonValueCall) -> Result<String, UdfError> {
+    let call = ScanJsonValue::of(call)?;
     let fallback = |fallback: &Fallback| match fallback {
         Fallback::Null => "NULL".to_string(),
         Fallback::Text(text) => format!("'{}'", sql_escape(text)),
@@ -397,214 +354,181 @@ fn render_json_value_scan(expr: &Json) -> Result<String, UdfError> {
     })
 }
 
-/// `Ok(None)` for `Json::Null` (an absent optional child).
-fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<String>, UdfError> {
-    if expr.is_null() {
-        return Ok(None);
-    }
-    if !expr.is_object() {
-        return Err(UdfError::User(
-            "unexpected expression node (not an object)".into(),
-        ));
-    }
-    let kind = match expr.get("type").and_then(|t| t.as_str()) {
-        Some(k) => k,
-        None => {
-            return Err(UdfError::User(
-                "expression node missing 'type' field".into(),
-            ));
-        }
-    };
-
-    let value = |key: &str| expr.get(key);
-
-    match kind {
-        "literal_null" => return Ok(Some("NULL".into())),
-        "literal_bool" => {
-            let v = value("value");
-            let truthy = matches!(v, Some(Json::Bool(true)))
-                || matches!(v, Some(Json::String(s)) if s == "true" || s == "TRUE")
-                || matches!(v, Some(Json::Number(n)) if n.as_i64() == Some(1));
-            return Ok(Some(if truthy {
-                "TRUE".into()
-            } else {
-                "FALSE".into()
-            }));
-        }
-        "literal_string" => return Ok(Some(quote_literal(value("value")))),
+fn render_literal(literal: &Literal, dialect: Dialect) -> Result<Option<String>, UdfError> {
+    let value = &literal.value;
+    Ok(Some(match (literal.kind, dialect) {
+        (LiteralKind::Null, _) => "NULL".into(),
+        (LiteralKind::Bool, _) => if literal.is_true() { "TRUE" } else { "FALSE" }.into(),
+        (LiteralKind::String, _) => quote_literal(value),
         // The scan parses bare numeric literals as DECIMAL, which rejects `1e+300`.
-        "literal_double" if dialect == Dialect::DataFusion => {
-            return Ok(Some(match value("value") {
-                None | Some(Json::Null) => "NULL".to_string(),
-                Some(v) => format!("CAST({} AS DOUBLE)", quote_literal(Some(v))),
-            }));
-        }
-        "literal_exactnumeric" | "literal_double" => {
-            return Ok(Some(match value("value") {
-                None | Some(Json::Null) => "NULL".to_string(),
-                Some(v) => json_scalar_to_string(v),
-            }));
-        }
-        "literal_date" => return Ok(Some(format!("DATE {}", quote_literal(value("value"))))),
-        // Synthesized by the adapter for a binary column, never sent by Exasol. A `width` types
-        // it `FixedSizeBinary`, so comparing it leaves a fixed-length column uncast.
-        "literal_binary" if dialect == Dialect::DataFusion => {
-            let hex = value("value").and_then(|v| v.as_str()).unwrap_or_default();
+        (LiteralKind::Double, Dialect::DataFusion) => match value {
+            Scalar::Null => "NULL".to_string(),
+            v => format!("CAST({} AS DOUBLE)", quote_literal(v)),
+        },
+        (LiteralKind::ExactNumeric | LiteralKind::Double, _) => match value {
+            Scalar::Null => "NULL".to_string(),
+            v => v.text(),
+        },
+        (LiteralKind::Date, _) => format!("DATE {}", quote_literal(value)),
+        // A `width` types it `FixedSizeBinary`, so comparing it leaves a fixed-length column
+        // uncast.
+        (LiteralKind::Binary { width }, Dialect::DataFusion) => {
+            let hex = value.as_str().unwrap_or_default();
             if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(UdfError::User(format!(
                     "literal_binary value '{hex}' is not hexadecimal"
                 )));
             }
-            return Ok(Some(match value("width").and_then(|w| w.as_u64()) {
+            match width {
                 Some(width) => format!("arrow_cast(X'{hex}', 'FixedSizeBinary({width})')"),
                 None => format!("X'{hex}'"),
-            }));
-        }
-        "literal_timestamp" => {
-            // Exasol has no `arrow_cast` (42000); re-emit the bare literal it sent.
-            if dialect == Dialect::Exasol {
-                return Ok(Some(render_exasol_timestamp_literal(value("value"))));
             }
-            // Explicit precision: DataFusion types a bare `TIMESTAMP` literal as
-            // nanoseconds, which overflows on far-future values when unified with
-            // microsecond columns, so only sub-microsecond digits get
-            // nanoseconds. A NULL value renders `arrow_cast(NULL, ...)`,
-            // deliberately unlike `literal_timestamp_utc`.
-            return Ok(Some(format!(
-                "arrow_cast({}, 'Timestamp({}, None)')",
-                quote_literal(value("value")),
-                timestamp_literal_unit(value("value"))
-            )));
         }
-        "literal_timestamp_utc" => {
-            if dialect == Dialect::Exasol {
-                return Ok(Some(render_exasol_tstz_literal(value("value"))));
-            }
-            // `+00:00` parses the value as UTC; the "UTC" tz label matches the
-            // scan's Timestamptz Arrow mapping, avoiding a tz-label mismatch.
-            let raw = match value("value") {
-                None | Some(Json::Null) => return Ok(Some("NULL".into())),
-                Some(v) => json_scalar_to_string(v),
+        (LiteralKind::Binary { .. }, Dialect::Exasol) => {
+            return Err(UdfError::User(
+                "unsupported expression node type: literal_binary".into(),
+            ));
+        }
+        // Exasol has no `arrow_cast` (42000); re-emit the bare literal it sent.
+        (LiteralKind::Timestamp, Dialect::Exasol) => render_exasol_timestamp_literal(value),
+        // Explicit precision: DataFusion types a bare `TIMESTAMP` literal as nanoseconds, which
+        // overflows on far-future values when unified with microsecond columns, so only
+        // sub-microsecond digits get nanoseconds. A NULL value renders `arrow_cast(NULL, ...)`,
+        // deliberately unlike `literal_timestamp_utc`.
+        (LiteralKind::Timestamp, Dialect::DataFusion) => format!(
+            "arrow_cast({}, 'Timestamp({}, None)')",
+            quote_literal(value),
+            timestamp_literal_unit(value)
+        ),
+        (LiteralKind::TimestampUtc | LiteralKind::LocalTimeZoneTimestamp, Dialect::Exasol) => {
+            render_exasol_tstz_literal(value)
+        }
+        // `+00:00` parses the value as UTC; the "UTC" tz label matches the scan's Timestamptz
+        // Arrow mapping, avoiding a tz-label mismatch.
+        (LiteralKind::TimestampUtc, Dialect::DataFusion) => {
+            let raw = match value {
+                Scalar::Null => return Ok(Some("NULL".into())),
+                v => v.text(),
             };
-            let quoted = quote_literal(Some(&Json::String(format!("{raw}+00:00"))));
-            return Ok(Some(format!(
-                "arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
-            )));
+            let quoted = quote_literal(&Scalar::String(format!("{raw}+00:00")));
+            format!("arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"UTC\"))')")
         }
-        "literal_timestamputc" => {
-            // Exasol's real wire name for a TSTZ literal. Its comparison depends on the
-            // session zone, so the adapter folds a compared one into a plain timestamp
-            // literal and the DataFusion dialect declines any left over.
-            if dialect == Dialect::Exasol {
-                return Ok(Some(render_exasol_tstz_literal(value("value"))));
-            }
-            return Ok(None);
-        }
-        "column" => {
-            let column = ColumnNode::parse(expr)
-                .ok_or_else(|| UdfError::User("column node without a name".to_string()))?;
+        // Exasol's real wire name for a TSTZ literal. Its comparison depends on the session zone,
+        // so the adapter folds a compared one into a plain timestamp literal and the DataFusion
+        // dialect declines any left over.
+        (LiteralKind::LocalTimeZoneTimestamp, Dialect::DataFusion) => return Ok(None),
+    }))
+}
+
+fn required(
+    node: &Expr,
+    dialect: Dialect,
+    what: impl FnOnce() -> String,
+) -> Result<String, UdfError> {
+    render_expression_inner(node, dialect)?.ok_or_else(|| UdfError::User(what()))
+}
+
+/// `Ok(None)` only for a node the dialect renders as no value: a TSTZ literal in the DataFusion
+/// dialect.
+fn render_expression_inner(expr: &Expr, dialect: Dialect) -> Result<Option<String>, UdfError> {
+    let sql = match expr {
+        Expr::Literal(literal) => return render_literal(literal, dialect),
+        Expr::Column(column) => {
             let quoted = quote_ident(&column.upper_name());
             // `tableAlias` is set only for multi-table renders (join wrapper), to
             // disambiguate a name shared by two joined subqueries.
-            return Ok(Some(match column.table_alias.filter(|a| !a.is_empty()) {
+            match column.table_alias.as_deref().filter(|a| !a.is_empty()) {
                 Some(alias) => format!("{}.{}", quote_ident(alias), quoted),
                 None => quoted,
-            }));
-        }
-        _ => {}
-    }
-
-    if let Some(op) = binary_op(kind) {
-        let left = render_expression_inner(value("left").unwrap_or(&Json::Null), dialect)?;
-        let right = render_expression_inner(value("right").unwrap_or(&Json::Null), dialect)?;
-        match (left, right) {
-            (Some(l), Some(r)) => return Ok(Some(format!("({l} {op} {r})"))),
-            _ => {
-                return Err(UdfError::User(format!(
-                    "binary predicate '{kind}' missing operand"
-                )));
             }
         }
-    }
-
-    match kind {
-        "predicate_and" => {
-            render_junction(value("expressions"), " AND ", "TRUE", dialect).map(Some)
+        Expr::Compare { op, left, right } => {
+            let left = render_expression_inner(left, dialect)?;
+            let right = render_expression_inner(right, dialect)?;
+            match (left, right) {
+                (Some(l), Some(r)) => format!("({l} {} {r})", op.sql()),
+                _ => {
+                    return Err(UdfError::User(format!(
+                        "binary predicate '{}' missing operand",
+                        op.sql()
+                    )));
+                }
+            }
         }
-        "predicate_or" => render_junction(value("expressions"), " OR ", "FALSE", dialect).map(Some),
-        "predicate_not" => {
-            let inner =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| UdfError::User("predicate_not missing 'expression'".into()))?;
-            Ok(Some(format!("(NOT {inner})")))
+        Expr::And(items) => render_junction(items, " AND ", "TRUE", dialect)?,
+        Expr::Or(items) => render_junction(items, " OR ", "FALSE", dialect)?,
+        Expr::Not(inner) => {
+            let inner = required(inner, dialect, || {
+                "predicate_not missing 'expression'".into()
+            })?;
+            format!("(NOT {inner})")
         }
-        "predicate_is_null" => {
-            let inner =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_is_null missing 'expression'".into())
-                    })?;
-            Ok(Some(format!("({inner} IS NULL)")))
+        Expr::IsNull(inner) => {
+            let inner = required(inner, dialect, || {
+                "predicate_is_null missing 'expression'".into()
+            })?;
+            format!("({inner} IS NULL)")
         }
-        "predicate_is_not_null" => {
-            let inner =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_is_not_null missing 'expression'".into())
-                    })?;
-            Ok(Some(format!("({inner} IS NOT NULL)")))
+        Expr::IsNotNull(inner) => {
+            let inner = required(inner, dialect, || {
+                "predicate_is_not_null missing 'expression'".into()
+            })?;
+            format!("({inner} IS NOT NULL)")
         }
-        "predicate_in_constlist" => {
-            let target =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_in_constlist missing 'expression'".into())
-                    })?;
+        Expr::InList { expression, values } => {
+            let target = required(expression, dialect, || {
+                "predicate_in_constlist missing 'expression'".into()
+            })?;
             let mut rendered: Vec<String> = Vec::new();
-            if let Some(Json::Array(args)) = value("arguments") {
-                for arg in args {
-                    if is_null_literal(arg) {
-                        continue;
-                    }
-                    if let Some(r) = render_expression_inner(arg, dialect)? {
-                        rendered.push(r);
-                    }
+            for value in values {
+                if is_null_literal(value) {
+                    continue;
+                }
+                if let Some(r) = render_expression_inner(value, dialect)? {
+                    rendered.push(r);
                 }
             }
             if rendered.is_empty() {
-                Ok(Some("FALSE".into()))
+                "FALSE".into()
             } else {
-                Ok(Some(format!("({target} IN ({}))", rendered.join(", "))))
+                format!("({target} IN ({}))", rendered.join(", "))
             }
         }
-        "predicate_between" => {
-            let target =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
-            let low = render_expression_inner(value("left").unwrap_or(&Json::Null), dialect)?;
-            let high = render_expression_inner(value("right").unwrap_or(&Json::Null), dialect)?;
+        Expr::Between {
+            expression,
+            low,
+            high,
+        } => {
+            let target = render_expression_inner(expression, dialect)?;
+            let low = render_expression_inner(low, dialect)?;
+            let high = render_expression_inner(high, dialect)?;
             match (target, low, high) {
-                (Some(t), Some(l), Some(h)) => Ok(Some(format!("({t} BETWEEN {l} AND {h})"))),
-                _ => Err(UdfError::User(
-                    "predicate_between requires expression/left/right".into(),
-                )),
+                (Some(t), Some(l), Some(h)) => format!("({t} BETWEEN {l} AND {h})"),
+                _ => {
+                    return Err(UdfError::User(
+                        "predicate_between requires expression/left/right".into(),
+                    ));
+                }
             }
         }
-        "predicate_like" => {
-            let pattern = value("pattern").unwrap_or(&Json::Null);
-            let left =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
+        Expr::Like {
+            expression,
+            pattern,
+            escape,
+        } => {
+            let left = render_expression_inner(expression, dialect)?;
             let (Some(l), Some(p)) = (left, render_expression_inner(pattern, dialect)?) else {
                 return Err(UdfError::User(
                     "predicate_like missing 'expression' or 'pattern'".into(),
                 ));
             };
-            match value("escapeChar") {
-                None => Ok(Some(format!("({l} LIKE {p})"))),
+            match escape {
+                None => format!("({l} LIKE {p})"),
                 Some(escape) if dialect == Dialect::Exasol => {
-                    let escape = render_expression_inner(escape, dialect)?.ok_or_else(|| {
-                        UdfError::User("predicate_like with a null 'escapeChar'".into())
+                    let escape = required(escape, dialect, || {
+                        "predicate_like with a null 'escapeChar'".into()
                     })?;
-                    Ok(Some(format!("({l} LIKE {p} ESCAPE {escape})")))
+                    format!("({l} LIKE {p} ESCAPE {escape})")
                 }
                 Some(escape) => {
                     let rewritten =
@@ -614,602 +538,377 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                                     .into(),
                             )
                         })?;
-                    Ok(Some(format!(
-                        "({l} LIKE {})",
-                        quote_literal(Some(&Json::String(rewritten)))
-                    )))
+                    format!("({l} LIKE {})", quote_literal(&Scalar::String(rewritten)))
                 }
             }
         }
-        "function_scalar_extract" => {
-            let field = value("toExtract")
-                .and_then(|f| f.as_str())
-                .ok_or_else(|| {
-                    UdfError::User("function_scalar_extract missing 'toExtract'".into())
-                })?
-                .to_uppercase();
-            let args = value("arguments")
-                .and_then(|a| a.as_array())
-                .ok_or_else(|| {
-                    UdfError::User("function_scalar_extract missing 'arguments'".into())
-                })?;
-            if args.is_empty() {
-                return Err(UdfError::User(
-                    "function_scalar_extract requires 1 argument".into(),
-                ));
-            }
-            let src = render_expression_inner(&args[0], dialect)?
-                .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
-            Ok(Some(match dialect {
+        Expr::Extract { field, argument } => {
+            let field = field.to_uppercase();
+            let src = required(argument, dialect, || "EXTRACT source is null".into())?;
+            match dialect {
                 Dialect::Exasol => format!("EXTRACT({field} FROM {src})"),
                 Dialect::DataFusion if field == "SECOND" => {
                     return Err(UdfError::User(UNTYPED_SECOND.into()));
                 }
                 // DataFusion has no EXTRACT(field FROM expr) planner by default.
                 Dialect::DataFusion => format!("date_part('{field}', {src})"),
-            }))
-        }
-        // `basis` present means simple CASE; `results` holds one THEN per WHEN plus
-        // an optional trailing ELSE.
-        "function_scalar_case" => {
-            let whens = value("arguments")
-                .and_then(|a| a.as_array())
-                .ok_or_else(|| UdfError::User("function_scalar_case missing 'arguments'".into()))?;
-            let results = value("results")
-                .and_then(|r| r.as_array())
-                .ok_or_else(|| UdfError::User("function_scalar_case missing 'results'".into()))?;
-            if results.len() != whens.len() && results.len() != whens.len() + 1 {
-                return Err(UdfError::User(format!(
-                    "function_scalar_case results ({}) must equal WHEN count ({}) or +1 for ELSE",
-                    results.len(),
-                    whens.len()
-                )));
-            }
-            let basis = match value("basis") {
-                Some(b) if !b.is_null() => Some(
-                    render_expression_inner(b, dialect)?
-                        .ok_or_else(|| UdfError::User("CASE basis is null".into()))?,
-                ),
-                _ => None,
-            };
-            let mut sql = String::from("CASE");
-            if let Some(b) = &basis {
-                sql.push(' ');
-                sql.push_str(b);
-            }
-            for (i, when) in whens.iter().enumerate() {
-                let when_sql = render_expression_inner(when, dialect)?
-                    .ok_or_else(|| UdfError::User("CASE WHEN value is null".into()))?;
-                let then_sql = render_expression_inner(&results[i], dialect)?
-                    .ok_or_else(|| UdfError::User("CASE THEN result is null".into()))?;
-                sql.push_str(&format!(" WHEN {when_sql} THEN {then_sql}"));
-            }
-            if results.len() == whens.len() + 1 {
-                let else_sql = render_expression_inner(&results[whens.len()], dialect)?
-                    .ok_or_else(|| UdfError::User("CASE ELSE result is null".into()))?;
-                sql.push_str(&format!(" ELSE {else_sql}"));
-            }
-            sql.push_str(" END");
-            Ok(Some(format!("({sql})")))
-        }
-        "function_scalar_json_value" => match dialect {
-            Dialect::Exasol => render_json_value_exasol(expr),
-            Dialect::DataFusion => render_json_value_scan(expr),
-        }
-        .map(Some),
-        // The CAST wire shape Exasol sends; the nested `function_scalar` CAST arm
-        // is a defensive alternate encoding.
-        "function_scalar_cast" => {
-            let args = value("arguments").and_then(|a| a.as_array());
-            render_cast(args, value("dataType"), dialect)
-        }
-        // Synthesized by the typed scan pass, DataFusion dialect only.
-        INTEGER_TEXT_NODE
-        | BOOLEAN_TEXT_NODE
-        | BOOLEAN_NUMBER_NODE
-        | SECOND_NODE
-        | INTEGER_ARGUMENT_NODE
-        | EMPTY_AS_NULL_NODE
-            if dialect == Dialect::DataFusion =>
-        {
-            let arg = value("arguments")
-                .and_then(|a| a.as_array())
-                .and_then(|a| a.first())
-                .ok_or_else(|| UdfError::User(format!("{kind} missing its argument")))?;
-            let inner = render_expression_inner(arg, dialect)?
-                .ok_or_else(|| UdfError::User(format!("{kind} argument is null")))?;
-            Ok(Some(match kind {
-                INTEGER_TEXT_NODE => format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)"),
-                BOOLEAN_TEXT_NODE => render_bool_to_string_case(&inner),
-                EMPTY_AS_NULL_NODE => format!("nullif({inner}, '')"),
-                INTEGER_ARGUMENT_NODE => render_integer_argument(expr, &inner),
-                SECOND_NODE => {
-                    let fraction = second_fraction(expr)
-                        .ok_or_else(|| UdfError::User(format!("{kind} missing its fraction")))?;
-                    render_seconds(&inner, fraction)?
-                }
-                _ => format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)"),
-            }))
-        }
-        "function_scalar" => {
-            let fn_name = value("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_uppercase();
-            let args = value("arguments").and_then(|a| a.as_array());
-
-            // An Exasol-dialect `VerbatimCall` and a DataFusion call render here, ahead
-            // of the per-name arms, so arm order carries no dialect precedence.
-            let Some(function) = scalar_function(&fn_name) else {
-                return Err(UdfError::User(format!(
-                    "unsupported scalar function: {fn_name}"
-                )));
-            };
-            let verbatim = match dialect {
-                Dialect::Exasol => {
-                    (function.exasol == ExasolForm::VerbatimCall).then_some(fn_name.as_str())
-                }
-                Dialect::DataFusion => function.datafusion_call,
-            };
-            if let Some(call_name) = verbatim {
-                let args = args.ok_or_else(|| {
-                    UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                })?;
-                let rendered = render_args(args, dialect)?;
-                return Ok(Some(format!("{call_name}({})", rendered.join(", "))));
-            }
-
-            match fn_name.as_str() {
-                // Node names equal the capability names minus `FN_` and must stay
-                // in lockstep with capabilities.rs (multiplication is `MULT`, not `MUL`).
-                "ADD" | "SUB" | "MULT" | "FLOAT_DIV" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() < 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let left = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User(format!("{fn_name} left operand is null")))?;
-                    let right = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
-                        UdfError::User(format!("{fn_name} right operand is null"))
-                    })?;
-                    if fn_name == "FLOAT_DIV" && dialect == Dialect::DataFusion {
-                        return Ok(Some(format!("{CHECKED_FLOAT_DIV_FN}({left}, {right})")));
-                    }
-                    let op = match fn_name.as_str() {
-                        "ADD" => "+",
-                        "SUB" => "-",
-                        "MULT" => "*",
-                        "FLOAT_DIV" => "/",
-                        _ => unreachable!(),
-                    };
-                    Ok(Some(format!("({left} {op} {right})")))
-                }
-                "NEG" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar NEG missing 'arguments'".into())
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(
-                            "function_scalar NEG requires 1 argument".into(),
-                        ));
-                    }
-                    let operand = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("NEG operand is null".into()))?;
-                    Ok(Some(format!("(-{operand})")))
-                }
-                "CAST" => render_cast(args, value("dataType"), dialect),
-                "ABS" | "FLOOR" | "CEIL" | "SQRT" | "EXP" | "LN" | "SIGN" | "DEGREES"
-                | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "SINH"
-                | "COSH" | "TANH" | "COT" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 1 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 1 argument, got {}",
-                            args.len()
-                        )));
-                    }
-                    let lower;
-                    let df_name = match fn_name.as_str() {
-                        "SIGN" => "signum",
-                        other => {
-                            lower = other.to_lowercase();
-                            &lower
-                        }
-                    };
-                    let arg = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
-                    Ok(Some(format!("{df_name}({arg})")))
-                }
-                "ROUND" | "TRUNC" | "LOG" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.is_empty() || args.len() > 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 1 or 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
-                }
-                "POWER" | "ATAN2" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
-                }
-                "MOD" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar MOD missing 'arguments'".into())
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar MOD requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let left = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("MOD left operand is null".into()))?;
-                    let right = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
-                    Ok(Some(match dialect {
-                        Dialect::Exasol => format!("MOD({left}, {right})"),
-                        Dialect::DataFusion => format!("({left} % {right})"),
-                    }))
-                }
-                // DataFusion's `concat` skips a NULL argument as Exasol's `||` does. The typed
-                // pass reads its empty result as NULL.
-                "CONCAT" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar CONCAT missing 'arguments'".into())
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(
-                            "function_scalar CONCAT requires at least 1 argument, got 0".into(),
-                        ));
-                    }
-                    let rendered = args
-                        .iter()
-                        .map(|arg| {
-                            render_expression_inner(arg, dialect)?.ok_or_else(|| {
-                                UdfError::User("CONCAT argument rendered to null".into())
-                            })
-                        })
-                        .collect::<Result<Vec<String>, UdfError>>()?;
-                    Ok(Some(match dialect {
-                        Dialect::Exasol => format!("({})", rendered.join(" || ")),
-                        Dialect::DataFusion => format!("concat({})", rendered.join(", ")),
-                    }))
-                }
-                // DataFusion dialect only. Exasol reads a NULL search text as "replace nothing"
-                // and a NULL replacement as the empty string, and sends the two-argument form
-                // with a NULL replacement. DataFusion's `replace` returns NULL for either (#203).
-                "REPLACE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar REPLACE missing 'arguments'".into())
-                    })?;
-                    let rendered = render_args(args, dialect)?;
-                    let (subject, search, replacement) = match rendered.as_slice() {
-                        [subject, search] => (subject, search, "NULL"),
-                        [subject, search, replacement] => (subject, search, replacement.as_str()),
-                        _ => {
-                            return Err(UdfError::User(format!(
-                                "function_scalar REPLACE requires 2 or 3 arguments, got {}",
-                                rendered.len()
-                            )));
-                        }
-                    };
-                    Ok(Some(format!(
-                        "CASE WHEN {search} IS NULL THEN {subject} ELSE replace({subject}, {search}, coalesce({replacement}, '')) END"
-                    )))
-                }
-                // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
-                // strpos(s, sub), which takes no start or occurrence argument (#228).
-                "INSTR" | "LOCATE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} renders exactly 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let (string, substr) = if fn_name == "INSTR" { (0, 1) } else { (1, 0) };
-                    let string = render_expression_inner(&args[string], dialect)?
-                        .ok_or_else(|| UdfError::User(format!("{fn_name} string arg is null")))?;
-                    let substr =
-                        render_expression_inner(&args[substr], dialect)?.ok_or_else(|| {
-                            UdfError::User(format!("{fn_name} substring arg is null"))
-                        })?;
-                    Ok(Some(format!("strpos({string}, {substr})")))
-                }
-                // Arguments interleave [cond, result, ...], with a trailing ELSE on an
-                // odd count.
-                "CASE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar CASE missing 'arguments'".into())
-                    })?;
-                    if args.len() < 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar CASE requires at least one WHEN branch (2 arguments), got {}",
-                            args.len()
-                        )));
-                    }
-                    let mut sql = "CASE".to_string();
-                    let has_else = args.len() % 2 == 1;
-                    let branch_end = if has_else { args.len() - 1 } else { args.len() };
-                    let mut i = 0;
-                    while i < branch_end {
-                        let cond =
-                            render_expression_inner(&args[i], dialect)?.ok_or_else(|| {
-                                UdfError::User(format!("CASE WHEN cond[{i}] is null"))
-                            })?;
-                        let result =
-                            render_expression_inner(&args[i + 1], dialect)?.ok_or_else(|| {
-                                UdfError::User(format!("CASE THEN result[{}] is null", i + 1))
-                            })?;
-                        sql.push_str(&format!(" WHEN {cond} THEN {result}"));
-                        i += 2;
-                    }
-                    if has_else {
-                        let else_val = render_expression_inner(&args[args.len() - 1], dialect)?
-                            .ok_or_else(|| UdfError::User("CASE ELSE value is null".into()))?;
-                        sql.push_str(&format!(" ELSE {else_val}"));
-                    }
-                    sql.push_str(" END");
-                    Ok(Some(sql))
-                }
-                "GREATEST" | "LEAST" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires at least 1 argument"
-                        )));
-                    }
-                    let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args, dialect)?;
-                    let guard = rendered
-                        .iter()
-                        .map(|a| format!("{a} IS NULL"))
-                        .collect::<Vec<_>>()
-                        .join(" OR ");
-                    Ok(Some(format!(
-                        "CASE WHEN {guard} THEN NULL ELSE {df_name}({}) END",
-                        rendered.join(", ")
-                    )))
-                }
-                "NULLIFZERO" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar NULLIFZERO missing 'arguments'".into())
-                    })?;
-                    if args.len() != 1 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar NULLIFZERO requires 1 argument, got {}",
-                            args.len()
-                        )));
-                    }
-                    let arg = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("NULLIFZERO argument is null".into()))?;
-                    Ok(Some(format!("nullif({arg}, 0)")))
-                }
-                "ZEROIFNULL" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar ZEROIFNULL missing 'arguments'".into())
-                    })?;
-                    if args.len() != 1 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar ZEROIFNULL requires 1 argument, got {}",
-                            args.len()
-                        )));
-                    }
-                    let arg = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("ZEROIFNULL argument is null".into()))?;
-                    Ok(Some(format!("coalesce({arg}, 0)")))
-                }
-                "NULLIF" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar NULLIF missing 'arguments'".into())
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar NULLIF requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let left = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("NULLIF first argument is null".into()))?;
-                    let right = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("NULLIF second argument is null".into()))?;
-                    Ok(Some(format!("nullif({left}, {right})")))
-                }
-                "SECOND" => Err(UdfError::User(UNTYPED_SECOND.into())),
-                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 1 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 1 argument, got {}",
-                            args.len()
-                        )));
-                    }
-                    let src = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
-                    Ok(Some(format!("date_part('{fn_name}', {src})")))
-                }
-                // Exasol WEEK and DataFusion `date_part('week')` are both ISO-8601, so
-                // year-boundary weeks agree.
-                "WEEK" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar WEEK missing 'arguments'".into())
-                    })?;
-                    if args.len() != 1 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar WEEK requires 1 argument, got {}",
-                            args.len()
-                        )));
-                    }
-                    let src = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("WEEK argument is null".into()))?;
-                    Ok(Some(format!("date_part('week', {src})")))
-                }
-                "DATE_TRUNC" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar DATE_TRUNC missing 'arguments'".into())
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar DATE_TRUNC requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let unit = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("DATE_TRUNC unit is null".into()))?;
-                    let src = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
-                    Ok(Some(format!("date_trunc({unit}, {src})")))
-                }
-                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, None, dialect),
-                "TO_TIMESTAMP" => render_to_datetime(
-                    FormatTarget::Timestamp,
-                    args,
-                    timestamp_digits(expr),
-                    dialect,
-                ),
-                "ADD_DAYS" | "ADD_WEEKS" | "ADD_HOURS" | "ADD_MINUTES" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let scan_fn = match fn_name.as_str() {
-                        "ADD_DAYS" => ADD_DAYS_FN,
-                        "ADD_WEEKS" => ADD_WEEKS_FN,
-                        "ADD_HOURS" => ADD_HOURS_FN,
-                        _ => ADD_MINUTES_FN,
-                    };
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("{scan_fn}({})", rendered.join(", "))))
-                }
-                // DATE - DATE yields an Int64 day count in DataFusion; Exasol uses only
-                // the date part of a timestamp.
-                "DAYS_BETWEEN" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar DAYS_BETWEEN missing 'arguments'".into())
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar DAYS_BETWEEN requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let first = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
-                        UdfError::User("DAYS_BETWEEN first argument is null".into())
-                    })?;
-                    let second = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
-                        UdfError::User("DAYS_BETWEEN second argument is null".into())
-                    })?;
-                    Ok(Some(format!(
-                        "(CAST({first} AS DATE) - CAST({second} AS DATE))"
-                    )))
-                }
-                "HOURS_BETWEEN" | "MINUTES_BETWEEN" | "SECONDS_BETWEEN" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
-                    })?;
-                    if args.len() != 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar {fn_name} requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let first = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
-                        UdfError::User(format!("{fn_name} first argument is null"))
-                    })?;
-                    let second = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
-                        UdfError::User(format!("{fn_name} second argument is null"))
-                    })?;
-                    let diff =
-                        format!("(date_part('epoch', {first}) - date_part('epoch', {second}))");
-                    Ok(Some(match fn_name.as_str() {
-                        "HOURS_BETWEEN" => format!("({diff} / 3600)"),
-                        "MINUTES_BETWEEN" => format!("({diff} / 60)"),
-                        "SECONDS_BETWEEN" => diff,
-                        _ => unreachable!(),
-                    }))
-                }
-                // Backstop: reachable only if a declared name loses its per-name arm.
-                other => Err(UdfError::User(format!(
-                    "unsupported scalar function: {other}"
-                ))),
             }
         }
+        Expr::Case(case) => render_case(case, dialect)?,
+        Expr::JsonValue(call) => match dialect {
+            Dialect::Exasol => render_json_value_exasol(call)?,
+            Dialect::DataFusion => render_json_value_scan(call)?,
+        },
+        Expr::Cast { target, argument } => return render_cast(argument, *target, dialect),
+        Expr::Scan(ScanNode(kind)) if dialect == Dialect::DataFusion => {
+            let inner = required(kind.argument(), dialect, || {
+                "a typed-pass node's argument is null".into()
+            })?;
+            match kind {
+                ScanKind::IntegerText(_) => {
+                    format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)")
+                }
+                ScanKind::BooleanText(_) => render_bool_to_string_case(&inner),
+                ScanKind::EmptyAsNull(_) => format!("nullif({inner}, '')"),
+                ScanKind::IntegerArgument {
+                    round,
+                    negative_is_null,
+                    ..
+                } => render_integer_argument(*round, *negative_is_null, &inner),
+                ScanKind::Second { fraction, .. } => render_seconds(&inner, *fraction)?,
+                ScanKind::BooleanNumber(_) => {
+                    format!("(CASE {inner} WHEN TRUE THEN 1 WHEN FALSE THEN 0 END)")
+                }
+            }
+        }
+        Expr::Scan(_) => {
+            return Err(UdfError::User(
+                "unsupported expression node type: a typed-pass node in the Exasol dialect".into(),
+            ));
+        }
+        Expr::Scalar(call) => return render_scalar(call, dialect),
         // The aggregate name Exasol pushed is valid in both engines, so it is spliced
         // verbatim; no arguments means `<NAME>(*)`.
-        "function_aggregate" => {
-            let name = value("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| UdfError::User("function_aggregate missing 'name'".into()))?
-                .to_uppercase();
-            match value("arguments").and_then(|a| a.as_array()) {
-                None => Ok(Some(format!("{name}(*)"))),
-                Some(args) if args.is_empty() => Ok(Some(format!("{name}(*)"))),
-                Some(args) => {
-                    let distinct = value("distinct").and_then(|d| d.as_bool()) == Some(true);
-                    let distinct_kw = if distinct { "DISTINCT " } else { "" };
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!(
-                        "{name}({distinct_kw}{})",
-                        rendered.join(", ")
-                    )))
-                }
+        Expr::Aggregate(call) => {
+            let name = &call.name;
+            if call.arguments.is_empty() {
+                format!("{name}(*)")
+            } else {
+                let distinct_kw = if call.distinct { "DISTINCT " } else { "" };
+                let rendered = render_args(&call.arguments, dialect)?;
+                format!("{name}({distinct_kw}{})", rendered.join(", "))
             }
         }
-        other => Err(UdfError::User(format!(
-            "unsupported expression node type: {other}"
-        ))),
+    };
+    Ok(Some(sql))
+}
+
+/// `basis` present means simple CASE; `results` holds one THEN per WHEN plus an optional trailing
+/// ELSE.
+fn render_case(case: &CaseExpr, dialect: Dialect) -> Result<String, UdfError> {
+    let mut sql = String::from("CASE");
+    if let Some(basis) = &case.basis {
+        sql.push(' ');
+        sql.push_str(&required(basis, dialect, || "CASE basis is null".into())?);
     }
+    for (when, result) in case.whens.iter().zip(&case.results) {
+        let when_sql = required(when, dialect, || "CASE WHEN value is null".into())?;
+        let then_sql = required(result, dialect, || "CASE THEN result is null".into())?;
+        sql.push_str(&format!(" WHEN {when_sql} THEN {then_sql}"));
+    }
+    if let Some(else_result) = case.else_result() {
+        let else_sql = required(else_result, dialect, || "CASE ELSE result is null".into())?;
+        sql.push_str(&format!(" ELSE {else_sql}"));
+    }
+    sql.push_str(" END");
+    Ok(format!("({sql})"))
+}
+
+fn arity(fn_name: &str, args: &[Expr], ok: bool, expected: &str) -> Result<(), UdfError> {
+    if ok {
+        return Ok(());
+    }
+    Err(UdfError::User(format!(
+        "function_scalar {fn_name} requires {expected}, got {}",
+        args.len()
+    )))
+}
+
+fn render_scalar(call: &ScalarCall, dialect: Dialect) -> Result<Option<String>, UdfError> {
+    let fn_name = call.name.as_str();
+    let args = call.arguments.as_slice();
+
+    // An Exasol-dialect `VerbatimCall` and a DataFusion call render here, ahead
+    // of the per-name arms, so arm order carries no dialect precedence.
+    let Some(function) = scalar_function(fn_name) else {
+        return Err(UdfError::User(format!(
+            "unsupported scalar function: {fn_name}"
+        )));
+    };
+    let verbatim = match dialect {
+        Dialect::Exasol => (function.exasol == ExasolForm::VerbatimCall).then_some(fn_name),
+        Dialect::DataFusion => function.datafusion_call,
+    };
+    if let Some(call_name) = verbatim {
+        let rendered = render_args(args, dialect)?;
+        return Ok(Some(format!("{call_name}({})", rendered.join(", "))));
+    }
+    let operand =
+        |i: usize, what: &str| required(&args[i], dialect, || format!("{fn_name} {what} is null"));
+
+    Ok(Some(match fn_name {
+        // Node names equal the capability names minus `FN_` and must stay
+        // in lockstep with capabilities.rs (multiplication is `MULT`, not `MUL`).
+        "ADD" | "SUB" | "MULT" | "FLOAT_DIV" => {
+            arity(fn_name, args, args.len() >= 2, "2 arguments")?;
+            let left = operand(0, "left operand")?;
+            let right = operand(1, "right operand")?;
+            if fn_name == "FLOAT_DIV" && dialect == Dialect::DataFusion {
+                return Ok(Some(format!("{CHECKED_FLOAT_DIV_FN}({left}, {right})")));
+            }
+            let op = match fn_name {
+                "ADD" => "+",
+                "SUB" => "-",
+                "MULT" => "*",
+                _ => "/",
+            };
+            format!("({left} {op} {right})")
+        }
+        "NEG" => {
+            if args.is_empty() {
+                return Err(UdfError::User(
+                    "function_scalar NEG requires 1 argument".into(),
+                ));
+            }
+            format!("(-{})", operand(0, "operand")?)
+        }
+        "CAST" => {
+            return Err(UdfError::User(
+                "function_scalar CAST renders only as a CAST node".into(),
+            ));
+        }
+        "ABS" | "FLOOR" | "CEIL" | "SQRT" | "EXP" | "LN" | "SIGN" | "DEGREES" | "RADIANS"
+        | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "SINH" | "COSH" | "TANH" | "COT" => {
+            arity(fn_name, args, args.len() == 1, "1 argument")?;
+            let df_name = match fn_name {
+                "SIGN" => "signum".to_string(),
+                other => other.to_lowercase(),
+            };
+            format!("{df_name}({})", operand(0, "argument")?)
+        }
+        "ROUND" | "TRUNC" | "LOG" => {
+            arity(
+                fn_name,
+                args,
+                !args.is_empty() && args.len() <= 2,
+                "1 or 2 arguments",
+            )?;
+            let rendered = render_args(args, dialect)?;
+            format!("{}({})", fn_name.to_lowercase(), rendered.join(", "))
+        }
+        "POWER" | "ATAN2" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let rendered = render_args(args, dialect)?;
+            format!("{}({})", fn_name.to_lowercase(), rendered.join(", "))
+        }
+        "MOD" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let left = operand(0, "left operand")?;
+            let right = operand(1, "right operand")?;
+            match dialect {
+                Dialect::Exasol => format!("MOD({left}, {right})"),
+                Dialect::DataFusion => format!("({left} % {right})"),
+            }
+        }
+        // DataFusion's `concat` skips a NULL argument as Exasol's `||` does. The typed
+        // pass reads its empty result as NULL.
+        "CONCAT" => {
+            if args.is_empty() {
+                return Err(UdfError::User(
+                    "function_scalar CONCAT requires at least 1 argument, got 0".into(),
+                ));
+            }
+            let rendered = args
+                .iter()
+                .map(|arg| required(arg, dialect, || "CONCAT argument rendered to null".into()))
+                .collect::<Result<Vec<String>, UdfError>>()?;
+            match dialect {
+                Dialect::Exasol => format!("({})", rendered.join(" || ")),
+                Dialect::DataFusion => format!("concat({})", rendered.join(", ")),
+            }
+        }
+        // DataFusion dialect only. Exasol reads a NULL search text as "replace nothing"
+        // and a NULL replacement as the empty string, and sends the two-argument form
+        // with a NULL replacement. DataFusion's `replace` returns NULL for either (#203).
+        "REPLACE" => {
+            let rendered = render_args(args, dialect)?;
+            let (subject, search, replacement) = match rendered.as_slice() {
+                [subject, search] => (subject, search, "NULL"),
+                [subject, search, replacement] => (subject, search, replacement.as_str()),
+                _ => {
+                    return Err(UdfError::User(format!(
+                        "function_scalar REPLACE requires 2 or 3 arguments, got {}",
+                        rendered.len()
+                    )));
+                }
+            };
+            format!(
+                "CASE WHEN {search} IS NULL THEN {subject} ELSE replace({subject}, {search}, coalesce({replacement}, '')) END"
+            )
+        }
+        // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
+        // strpos(s, sub), which takes no start or occurrence argument (#228).
+        "INSTR" | "LOCATE" => {
+            if args.len() != 2 {
+                return Err(UdfError::User(format!(
+                    "function_scalar {fn_name} renders exactly 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (string, substr) = if fn_name == "INSTR" { (0, 1) } else { (1, 0) };
+            let string = operand(string, "string arg")?;
+            let substr = operand(substr, "substring arg")?;
+            format!("strpos({string}, {substr})")
+        }
+        // Arguments interleave [cond, result, ...], with a trailing ELSE on an
+        // odd count.
+        "CASE" => {
+            if args.len() < 2 {
+                return Err(UdfError::User(format!(
+                    "function_scalar CASE requires at least one WHEN branch (2 arguments), got {}",
+                    args.len()
+                )));
+            }
+            let mut sql = "CASE".to_string();
+            let has_else = args.len() % 2 == 1;
+            let branch_end = if has_else { args.len() - 1 } else { args.len() };
+            let mut i = 0;
+            while i < branch_end {
+                let cond = required(&args[i], dialect, || format!("CASE WHEN cond[{i}] is null"))?;
+                let result = required(&args[i + 1], dialect, || {
+                    format!("CASE THEN result[{}] is null", i + 1)
+                })?;
+                sql.push_str(&format!(" WHEN {cond} THEN {result}"));
+                i += 2;
+            }
+            if has_else {
+                let else_val = required(&args[args.len() - 1], dialect, || {
+                    "CASE ELSE value is null".into()
+                })?;
+                sql.push_str(&format!(" ELSE {else_val}"));
+            }
+            sql.push_str(" END");
+            sql
+        }
+        "GREATEST" | "LEAST" => {
+            if args.is_empty() {
+                return Err(UdfError::User(format!(
+                    "function_scalar {fn_name} requires at least 1 argument"
+                )));
+            }
+            let df_name = fn_name.to_lowercase();
+            let rendered = render_args(args, dialect)?;
+            let guard = rendered
+                .iter()
+                .map(|a| format!("{a} IS NULL"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(
+                "CASE WHEN {guard} THEN NULL ELSE {df_name}({}) END",
+                rendered.join(", ")
+            )
+        }
+        "NULLIFZERO" => {
+            arity(fn_name, args, args.len() == 1, "1 argument")?;
+            format!("nullif({}, 0)", operand(0, "argument")?)
+        }
+        "ZEROIFNULL" => {
+            arity(fn_name, args, args.len() == 1, "1 argument")?;
+            format!("coalesce({}, 0)", operand(0, "argument")?)
+        }
+        "NULLIF" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let left = operand(0, "first argument")?;
+            let right = operand(1, "second argument")?;
+            format!("nullif({left}, {right})")
+        }
+        "SECOND" => return Err(UdfError::User(UNTYPED_SECOND.into())),
+        "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" => {
+            arity(fn_name, args, args.len() == 1, "1 argument")?;
+            format!("date_part('{fn_name}', {})", operand(0, "argument")?)
+        }
+        // Exasol WEEK and DataFusion `date_part('week')` are both ISO-8601, so
+        // year-boundary weeks agree.
+        "WEEK" => {
+            arity(fn_name, args, args.len() == 1, "1 argument")?;
+            format!("date_part('week', {})", operand(0, "argument")?)
+        }
+        "DATE_TRUNC" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let unit = operand(0, "unit")?;
+            let src = operand(1, "source")?;
+            format!("date_trunc({unit}, {src})")
+        }
+        "TO_DATE" => return render_to_datetime(FormatTarget::Date, args, None, dialect),
+        "TO_TIMESTAMP" => {
+            return render_to_datetime(
+                FormatTarget::Timestamp,
+                args,
+                call.timestamp_digits,
+                dialect,
+            );
+        }
+        "ADD_DAYS" | "ADD_WEEKS" | "ADD_HOURS" | "ADD_MINUTES" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let scan_fn = match fn_name {
+                "ADD_DAYS" => ADD_DAYS_FN,
+                "ADD_WEEKS" => ADD_WEEKS_FN,
+                "ADD_HOURS" => ADD_HOURS_FN,
+                _ => ADD_MINUTES_FN,
+            };
+            let rendered = render_args(args, dialect)?;
+            format!("{scan_fn}({})", rendered.join(", "))
+        }
+        // DATE - DATE yields an Int64 day count in DataFusion; Exasol uses only
+        // the date part of a timestamp.
+        "DAYS_BETWEEN" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let first = operand(0, "first argument")?;
+            let second = operand(1, "second argument")?;
+            format!("(CAST({first} AS DATE) - CAST({second} AS DATE))")
+        }
+        "HOURS_BETWEEN" | "MINUTES_BETWEEN" | "SECONDS_BETWEEN" => {
+            arity(fn_name, args, args.len() == 2, "2 arguments")?;
+            let first = operand(0, "first argument")?;
+            let second = operand(1, "second argument")?;
+            let diff = format!("(date_part('epoch', {first}) - date_part('epoch', {second}))");
+            match fn_name {
+                "HOURS_BETWEEN" => format!("({diff} / 3600)"),
+                "MINUTES_BETWEEN" => format!("({diff} / 60)"),
+                _ => diff,
+            }
+        }
+        // Backstop: reachable only if a declared name loses its per-name arm.
+        other => {
+            return Err(UdfError::User(format!(
+                "unsupported scalar function: {other}"
+            )));
+        }
+    }))
 }
 
 fn render_junction(
-    expressions: Option<&Json>,
+    items: &[Expr],
     op: &str,
     empty_value: &str,
     dialect: Dialect,
 ) -> Result<String, UdfError> {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(Json::Array(items)) = expressions {
-        for expr in items {
-            let rendered = render_expression_inner(expr, dialect)?;
-            if let Some(r) = rendered
-                && !r.is_empty()
-            {
-                parts.push(r);
-            }
+    for expr in items {
+        if let Some(r) = render_expression_inner(expr, dialect)?
+            && !r.is_empty()
+        {
+            parts.push(r);
         }
     }
     Ok(join_junction(parts, op, empty_value))
@@ -1226,36 +925,39 @@ fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String 
 /// The only DataFusion-dialect entry point, so every scan expression is typed first. `Err` declines.
 /// A CHAR or VARCHAR CAST renders unsized, so its fragment type is the widest VARCHAR.
 impl ScanTyping<'_> {
-    pub fn render_expression(self, expr: &Json) -> Result<SqlFragment, UdfError> {
+    pub fn render_expression(self, expr: &Expr) -> Result<SqlFragment, UdfError> {
         scan_fragment(self.type_scan_tree(expr)?)
     }
 
     /// [`Self::render_expression`] for an operand of a computation the caller renders around it,
     /// such as an aggregate argument: a bare string column reads its empty strings as NULL.
-    pub fn render_operand(self, expr: &Json) -> Result<SqlFragment, UdfError> {
+    pub fn render_operand(self, expr: &Expr) -> Result<SqlFragment, UdfError> {
         let (typed, ty) = self.type_scan_tree(expr)?;
-        scan_fragment((empty_as_null(expr, typed, ty), ty))
+        scan_fragment((empty_as_null(typed, ty), ty))
     }
 
     /// [`Self::render_expression`] for a filter or a join condition. Exasol drops a `WHERE` that
     /// folds to `TRUE`, so no filter it sends renders as `TRUE`.
-    pub fn render_filter(self, filter_expr: &Json) -> Result<String, UdfError> {
+    pub fn render_filter(self, filter_expr: &Expr) -> Result<String, UdfError> {
         Ok(null_keeps_no_row(self.render_filter_root(filter_expr)?))
     }
 
     /// A filter, a join condition, or one of their top-level conjuncts.
-    pub(crate) fn render_filter_root(self, root: &Json) -> Result<String, UdfError> {
+    pub(crate) fn render_filter_root(self, root: &Expr) -> Result<String, UdfError> {
         let (typed, _) = self.type_scan_filter(root)?;
         render_expression(&typed)
     }
 
     /// [`render_expression_exasol`] for an output select item, with its [`Self::exact_type`].
-    pub fn exasol_fragment(self, expr: &Json) -> SqlFragment {
-        SqlFragment::new(render_expression_exasol(expr), self.exact_type(expr))
+    pub fn exasol_fragment(self, expr: &Expr) -> Result<SqlFragment, UdfError> {
+        Ok(SqlFragment::new(
+            render_expression_exasol(expr)?,
+            self.exact_type(expr),
+        ))
     }
 }
 
-fn scan_fragment((typed, inferred): (Json, Inferred)) -> Result<SqlFragment, UdfError> {
+fn scan_fragment((typed, inferred): (Expr, Inferred)) -> Result<SqlFragment, UdfError> {
     let ty = inferred.exact().map(|ty| {
         if ty.is_character() {
             ExasolType::WIDEST_VARCHAR
@@ -1280,7 +982,7 @@ fn null_keeps_no_row(sql: String) -> String {
 }
 
 /// DataFusion dialect, untyped. Use [`ScanTyping::render_expression`].
-pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
+pub(crate) fn render_expression(expr: &Expr) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
@@ -1289,17 +991,23 @@ pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
 /// wrappers), never for a DataFusion `ScanSpec`. Character CAST targets are
 /// length-qualified, since Exasol has no length-less character type.
 ///
-/// Panics on a tree Exasol does not send: Exasol pushes only the capabilities the adapter
-/// advertises, and this dialect renders every one of them.
-pub fn render_expression_exasol(expr: &Json) -> String {
-    match render_expression_inner(expr, Dialect::Exasol) {
-        Ok(Some(sql)) => sql,
-        Ok(None) => panic!("{EXASOL_RENDERS}: a null node"),
-        Err(err) => panic!("{EXASOL_RENDERS}: {err}"),
-    }
+/// Fails only on a tree Exasol does not send, such as a function call of the wrong arity.
+pub fn render_expression_exasol(expr: &Expr) -> Result<String, UdfError> {
+    render_expression_inner(expr, Dialect::Exasol)?
+        .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
-const EXASOL_RENDERS: &str = "the Exasol dialect renders every advertised capability";
+/// A short description of `node` for an error message: its Exasol SQL where it has one.
+pub fn short(node: &Expr) -> String {
+    let text = match render_expression_inner(node, Dialect::Exasol) {
+        Ok(Some(sql)) => sql,
+        _ => format!("{node:?}"),
+    };
+    match text.char_indices().nth(120) {
+        Some((byte, _)) => format!("{}…", &text[..byte]),
+        None => text,
+    }
+}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

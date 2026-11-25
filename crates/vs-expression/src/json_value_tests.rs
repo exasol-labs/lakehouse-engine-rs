@@ -1,7 +1,12 @@
 use super::*;
 use crate::ExasolVersion;
+use crate::ScanTyping;
 use crate::test_support::*;
-use crate::{ScanTyping, render_expression_exasol};
+use serde_json::Value as Json;
+
+fn render_expression_exasol(node: &Json) -> String {
+    crate::render_expression_exasol(&ast(node)).expect("the Exasol dialect renders the node")
+}
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -101,7 +106,7 @@ fn session_free_calls_render_to_the_scan_functions() {
     for (call, sql) in cases {
         assert_eq!(
             ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
-                .render_expression(&call)
+                .render_expression(&ast(&call))
                 .unwrap()
                 .sql,
             sql
@@ -162,7 +167,7 @@ fn calls_the_scan_cannot_compute_decline() {
     for (case, call) in cases {
         assert!(
             ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
-                .render_expression(&call)
+                .render_expression(&ast(&call))
                 .is_err(),
             "{case} must decline"
         );
@@ -194,7 +199,7 @@ fn the_returning_type_is_the_exact_type() {
         null(),
     );
     assert_eq!(
-        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).exact_type(&call),
+        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).exact_type(&ast(&call)),
         Some(ExasolType::decimal(18, 0))
     );
 }

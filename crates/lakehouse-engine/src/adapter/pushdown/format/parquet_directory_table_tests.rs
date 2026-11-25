@@ -14,6 +14,7 @@ use crate::scan::spec::{NestedField, NestedMembers, reconstruct_abs_uri};
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::datasource::listing::ListingTableUrl;
 use object_store::path::Path as StorePath;
+use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
 const BASE_PATH: &str = "s3://warehouse/direct";

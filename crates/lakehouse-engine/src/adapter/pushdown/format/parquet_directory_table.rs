@@ -3,7 +3,7 @@ use std::sync::Arc;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::StorageBackend;
 use object_store::ObjectStore;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::partition_predicate::PartitionPredicate;
 use super::{LoadedTable, PlannedFiles, UdfFuture, redacted};
@@ -69,10 +69,10 @@ impl LoadedTable for ParquetDirectoryTable {
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
-        filter_json: Option<&'a Json>,
+        filter: Option<&'a Expr>,
     ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
-            let predicate = PartitionPredicate::from_filter(filter_json, &[]);
+            let predicate = PartitionPredicate::from_filter(filter, &[]);
             let keep = move |values: &_| predicate.keeps(values);
             self.plan(&declared.partition_columns, &keep)
         })

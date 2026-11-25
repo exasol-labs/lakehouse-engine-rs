@@ -1,11 +1,28 @@
 use crate::adapter::pushdown::test_support::{
-    alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
+    alias_col, and, ast, between, binary_lit, column_types_under, compare, declared_column_types,
     fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, sales_col,
     sales_equal, scan_filter_sql, str_lit,
 };
 
 use super::*;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
+use vs_expression::CompareOp;
+
+/// The `SALES` column `name`.
+fn column(name: &str) -> Expr {
+    ast(&sales_col(name))
+}
+
+/// [`super::compare_binary_bytes`] over the filter node `filter`.
+fn compare_binary_bytes(filter: Json, columns: &ColumnTypes) -> Expr {
+    super::compare_binary_bytes(ast(&filter), columns)
+}
+
+/// [`super::with_binary_literals`] over the filter node `filter`.
+fn with_binary_literals(filter: Json, columns: &ColumnTypes) -> Expr {
+    super::with_binary_literals(ast(&filter), columns)
+}
 
 /// The involved columns of a table whose `B` and `U` read as hex text and `S` as text.
 const HEX_COLUMNS: [(&str, ExasolType); 3] = [
@@ -83,7 +100,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
                 filter.clone(),
                 &declared_column_types(&HEX_COLUMNS, &binary_fields())
             ),
-            filter,
+            ast(&filter),
             "{literal}"
         );
     }
@@ -93,7 +110,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
             wrong_width.clone(),
             &declared_column_types(&HEX_COLUMNS, &binary_fields())
         ),
-        wrong_width
+        ast(&wrong_width)
     );
     let string_column = sales_equal("S", "0a");
     assert_eq!(
@@ -101,7 +118,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
             string_column.clone(),
             &declared_column_types(&HEX_COLUMNS, &binary_fields())
         ),
-        string_column
+        ast(&string_column)
     );
 }
 
@@ -114,7 +131,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
             negated.clone(),
             &declared_column_types(&HEX_COLUMNS, &binary_fields())
         ),
-        negated,
+        ast(&negated),
         "NOT turns the empty value's false into true, where Exasol keeps NULL"
     );
     let junction = or([and([equal, negated]), sales_equal("S", "x")]);
@@ -134,12 +151,14 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
         &column_types_under(&HEX_COLUMNS, &binary_fields(), true),
     );
 
+    let (rewritten, filter) = (rewritten.conjuncts(), ast(&filter));
+    let filter = filter.conjuncts();
     assert_eq!(
-        rewritten["expressions"][0], filter["expressions"][0],
+        rewritten[0], filter[0],
         "a column read as text compares its text"
     );
     assert_ne!(
-        rewritten["expressions"][1], filter["expressions"][1],
+        rewritten[1], filter[1],
         "a fixed-length column keeps its hex rendering and its byte comparison"
     );
 }
@@ -158,12 +177,19 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
             filter,
             &declared_column_types(&HEX_COLUMNS, &binary_fields())
         ),
-        not(or([
-            predicate_equal(sales_col("B"), binary_lit("0a1b")),
-            predicate_equal(sales_col("U"), fixed_binary_lit("0a0b", 2)),
-            between(sales_col("B"), binary_lit("00"), binary_lit("ff")),
-            in_list(sales_col("B"), [binary_lit("0a"), str_lit("0A")]),
-        ])),
+        Expr::Not(Box::new(Expr::Or(vec![
+            Expr::compare(CompareOp::Equal, column("B"), binary_lit("0a1b")),
+            Expr::compare(CompareOp::Equal, column("U"), fixed_binary_lit("0a0b", 2)),
+            Expr::Between {
+                expression: Box::new(column("B")),
+                low: Box::new(binary_lit("00")),
+                high: Box::new(binary_lit("ff")),
+            },
+            Expr::InList {
+                expression: Box::new(column("B")),
+                values: vec![binary_lit("0a"), ast(&str_lit("0A"))],
+            },
+        ]))),
         "the column keeps its name, and an uppercase literal stays text"
     );
 }
@@ -181,7 +207,7 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
                 filter.clone(),
                 &column_types_under(&HEX_COLUMNS, &binary_fields(), under_binary_as_string)
             ),
-            filter
+            ast(&filter)
         );
     }
     assert_eq!(
@@ -189,7 +215,7 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
             sales_equal("U", "0a0b"),
             &column_types_under(&HEX_COLUMNS, &binary_fields(), true)
         ),
-        predicate_equal(sales_col("U"), fixed_binary_lit("0a0b", 2)),
+        Expr::compare(CompareOp::Equal, column("U"), fixed_binary_lit("0a0b", 2)),
         "BINARY_AS_STRING leaves a fixed column hex"
     );
 }
@@ -200,7 +226,7 @@ fn a_binary_literal_carries_its_bytes() {
         literal_binary_bytes(&binary_lit("00abff")),
         Some(vec![0x00, 0xab, 0xff])
     );
-    assert_eq!(literal_binary_bytes(&str_lit("00abff")), None);
+    assert_eq!(literal_binary_bytes(&ast(&str_lit("00abff"))), None);
 }
 
 #[test]
@@ -224,7 +250,7 @@ fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
     );
     assert_eq!(
         compare_binary_bytes(on("LHS_T1"), &columns),
-        on("LHS_T1"),
+        ast(&on("LHS_T1")),
         "the text leg's same-named column stays a text comparison"
     );
 }

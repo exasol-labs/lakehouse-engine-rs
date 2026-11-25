@@ -5,16 +5,15 @@ use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::context::PushdownContext;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
-use super::request::{Clause, OutputContract, PushdownRequest};
+use super::request::{AdapterRequest, Clause, OutputContract, PushdownRequest};
 use super::scan_resolution::TableScanResolver;
 use super::support::ScanTranslator;
-use super::support::{
-    ColumnTypes, InvolvedColumns, flatten_conjuncts, project_columns, pushdown_response,
-};
+use super::support::{ColumnTypes, InvolvedColumns, project_columns, pushdown_response};
 
 mod attribution;
 mod broadcast_policy;
@@ -52,7 +51,7 @@ use sql_builders::qualified_emission;
 /// each leg's columns in leg order, as the caller already read them from `involvedTables`. Both
 /// planners run it before any catalog request.
 pub(crate) fn ensure_columns_declared(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     join: Option<&DetectedJoin>,
     declared: &[&InvolvedColumns<'_>],
@@ -67,12 +66,12 @@ pub(crate) fn ensure_columns_declared(
 /// Attribution is per side: a name refused on one side must not refuse a query reading only
 /// the other side's same-named column. `SELECT *` names no column, so it charges every one.
 fn ensure_no_side_refuses_a_referenced_column(
-    request: &Json,
+    request: &AdapterRequest,
     output: OutputContract,
     sides: &[ResolvedJoinSide],
 ) -> Result<(), UdfError> {
     for side in sides {
-        let mut touched = possible_side_column_names(request, &side.table_name);
+        let mut touched = possible_side_column_names(request.pushdown(), &side.table_name);
         match output {
             OutputContract::WholeRow => touched.extend(
                 side.scan
@@ -99,11 +98,11 @@ fn empty_join_sql(
     let emitted = n_scan_emission(pushdown, &WherePlacement::whole(pushdown), join, sides)?;
     let legs = join.legs();
     let col_types = leg_column_types(&legs, sides);
-    let bound = pushdown.map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
+    let bound = pushdown.map_expressions(&Clause::ALL, |tree| legs.qualify(tree));
     let scan = ScanTranslator::over(
         &col_types,
         context.version,
-        &bound.clauses(&Clause::ALL).collect::<Vec<_>>(),
+        &bound.expressions(&Clause::ALL),
     )?;
     let projection = project_columns(&bound, scan, &qualified_emission(&legs, &emitted))?;
     empty_result_sql(
@@ -133,7 +132,7 @@ fn empty_join_sql(
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
 /// different stores) is owned by the scan's `validate_sides_share_one_store`.
 pub(super) async fn plan_join(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     join: &DetectedJoin,
     statement: &StatementCatalog,
@@ -146,7 +145,7 @@ pub(super) async fn plan_join(
         .tables
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     // Before the move, whose leg lookups rely on every column binding a leg.
     ensure_columns_declared(
         request,
@@ -177,7 +176,7 @@ pub(super) async fn plan_join(
         .collect();
     let resolver =
         TableScanResolver::for_request(statement, permission, &identifiers, context).await?;
-    let side_filters: Vec<Option<Json>> = (0..join.tables.len())
+    let side_filters: Vec<Option<Expr>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| fan_out_filter(f, &legs, leg)))
         .collect();
     // `try_join_all` preserves leg order, which later steps index by.
@@ -239,7 +238,7 @@ fn broadcast_candidates(
     if !broadcast_serves_window(pushdown, &legs, sides.len()) {
         return Ok(Vec::new());
     }
-    let trees: Vec<&Json> = pushdown.filter().map(flatten_conjuncts).unwrap_or_default();
+    let trees: Vec<&Expr> = pushdown.filter().map(Expr::conjuncts).unwrap_or_default();
     let conjuncts = trees
         .into_iter()
         .map(|tree| {
@@ -251,7 +250,7 @@ fn broadcast_candidates(
         .collect::<Result<Vec<_>, UdfError>>()?;
     let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
     let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
-    let above: Vec<&Json> = pushdown.clauses(&Clause::WRAPPER).collect();
+    let above: Vec<&Expr> = pushdown.expressions(&Clause::WRAPPER);
     Ok(group_legs(&JoinGraph {
         legs: &legs,
         bytes: &bytes,

@@ -4,23 +4,24 @@
 use std::convert::Infallible;
 
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 
-use crate::datetime_format::{format_literal, fraction_digits};
-use crate::exasol_type::{
-    Decimal, ExasolType, MAX_DECIMAL_PRECISION, MAX_FRACTIONAL_DIGITS, exasol_type_from_json,
-    exasol_type_to_json,
+use crate::datetime_format::fraction_digits;
+use crate::exasol_type::{Decimal, ExasolType, MAX_DECIMAL_PRECISION, MAX_FRACTIONAL_DIGITS};
+use crate::expr::{
+    Column, CompareOp, Expr, JsonValueCall, Literal, LiteralKind, Scalar, ScalarCall, ScanKind,
+    take,
 };
-use crate::json_value::{JsonValueCall, returning_type};
+use crate::json_value::{ScanJsonValue, returning_type};
 use crate::scalar_functions::{
     DateResult, IntegerArg, ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function,
 };
+use crate::short;
 use crate::timestamp::{TimestampLiteral, TimestampUnit};
 use crate::version::ExasolVersion;
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
-    fn column_type(&self, column: &Json) -> Option<ExasolType>;
+    fn column_type(&self, column: &Column) -> Option<ExasolType>;
 }
 
 /// What the typed pass knows of a node's Exasol type.
@@ -185,26 +186,6 @@ fn unified_type(a: ExasolType, b: ExasolType) -> Option<ExasolType> {
 /// Exasol computes such a call.
 const MAX_SCAN_CONSTANT_COUNT: f64 = 1e10;
 
-/// Synthetic node: an integer operand converted to text, rendered only in the DataFusion dialect.
-pub(crate) const INTEGER_TEXT_NODE: &str = "scan_integer_text";
-/// Synthetic node: a boolean operand converted to Exasol's `TRUE`/`FALSE`.
-pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
-/// Synthetic node: a boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
-/// (apache/datafusion#16797).
-pub(crate) const BOOLEAN_NUMBER_NODE: &str = "scan_boolean_number";
-/// Synthetic node: a string function's numeric argument as the `Int64` DataFusion requires,
-/// rounded as Exasol rounds it.
-pub(crate) const INTEGER_ARGUMENT_NODE: &str = "scan_integer_argument";
-const ROUND: &str = "scanRound";
-const NEGATIVE_IS_NULL: &str = "scanNegativeIsNull";
-/// Synthetic node: the seconds of its argument with `fraction` fractional digits, which only this
-/// pass knows.
-pub(crate) const SECOND_NODE: &str = "scan_second";
-
-/// Synthetic node: its text argument with an empty string read as NULL, because Exasol has no
-/// empty string and DataFusion keeps one as a value (#203).
-pub(crate) const EMPTY_AS_NULL_NODE: &str = "scan_empty_as_null";
-
 /// `DECIMAL(2+p, p)`: Exasol's type of the seconds of a `TIMESTAMP(p)` on every supported version.
 pub(crate) fn seconds_type(fraction: u8) -> ExasolType {
     ExasolType::decimal(2 + fraction, fraction)
@@ -252,30 +233,17 @@ impl Seconds {
             })
     }
 
-    fn node(self, argument: Json) -> Json {
+    fn node(self, argument: Expr) -> Expr {
         let fraction = self.fraction().unwrap_or(0);
         let argument = match self {
             Self::OfDate(_) if fraction > 0 => cast_node(ExasolType::timestamp(fraction), argument),
             _ => argument,
         };
-        serde_json::json!({"type": SECOND_NODE, SECOND_FRACTION: fraction, "arguments": [argument]})
+        Expr::scan(ScanKind::Second {
+            argument: Box::new(argument),
+            fraction,
+        })
     }
-}
-
-const SECOND_FRACTION: &str = "fraction";
-
-/// Set on a `TO_TIMESTAMP` node: the fractional digits it keeps, which only this pass knows.
-const TIMESTAMP_DIGITS: &str = "scanDigits";
-
-/// The fractional digits a `TO_TIMESTAMP` node keeps, when the typed pass derived them.
-pub(crate) fn timestamp_digits(node: &Json) -> Option<u8> {
-    u8::try_from(node.get(TIMESTAMP_DIGITS)?.as_u64()?).ok()
-}
-
-/// The fractional digits a [`SECOND_NODE`] keeps.
-pub(crate) fn second_fraction(node: &Json) -> Option<u8> {
-    let fraction = node.get(SECOND_FRACTION)?.as_u64()?;
-    u8::try_from(fraction).ok()
 }
 
 /// How a node relates to the one-argument `SECOND(x)` and `EXTRACT(SECOND FROM x)`.
@@ -287,33 +255,183 @@ enum SecondCall {
     Of(Seconds),
 }
 
-/// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
-/// a `name` identifier to its visitor.
-const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
-/// See [`EXPR_ARRAY_FIELDS`].
-const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
+/// A field of a node that holds expressions the typed pass types. Curated: an `ESCAPE` character
+/// and a JSON_VALUE `DEFAULT` are left as sent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Field {
+    /// The operands of `AND` and `OR`.
+    Expressions,
+    /// A call's arguments, an IN list's values, or a CASE's WHEN values.
+    Arguments,
+    /// A CASE's THEN and ELSE results.
+    Results,
+    /// The subject of a unary predicate, IN, BETWEEN, or LIKE.
+    Expression,
+    Pattern,
+    /// A comparison's left operand or BETWEEN's lower bound.
+    Left,
+    /// A comparison's right operand or BETWEEN's upper bound.
+    Right,
+    Basis,
+}
+
+/// The fields that hold a predicate's operands or a simple CASE's basis. [`Field::Arguments`]
+/// holds the rest: an IN list or the WHEN values.
+const COMPARED_FIELDS: [Field; 4] = [Field::Expression, Field::Left, Field::Right, Field::Basis];
+
+/// Each typed child of `node` with its field and its index in an array field, the array fields
+/// first.
+fn typed_children(node: &Expr) -> Vec<(Field, Option<usize>, &Expr)> {
+    fn array<'e>(field: Field, items: &[&'e Expr]) -> Vec<(Field, Option<usize>, &'e Expr)> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (field, Some(i), *item))
+            .collect()
+    }
+    fn refs(items: &[Expr]) -> Vec<&Expr> {
+        items.iter().collect()
+    }
+    match node {
+        Expr::Literal(_) | Expr::Column(_) => Vec::new(),
+        Expr::And(items) | Expr::Or(items) => array(Field::Expressions, &refs(items)),
+        Expr::Scalar(ScalarCall { arguments, .. }) => array(Field::Arguments, &refs(arguments)),
+        Expr::Aggregate(call) => array(Field::Arguments, &refs(&call.arguments)),
+        Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
+            array(Field::Arguments, &[argument])
+        }
+        Expr::Scan(scan) => array(Field::Arguments, &[scan.0.argument()]),
+        Expr::JsonValue(call) => array(Field::Arguments, &[&call.document, &call.path]),
+        Expr::Case(case) => {
+            let mut children = array(Field::Arguments, &refs(&case.whens));
+            children.extend(array(Field::Results, &refs(&case.results)));
+            children.extend(
+                case.basis
+                    .as_deref()
+                    .map(|basis| (Field::Basis, None, basis)),
+            );
+            children
+        }
+        Expr::InList { expression, values } => {
+            let mut children = array(Field::Arguments, &refs(values));
+            children.push((Field::Expression, None, expression));
+            children
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            vec![(Field::Expression, None, inner)]
+        }
+        Expr::Between {
+            expression,
+            low,
+            high,
+        } => vec![
+            (Field::Expression, None, expression),
+            (Field::Left, None, low),
+            (Field::Right, None, high),
+        ],
+        Expr::Like {
+            expression,
+            pattern,
+            ..
+        } => vec![
+            (Field::Expression, None, expression),
+            (Field::Pattern, None, pattern),
+        ],
+        Expr::Compare { left, right, .. } => {
+            vec![(Field::Left, None, left), (Field::Right, None, right)]
+        }
+    }
+}
+
+/// The typed child of `node` at `field` and `index`, as [`typed_children`] lists it.
+fn slot(node: &mut Expr, field: Field, index: Option<usize>) -> Option<&mut Expr> {
+    let i = index.unwrap_or(0);
+    match field {
+        Field::Expressions => match node {
+            Expr::And(items) | Expr::Or(items) => items.get_mut(i),
+            _ => None,
+        },
+        Field::Arguments => match node {
+            Expr::Scalar(ScalarCall { arguments, .. }) => arguments.get_mut(i),
+            Expr::Aggregate(call) => call.arguments.get_mut(i),
+            Expr::Case(case) => case.whens.get_mut(i),
+            Expr::InList { values, .. } => values.get_mut(i),
+            Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
+                (i == 0).then_some(&mut **argument)
+            }
+            Expr::Scan(scan) => (i == 0).then(|| scan.0.argument_mut()),
+            Expr::JsonValue(call) => match i {
+                0 => Some(&mut *call.document),
+                1 => Some(&mut *call.path),
+                _ => None,
+            },
+            _ => None,
+        },
+        Field::Results => match node {
+            Expr::Case(case) => case.results.get_mut(i),
+            _ => None,
+        },
+        Field::Basis => match node {
+            Expr::Case(case) => case.basis.as_deref_mut(),
+            _ => None,
+        },
+        Field::Expression => match node {
+            Expr::InList { expression, .. }
+            | Expr::Between { expression, .. }
+            | Expr::Like { expression, .. }
+            | Expr::Not(expression)
+            | Expr::IsNull(expression)
+            | Expr::IsNotNull(expression) => Some(&mut **expression),
+            _ => None,
+        },
+        Field::Pattern => match node {
+            Expr::Like { pattern, .. } => Some(&mut **pattern),
+            _ => None,
+        },
+        Field::Left => match node {
+            Expr::Between { low: operand, .. } | Expr::Compare { left: operand, .. } => {
+                Some(&mut **operand)
+            }
+            _ => None,
+        },
+        Field::Right => match node {
+            Expr::Between { high: operand, .. } | Expr::Compare { right: operand, .. } => {
+                Some(&mut **operand)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Replaces the typed child at `field` and `index` of `node` with `rewrite`'s result.
+fn rewrite_slot<E>(
+    node: &mut Expr,
+    field: Field,
+    index: Option<usize>,
+    rewrite: impl FnOnce(Expr) -> Result<Expr, E>,
+) -> Result<(), E> {
+    let child = slot(node, field, index).expect("a typed child the node holds");
+    *child = rewrite(take(child))?;
+    Ok(())
+}
 
 pub(crate) fn decline(reason: String) -> UdfError {
     UdfError::User(format!("the scan cannot compute this expression: {reason}"))
 }
 
-pub(crate) fn kind(node: &Json) -> &str {
-    node.get("type").and_then(Json::as_str).unwrap_or("")
-}
-
-fn wrap(node_type: &str, arg: Json) -> Json {
-    serde_json::json!({"type": node_type, "arguments": [arg]})
+fn wrap(kind: fn(Box<Expr>) -> ScanKind, argument: Expr) -> Expr {
+    Expr::scan(kind(Box::new(argument)))
 }
 
 /// `node` converted to text implicitly, as a LIKE operand, a `||` operand, or a string-function
 /// argument.
-fn to_text(node: Json, ty: Inferred) -> Result<Json, UdfError> {
+fn to_text(node: Expr, ty: Inferred) -> Result<Expr, UdfError> {
     if ty.is_text() || ty == Inferred::Null {
         Ok(node)
     } else if ty.is_integer() {
-        Ok(wrap(INTEGER_TEXT_NODE, node))
+        Ok(wrap(ScanKind::IntegerText, node))
     } else if ty == BOOLEAN {
-        Ok(wrap(BOOLEAN_TEXT_NODE, node))
+        Ok(wrap(ScanKind::BooleanText, node))
     } else {
         Err(decline(format!(
             "converting {} to text depends on the session's NLS settings",
@@ -324,17 +442,22 @@ fn to_text(node: Json, ty: Inferred) -> Result<Json, UdfError> {
 
 /// `node` at an [`IntegerArg`] position. A non-negative integer literal is already `Int64`.
 fn to_integer_argument(
-    node: Json,
+    node: Expr,
     ty: Inferred,
     arg: IntegerArg,
     function: &str,
-) -> Result<Json, UdfError> {
-    let literal = kind(&node) == "literal_exactnumeric"
-        && match &node["value"] {
-            Json::Number(n) => n.is_u64(),
-            Json::String(s) => s.parse::<i64>().is_ok_and(|v| v >= 0),
+) -> Result<Expr, UdfError> {
+    let literal = match node.as_literal() {
+        Some(Literal {
+            kind: LiteralKind::ExactNumeric,
+            value,
+        }) => match value {
+            Scalar::Number(n) => n.is_u64(),
+            Scalar::String(s) => s.parse::<i64>().is_ok_and(|v| v >= 0),
             _ => false,
-        };
+        },
+        _ => false,
+    };
     if literal {
         return Ok(node);
     }
@@ -348,32 +471,24 @@ fn to_integer_argument(
             short(&node)
         )));
     };
-    let mut out = wrap(INTEGER_ARGUMENT_NODE, node);
-    out[ROUND] = round.into();
-    out[NEGATIVE_IS_NULL] = arg.negative_is_null.into();
-    Ok(out)
+    Ok(Expr::scan(ScanKind::IntegerArgument {
+        argument: Box::new(node),
+        round,
+        negative_is_null: arg.negative_is_null,
+    }))
 }
 
-/// The DataFusion SQL of an [`INTEGER_ARGUMENT_NODE`] over its rendered argument.
-pub(crate) fn render_integer_argument(node: &Json, inner: &str) -> String {
-    let flag = |field: &str| node.get(field).and_then(Json::as_bool).unwrap_or(false);
-    let value = if flag(ROUND) {
+/// The DataFusion SQL of an integer-argument node over its rendered argument.
+pub(crate) fn render_integer_argument(round: bool, negative_is_null: bool, inner: &str) -> String {
+    let value = if round {
         format!("CAST(round({inner}) AS BIGINT)")
     } else {
         format!("CAST({inner} AS BIGINT)")
     };
-    if flag(NEGATIVE_IS_NULL) {
+    if negative_is_null {
         format!("(CASE WHEN {value} >= 0 THEN {value} END)")
     } else {
         value
-    }
-}
-
-fn short(node: &Json) -> String {
-    let text = node.to_string();
-    match text.char_indices().nth(120) {
-        Some((byte, _)) => format!("{}…", &text[..byte]),
-        None => text,
     }
 }
 
@@ -453,12 +568,12 @@ fn integer_text_width(precision: Option<u8>) -> u32 {
 /// A CAST to CHAR or VARCHAR. Text into a shorter VARCHAR or ASCII runs unchecked
 /// (`docs/semantic-differences.md`); CHAR declines, because the scan does not blank-pad.
 fn cast_to_text(
-    source: Json,
+    source: Expr,
     ty: Inferred,
     target: ExasolType,
     size: u32,
     is_char: bool,
-) -> Result<Json, UdfError> {
+) -> Result<Expr, UdfError> {
     let refuse = |why: &str| {
         Err(decline(format!(
             "CAST of {} to {target} {why}",
@@ -474,12 +589,12 @@ fn cast_to_text(
         if integer_text_width(ty.integer_precision()) > size {
             return refuse("may not fit the integer's text");
         }
-        Ok(wrap(INTEGER_TEXT_NODE, source))
+        Ok(wrap(ScanKind::IntegerText, source))
     } else if ty == BOOLEAN {
         if size < 5 {
             return refuse("may not fit FALSE");
         }
-        Ok(wrap(BOOLEAN_TEXT_NODE, source))
+        Ok(wrap(ScanKind::BooleanText, source))
     } else {
         refuse("depends on the session's NLS settings")
     }
@@ -487,7 +602,7 @@ fn cast_to_text(
 
 /// A CAST from text to a type Exasol parses by session settings (`NLS_DATE_FORMAT`,
 /// `NLS_TIMESTAMP_FORMAT`, `NLS_NUMERIC_CHARACTERS`).
-fn cast_from_text(source: &Json, ty: Inferred, target: ExasolType) -> Result<(), UdfError> {
+fn cast_from_text(source: &Expr, ty: Inferred, target: ExasolType) -> Result<(), UdfError> {
     let session_parsed = match target {
         ExasolType::Date
         | ExasolType::Timestamp { .. }
@@ -519,21 +634,21 @@ impl<'a> ScanTyping<'a> {
     }
 
     /// The type Exasol gives `node`, where the typed pass proves it. `None` leaves the type to Exasol.
-    pub fn exact_type(self, node: &Json) -> Option<ExasolType> {
+    pub fn exact_type(self, node: &Expr) -> Option<ExasolType> {
         self.infer_type(node).exact()
     }
 
     /// An operand of a top-level `AND`, rendered alone only where it renders inside the `AND`,
     /// which refuses a text operand that Exasol rejects and DataFusion cannot combine.
-    pub fn render_conjunct(self, conjunct: &Json) -> Result<String, UdfError> {
+    pub fn render_conjunct(self, conjunct: &Expr) -> Result<String, UdfError> {
         refuse_implicit_text(conjunct, &[self.infer_type(conjunct)])?;
         self.render_filter_root(conjunct)
     }
 
     /// Exasol's type of `node`, whether or not the scan computes it. It reads the tree as Exasol sent
     /// it, because the scan's rewrites keep Exasol's semantics.
-    pub(crate) fn infer_type(self, node: &Json) -> Inferred {
-        if let Some(ty) = leaf_type(node, self.columns) {
+    pub(crate) fn infer_type(self, node: &Expr) -> Inferred {
+        if let Some(ty) = self.leaf_type(node) {
             return ty;
         }
         let Ok(children) = ChildTypes::collect(node, |_, _, child| {
@@ -544,36 +659,38 @@ impl<'a> ScanTyping<'a> {
 
     /// Rewrites `node` for the DataFusion dialect and derives its type, post-order. Text passes only
     /// where Exasol takes text; elsewhere Exasol converts it by the session's NLS settings.
-    pub(crate) fn type_scan_tree(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+    pub(crate) fn type_scan_tree(self, node: &Expr) -> Result<(Expr, Inferred), UdfError> {
         self.type_at(node, Position::Value)
     }
 
     /// [`Self::type_scan_tree`] for the root of a filter or of a join condition.
-    pub(crate) fn type_scan_filter(self, node: &Json) -> Result<(Json, Inferred), UdfError> {
+    pub(crate) fn type_scan_filter(self, node: &Expr) -> Result<(Expr, Inferred), UdfError> {
         self.type_at(node, Position::Filter)
     }
 
-    fn type_at(self, node: &Json, position: Position) -> Result<(Json, Inferred), UdfError> {
-        if let Some(ty) = leaf_type(node, self.columns) {
+    fn type_at(self, node: &Expr, position: Position) -> Result<(Expr, Inferred), UdfError> {
+        if let Some(ty) = self.leaf_type(node) {
             return Ok((node.clone(), ty));
         }
-        let mut out = node.clone();
         let bare = self.bare_form(node, position);
-        let child_position = match kind(node) {
-            "predicate_and" | "predicate_or" => position,
+        let child_position = match node {
+            Expr::And(_) | Expr::Or(_) => position,
             _ => Position::Value,
         };
+        let mut rewritten = Vec::new();
         let children = ChildTypes::collect(node, |field, index, child| {
-            let (mut rewritten, ty) = self.type_at(child, child_position)?;
+            let (mut typed, ty) = self.type_at(child, child_position)?;
             if bare.is_none() {
-                rewritten = empty_as_null(child, rewritten, ty);
+                typed = empty_as_null(typed, ty);
             }
-            match index {
-                Some(i) => out[field][i] = rewritten,
-                None => out[field] = rewritten,
-            }
+            rewritten.push((field, index, typed));
             Ok(ty)
         })?;
+        let mut out = node.clone();
+        for (field, index, typed) in rewritten {
+            rewrite_slot(&mut out, field, index, |_| Ok::<_, Infallible>(typed))
+                .unwrap_or_else(|never| match never {});
+        }
         let ty = self.node_type(node, &children);
         self.rewrite_for_scan(node, &mut out, &children, ty)?;
         if let Some(bare) = bare {
@@ -582,56 +699,69 @@ impl<'a> ScanTyping<'a> {
         Ok((out, ty))
     }
 
+    fn leaf_type(self, node: &Expr) -> Option<Inferred> {
+        let Expr::Column(column) = node else {
+            return None;
+        };
+        Some(
+            self.columns
+                .column_type(column)
+                .map_or(Inferred::Unknown, Inferred::Exact),
+        )
+    }
+
     /// The form of `node` that keeps its string columns bare, so statistics still prune it.
-    fn bare_form(self, node: &Json, position: Position) -> Option<BareForm> {
-        let text_column = |operand: &Json| {
-            kind(operand) == "column"
-                && leaf_type(operand, self.columns).is_some_and(Inferred::is_text)
+    fn bare_form(self, node: &Expr, position: Position) -> Option<BareForm> {
+        let text_column = |operand: &Expr| {
+            matches!(operand, Expr::Column(_))
+                && self.leaf_type(operand).is_some_and(Inferred::is_text)
         };
-        let literal = |operand: &Json| matches!(kind(operand), "literal_string" | "literal_null");
-        let subject = || {
-            node.get("expression")
-                .filter(|subject| text_column(subject))
+        let literal = |operand: &Expr| {
+            matches!(
+                operand.as_literal().map(|literal| literal.kind),
+                Some(LiteralKind::String | LiteralKind::Null)
+            )
         };
-        let op = kind(node);
-        match op {
-            "predicate_is_null" => return subject().cloned().map(BareForm::OrEmpty),
-            "predicate_is_not_null" => return subject().cloned().map(BareForm::Guarded),
+        match node {
+            Expr::IsNull(subject) => {
+                return text_column(subject).then(|| BareForm::OrEmpty((**subject).clone()));
+            }
+            Expr::IsNotNull(subject) => {
+                return text_column(subject).then(|| BareForm::Guarded((**subject).clone()));
+            }
             _ if position == Position::Value => return None,
             _ => {}
         }
-        match op {
-            "predicate_in_constlist" => {
-                let values = node.get("arguments")?.as_array()?;
-                (subject().is_some() && values.iter().all(literal)).then_some(BareForm::Unguarded)
-            }
-            "predicate_between" => {
-                (subject().is_some() && literal(node.get("left")?) && literal(node.get("right")?))
-                    .then_some(BareForm::Unguarded)
-            }
-            "predicate_like" => subject()
-                .filter(|_| node.get("pattern").is_some_and(literal))
-                .map(|column| BareForm::Guarded(column.clone())),
-            "predicate_equal"
-            | "predicate_notequal"
-            | "predicate_less"
-            | "predicate_lessequal"
-            | "predicate_greater"
-            | "predicate_greaterequal" => {
-                let (left, right) = (node.get("left")?, node.get("right")?);
+        match node {
+            Expr::InList { expression, values } => (text_column(expression)
+                && values.iter().all(literal))
+            .then_some(BareForm::Unguarded),
+            Expr::Between {
+                expression,
+                low,
+                high,
+            } => (text_column(expression) && literal(low) && literal(high))
+                .then_some(BareForm::Unguarded),
+            Expr::Like {
+                expression,
+                pattern,
+                ..
+            } => (text_column(expression) && literal(pattern))
+                .then(|| BareForm::Guarded((**expression).clone())),
+            Expr::Compare { op, left, right } => {
                 let (column, op) = if text_column(left) && literal(right) {
-                    (left, op)
+                    (left, *op)
                 } else if literal(left) && text_column(right) {
-                    (right, mirrored(op))
-                } else if op == "predicate_equal" && text_column(left) && text_column(right) {
+                    (right, op.mirrored())
+                } else if *op == CompareOp::Equal && text_column(left) && text_column(right) {
                     // Equal columns are both empty or neither, so one guard covers both.
-                    return Some(BareForm::Guarded(left.clone()));
+                    return Some(BareForm::Guarded((**left).clone()));
                 } else {
                     return None;
                 };
                 Some(match op {
-                    "predicate_notequal" | "predicate_less" | "predicate_lessequal" => {
-                        BareForm::Guarded(column.clone())
+                    CompareOp::NotEqual | CompareOp::Less | CompareOp::LessEqual => {
+                        BareForm::Guarded((**column).clone())
                     }
                     _ => BareForm::Unguarded,
                 })
@@ -641,40 +771,48 @@ impl<'a> ScanTyping<'a> {
     }
 
     /// Exasol's type of a non-column `node` whose children are typed.
-    fn node_type(self, node: &Json, children: &ChildTypes) -> Inferred {
+    fn node_type(self, node: &Expr, children: &ChildTypes) -> Inferred {
         match self.second_call(node, children) {
             SecondCall::Of(seconds) => return seconds.inferred(),
             SecondCall::Unsupported => return Inferred::Unknown,
             SecondCall::NotSecond => {}
         }
-        match kind(node) {
-            "literal_null" => Inferred::Null,
-            "literal_bool" => BOOLEAN,
-            "literal_string" => Inferred::Partial(Partial::Text),
-            "literal_double" => Inferred::Exact(ExasolType::DoublePrecision),
-            "literal_exactnumeric" => exact_numeric_type(node),
-            "literal_date" => DATE,
-            "literal_timestamp" => timestamp_literal_type(node, self.version),
-            k if k.starts_with("predicate_") => BOOLEAN,
-            "function_scalar_extract" => node
-                .get("toExtract")
-                .and_then(Json::as_str)
-                .map_or(Inferred::Unknown, |field| {
-                    typed_function(field).result_type(&[], self.version)
-                }),
-            "function_scalar_case" => union_of(children.of("results"), self.version),
-            "function_scalar_json_value" => json_value_type(node),
-            _ if is_cast(node) => cast_target(node).map_or(Inferred::Unknown, Inferred::Exact),
-            "function_scalar" => {
-                let function = typed_function(&upper_name(node));
-                let ty = function.result_type(children.of("arguments"), self.version);
-                match format_digits(node, function) {
+        match node {
+            Expr::Literal(literal) => match literal.kind {
+                LiteralKind::Null => Inferred::Null,
+                LiteralKind::Bool => BOOLEAN,
+                LiteralKind::String => Inferred::Partial(Partial::Text),
+                LiteralKind::Double => Inferred::Exact(ExasolType::DoublePrecision),
+                LiteralKind::ExactNumeric => exact_numeric_type(literal),
+                LiteralKind::Date => DATE,
+                LiteralKind::Timestamp => timestamp_literal_type(literal, self.version),
+                LiteralKind::TimestampUtc
+                | LiteralKind::LocalTimeZoneTimestamp
+                | LiteralKind::Binary { .. } => Inferred::Unknown,
+            },
+            Expr::Compare { .. }
+            | Expr::And(_)
+            | Expr::Or(_)
+            | Expr::Not(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Like { .. } => BOOLEAN,
+            Expr::Extract { field, .. } => typed_function(field).result_type(&[], self.version),
+            Expr::Case(_) => union_of(children.of(Field::Results), self.version),
+            Expr::JsonValue(call) => Inferred::Exact(returning_type(call)),
+            Expr::Cast { target, .. } => Inferred::Exact(*target),
+            Expr::Scalar(call) => {
+                let function = typed_function(&call.name);
+                let ty = function.result_type(children.of(Field::Arguments), self.version);
+                match format_digits(call, function) {
                     Some(digits) => ty.holding(digits),
                     None => ty,
                 }
             }
-            "function_aggregate" => aggregate_type(&upper_name(node), children.of("arguments")),
-            _ => Inferred::Unknown,
+            Expr::Aggregate(call) => aggregate_type(&call.name, children.of(Field::Arguments)),
+            Expr::Column(_) | Expr::Scan(_) => Inferred::Unknown,
         }
     }
 
@@ -682,14 +820,15 @@ impl<'a> ScanTyping<'a> {
     /// `ty` is the node's [`Self::node_type`].
     fn rewrite_for_scan(
         self,
-        node: &Json,
-        out: &mut Json,
+        node: &Expr,
+        out: &mut Expr,
         children: &ChildTypes,
         ty: Inferred,
     ) -> Result<(), UdfError> {
         match self.second_call(node, children) {
             SecondCall::Of(seconds) => {
-                *out = seconds.node(out["arguments"][0].take());
+                let argument = slot(out, Field::Arguments, Some(0)).expect("SECOND's argument");
+                *out = seconds.node(take(argument));
                 return Ok(());
             }
             SecondCall::Unsupported => {
@@ -700,59 +839,51 @@ impl<'a> ScanTyping<'a> {
             }
             SecondCall::NotSecond => {}
         }
-        match kind(node) {
-            "predicate_like" => {
-                for field in ["expression", "pattern"] {
+        match node {
+            Expr::Like { .. } => {
+                for field in [Field::Expression, Field::Pattern] {
                     if let Some(ty) = children.one(field) {
-                        out[field] = to_text(out[field].take(), ty)?;
+                        rewrite_slot(out, field, None, |operand| to_text(operand, ty))?;
                     }
                 }
             }
-            "predicate_equal"
-            | "predicate_notequal"
-            | "predicate_less"
-            | "predicate_lessequal"
-            | "predicate_greater"
-            | "predicate_greaterequal"
-            | "predicate_between"
-            | "predicate_in_constlist" => {
+            Expr::Compare { .. } | Expr::Between { .. } | Expr::InList { .. } => {
                 type_comparison(node, out, children)?;
                 floor_timestamp_literals(node, out, children);
             }
-            "predicate_is_null" | "predicate_is_not_null" => {}
-            "function_scalar_case" => {
+            Expr::IsNull(_) | Expr::IsNotNull(_) => {}
+            Expr::Case(_) => {
                 // A simple CASE compares its basis with each WHEN value.
-                if children.one("basis").is_some() {
+                if children.one(Field::Basis).is_some() {
                     type_comparison(node, out, children)?;
                 } else {
-                    refuse_implicit_text(node, children.of("arguments"))?;
+                    refuse_implicit_text(node, children.of(Field::Arguments))?;
                 }
-                unify_branches(node, out, "results", children.of("results"), ty)?;
+                unify_branches(node, out, Field::Results, children.of(Field::Results), ty)?;
             }
-            "function_scalar_json_value" => check_json_value(node, children.of("arguments"))?,
-            _ if is_cast(node) => rewrite_cast(out, children.of("arguments"))?,
-            "function_scalar" => rewrite_scalar_function(node, out, children.of("arguments"), ty)?,
-            "function_aggregate" => check_aggregate(node, children.of("arguments"))?,
+            Expr::JsonValue(call) => check_json_value(call, children.of(Field::Arguments))?,
+            Expr::Cast { .. } => rewrite_cast(out, children.of(Field::Arguments))?,
+            Expr::Scalar(call) => {
+                rewrite_scalar_function(call, out, children.of(Field::Arguments), ty)?;
+            }
+            Expr::Aggregate(call) => {
+                check_aggregate(node, &call.name, children.of(Field::Arguments))?
+            }
             _ => refuse_implicit_text(node, &children.all())?,
         }
         Ok(())
     }
 
-    fn second_call(self, node: &Json, children: &ChildTypes) -> SecondCall {
-        let (name, extract) = match kind(node) {
-            "function_scalar_extract" => (
-                node.get("toExtract")
-                    .and_then(Json::as_str)
-                    .map(str::to_uppercase),
-                true,
-            ),
-            "function_scalar" => (Some(upper_name(node)), false),
-            _ => (None, false),
+    fn second_call(self, node: &Expr, children: &ChildTypes) -> SecondCall {
+        let (name, extract) = match node {
+            Expr::Extract { field, .. } => (field.to_uppercase(), true),
+            Expr::Scalar(call) => (call.name.clone(), false),
+            _ => return SecondCall::NotSecond,
         };
-        if name.as_deref() != Some("SECOND") {
+        if name != "SECOND" {
             return SecondCall::NotSecond;
         }
-        match children.of("arguments") {
+        match children.of(Field::Arguments) {
             [Inferred::Exact(ExasolType::Date)] if !extract => {
                 SecondCall::Of(Seconds::OfDate(self.version))
             }
@@ -775,10 +906,10 @@ enum Position {
     Value,
 }
 
-/// `typed`, the rewrite of the operand `node`, with a string column's empty strings read as NULL.
-pub(crate) fn empty_as_null(node: &Json, typed: Json, ty: Inferred) -> Json {
-    if kind(node) == "column" && ty.is_text() {
-        wrap(EMPTY_AS_NULL_NODE, typed)
+/// `typed`, the rewrite of an operand, with a string column's empty strings read as NULL.
+pub(crate) fn empty_as_null(typed: Expr, ty: Inferred) -> Expr {
+    if matches!(typed, Expr::Column(_)) && ty.is_text() {
+        wrap(ScanKind::EmptyAsNull, typed)
     } else {
         typed
     }
@@ -790,87 +921,63 @@ enum BareForm {
     /// A predicate that is never TRUE for an empty string.
     Unguarded,
     /// A predicate that could be TRUE for an empty string, so it adds that the column is not one.
-    Guarded(Json),
+    Guarded(Expr),
     /// `IS NULL`, which also holds for an empty string.
-    OrEmpty(Json),
+    OrEmpty(Expr),
 }
 
 impl BareForm {
-    fn apply(self, out: &mut Json) {
-        let (junction, comparison, column) = match self {
+    fn apply(self, out: &mut Expr) {
+        let empty = || Expr::Literal(Literal::string(""));
+        *out = match self {
             Self::Unguarded => return,
-            Self::Guarded(column) => ("predicate_and", "predicate_notequal", column),
-            Self::OrEmpty(column) => ("predicate_or", "predicate_equal", column),
+            Self::Guarded(column) => Expr::And(vec![
+                take(out),
+                Expr::compare(CompareOp::NotEqual, column, empty()),
+            ]),
+            Self::OrEmpty(column) => Expr::Or(vec![
+                take(out),
+                Expr::compare(CompareOp::Equal, column, empty()),
+            ]),
         };
-        *out = serde_json::json!({
-            "type": junction,
-            "expressions": [out.take(), {
-                "type": comparison,
-                "left": column,
-                "right": {"type": "literal_string", "value": ""},
-            }],
-        });
-    }
-}
-
-fn leaf_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<Inferred> {
-    if !node.is_object() {
-        Some(Inferred::Unknown)
-    } else if kind(node) == "column" {
-        Some(
-            columns
-                .column_type(node)
-                .map_or(Inferred::Unknown, Inferred::Exact),
-        )
-    } else {
-        None
     }
 }
 
 /// The types of a node's typed child expressions, by field.
 #[derive(Default)]
 struct ChildTypes {
-    arrays: Vec<(&'static str, Vec<Inferred>)>,
-    singles: Vec<(&'static str, Inferred)>,
+    arrays: Vec<(Field, Vec<Inferred>)>,
+    singles: Vec<(Field, Inferred)>,
 }
 
 impl ChildTypes {
     /// Types each child expression of `node`, given its field and its index in an array field.
     fn collect<E>(
-        node: &Json,
-        mut type_child: impl FnMut(&'static str, Option<usize>, &Json) -> Result<Inferred, E>,
+        node: &Expr,
+        mut type_child: impl FnMut(Field, Option<usize>, &Expr) -> Result<Inferred, E>,
     ) -> Result<Self, E> {
         let mut children = Self::default();
-        for field in EXPR_ARRAY_FIELDS {
-            if let Some(Json::Array(items)) = node.get(field) {
-                let types = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| type_child(field, Some(i), item))
-                    .collect::<Result<_, _>>()?;
-                children.arrays.push((field, types));
-            }
-        }
-        for field in EXPR_SINGLE_FIELDS {
-            if let Some(child) = node.get(field)
-                && child.is_object()
-            {
-                children
-                    .singles
-                    .push((field, type_child(field, None, child)?));
+        for (field, index, child) in typed_children(node) {
+            let ty = type_child(field, index, child)?;
+            match index {
+                Some(_) => match children.arrays.iter_mut().find(|(f, _)| *f == field) {
+                    Some((_, types)) => types.push(ty),
+                    None => children.arrays.push((field, vec![ty])),
+                },
+                None => children.singles.push((field, ty)),
             }
         }
         Ok(children)
     }
 
-    fn of(&self, field: &str) -> &[Inferred] {
+    fn of(&self, field: Field) -> &[Inferred] {
         self.arrays
             .iter()
             .find(|(f, _)| *f == field)
             .map_or(&[], |(_, c)| c.as_slice())
     }
 
-    fn one(&self, field: &str) -> Option<Inferred> {
+    fn one(&self, field: Field) -> Option<Inferred> {
         self.singles
             .iter()
             .find(|(f, _)| *f == field)
@@ -887,26 +994,22 @@ impl ChildTypes {
 }
 
 /// The `n` of a `TO_TIMESTAMP` format's `FFn`, or 0, when the format is a literal it translates.
-fn format_digits(node: &Json, function: ScalarFunction) -> Option<u8> {
+fn format_digits(call: &ScalarCall, function: ScalarFunction) -> Option<u8> {
     if function.result != ResultRule::Timestamp {
         return None;
     }
-    format_literal(node.get("arguments")?.get(1)?).and_then(fraction_digits)
-}
-
-fn upper_name(node: &Json) -> String {
-    node.get("name")
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_uppercase()
+    call.arguments
+        .get(1)?
+        .as_string_literal()
+        .and_then(fraction_digits)
 }
 
 /// An exact numeric literal is a DECIMAL(digits,0) or fractional. Exasol sends an integer beyond
 /// 36 digits as `literal_double`.
-fn exact_numeric_type(node: &Json) -> Inferred {
-    let text = match node.get("value") {
-        Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
-        Some(Json::String(s)) => Some(s.clone()),
+fn exact_numeric_type(literal: &Literal) -> Inferred {
+    let text = match &literal.value {
+        Scalar::Number(n) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+        Scalar::String(s) => Some(s.clone()),
         _ => None,
     };
     text.as_deref()
@@ -917,10 +1020,10 @@ fn exact_numeric_type(node: &Json) -> Inferred {
         })
 }
 
-fn timestamp_literal_type(node: &Json, version: ExasolVersion) -> Inferred {
-    let precision = node
-        .get("value")
-        .and_then(Json::as_str)
+fn timestamp_literal_type(literal: &Literal, version: ExasolVersion) -> Inferred {
+    let precision = literal
+        .value
+        .as_str()
         .and_then(|value| u8::try_from(TimestampLiteral(value).type_precision()).ok());
     match precision {
         Some(p) if p <= TimestampUnit::Nanosecond.digits() => derived_timestamp(p, version),
@@ -929,15 +1032,18 @@ fn timestamp_literal_type(node: &Json, version: ExasolVersion) -> Inferred {
 }
 
 fn rewrite_scalar_function(
-    node: &Json,
-    out: &mut Json,
+    call: &ScalarCall,
+    out: &mut Expr,
     args: &[Inferred],
     ty: Inferred,
 ) -> Result<(), UdfError> {
-    let function = typed_function(&upper_name(node));
+    let node = Expr::Scalar(call.clone());
+    let function = typed_function(&call.name);
     let text_positions = function.string_positions(args.len());
     for &i in &text_positions {
-        out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
+        rewrite_slot(out, Field::Arguments, Some(i), |argument| {
+            to_text(argument, args[i])
+        })?;
     }
     let integer_positions: Vec<usize> = function
         .integer_args()
@@ -945,22 +1051,24 @@ fn rewrite_scalar_function(
         .filter(|arg| arg.position < args.len())
         .map(|&arg| {
             let i = arg.position;
-            out["arguments"][i] =
-                to_integer_argument(out["arguments"][i].take(), args[i], arg, function.name)?;
+            rewrite_slot(out, Field::Arguments, Some(i), |argument| {
+                to_integer_argument(argument, args[i], arg, function.name)
+            })?;
             Ok(i)
         })
         .collect::<Result<_, UdfError>>()?;
     if function.result == ResultRule::Unified {
-        return unify_branches(node, out, "arguments", args, ty);
+        return unify_branches(&node, out, Field::Arguments, args, ty);
     }
     // An unknown version proves no digits, so the format's own `FFn` gives them.
     if function.result == ResultRule::Timestamp
-        && let Some(digits) = ty.value_digits().or_else(|| format_digits(node, function))
+        && let Some(digits) = ty.value_digits().or_else(|| format_digits(call, function))
+        && let Expr::Scalar(out) = out
     {
-        out[TIMESTAMP_DIGITS] = digits.into();
+        out.timestamp_digits = Some(digits);
     }
     if let ResultRule::DateAddition(_) = function.result {
-        check_date_addition(node, out, args)?;
+        check_date_addition(call, out, args)?;
     } else {
         let converted: Vec<Inferred> = args
             .iter()
@@ -972,47 +1080,50 @@ fn rewrite_scalar_function(
             })
             .map(|(_, ty)| *ty)
             .collect();
-        refuse_implicit_text(node, &converted)?;
+        refuse_implicit_text(&node, &converted)?;
     }
     match function.result {
         ResultRule::IntegerOverIntegers if !args.iter().all(|ty| ty.is_integer()) => {
             return Err(decline(format!(
                 "{} computes over integer operands only: {}",
                 function.name,
-                short(node)
+                short(&node)
             )));
         }
         // DataFusion truncates a DATE to a timestamp, so the scan casts the result back to DATE.
         ResultRule::Truncated if args.get(1) == Some(&DATE) => {
-            *out = cast_node(ExasolType::Date, out.take());
+            *out = cast_node(ExasolType::Date, take(out));
         }
-        ResultRule::Text => *out = wrap(EMPTY_AS_NULL_NODE, out.take()),
+        ResultRule::Text => *out = wrap(ScanKind::EmptyAsNull, take(out)),
         _ => {}
     }
     Ok(())
 }
 
-fn cast_node(target: ExasolType, argument: Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&target),
-        "arguments": [argument],
-    })
+fn cast_node(target: ExasolType, argument: Expr) -> Expr {
+    Expr::Cast {
+        target,
+        argument: Box::new(argument),
+    }
 }
 
 /// The scan computes `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, and `ADD_MINUTES` over a DATE or a
 /// TIMESTAMP, in `Date32` or a microsecond or nanosecond timestamp. The first argument gets a
 /// CAST to that type, whatever Arrow type holds it.
-fn check_date_addition(node: &Json, out: &mut Json, args: &[Inferred]) -> Result<(), UdfError> {
+fn check_date_addition(
+    call: &ScalarCall,
+    out: &mut Expr,
+    args: &[Inferred],
+) -> Result<(), UdfError> {
+    let node = Expr::Scalar(call.clone());
     let &[first, count] = args else {
         return Err(decline(format!(
             "a date addition takes 2 arguments, got {}: {}",
             args.len(),
-            short(node)
+            short(&node)
         )));
     };
-    refuse_implicit_text(node, args)?;
+    refuse_implicit_text(&node, args)?;
     let cast_target = if first == DATE {
         ExasolType::Date
     } else if let Some(digits) = first.value_digits() {
@@ -1024,33 +1135,38 @@ fn check_date_addition(node: &Json, out: &mut Json, args: &[Inferred]) -> Result
     } else {
         return Err(decline(format!(
             "a date addition over a value that is not a DATE or TIMESTAMP: {}",
-            short(node)
+            short(&node)
         )));
     };
     if count == BOOLEAN {
-        out["arguments"][1] = wrap(BOOLEAN_NUMBER_NODE, out["arguments"][1].take());
+        rewrite_slot(out, Field::Arguments, Some(1), |count| {
+            Ok::<_, Infallible>(wrap(ScanKind::BooleanNumber, count))
+        })
+        .unwrap_or_else(|never| match never {});
     } else if !count.is_numeric() {
         return Err(decline(format!(
             "a date addition count that is not a number: {}",
-            short(node)
+            short(&node)
         )));
     }
-    refuse_constant_count_beyond_scan_limit(node)?;
-    out["arguments"][0] = cast_node(cast_target, out["arguments"][0].take());
+    refuse_constant_count_beyond_scan_limit(call)?;
+    rewrite_slot(out, Field::Arguments, Some(0), |first| {
+        Ok::<_, Infallible>(cast_node(cast_target, first))
+    })
+    .unwrap_or_else(|never| match never {});
     Ok(())
 }
 
-fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> {
-    let count = &node["arguments"][1];
-    if !matches!(
-        count["type"].as_str(),
-        Some("literal_exactnumeric" | "literal_double")
-    ) {
+fn refuse_constant_count_beyond_scan_limit(call: &ScalarCall) -> Result<(), UdfError> {
+    let Some(Expr::Literal(count)) = call.arguments.get(1) else {
+        return Ok(());
+    };
+    if !matches!(count.kind, LiteralKind::ExactNumeric | LiteralKind::Double) {
         return Ok(());
     }
-    let magnitude = match &count["value"] {
-        Json::String(text) => text.parse::<f64>().ok(),
-        Json::Number(number) => number.as_f64(),
+    let magnitude = match &count.value {
+        Scalar::String(text) => text.parse::<f64>().ok(),
+        Scalar::Number(number) => number.as_f64(),
         _ => None,
     }
     .map(f64::abs);
@@ -1059,7 +1175,7 @@ fn refuse_constant_count_beyond_scan_limit(node: &Json) -> Result<(), UdfError> 
     }
     Err(decline(format!(
         "a constant date addition count beyond {MAX_SCAN_CONSTANT_COUNT} runs in Exasol, which checks it before it reads a row: {}",
-        short(node)
+        short(&Expr::Scalar(call.clone()))
     )))
 }
 
@@ -1101,28 +1217,22 @@ fn aggregate_type(name: &str, args: &[Inferred]) -> Inferred {
     }
 }
 
-fn check_aggregate(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {
-    let name = upper_name(node);
-    match name.as_str() {
+fn check_aggregate(node: &Expr, name: &str, args: &[Inferred]) -> Result<(), UdfError> {
+    match name {
         "COUNT" | "MIN" | "MAX" => Ok(()),
         n if is_numeric_aggregate(n) => check_numeric_aggregate(node, n, args),
         _ => refuse_implicit_text(node, args),
     }
 }
 
-/// The type the RETURNING clause states, or Exasol's default without one.
-fn json_value_type(node: &Json) -> Inferred {
-    returning_type(node).map_or(Inferred::Unknown, Inferred::Exact)
-}
-
-fn check_json_value(node: &Json, args: &[Inferred]) -> Result<(), UdfError> {
+fn check_json_value(call: &JsonValueCall, args: &[Inferred]) -> Result<(), UdfError> {
     if !args.first().is_some_and(|ty| ty.is_text()) {
         return Err(decline(format!(
             "JSON_VALUE over a document that is not text: {}",
-            short(node)
+            short(&Expr::JsonValue(call.clone()))
         )));
     }
-    JsonValueCall::parse(node).map(drop)
+    ScanJsonValue::of(call).map(drop)
 }
 
 /// The most digits of a text literal the scan compares with an integer as a number.
@@ -1140,29 +1250,41 @@ fn integer_digits(text: &str) -> Option<u8> {
 /// A literal of at most `precision` digits, and at most [`MAX_INTEGER_TEXT_DIGITS`], reads as the
 /// same integer in every session, so comparing it with an integer of that precision needs no
 /// session setting. Plan-time pruning reads the same literals as numbers.
-pub fn is_session_free_integer_text(node: &Json, precision: u8) -> bool {
-    kind(node) == "literal_string"
-        && node
-            .get("value")
-            .and_then(Json::as_str)
-            .and_then(integer_digits)
-            .is_some_and(|digits| digits <= precision.min(MAX_INTEGER_TEXT_DIGITS))
+pub fn is_session_free_integer_text(node: &Expr, precision: u8) -> bool {
+    node.as_string_literal()
+        .and_then(integer_digits)
+        .is_some_and(|digits| digits <= precision.min(MAX_INTEGER_TEXT_DIGITS))
 }
 
-/// The fields that hold a predicate's operands or a simple CASE's basis. `arguments` holds the
-/// rest: an IN list or the WHEN values.
-const COMPARED_FIELDS: [&str; 4] = ["expression", "left", "right", "basis"];
+/// The child of `node` at a single `field`.
+fn field_of(node: &Expr, field: Field) -> Option<&Expr> {
+    typed_children(node)
+        .into_iter()
+        .find(|(f, index, _)| *f == field && index.is_none())
+        .map(|(_, _, child)| child)
+}
+
+/// The operands of `node`'s [`Field::Arguments`].
+fn arguments_of(node: &Expr) -> Vec<&Expr> {
+    typed_children(node)
+        .into_iter()
+        .filter(|(f, _, _)| *f == Field::Arguments)
+        .map(|(_, _, child)| child)
+        .collect()
+}
 
 /// Types the operands that a predicate or a simple CASE compares with each other.
-fn type_comparison(node: &Json, out: &mut Json, children: &ChildTypes) -> Result<(), UdfError> {
-    let mut operands: Vec<(&Json, Inferred)> = COMPARED_FIELDS
+fn type_comparison(node: &Expr, out: &mut Expr, children: &ChildTypes) -> Result<(), UdfError> {
+    let mut operands: Vec<(&Expr, Inferred)> = COMPARED_FIELDS
         .iter()
-        .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
+        .filter_map(|&field| Some((field_of(node, field)?, children.one(field)?)))
         .collect();
-    if let Some(Json::Array(args)) = node.get("arguments") {
-        operands.extend(args.iter().zip(children.of("arguments").iter().copied()));
-    }
-    compare_without_session_parse(node, out, &operands)?;
+    operands.extend(
+        arguments_of(node)
+            .into_iter()
+            .zip(children.of(Field::Arguments).iter().copied()),
+    );
+    compare_without_session_parse(node, out, children, &operands)?;
     compare_dates_as_timestamps(out, children, &operands);
     compare_booleans_as_numbers(node, out, children, &operands)
 }
@@ -1170,11 +1292,12 @@ fn type_comparison(node: &Json, out: &mut Json, children: &ChildTypes) -> Result
 /// Exasol parses text compared with a date or number by the session's NLS settings. A digits-only
 /// literal against integers reads the same in every session, so it renders as that number.
 fn compare_without_session_parse(
-    node: &Json,
-    out: &mut Json,
-    operands: &[(&Json, Inferred)],
+    node: &Expr,
+    out: &mut Expr,
+    children: &ChildTypes,
+    operands: &[(&Expr, Inferred)],
 ) -> Result<(), UdfError> {
-    let text: Vec<&Json> = operands
+    let text: Vec<&Expr> = operands
         .iter()
         .filter(|(_, ty)| ty.is_text())
         .map(|(n, _)| *n)
@@ -1203,18 +1326,20 @@ fn compare_without_session_parse(
             short(node)
         )));
     }
-    let to_number = |operand: &mut Json| {
-        if kind(operand) == "literal_string" {
-            *operand = integer_literal(operand["value"].as_str().unwrap_or_default());
-        }
+    let to_number = |operand: Expr| {
+        Ok::<_, Infallible>(match operand.as_string_literal() {
+            Some(digits) => integer_literal(digits),
+            None => operand,
+        })
     };
     for field in COMPARED_FIELDS {
-        if let Some(operand) = out.get_mut(field) {
-            to_number(operand);
+        if children.one(field).is_some() {
+            rewrite_slot(out, field, None, to_number).unwrap_or_else(|never| match never {});
         }
     }
-    if let Some(Json::Array(args)) = out.get_mut("arguments") {
-        args.iter_mut().for_each(to_number);
+    for i in 0..children.of(Field::Arguments).len() {
+        rewrite_slot(out, Field::Arguments, Some(i), to_number)
+            .unwrap_or_else(|never| match never {});
     }
     Ok(())
 }
@@ -1222,10 +1347,10 @@ fn compare_without_session_parse(
 /// Exasol compares a BOOLEAN with a number as 1 or 0, except a multi-value IN over a BOOLEAN,
 /// which converts its numbers to BOOLEAN and fails on any but 0 and 1.
 fn compare_booleans_as_numbers(
-    node: &Json,
-    out: &mut Json,
+    node: &Expr,
+    out: &mut Expr,
     children: &ChildTypes,
-    operands: &[(&Json, Inferred)],
+    operands: &[(&Expr, Inferred)],
 ) -> Result<(), UdfError> {
     let has_number = operands
         .iter()
@@ -1234,23 +1359,23 @@ fn compare_booleans_as_numbers(
     if !has_number || !has_boolean {
         return Ok(());
     }
-    if kind(node) == "predicate_in_constlist" && children.one("expression") == Some(BOOLEAN) {
+    if matches!(node, Expr::InList { .. }) && children.one(Field::Expression) == Some(BOOLEAN) {
         return Err(decline(format!(
             "an IN list converts its numbers to the BOOLEAN it tests: {}",
             short(node)
         )));
     }
     rewrite_operands(out, children, BOOLEAN, |operand| {
-        wrap(BOOLEAN_NUMBER_NODE, operand)
+        wrap(ScanKind::BooleanNumber, operand)
     });
     Ok(())
 }
 
 /// A DATE compared with a TIMESTAMP gets a CAST to the timestamp's unit ([`common_timestamp`]).
 fn compare_dates_as_timestamps(
-    out: &mut Json,
+    out: &mut Expr,
     children: &ChildTypes,
-    operands: &[(&Json, Inferred)],
+    operands: &[(&Expr, Inferred)],
 ) {
     let types: Vec<Inferred> = operands.iter().map(|(_, ty)| *ty).collect();
     if let Some(target) = common_timestamp(&types) {
@@ -1259,107 +1384,107 @@ fn compare_dates_as_timestamps(
 }
 
 fn rewrite_operands(
-    out: &mut Json,
+    out: &mut Expr,
     children: &ChildTypes,
     ty: Inferred,
-    rewrite: impl Fn(Json) -> Json,
+    rewrite: impl Fn(Expr) -> Expr,
 ) {
+    let rewrite = |operand| Ok::<_, Infallible>(rewrite(operand));
     for field in COMPARED_FIELDS {
         if children.one(field) == Some(ty) {
-            out[field] = rewrite(out[field].take());
+            rewrite_slot(out, field, None, rewrite).unwrap_or_else(|never| match never {});
         }
     }
-    for (i, operand) in children.of("arguments").iter().enumerate() {
+    for (i, operand) in children.of(Field::Arguments).iter().enumerate() {
         if *operand == ty {
-            out["arguments"][i] = rewrite(out["arguments"][i].take());
+            rewrite_slot(out, Field::Arguments, Some(i), rewrite)
+                .unwrap_or_else(|never| match never {});
         }
     }
 }
 
 /// DataFusion compares a TIMESTAMP with a finer literal at nanoseconds, failing outside 1677-2262,
 /// so the literal is floored to the operand's unit. A DATE compares at the literal's unit instead.
-fn floor_timestamp_literals(node: &Json, out: &mut Json, children: &ChildTypes) {
-    let precision = |field: &str| children.one(field)?.value_digits();
-    let finer = |literal: &Json, p: u8| floored_literal(literal, p).is_some();
-    match kind(node) {
-        "predicate_between" => {
-            let Some(p) = precision("expression") else {
+fn floor_timestamp_literals(node: &Expr, out: &mut Expr, children: &ChildTypes) {
+    let precision = |field: Field| children.one(field)?.value_digits();
+    let finer = |literal: &Expr, p: u8| floored_literal(literal, p).is_some();
+    match (node, &*out) {
+        (
+            Expr::Between { .. },
+            Expr::Between {
+                expression,
+                low,
+                high,
+            },
+        ) => {
+            let Some(p) = precision(Field::Expression) else {
                 return;
             };
-            if !finer(&out["left"], p) && !finer(&out["right"], p) {
+            if !finer(low, p) && !finer(high, p) {
                 return;
             }
-            let operand = &out["expression"];
-            *out = serde_json::json!({"type": "predicate_and", "expressions": [
-                floored_comparison("predicate_greaterequal", operand, &out["left"], p),
-                floored_comparison("predicate_lessequal", operand, &out["right"], p),
-            ]});
+            *out = Expr::And(vec![
+                floored_comparison(CompareOp::GreaterEqual, expression, low, p),
+                floored_comparison(CompareOp::LessEqual, expression, high, p),
+            ]);
         }
-        "predicate_in_constlist" => {
-            let Some(p) = precision("expression") else {
-                return;
-            };
-            let Some(Json::Array(values)) = out.get("arguments") else {
+        (Expr::InList { .. }, Expr::InList { expression, values }) => {
+            let Some(p) = precision(Field::Expression) else {
                 return;
             };
             if !values.iter().any(|value| finer(value, p)) {
                 return;
             }
-            let operand = &out["expression"];
-            let expressions: Vec<Json> = values
-                .iter()
-                .map(|value| floored_comparison("predicate_equal", operand, value, p))
-                .collect();
-            *out = serde_json::json!({"type": "predicate_or", "expressions": expressions});
+            *out = Expr::Or(
+                values
+                    .iter()
+                    .map(|value| floored_comparison(CompareOp::Equal, expression, value, p))
+                    .collect(),
+            );
         }
-        op => {
-            if let Some(p) = precision("left")
-                && finer(&out["right"], p)
+        (Expr::Compare { .. }, Expr::Compare { op, left, right }) => {
+            if let Some(p) = precision(Field::Left)
+                && finer(right, p)
             {
-                *out = floored_comparison(op, &out["left"], &out["right"], p);
-            } else if let Some(p) = precision("right")
-                && finer(&out["left"], p)
+                *out = floored_comparison(*op, left, right, p);
+            } else if let Some(p) = precision(Field::Right)
+                && finer(left, p)
             {
-                *out = floored_comparison(mirrored(op), &out["right"], &out["left"], p);
+                *out = floored_comparison(op.mirrored(), right, left, p);
             }
         }
+        _ => {}
     }
 }
 
-fn mirrored(op: &str) -> &str {
-    match op {
-        "predicate_less" => "predicate_greater",
-        "predicate_lessequal" => "predicate_greaterequal",
-        "predicate_greater" => "predicate_less",
-        "predicate_greaterequal" => "predicate_lessequal",
-        op => op,
-    }
-}
-
-fn floored_literal(node: &Json, precision: u8) -> Option<Json> {
-    if kind(node) != "literal_timestamp" {
+fn floored_literal(node: &Expr, precision: u8) -> Option<Expr> {
+    let literal = node.as_literal()?;
+    if literal.kind != LiteralKind::Timestamp {
         return None;
     }
-    let floor = TimestampLiteral(node.get("value")?.as_str()?).floor(precision)?;
-    Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
+    let floor = TimestampLiteral(literal.value.as_str()?).floor(precision)?;
+    Some(Expr::Literal(Literal::new(
+        LiteralKind::Timestamp,
+        Scalar::String(floor),
+    )))
 }
 
 /// `operand <op> literal`, with a literal finer than `precision` floored. `x <> x` and `x = x`
 /// keep a NULL operand NULL, so an enclosing NOT stays exact.
-fn floored_comparison(op: &str, operand: &Json, literal: &Json, precision: u8) -> Json {
+fn floored_comparison(op: CompareOp, operand: &Expr, literal: &Expr, precision: u8) -> Expr {
     let Some(floor) = floored_literal(literal, precision) else {
-        return serde_json::json!({"type": op, "left": operand, "right": literal});
+        return Expr::compare(op, operand.clone(), literal.clone());
     };
     let (op, right) = match op {
-        "predicate_equal" => ("predicate_notequal", operand.clone()),
-        "predicate_notequal" => ("predicate_equal", operand.clone()),
-        "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
-        _ => ("predicate_greater", floor),
+        CompareOp::Equal => (CompareOp::NotEqual, operand.clone()),
+        CompareOp::NotEqual => (CompareOp::Equal, operand.clone()),
+        CompareOp::Less | CompareOp::LessEqual => (CompareOp::LessEqual, floor),
+        _ => (CompareOp::Greater, floor),
     };
-    serde_json::json!({"type": op, "left": operand, "right": right})
+    Expr::compare(op, operand.clone(), right)
 }
 
-fn integer_literal(digits: &str) -> Json {
+fn integer_literal(digits: &str) -> Expr {
     let (sign, digits) = match digits.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", digits),
@@ -1368,12 +1493,15 @@ fn integer_literal(digits: &str) -> Json {
         "" => "0".to_string(),
         trimmed => format!("{sign}{trimmed}"),
     };
-    serde_json::json!({"type": "literal_exactnumeric", "value": value})
+    Expr::Literal(Literal::new(
+        LiteralKind::ExactNumeric,
+        Scalar::String(value),
+    ))
 }
 
 /// Text in a position that expects a date, timestamp, number, or boolean: Exasol converts it by
 /// the session's NLS settings, and DataFusion parses ISO dates and a `.` or fails to plan.
-fn refuse_implicit_text(node: &Json, operands: &[Inferred]) -> Result<(), UdfError> {
+fn refuse_implicit_text(node: &Expr, operands: &[Inferred]) -> Result<(), UdfError> {
     if operands.iter().any(|ty| ty.is_text()) {
         return Err(decline(format!(
             "converting a text operand to another type parses it by the session's NLS settings: {}",
@@ -1385,7 +1513,7 @@ fn refuse_implicit_text(node: &Json, operands: &[Inferred]) -> Result<(), UdfErr
 
 /// DataFusion aggregates only numbers here. Exasol also converts text by the session's NLS
 /// settings and BOOLEAN to 1 or 0, so those run in Exasol.
-fn check_numeric_aggregate(node: &Json, name: &str, args: &[Inferred]) -> Result<(), UdfError> {
+fn check_numeric_aggregate(node: &Expr, name: &str, args: &[Inferred]) -> Result<(), UdfError> {
     refuse_implicit_text(node, args)?;
     if !args.iter().all(|ty| ty.is_numeric()) {
         return Err(decline(format!(
@@ -1401,7 +1529,7 @@ fn check_numeric_aggregate(node: &Json, name: &str, args: &[Inferred]) -> Result
 }
 
 /// Text among other types converts by the session's NLS settings.
-fn refuse_text_among_others(node: &Json, types: &[Inferred]) -> Result<(), UdfError> {
+fn refuse_text_among_others(node: &Expr, types: &[Inferred]) -> Result<(), UdfError> {
     let has_text = types.iter().any(|ty| ty.is_text());
     let has_other = types
         .iter()
@@ -1419,25 +1547,27 @@ fn refuse_text_among_others(node: &Json, types: &[Inferred]) -> Result<(), UdfEr
 /// Branches of DATEs and TIMESTAMPs each get a CAST to their [`common_timestamp`], or to DATE where
 /// Exasol 8 brings a TIMESTAMP after a DATE to the DATE.
 fn unify_branches(
-    node: &Json,
-    out: &mut Json,
-    field: &str,
+    node: &Expr,
+    out: &mut Expr,
+    field: Field,
     branches: &[Inferred],
     unified: Inferred,
 ) -> Result<(), UdfError> {
     refuse_text_among_others(node, branches)?;
+    let cast_branches = |out: &mut Expr, target: ExasolType, keep: &dyn Fn(Inferred) -> bool| {
+        for (i, branch) in branches.iter().enumerate() {
+            if keep(*branch) {
+                rewrite_slot(out, field, Some(i), |branch| {
+                    Ok::<_, Infallible>(cast_node(target, branch))
+                })
+                .unwrap_or_else(|never| match never {});
+            }
+        }
+    };
     if unified.exact() == Some(ExasolType::Date) {
-        for (i, branch) in branches.iter().enumerate() {
-            if branch.is_timestamp() {
-                out[field][i] = cast_node(ExasolType::Date, out[field][i].take());
-            }
-        }
+        cast_branches(out, ExasolType::Date, &|branch| branch.is_timestamp());
     } else if let Some(target) = common_timestamp(branches) {
-        for (i, branch) in branches.iter().enumerate() {
-            if *branch != Inferred::Null {
-                out[field][i] = cast_node(target, out[field][i].take());
-            }
-        }
+        cast_branches(out, target, &|branch| branch != Inferred::Null);
     }
     Ok(())
 }
@@ -1465,45 +1595,29 @@ fn union_of(branches: &[Inferred], version: ExasolVersion) -> Inferred {
         .unwrap_or(Inferred::Unknown)
 }
 
-fn is_cast(node: &Json) -> bool {
-    match kind(node) {
-        "function_scalar_cast" => true,
-        "function_scalar" => upper_name(node) == "CAST",
-        _ => false,
-    }
-}
-
-fn cast_target(node: &Json) -> Result<ExasolType, UdfError> {
-    node.get("dataType")
-        .map(exasol_type_from_json)
-        .transpose()?
-        .ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))
-}
-
-fn rewrite_cast(out: &mut Json, args: &[Inferred]) -> Result<(), UdfError> {
-    let target = cast_target(out)?;
+fn rewrite_cast(out: &mut Expr, args: &[Inferred]) -> Result<(), UdfError> {
+    let Expr::Cast { target, argument } = out else {
+        unreachable!("rewrite_cast runs on a CAST");
+    };
+    let target = *target;
     let source_type = args.first().copied().unwrap_or(Inferred::Unknown);
-    let source = out
-        .get_mut("arguments")
-        .and_then(|args| args.get_mut(0))
-        .ok_or_else(|| UdfError::User("CAST missing its argument".into()))?;
     match target {
         ExasolType::Char { size, .. } => {
-            *source = cast_to_text(source.take(), source_type, target, size, true)?;
+            **argument = cast_to_text(take(argument), source_type, target, size, true)?;
         }
         ExasolType::Varchar { size, .. } => {
-            *source = cast_to_text(source.take(), source_type, target, size, false)?;
+            **argument = cast_to_text(take(argument), source_type, target, size, false)?;
         }
         ExasolType::Decimal(d) if source_type == BOOLEAN => {
             if d.precision() == d.scale() {
                 return Err(decline(format!(
                     "CAST of {} to {target} cannot hold 1",
-                    short(source)
+                    short(argument)
                 )));
             }
-            *source = wrap(BOOLEAN_NUMBER_NODE, source.take());
+            **argument = wrap(ScanKind::BooleanNumber, take(argument));
         }
-        _ => cast_from_text(source, source_type, target)?,
+        _ => cast_from_text(argument, source_type, target)?,
     }
     Ok(())
 }

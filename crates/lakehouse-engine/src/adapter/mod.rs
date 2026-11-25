@@ -32,8 +32,8 @@ use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::{Check, PROP_CATALOG_CONNECTION, PROP_NAMESPACE, VsProperties};
 use crate::adapter::pushdown::{
-    ConnectionStorage, PushdownContext, ScanCatalog, ScanUdfs, StatementClock, declare_columns,
-    handle_pushdown, statement_instant,
+    AdapterRequest, ConnectionStorage, PushdownContext, ScanCatalog, ScanUdfs, StatementClock,
+    declare_columns, handle_pushdown, statement_instant,
 };
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
@@ -329,10 +329,11 @@ async fn handle_pushdown_request(
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
     let config = statement.connection();
-    let iceberg_identifier = resolve_pushdown_identifier(request)?;
+    let request = AdapterRequest::parse(request)?;
+    let iceberg_identifier = resolve_pushdown_identifier(&request)?;
     let catalog = catalog_block(&config.creds, &iceberg_identifier);
 
-    handle_pushdown(request, statement, permission, &catalog, context)
+    handle_pushdown(&request, statement, permission, &catalog, context)
         .await
         .map_err(|e| redact_error(&config.storage, e))
 }
@@ -491,13 +492,11 @@ fn build_listing_virtual_tables(
     Ok(tables_json)
 }
 
-fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
+fn resolve_pushdown_identifier(request: &AdapterRequest) -> Result<String, UdfError> {
     let involved_table_name = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|t| t.get("name"))
-        .and_then(|n| n.as_str())
+        .involved_tables()
+        .first()
+        .map(|table| table.name.as_str())
         .ok_or_else(|| UdfError::User("pushdown request missing involvedTables[0].name".into()))?;
 
     read_identifier(request, involved_table_name)

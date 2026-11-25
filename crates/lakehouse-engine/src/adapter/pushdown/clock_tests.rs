@@ -1,23 +1,22 @@
+use super::super::request::{FromClause, SortElement};
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    inner_join, order_by_element, parsed_pushdown, pushdown_request, table_ref,
+    ast, inner_join, order_by_element, parsed_pushdown, pushdown_request, table_ref,
 };
 use crate::types::exasol_type::ExasolType;
 use chrono::TimeZone as _;
+use serde_json::Value as Json;
 use vs_expression::test_support::{
     agg_item_expr, compare, date_lit, lit, num_lit, numbered_col, predicate_equal, scalar_fn,
     table_col, timestamp_lit,
 };
 
-/// The clauses of `pushdown` the clock rewrites, as one object to assert on.
-fn clauses(pushdown: &PushdownRequest) -> Json {
-    serde_json::json!({
-        "filter": pushdown.filter(),
-        "from": pushdown.from(),
-        "having": pushdown.having(),
-        "orderBy": pushdown.order_by(),
-        "selectList": pushdown.select_items(),
-    })
+/// The operands of the comparison `tree`.
+fn operands(tree: &Expr) -> (&Expr, &Expr) {
+    match tree {
+        Expr::Compare { left, right, .. } => (left, right),
+        other => panic!("not a comparison: {other:?}"),
+    }
 }
 
 /// 2024-01-15 23:30:45.123456789 UTC: 18:30 on the 15th in New York (`TZ`), 08:30 on the 16th
@@ -52,11 +51,14 @@ fn ts() -> Json {
 }
 
 /// The request's filter after `clock` folds `ts < right`.
-fn folded_filter(clock: &StatementClock, right: Json) -> Result<Json, UdfError> {
+fn folded_filter(clock: &StatementClock, right: Json) -> Result<Expr, UdfError> {
     let pushdown = pushdown_request("T", &columns())
         .filter(compare("predicate_less", ts(), right))
         .build_pushdown();
-    Ok(clauses(&clock.fold(pushdown)?)["filter"]["right"].clone())
+    let folded = clock.fold(pushdown)?;
+    Ok(operands(folded.filter().expect("the filter stays"))
+        .1
+        .clone())
 }
 
 #[test]
@@ -112,7 +114,7 @@ fn folds_each_clock_function_into_its_literal() {
     for (clock, call, expected) in cases {
         let folded = folded_filter(&clock, call.clone())
             .unwrap_or_else(|e| panic!("{call} must fold: {e:?}"));
-        assert_eq!(folded, expected, "{call}");
+        assert_eq!(folded, ast(&expected), "{call}");
     }
 }
 
@@ -137,23 +139,22 @@ fn tstz_values_fold_to_the_wall_clock_outside_tstz_select_items() {
         .build_pushdown();
 
     let folded = tokyo_clock().fold(pushdown).expect("the request folds");
-    let json = clauses(&folded);
 
     assert_eq!(
-        json["selectList"],
-        serde_json::json!([
-            tstz_lit("2024-01-15 23:30:45.123"),
-            tstz_lit("2024-03-01 09:00:00.000"),
-            timestamp_lit("2024-01-16 08:30:45.123"),
-        ])
+        folded.select_items().expect("a select list"),
+        [
+            ast(&tstz_lit("2024-01-15 23:30:45.123")),
+            ast(&tstz_lit("2024-03-01 09:00:00.000")),
+            ast(&timestamp_lit("2024-01-16 08:30:45.123")),
+        ]
     );
     assert_eq!(
-        json["filter"]["right"],
-        timestamp_lit("2024-03-01 18:00:00.000")
+        *operands(folded.filter().expect("the filter stays")).1,
+        ast(&timestamp_lit("2024-03-01 18:00:00.000"))
     );
     assert_eq!(
-        json["having"]["left"],
-        timestamp_lit("2024-01-16 08:30:45.123")
+        *operands(folded.having().expect("the HAVING stays")).0,
+        ast(&timestamp_lit("2024-01-16 08:30:45.123"))
     );
 }
 
@@ -165,8 +166,11 @@ fn a_request_without_a_clock_or_tstz_node_never_reads_tz() {
         folded_filter(&unreadable, node.clone())
             .unwrap_or_else(|e| panic!("{node} must fold without TZ: {e:?}"))
     };
-    assert_eq!(folds(plain.clone()), plain);
-    assert_eq!(folds(scalar_fn("CURRENT_DATE", [])), date_lit("2024-01-16"));
+    assert_eq!(folds(plain.clone()), ast(&plain));
+    assert_eq!(
+        folds(scalar_fn("CURRENT_DATE", [])),
+        ast(&date_lit("2024-01-16"))
+    );
     let error = folded_filter(&unreadable, scalar_fn("SYSDATE", []))
         .expect_err("SYSDATE needs the TZ zone");
     assert!(
@@ -192,8 +196,12 @@ fn a_folded_clock_sort_key_is_dropped() {
     let folded = tokyo_clock().fold(pushdown).expect("the request folds");
 
     assert_eq!(
-        clauses(&folded)["orderBy"],
-        serde_json::json!([order_by_element(ts(), true, true)])
+        folded.order_by(),
+        [SortElement {
+            expression: ast(&ts()),
+            ascending: true,
+            nulls_last: true,
+        }]
     );
 }
 
@@ -226,14 +234,18 @@ fn tstz_values_fold_in_a_join_condition_and_an_aggregate_argument() {
     let folded = tokyo_clock()
         .fold(parsed_pushdown(&request))
         .expect("the request folds");
-    let json = clauses(&folded);
-
+    let Some(FromClause::Join { condition, .. }) = folded.from() else {
+        panic!("the join stays: {:?}", folded.from());
+    };
     assert_eq!(
-        json["from"]["condition"]["right"],
-        timestamp_lit("2024-03-01 18:00:00.000")
+        *operands(condition).1,
+        ast(&timestamp_lit("2024-03-01 18:00:00.000"))
     );
+    let Expr::Aggregate(max) = &folded.select_items().expect("a select list")[0] else {
+        panic!("the MAX stays");
+    };
     assert_eq!(
-        json["selectList"][0]["arguments"][0]["right"],
-        timestamp_lit("2024-01-16 08:30:45.123")
+        *operands(&max.arguments[0]).1,
+        ast(&timestamp_lit("2024-01-16 08:30:45.123"))
     );
 }

@@ -3600,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -6319,7 +6319,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs-expression"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "exasol-udf-sdk",
  "regex",

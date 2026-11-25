@@ -2,9 +2,10 @@ use super::super::attribution::JoinLegs;
 use super::super::planning::{DetectedJoin, JoinLeaf};
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, and, compare, num_lit, or, predicate_equal, scalar_fn, str_lit, table_col,
+    aliased_col, and, ast, compare, num_lit, or, predicate_equal, scalar_fn, str_lit, table_col,
     table_ref, table_ref_as,
 };
+use serde_json::Value as Json;
 
 fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
     JoinLeaf {
@@ -155,7 +156,7 @@ fn equality_cases() -> Vec<(&'static str, JoinLegs, Json, bool, bool)> {
 #[test]
 fn a_join_equality_reads_disjoint_non_empty_leg_sets() {
     for (case, legs, conjunct, expected, _) in equality_cases() {
-        assert_eq!(is_join_equality(&conjunct, &legs), expected, "{case}");
+        assert_eq!(is_join_equality(&ast(&conjunct), &legs), expected, "{case}");
     }
 }
 
@@ -163,7 +164,7 @@ fn a_join_equality_reads_disjoint_non_empty_leg_sets() {
 fn a_join_key_reads_one_leg_on_each_side() {
     for (case, legs, conjunct, _, expected) in equality_cases() {
         assert_eq!(
-            join_key_legs(&conjunct, &legs).is_some(),
+            join_key_legs(&ast(&conjunct), &legs).is_some(),
             expected,
             "{case}"
         );
@@ -176,10 +177,10 @@ fn a_join_key_names_its_two_legs_in_from_tree_order() {
     let reversed = predicate_equal(table_col("B", "J"), table_col("A", "J"));
     let across = predicate_equal(table_col("C", "K"), table_col("A", "K"));
 
-    assert_eq!(join_key_legs(&ab_key(), &legs), Some((0, 1)));
-    assert_eq!(join_key_legs(&reversed, &legs), Some((0, 1)));
-    assert_eq!(join_key_legs(&across, &legs), Some((0, 2)));
-    assert_eq!(join_key_legs(&a_filter(), &legs), None);
+    assert_eq!(join_key_legs(&ast(&ab_key()), &legs), Some((0, 1)));
+    assert_eq!(join_key_legs(&ast(&reversed), &legs), Some((0, 1)));
+    assert_eq!(join_key_legs(&ast(&across), &legs), Some((0, 2)));
+    assert_eq!(join_key_legs(&ast(&a_filter()), &legs), None);
 }
 
 #[test]
@@ -198,10 +199,10 @@ fn filters_of_a_nested_three_leg_tree_move_to_the_top_level_filter() {
         table_ref("C"),
         bc_key(),
     );
-    assert_eq!(clauses(&moved)["from"], expected_from);
+    assert_eq!(moved.from(), request(expected_from, None).from());
     assert_eq!(
-        clauses(&moved)["filter"],
-        and([a_filter(), c_filter(), b_filter()])
+        moved.filter(),
+        Some(&ast(&and([a_filter(), c_filter(), b_filter()])))
     );
 }
 
@@ -214,8 +215,12 @@ fn moved_filters_are_conjoined_after_the_existing_filter() {
         .expect("the condition holds a filter");
 
     assert_eq!(
-        clauses(&moved)["filter"],
-        and([b_filter(), or([a_filter(), c_filter()]), a_filter()])
+        moved.filter(),
+        Some(&ast(&and([
+            b_filter(),
+            or([a_filter(), c_filter()]),
+            a_filter()
+        ])))
     );
 }
 
@@ -231,11 +236,8 @@ fn several_join_equalities_stay_as_one_conjunction() {
     let moved = move_condition_filters(&request(from, None), &three_legs())
         .expect("the condition holds a filter");
 
-    assert_eq!(
-        clauses(&moved)["from"]["condition"],
-        and([ab_key(), second_key])
-    );
-    assert_eq!(clauses(&moved)["filter"], a_filter());
+    assert_eq!(*condition(&moved), ast(&and([ab_key(), second_key])));
+    assert_eq!(moved.filter(), Some(&ast(&a_filter())));
 }
 
 #[test]
@@ -251,8 +253,8 @@ fn a_self_join_filter_keeps_its_occurrence_alias() {
     let moved = move_condition_filters(&request(from, None), &self_join())
         .expect("the condition holds a filter");
 
-    assert_eq!(clauses(&moved)["from"]["condition"], key);
-    assert_eq!(clauses(&moved)["filter"], filter);
+    assert_eq!(*condition(&moved), ast(&key));
+    assert_eq!(moved.filter(), Some(&ast(&filter)));
 }
 
 #[test]
@@ -285,8 +287,8 @@ fn a_keyless_join_keeps_its_condition_while_another_join_moves() {
     let moved = move_condition_filters(&request(from, None), &three_legs())
         .expect("the lower condition holds a filter");
 
-    assert_eq!(clauses(&moved)["from"]["condition"], keyless);
-    assert_eq!(clauses(&moved)["filter"], a_filter());
+    assert_eq!(*condition(&moved), ast(&keyless));
+    assert_eq!(moved.filter(), Some(&ast(&a_filter())));
 }
 
 /// Scenario: The filters of a join on an outer join's null-supplying side stay in its condition
@@ -402,12 +404,16 @@ fn outer_joins_and_null_supplying_subtrees_keep_their_conditions() {
         let moved = move_condition_filters(&original, &three_legs());
 
         let result = moved.as_ref().unwrap_or(&original);
-        assert_eq!(result.from(), Some(&expected_from), "{case}");
-        assert_eq!(result.filter(), expected_filter.as_ref(), "{case}");
+        let expected = request(expected_from, expected_filter);
+        assert_eq!(result.from(), expected.from(), "{case}");
+        assert_eq!(result.filter(), expected.filter(), "{case}");
     }
 }
 
-/// The clauses a condition move rewrites, as one object to assert on.
-fn clauses(pushdown: &PushdownRequest) -> Json {
-    serde_json::json!({"from": pushdown.from(), "filter": pushdown.filter()})
+/// The condition of `pushdown`'s top-level join.
+fn condition(pushdown: &PushdownRequest) -> &Expr {
+    match pushdown.from() {
+        Some(FromClause::Join { condition, .. }) => condition,
+        other => panic!("not a join: {other:?}"),
+    }
 }

@@ -1,5 +1,5 @@
 use crate::adapter::pushdown::test_support::{
-    between, by_name, col, compare, num_lit, or, str_lit,
+    ast, between, by_name, col, compare, num_lit, or, str_lit,
 };
 use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
@@ -1197,7 +1197,7 @@ fn pruning_under_column_mapping_records_its_observed_behavior() {
 fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
     let schema = open_fixture("multi-part-stats").schema();
     let node = between(col("ID"), num_lit(4), str_lit("ten"));
-    let predicate = to_delta_predicate(&node, &by_name(&schema))
+    let predicate = to_delta_predicate(&ast(&node), &by_name(&schema))
         .expect("a BETWEEN must keep the bound it can translate");
 
     let files = replay_fixture_pruned("multi-part-stats", predicate);
@@ -1220,7 +1220,7 @@ fn an_or_with_an_untranslatable_branch_keeps_every_file() {
         compare("predicate_equal", col("ID"), str_lit("seven")),
     ]);
 
-    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
+    assert_eq!(to_delta_predicate(&ast(&node), &by_name(&schema)), None);
 
     let forfeited = replay_fixture("multi-part-stats");
     let paths: Vec<&str> = forfeited.iter().map(|f| f.path.as_str()).collect();

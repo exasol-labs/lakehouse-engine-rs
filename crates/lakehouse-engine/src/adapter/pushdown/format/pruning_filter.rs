@@ -3,11 +3,11 @@
 
 use arrow::datatypes::DataType;
 use datafusion::scalar::ScalarValue;
-use serde_json::Value as Json;
+use vs_expression::{CompareOp, Expr};
 
-use super::filter_json::{
-    Comparison, LikeBound, LikePattern, Translated, between_operands, comparison_operands,
-    fold_and, fold_or, in_operands, like_operands, operands, subject_column,
+use super::filter_operands::{
+    LikeBound, LikePattern, Translated, column_name, comparison_operands, fold_and, fold_or,
+    in_operands, like_operands, operands,
 };
 use super::literal::exact_literal;
 
@@ -17,7 +17,7 @@ use super::literal::exact_literal;
 pub(super) enum PruningFilter<C> {
     Compare {
         column: C,
-        comparison: Comparison,
+        comparison: CompareOp,
         literal: ScalarValue,
     },
     /// Never empty.
@@ -46,44 +46,43 @@ impl<C: Clone> PruningFilter<C> {
     /// `resolve` maps a filter column to the path's column and its Arrow type, `None` for a type
     /// the path compares no literal with. A column it does not resolve constrains nothing.
     pub(super) fn parse(
-        node: &Json,
+        node: &Expr,
         resolve: &impl Fn(&str) -> Option<(C, Option<DataType>)>,
     ) -> Self {
         Self::try_parse(node, resolve).unwrap_or(Self::Opaque)
     }
 
     fn try_parse(
-        node: &Json,
+        node: &Expr,
         resolve: &impl Fn(&str) -> Option<(C, Option<DataType>)>,
     ) -> Option<Self> {
-        let kind = node.get("type")?.as_str()?;
-        if let Some(comparison) = Comparison::from_node_type(kind) {
-            let (column, literal, comparison) = comparison_operands(node, comparison)?;
-            let (column, data_type) = resolve(column)?;
-            return Some(Self::Compare {
-                literal: exact_literal(literal, &data_type?)?,
-                column,
-                comparison,
-            });
-        }
-        let parse_all = |nodes: &[Json]| -> Vec<Self> {
+        let parse_all = |nodes: &[Expr]| -> Vec<Self> {
             nodes
                 .iter()
                 .map(|node| Self::parse(node, resolve))
                 .collect()
         };
-        Some(match kind {
-            "predicate_and" => Self::And(parse_all(operands(node)?)),
-            "predicate_or" => Self::Or(parse_all(operands(node)?)),
-            "predicate_not" => Self::Not(Box::new(Self::parse(node.get("expression")?, resolve))),
-            "predicate_is_null" | "predicate_is_not_null" => {
-                let (column, data_type) = resolve(subject_column(node)?)?;
-                let is_null = kind == "predicate_is_null";
+        Some(match node {
+            Expr::Compare { op, left, right } => {
+                let (column, literal, comparison) = comparison_operands(left, right, *op)?;
+                let (column, data_type) = resolve(column)?;
+                Self::Compare {
+                    literal: exact_literal(literal, &data_type?)?,
+                    column,
+                    comparison,
+                }
+            }
+            Expr::And(items) => Self::And(parse_all(operands(items)?)),
+            Expr::Or(items) => Self::Or(parse_all(operands(items)?)),
+            Expr::Not(inner) => Self::Not(Box::new(Self::parse(inner, resolve))),
+            Expr::IsNull(subject) | Expr::IsNotNull(subject) => {
+                let (column, data_type) = resolve(column_name(subject)?)?;
+                let is_null = matches!(node, Expr::IsNull(_));
                 let empty = data_type.as_ref().and_then(empty_value).map(|literal| {
                     let comparison = if is_null {
-                        Comparison::Equal
+                        CompareOp::Equal
                     } else {
-                        Comparison::NotEqual
+                        CompareOp::NotEqual
                     };
                     Self::Compare {
                         column: column.clone(),
@@ -98,8 +97,8 @@ impl<C: Clone> PruningFilter<C> {
                     Some(empty) => Self::And(vec![null_test, empty]),
                 }
             }
-            "predicate_in_constlist" => {
-                let (column, arguments) = in_operands(node)?;
+            Expr::InList { expression, values } => {
+                let (column, arguments) = in_operands(expression, values)?;
                 let (column, data_type) = resolve(column)?;
                 let data_type = data_type?;
                 Self::InList {
@@ -110,27 +109,35 @@ impl<C: Clone> PruningFilter<C> {
                     column,
                 }
             }
-            "predicate_between" => {
-                let (column, low, high) = between_operands(node)?;
-                let (column, data_type) = resolve(column)?;
+            Expr::Between {
+                expression,
+                low,
+                high,
+            } => {
+                let (column, data_type) = resolve(column_name(expression)?)?;
                 let data_type = data_type?;
                 // Exasol compares each bound in its own kind, so either bound alone is implied and
                 // an unconvertible one is opaque.
-                let bound = |literal: Option<&Json>, comparison| {
-                    let literal = literal.and_then(|literal| exact_literal(literal, &data_type));
-                    literal.map_or(Self::Opaque, |literal| Self::Compare {
-                        column: column.clone(),
-                        comparison,
-                        literal,
+                let bound = |literal: &Expr, comparison| {
+                    exact_literal(literal, &data_type).map_or(Self::Opaque, |literal| {
+                        Self::Compare {
+                            column: column.clone(),
+                            comparison,
+                            literal,
+                        }
                     })
                 };
                 Self::And(vec![
-                    bound(low, Comparison::GreaterEqual),
-                    bound(high, Comparison::LessEqual),
+                    bound(low, CompareOp::GreaterEqual),
+                    bound(high, CompareOp::LessEqual),
                 ])
             }
-            "predicate_like" => {
-                let (column, pattern) = like_operands(node)?;
+            Expr::Like {
+                expression,
+                pattern,
+                escape,
+            } => {
+                let (column, pattern) = like_operands(expression, pattern, escape.as_deref())?;
                 let (column, data_type) = resolve(column)?;
                 data_type?.is_string().then_some(())?;
                 Self::Like { column, pattern }
@@ -159,7 +166,7 @@ pub(super) trait StatisticsTarget {
     fn compare(
         &self,
         column: &Self::Column,
-        comparison: Comparison,
+        comparison: CompareOp,
         literal: &ScalarValue,
     ) -> Option<Self::Predicate>;
     /// `None` when the format cannot hold a literal, which constrains nothing.
@@ -198,7 +205,7 @@ impl<C> PruningFilter<C> {
             Self::Like { column, pattern } => Some(match pattern.bound()? {
                 LikeBound::Equal(value) => Translated::exact(target.compare(
                     column,
-                    Comparison::Equal,
+                    CompareOp::Equal,
                     &ScalarValue::Utf8(Some(value)),
                 )?),
                 LikeBound::Prefix { prefix, exact } => Translated {

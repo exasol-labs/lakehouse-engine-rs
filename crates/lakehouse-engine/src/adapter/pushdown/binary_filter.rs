@@ -3,11 +3,9 @@
 //! which Parquet statistics prune and which returns the same rows.
 
 use arrow::datatypes::DataType;
-use serde_json::{Value as Json, json};
-use vs_expression::ColumnNode;
+use vs_expression::{Column, CompareOp, Expr, Literal, LiteralKind, Scalar};
 
-use super::format::filter_json::Comparison;
-use super::support::{ColumnTypes, column_node_ref};
+use super::support::{ColumnTypes, column_ref};
 use crate::scan::raw_bytes_alias;
 use crate::scan::spec::{ColumnRef, LogicalField};
 use crate::types::mapping::arrow_type_from_tag;
@@ -34,8 +32,8 @@ impl BinaryLayout {
 
 /// The node's own (relation alias, column) pair, so the raw-bytes column it becomes stays on the
 /// node's relation, with the layout of the binary column it binds.
-fn binary_column(columns: &ColumnTypes, node: &Json) -> Option<(ColumnRef, BinaryLayout)> {
-    let column = column_node_ref(node)?;
+fn binary_column(columns: &ColumnTypes, node: &Expr) -> Option<(ColumnRef, BinaryLayout)> {
+    let column = column_ref(node.as_column()?);
     let layout = columns.get(&column)?.binary?;
     Some((column, layout))
 }
@@ -43,165 +41,163 @@ fn binary_column(columns: &ColumnTypes, node: &Json) -> Option<(ColumnRef, Binar
 /// Rewrites only the comparisons the root reaches through AND and OR, where a false result drops
 /// a row exactly as a NULL one does, so the bytes may stand in for the hex text whose empty value
 /// Exasol reads as NULL.
-pub(crate) fn compare_binary_bytes(mut node: Json, columns: &ColumnTypes) -> Json {
-    match node.get("type").and_then(Json::as_str) {
-        Some("predicate_and" | "predicate_or") => {
-            if let Some(Json::Array(children)) = node.get_mut("expressions") {
-                for child in children {
-                    *child = compare_binary_bytes(child.take(), columns);
-                }
-            }
-            node
-        }
+pub(crate) fn compare_binary_bytes(node: Expr, columns: &ColumnTypes) -> Expr {
+    let each = |children: Vec<Expr>| {
+        children
+            .into_iter()
+            .map(|child| compare_binary_bytes(child, columns))
+            .collect()
+    };
+    match node {
+        Expr::And(children) => Expr::And(each(children)),
+        Expr::Or(children) => Expr::Or(each(children)),
         _ => byte_comparison(&node, columns).unwrap_or(node),
     }
 }
 
-fn byte_comparison(node: &Json, columns: &ColumnTypes) -> Option<Json> {
-    match node.get("type")?.as_str()? {
-        "predicate_in_constlist" => {
-            let (column, layout) = binary_column(columns, node.get("expression")?)?;
-            let values = node
-                .get("arguments")?
-                .as_array()?
+fn byte_comparison(node: &Expr, columns: &ColumnTypes) -> Option<Expr> {
+    match node {
+        Expr::InList { expression, values } => {
+            let (column, layout) = binary_column(columns, expression)?;
+            let values = values
                 .iter()
                 .map(|value| byte_literal(value, layout))
                 .collect::<Option<Vec<_>>>()?;
-            Some(json!({
-                "type": "predicate_in_constlist",
-                "expression": raw_bytes(&column),
-                "arguments": values,
-            }))
+            Some(Expr::InList {
+                expression: Box::new(raw_bytes(&column)),
+                values,
+            })
         }
-        "predicate_between" => {
-            let (column, layout) = binary_column(columns, node.get("expression")?)?;
-            Some(json!({
-                "type": "predicate_between",
-                "expression": raw_bytes(&column),
-                "left": byte_literal(node.get("left")?, layout)?,
-                "right": byte_literal(node.get("right")?, layout)?,
-            }))
+        Expr::Between {
+            expression,
+            low,
+            high,
+        } => {
+            let (column, layout) = binary_column(columns, expression)?;
+            Some(Expr::Between {
+                expression: Box::new(raw_bytes(&column)),
+                low: Box::new(byte_literal(low, layout)?),
+                high: Box::new(byte_literal(high, layout)?),
+            })
         }
-        kind => {
-            let op = Comparison::from_node_type(kind)?;
-            let (left, right) = (node.get("left")?, node.get("right")?);
+        Expr::Compare { op, left, right } => {
             let ((column, layout), literal, op) = match binary_column(columns, left) {
-                Some(column) => (column, right, op),
-                None => (
-                    binary_column(columns, right)?,
-                    left,
-                    op.with_operands_swapped(),
-                ),
+                Some(column) => (column, right, *op),
+                None => (binary_column(columns, right)?, left, op.mirrored()),
             };
-            let comparison = json!({
-                "type": op.node_type(),
-                "left": raw_bytes(&column),
-                "right": byte_literal(literal, layout)?,
-            });
+            let comparison = Expr::compare(op, raw_bytes(&column), byte_literal(literal, layout)?);
             // The empty value sorts first, so only these operators would keep the row Exasol
             // reads as NULL; a fixed-length value is never empty.
             let admits_empty = matches!(
                 op,
-                Comparison::NotEqual | Comparison::Less | Comparison::LessEqual
+                CompareOp::NotEqual | CompareOp::Less | CompareOp::LessEqual
             );
             if layout == BinaryLayout::Variable && admits_empty {
-                let non_empty = json!({
-                    "type": "predicate_notequal",
-                    "left": raw_bytes(&column),
-                    "right": {"type": "literal_binary", "value": ""},
-                });
-                return Some(json!({
-                    "type": "predicate_and",
-                    "expressions": [comparison, non_empty],
-                }));
+                let empty = Literal::new(
+                    LiteralKind::Binary { width: None },
+                    Scalar::String(String::new()),
+                );
+                let non_empty = Expr::compare(
+                    CompareOp::NotEqual,
+                    raw_bytes(&column),
+                    Expr::Literal(empty),
+                );
+                return Some(Expr::And(vec![comparison, non_empty]));
             }
             Some(comparison)
         }
+        _ => None,
     }
 }
 
-fn raw_bytes(column: &ColumnRef) -> Json {
-    let name = raw_bytes_alias(&column.name);
-    ColumnNode::to_json(&name, None, column.relation.as_deref())
+fn raw_bytes(column: &ColumnRef) -> Expr {
+    Expr::Column(Column::aliased(
+        raw_bytes_alias(&column.name),
+        column.relation.as_deref(),
+    ))
 }
 
 /// Only lowercase hex of whole bytes names a byte string: Exasol compares text case-sensitively,
 /// and the column never renders an uppercase digit. An empty string is Exasol's NULL.
-fn byte_literal(node: &Json, layout: BinaryLayout) -> Option<Json> {
-    if node.get("type")?.as_str()? != "literal_string" {
+fn byte_literal(node: &Expr, layout: BinaryLayout) -> Option<Expr> {
+    let literal = node.as_literal()?;
+    if literal.kind != LiteralKind::String {
         return None;
     }
-    let digits = node.get("value")?.as_str()?;
+    let digits = literal.value.as_str()?;
     if digits.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
     let bytes = hex::decode(digits).ok().filter(|bytes| !bytes.is_empty())?;
-    match layout {
-        BinaryLayout::Variable => Some(json!({"type": "literal_binary", "value": digits})),
-        BinaryLayout::Fixed(width) => (usize::try_from(width).ok() == Some(bytes.len()))
-            .then(|| json!({"type": "literal_binary", "value": digits, "width": width})),
-    }
+    let width = match layout {
+        BinaryLayout::Variable => None,
+        BinaryLayout::Fixed(width) => {
+            if usize::try_from(width).ok() != Some(bytes.len()) {
+                return None;
+            }
+            Some(u64::try_from(width).ok()?)
+        }
+    };
+    Some(Expr::Literal(Literal::new(
+        LiteralKind::Binary { width },
+        Scalar::String(digits.to_string()),
+    )))
 }
 
 /// For format-level pruning: retypes each hex literal a binary column is compared with, at any
 /// depth. The raw bytes differ from the hex text only on an empty value, which the text reads as
 /// NULL, so the retyped tree is TRUE on every row the original is and never prunes a match.
-pub(crate) fn with_binary_literals(mut node: Json, columns: &ColumnTypes) -> Json {
+pub(crate) fn with_binary_literals(mut node: Expr, columns: &ColumnTypes) -> Expr {
     retype_binary_literals(&mut node, columns);
     node
 }
 
-fn retype_binary_literals(node: &mut Json, columns: &ColumnTypes) {
-    let operands: &[&str] = match node.get("type").and_then(Json::as_str) {
-        Some("predicate_and" | "predicate_or") => {
-            if let Some(Json::Array(children)) = node.get_mut("expressions") {
-                for child in children {
-                    retype_binary_literals(child, columns);
-                }
-            }
-            return;
-        }
-        Some("predicate_not") => {
-            if let Some(child) = node.get_mut("expression") {
+fn retype_binary_literals(node: &mut Expr, columns: &ColumnTypes) {
+    let operands: Vec<&mut Expr> = match node {
+        Expr::And(children) | Expr::Or(children) => {
+            for child in children {
                 retype_binary_literals(child, columns);
             }
             return;
         }
-        Some("predicate_in_constlist") => &["expression", "arguments"],
-        Some("predicate_between") => &["expression", "left", "right"],
-        Some(kind) if Comparison::from_node_type(kind).is_some() => &["left", "right"],
+        Expr::Not(child) => {
+            retype_binary_literals(child, columns);
+            return;
+        }
+        Expr::InList { expression, values } => {
+            std::iter::once(&mut **expression).chain(values).collect()
+        }
+        Expr::Between {
+            expression,
+            low,
+            high,
+        } => vec![expression, low, high]
+            .into_iter()
+            .map(|operand| &mut **operand)
+            .collect(),
+        Expr::Compare { left, right, .. } => vec![&mut **left, &mut **right],
         _ => return,
     };
     let Some((_, layout)) = operands
         .iter()
-        .filter_map(|key| binary_column(columns, node.get(*key)?))
-        .next()
+        .find_map(|operand| binary_column(columns, operand))
     else {
         return;
     };
-    for key in operands {
-        match node.get_mut(*key) {
-            Some(Json::Array(values)) => values
-                .iter_mut()
-                .for_each(|value| retype_literal(value, layout)),
-            Some(operand) => retype_literal(operand, layout),
-            None => {}
+    for operand in operands {
+        if let Some(literal) = byte_literal(operand, layout) {
+            *operand = literal;
         }
     }
 }
 
-fn retype_literal(node: &mut Json, layout: BinaryLayout) {
-    if let Some(literal) = byte_literal(node, layout) {
-        *node = literal;
-    }
-}
-
-/// The bytes of a `literal_binary` node that [`with_binary_literals`] wrote.
-pub(crate) fn literal_binary_bytes(node: &Json) -> Option<Vec<u8>> {
-    if node.get("type")?.as_str()? != "literal_binary" {
+/// The bytes of a binary literal that [`with_binary_literals`] wrote.
+pub(crate) fn literal_binary_bytes(node: &Expr) -> Option<Vec<u8>> {
+    let literal = node.as_literal()?;
+    if !matches!(literal.kind, LiteralKind::Binary { .. }) {
         return None;
     }
-    hex::decode(node.get("value")?.as_str()?).ok()
+    hex::decode(literal.value.as_str()?).ok()
 }
 
 #[cfg(test)]

@@ -3,9 +3,8 @@ use datafusion::scalar::ScalarValue;
 use delta_kernel::expressions::{DecimalData, Scalar};
 use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField};
 use delta_kernel::{Expression, Predicate};
-use serde_json::Value as Json;
+use vs_expression::{CompareOp, Expr};
 
-use super::filter_json::Comparison;
 use super::literal::UTC;
 use super::pruning_filter::{PruningFilter, StatisticsTarget};
 
@@ -16,12 +15,12 @@ type FilterColumns<'s> = [(&'s str, &'s StructField)];
 /// widen the surviving file set, never narrow it. A filter column is found among `columns` by
 /// its declared name and emitted under its field's current name; one missing from `columns`
 /// constrains nothing.
-pub(crate) fn to_delta_predicate(filter_json: &Json, columns: &FilterColumns) -> Option<Predicate> {
+pub(crate) fn to_delta_predicate(filter: &Expr, columns: &FilterColumns) -> Option<Predicate> {
     let resolve = |column: &str| {
         let (name, primitive) = resolve_column(column, columns)?;
         Some((name.to_string(), arrow_type(primitive)))
     };
-    PruningFilter::parse(filter_json, &resolve)
+    PruningFilter::parse(filter, &resolve)
         .to_statistics(&DeltaTarget)
         .map(|translated| translated.predicate)
 }
@@ -36,7 +35,7 @@ impl StatisticsTarget for DeltaTarget {
     fn compare(
         &self,
         name: &String,
-        comparison: Comparison,
+        comparison: CompareOp,
         literal: &ScalarValue,
     ) -> Option<Predicate> {
         Some(compare(name, comparison, scalar(literal)?))
@@ -46,7 +45,7 @@ impl StatisticsTarget for DeltaTarget {
     fn in_list(&self, name: &String, literals: &[ScalarValue]) -> Option<Predicate> {
         let equalities = literals
             .iter()
-            .map(|literal| Some(compare(name, Comparison::Equal, scalar(literal)?)))
+            .map(|literal| Some(compare(name, CompareOp::Equal, scalar(literal)?)))
             .collect::<Option<Vec<_>>>()?;
         Some(Predicate::or_from(equalities))
     }
@@ -64,12 +63,11 @@ impl StatisticsTarget for DeltaTarget {
     /// A prefix of only the last code point has none, and every string above it starts with it.
     fn starts_with(&self, name: &String, prefix: String) -> Predicate {
         let upper = successor(&prefix);
-        let lower = compare(name, Comparison::GreaterEqual, Scalar::String(prefix));
+        let lower = compare(name, CompareOp::GreaterEqual, Scalar::String(prefix));
         match upper {
-            Some(upper) => Predicate::and_from([
-                lower,
-                compare(name, Comparison::Less, Scalar::String(upper)),
-            ]),
+            Some(upper) => {
+                Predicate::and_from([lower, compare(name, CompareOp::Less, Scalar::String(upper))])
+            }
             None => lower,
         }
     }
@@ -88,14 +86,14 @@ impl StatisticsTarget for DeltaTarget {
     }
 }
 
-fn compare(name: &str, comparison: Comparison, scalar: Scalar) -> Predicate {
+fn compare(name: &str, comparison: CompareOp, scalar: Scalar) -> Predicate {
     let compare: fn(Expression, Expression) -> Predicate = match comparison {
-        Comparison::Equal => Predicate::eq,
-        Comparison::NotEqual => Predicate::ne,
-        Comparison::Less => Predicate::lt,
-        Comparison::LessEqual => Predicate::le,
-        Comparison::Greater => Predicate::gt,
-        Comparison::GreaterEqual => Predicate::ge,
+        CompareOp::Equal => Predicate::eq,
+        CompareOp::NotEqual => Predicate::ne,
+        CompareOp::Less => Predicate::lt,
+        CompareOp::LessEqual => Predicate::le,
+        CompareOp::Greater => Predicate::gt,
+        CompareOp::GreaterEqual => Predicate::ge,
     };
     compare(Expression::column([name]), Expression::literal(scalar))
 }

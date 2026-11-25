@@ -1,16 +1,21 @@
 use super::*;
 use crate::adapter::pushdown::format::literal::exact_literal;
 use crate::adapter::pushdown::test_support::{
-    and, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
+    Tree, and, ast, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
     nullable_field, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use iceberg::expr::Bind;
 use iceberg::spec::{NestedField, Schema, Type};
+use serde_json::Value as Json;
 use std::sync::Arc;
+use vs_expression::{CompareOp, Expr};
 
 /// `literal` converted as the parse converts it for a column of `primitive`, then made a datum.
 fn literal_to_datum(literal: &Json, primitive: &PrimitiveType) -> Option<Datum> {
-    datum(&exact_literal(literal, &arrow_type(primitive)?)?, primitive)
+    datum(
+        &exact_literal(&ast(literal), &arrow_type(primitive)?)?,
+        primitive,
+    )
 }
 
 fn test_schema() -> Schema {
@@ -55,14 +60,14 @@ fn declared_field(field_id: i32, name: &str) -> LogicalField {
 }
 
 /// Translates `filter` for a table whose declaration CREATE took from `schema` itself.
-fn translate_as_created(filter: &Json, schema: &Schema) -> Option<Predicate> {
+fn translate_as_created(filter: &impl Tree, schema: &Schema) -> Option<Predicate> {
     let declared: Vec<LogicalField> = schema
         .as_struct()
         .fields()
         .iter()
         .map(|field| declared_field(field.id, &field.name))
         .collect();
-    to_iceberg_predicate(filter, &declared, schema)
+    to_iceberg_predicate(&filter.tree(), &declared, schema)
 }
 
 fn translate(filter: &Json) -> Option<Predicate> {
@@ -285,17 +290,17 @@ fn a_filter_column_whose_declared_id_was_dropped_imposes_no_constraint() {
     let on_both = and([equal_to("ID", 5), equal_to("NOTE", 1)]);
 
     assert_eq!(
-        to_iceberg_predicate(&equal_to("NOTE", 1), &declared, &note_dropped),
+        to_iceberg_predicate(&ast(&equal_to("NOTE", 1)), &declared, &note_dropped),
         None,
         "field id 2 is gone; the later field `note` (id 3) is another column"
     );
     assert_eq!(
-        to_iceberg_predicate(&on_both, &declared, &note_dropped),
+        to_iceberg_predicate(&ast(&on_both), &declared, &note_dropped),
         Some(Reference::new("id").equal_to(Datum::int(5))),
         "AND drops only the conjunct on the dropped id"
     );
     assert_eq!(
-        to_iceberg_predicate(&not(on_both), &declared, &note_dropped),
+        to_iceberg_predicate(&ast(&not(on_both)), &declared, &note_dropped),
         None,
         "NOT never negates the AND that dropped a conjunct"
     );
@@ -307,7 +312,7 @@ fn a_filter_column_the_declaration_does_not_carry_imposes_no_constraint() {
     let added_since = int_schema(&[(1, "id"), (2, "extra")]);
 
     assert_eq!(
-        to_iceberg_predicate(&equal_to("EXTRA", 1), &declared, &added_since),
+        to_iceberg_predicate(&ast(&equal_to("EXTRA", 1)), &declared, &added_since),
         None
     );
 }
@@ -327,8 +332,8 @@ fn binary_schema() -> Schema {
         .unwrap()
 }
 
-fn equal_to_bytes(column: &str, hex: &str) -> Json {
-    predicate_equal(col(column), binary_lit(hex))
+fn equal_to_bytes(column: &str, hex: &str) -> Expr {
+    Expr::compare(CompareOp::Equal, ast(&col(column)), binary_lit(hex))
 }
 
 /// Scenario: A hex-literal filter on a binary column prunes files at plan time

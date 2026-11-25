@@ -26,13 +26,13 @@ fn a_split_keeps_each_declined_conjunct_as_exasol_sent_it() {
         placement.scan_filter(0),
         Some(
             scan_over(&col_types)
-                .filter(&id_above_five)
+                .filter(&ast(&id_above_five))
                 .expect("the bare id comparison renders")
         ),
     );
     assert_eq!(
         placement.wrapper(),
-        Some(&and([second, length])),
+        Some(&ast(&and([second, length]))),
         "the declined half must hold the declined conjuncts as Exasol sent them, not their scan \
          rewrites"
     );

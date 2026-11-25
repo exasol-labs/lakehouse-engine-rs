@@ -1,38 +1,25 @@
 use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
-use serde_json::Value as Json;
 use vs_expression::render_expression_exasol;
 
-use super::request::{AggregationType, PushdownRequest};
+use super::request::{AggregationType, PushdownRequest, SortElement};
 use super::support::{
-    Emitted, ProjectedColumn, collect_all_column_names, column_node_ref, emits_ident,
+    Emitted, ProjectedColumn, collect_all_column_names, column_ref, emits_ident,
     render_limit_offset,
 };
 use exasol_udf_sdk::error::UdfError;
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
-/// only. Expression sort keys use [`sort_flags`] instead.
+/// only. An expression sort key reads its flags from its element instead.
 ///
 /// A node's `tableAlias` qualifies the key, so a broadcast join's key keeps the leg its
 /// qualification stamped; the single-table paths strip every alias first, so their keys stay
 /// bare.
-pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
-    let column = column_node_ref(element.get("expression")?)?;
-    let (ascending, nulls_last) = sort_flags(element);
+pub(super) fn parse_sort_key_element(element: &SortElement) -> Option<SortKey> {
     Some(SortKey {
-        column,
-        ascending,
-        nulls_last,
+        column: column_ref(element.expression.as_column()?),
+        ascending: element.ascending,
+        nulls_last: element.nulls_last,
     })
-}
-
-/// `(ascending, nulls_last)`: Exasol states both flags on every `orderBy` element.
-pub(super) fn sort_flags(element: &Json) -> (bool, bool) {
-    let flag = |key: &str| {
-        element[key]
-            .as_bool()
-            .unwrap_or_else(|| panic!("Exasol states {key} on every orderBy element"))
-    };
-    (flag("isAscending"), flag("nullsLast"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,30 +58,32 @@ impl ParsedSortKey {
 
 /// Rendered in the Exasol dialect because the outer wrapper is parsed by Exasol,
 /// never inside a DataFusion `ScanSpec`.
-fn parse_declined_sort_key(element: &Json) -> ParsedSortKey {
+fn parse_declined_sort_key(element: &SortElement) -> Result<ParsedSortKey, UdfError> {
     if let Some(key) = parse_sort_key_element(element) {
-        return ParsedSortKey::Column(key);
+        return Ok(ParsedSortKey::Column(key));
     }
-    let (ascending, nulls_last) = sort_flags(element);
-    let expr = &element["expression"];
-    let rendered = render_expression_exasol(expr);
+    let (ascending, nulls_last) = (element.ascending, element.nulls_last);
+    let expr = &element.expression;
+    let rendered = render_expression_exasol(expr)?;
     let mut names = std::collections::HashSet::new();
     collect_all_column_names(expr, &mut names);
     let mut columns: Vec<String> = names.into_iter().collect();
     // Sorted so the hidden columns' EMITS order (and `_LH_PROJ_{i}` aliases) is
     // deterministic across processes.
     columns.sort();
-    ParsedSortKey::Expression {
+    Ok(ParsedSortKey::Expression {
         rendered,
         columns,
         ascending,
         nulls_last,
-    }
+    })
 }
 
 /// Exasol does not re-apply a delegated `ORDER BY`, so the declined paths must
 /// reproduce the global sort, one key per element.
-pub(super) fn parse_order_by_keys(pushdown: &PushdownRequest) -> Vec<ParsedSortKey> {
+pub(super) fn parse_order_by_keys(
+    pushdown: &PushdownRequest,
+) -> Result<Vec<ParsedSortKey>, UdfError> {
     pushdown
         .order_by()
         .iter()
@@ -126,10 +115,7 @@ pub(super) fn sort_by_select_items(
         else {
             continue;
         };
-        let Some(index) = items
-            .iter()
-            .position(|item| Some(item) == element.get("expression"))
-        else {
+        let Some(index) = items.iter().position(|item| *item == element.expression) else {
             continue;
         };
         *key = ParsedSortKey::Expression {

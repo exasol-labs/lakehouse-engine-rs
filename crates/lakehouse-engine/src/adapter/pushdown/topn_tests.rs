@@ -10,6 +10,7 @@ use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
@@ -68,7 +69,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let mut keys = parse_order_by_keys(&pushdown);
+        let mut keys =
+            parse_order_by_keys(&pushdown).expect("the Exasol dialect renders every sort key");
         sort_by_select_items(&mut keys, &pushdown, &projection);
         extend_projection_with_sort_keys(&mut projection, &keys, &emitted)
             .expect("the fan-out emits every sort key");
@@ -731,4 +733,18 @@ fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
         "effective_limit stays withheld: the per-shard common blob must carry no \
          limit, or each shard's partial aggregate would be zeroed out: {common}"
     );
+}
+
+#[test]
+fn a_declined_sort_key_the_exasol_dialect_cannot_render_fails_the_request() {
+    let pushdown = PushdownRequest::parse(serde_json::json!({
+        "selectListDataTypes": [],
+        "orderBy": [order_by_element(scalar_fn("ADD", [col("ID")]), true, true)],
+    }))
+    .expect("the request parses");
+
+    match parse_order_by_keys(&pushdown) {
+        Err(UdfError::User(message)) => assert!(message.contains("ADD"), "{message}"),
+        other => panic!("a one-argument ADD must fail the request, got {other:?}"),
+    }
 }

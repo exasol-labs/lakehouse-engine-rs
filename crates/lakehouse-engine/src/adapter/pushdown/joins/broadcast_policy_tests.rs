@@ -1,16 +1,18 @@
 use super::super::tests::{customer_orders_legs, legs_of, self_join_legs};
 use super::*;
 use crate::adapter::pushdown::test_support::*;
+use serde_json::Value as Json;
+use vs_expression::Expr;
 
 /// A join graph over owned inputs. Every conjunct renders unless listed in `declined`.
 struct Graph {
     legs: JoinLegs,
     bytes: Vec<u64>,
     columns: Vec<ColumnTypes>,
-    conditions: Vec<Json>,
-    conjuncts: Vec<Json>,
-    declined: Vec<Json>,
-    above: Vec<Json>,
+    conditions: Vec<Expr>,
+    conjuncts: Vec<Expr>,
+    declined: Vec<Expr>,
+    above: Vec<Expr>,
     aggregates: bool,
 }
 
@@ -26,7 +28,7 @@ impl Graph {
             legs,
             bytes: bytes.to_vec(),
             columns,
-            conditions,
+            conditions: conditions.iter().map(ast).collect(),
             conjuncts: Vec::new(),
             declined: Vec::new(),
             above: Vec::new(),
@@ -55,13 +57,14 @@ impl Graph {
 
     fn filtered(mut self, filter: Option<Json>) -> Self {
         self.conjuncts = filter
-            .map(|filter| flatten_conjuncts(&filter).into_iter().cloned().collect())
+            .map(|filter| ast(&filter).conjuncts().into_iter().cloned().collect())
             .unwrap_or_default();
         self
     }
 
     /// The graph with `conjunct` in its WHERE, a conjunct the scan declines.
     fn declining(mut self, conjunct: Json) -> Self {
+        let conjunct = ast(&conjunct);
         self.conjuncts.push(conjunct.clone());
         self.declined.push(conjunct);
         self
@@ -69,7 +72,8 @@ impl Graph {
 
     /// The graph whose clauses above the join also read `columns`.
     fn reading(mut self, columns: impl IntoIterator<Item = Json>) -> Self {
-        self.above.extend(columns);
+        self.above
+            .extend(columns.into_iter().map(|column| ast(&column)));
         self
     }
 
@@ -83,7 +87,7 @@ impl Graph {
                 renders: !self.declined.contains(tree),
             })
             .collect();
-        let above: Vec<&Json> = self.above.iter().collect();
+        let above: Vec<&Expr> = self.above.iter().collect();
         group_legs(&JoinGraph {
             legs: &self.legs,
             bytes: &self.bytes,
@@ -262,11 +266,7 @@ fn a_two_leg_row_scan_reads_unbounded_text_only_once_a_conjunct_is_left_for_exas
         aggregates: false,
         ..Graph::aggregating_customer_orders(text())
     };
-    let declined = compare(
-        "predicate_like",
-        table_col("CUSTOMER", "C_NAME"),
-        str_lit("A%"),
-    );
+    let declined = like(table_col("CUSTOMER", "C_NAME"), "A%");
     // Exasol applies a declined literal after the fan-out has emitted the column, so it bounds
     // nothing.
     let literal = string_equal("CUSTOMER", "C_NAME", "x");
@@ -314,15 +314,15 @@ fn ranks_candidate_pairs_by_filter_then_fact_bytes_then_dimension_bytes_then_ord
     let brand = || string_equal("PART", "P_BRAND", "Brand#23");
     let reading_brand = || star([90, 50, 10]).reading([table_col("PART", "P_BRAND")]);
     let mut chain = star([90, 50, 10]);
-    chain.conditions[1] = predicate_equal(
+    chain.conditions[1] = ast(&predicate_equal(
         table_col("PART", "P_SUPPKEY"),
         table_col("SUPPLIER", "S_SUPPKEY"),
-    );
+    ));
     let mut cross_dimension = star([90, 50, 10]);
-    cross_dimension.conditions.push(predicate_equal(
+    cross_dimension.conditions.push(ast(&predicate_equal(
         table_col("PART", "P_BRAND"),
         table_col("SUPPLIER", "S_SUPPKEY"),
-    ));
+    )));
     let cases = [
         (
             "the filtered dimension ranks first, though the other is smaller",

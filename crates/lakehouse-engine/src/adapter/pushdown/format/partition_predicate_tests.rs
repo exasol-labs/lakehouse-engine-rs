@@ -1,11 +1,12 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null, like,
-    like_escape, lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal,
-    scalar_fn, str_lit, timestamp_lit,
+    Tree, and, ast, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null,
+    is_null, like, like_escape, lit, not, null_lit, num_lit, or, predicate_equal, sales_col,
+    sales_equal, scalar_fn, str_lit, timestamp_lit,
 };
 use arrow::datatypes::TimeUnit;
-use serde_json::json;
+use serde_json::{Value as Json, json};
+use vs_expression::{CompareOp, Expr};
 
 /// A filter no partition column can decide.
 fn on_a_data_column() -> Json {
@@ -21,11 +22,11 @@ fn kept(filter: &Json, files: &[BTreeMap<String, Option<String>>]) -> Vec<bool> 
 }
 
 fn kept_under(
-    filter: &Json,
+    filter: &impl Tree,
     declared: &[(String, DataType)],
     files: &[BTreeMap<String, Option<String>>],
 ) -> Vec<bool> {
-    let predicate = PartitionPredicate::from_filter(Some(filter), declared);
+    let predicate = PartitionPredicate::from_filter(Some(&filter.tree()), declared);
     files.iter().map(|values| predicate.keeps(values)).collect()
 }
 
@@ -213,8 +214,8 @@ fn a_non_partition_node_never_prunes() {
             [true, true, true],
         ),
         (
-            "an operator this module does not evaluate",
-            json!({"type": "predicate_is_json", "expression": sales_col("YEAR")}),
+            "a function this module does not evaluate",
+            predicate_equal(scalar_fn("ABS", [sales_col("YEAR")]), num_lit("2025")),
             [true, true, true],
         ),
         (
@@ -231,11 +232,6 @@ fn a_non_partition_node_never_prunes() {
         (
             "an IN with no element",
             in_list(sales_col("YEAR"), Vec::new()),
-            [true, true, true],
-        ),
-        (
-            "a node without a type",
-            json!({"left": sales_col("YEAR")}),
             [true, true, true],
         ),
         (
@@ -644,7 +640,11 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
     ];
     assert_eq!(
         kept_under(
-            &predicate_equal(sales_col("PART"), binary_lit("4142")),
+            &Expr::compare(
+                CompareOp::Equal,
+                ast(&sales_col("PART")),
+                binary_lit("4142")
+            ),
             &declared,
             &files
         ),
@@ -653,11 +653,11 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
     );
     assert_eq!(
         kept_under(
-            &not(compare(
-                "predicate_greater",
-                sales_col("PART"),
+            &Expr::Not(Box::new(Expr::compare(
+                CompareOp::Greater,
+                ast(&sales_col("PART")),
                 binary_lit("4142")
-            )),
+            ))),
             &declared,
             &files
         ),

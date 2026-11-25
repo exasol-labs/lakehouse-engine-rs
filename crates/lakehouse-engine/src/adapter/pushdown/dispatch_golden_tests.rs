@@ -3,9 +3,9 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, column_types, count_star,
-    dispatch_base, dispatch_context, float_div, n_scan_sql_over, pair_plan_sql, parsed_pushdown,
-    pd, projected_columns, pushdown_request, request_typed, resolved_table, round_of,
+    NO_COLUMNS, PushdownRequestBuilder, adapter_request, agg_item, agg_item_expr, column_types,
+    count_star, dispatch_base, dispatch_context, float_div, n_scan_sql_over, pair_plan_sql,
+    parsed_pushdown, projected_columns, pushdown_request, request_typed, resolved_table, round_of,
     sample_storage, scan_for, test_context, unqualified_shards, whole_request_emission,
     with_identifier_notes,
 };
@@ -226,10 +226,9 @@ fn dispatch_sql(
     proj_types: Vec<ExasolType>,
     limit: Option<u64>,
 ) -> String {
-    let pushdown_req = pd(request);
     dispatch_sql_with_pushdown_req(
         request,
-        &pushdown_req,
+        &parsed_pushdown(request),
         proj_cols,
         proj_types,
         base_col_types(),
@@ -266,22 +265,20 @@ fn dispatch_sql_wrapped(request: &Json) -> String {
 /// body (#193).
 fn dispatch_sql_with_pushdown_req(
     request: &Json,
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     proj_cols: Vec<ProjectionItem>,
     proj_types: Vec<ExasolType>,
     col_types: Vec<(String, ExasolType)>,
     limit: Option<u64>,
 ) -> String {
-    let pushdown = PushdownRequest::parse(pushdown_req.clone())
-        .expect("the fixture declares a valid selectListDataTypes");
     let columns = column_types(&col_types);
     golden_dispatch(
         request,
-        &pushdown,
+        pushdown,
         RowProjection::Direct(projected_columns(&proj_cols, &proj_types)),
-        &golden_emission(request, &pushdown, &columns),
-        scan_for(&columns, &pushdown),
-        WherePlacement::single_scan(scan_for(&columns, &pushdown), &pushdown),
+        &golden_emission(request, pushdown, &columns),
+        scan_for(&columns, pushdown),
+        WherePlacement::single_scan(scan_for(&columns, pushdown), pushdown),
         limit,
     )
 }
@@ -314,7 +311,7 @@ fn golden_dispatch(
     limit: Option<u64>,
 ) -> String {
     let result = build_dispatch_sql(
-        request,
+        &adapter_request(request),
         pushdown,
         projection,
         emitted,
@@ -345,7 +342,10 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &pushdown,
         &RowProjection::Direct(projected_columns(proj_cols, proj_types)),
         scan_for(&columns, &pushdown),
-        &EmptyRelation::single_scan(request, golden_emission(request, &pushdown, &columns)),
+        &EmptyRelation::single_scan(
+            &adapter_request(request),
+            golden_emission(request, &pushdown, &columns),
+        ),
         &test_context(),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
@@ -553,8 +553,9 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
             num_lit(100),
         ),
     );
-    let raw_pushdown_req = pd(&request);
-    let stripped_pushdown_req = strip_table_alias(&raw_pushdown_req);
+    let raw_pushdown_req = parsed_pushdown(&request);
+    let stripped_pushdown_req =
+        raw_pushdown_req.map_expressions(&Clause::ALL, |tree| tree.strip_table_alias());
 
     let actual = dispatch_sql_with_pushdown_req(
         &request,
@@ -598,8 +599,9 @@ fn aliased_multi_count_distinct_decline_request() -> (Json, Vec<ExasolType>) {
 #[test]
 fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_presence() {
     let request = aliased_multi_count_distinct_decline_request().0;
-    let raw_pushdown_req = pd(&request);
-    let stripped_pushdown_req = strip_table_alias(&raw_pushdown_req);
+    let raw_pushdown_req = parsed_pushdown(&request);
+    let stripped_pushdown_req =
+        raw_pushdown_req.map_expressions(&Clause::ALL, |tree| tree.strip_table_alias());
 
     let sql_with_alias = dispatch_sql_with_pushdown_req(
         &request,
@@ -696,7 +698,7 @@ fn grouped_all_agg_kinds_request() -> (Json, Vec<ExasolType>) {
 fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, ExasolType)>) -> String {
     dispatch_sql_with_pushdown_req(
         request,
-        &pd(request),
+        &parsed_pushdown(request),
         Vec::new(),
         Vec::new(),
         col_types,
@@ -760,7 +762,8 @@ fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
 }
 
 fn two_table_detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(request, &parsed_pushdown(request)).expect("two-table join must be detected")
+    match detect_join(&adapter_request(request), &parsed_pushdown(request))
+        .expect("two-table join must be detected")
     {
         JoinShape::Join(join) => join,
         other => panic!("expected a detected join, got {other:?}"),

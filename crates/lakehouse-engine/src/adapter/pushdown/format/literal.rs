@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::scalar::ScalarValue;
-use serde_json::Value as Json;
+use vs_expression::{Expr, LiteralKind, Scalar};
 
 use crate::adapter::pushdown::literal_binary_bytes;
 use crate::types::exasol_type::ExasolType;
@@ -8,43 +8,47 @@ use crate::types::mapping::{arrow_to_exasol_type, timestamp_unit};
 use vs_expression::is_session_free_integer_text;
 use vs_expression::timestamp::TimestampLiteral;
 
-use super::filter_json::non_empty_str;
+use super::filter_operands::non_empty_str;
 
 /// The time zone of a UTC-adjusted column's Arrow type, on every pruning path.
 pub(super) const UTC: &str = "+00:00";
 
 /// A literal converts only when the column's type holds it exactly, because a rounded bound
 /// could prune a file holding a matching row. Each pruning path maps the value to its own type.
-pub(super) fn exact_literal(literal: &Json, column: &DataType) -> Option<ScalarValue> {
-    let kind = literal.get("type")?.as_str()?;
-    let value = literal.get("value")?;
+pub(super) fn exact_literal(literal: &Expr, column: &DataType) -> Option<ScalarValue> {
+    let Expr::Literal(vs_expression::Literal { kind, value }) = literal else {
+        return None;
+    };
     let text = match (kind, column) {
-        ("literal_bool", DataType::Boolean) => value.as_bool()?.to_string(),
-        ("literal_exactnumeric", integer) if integer.is_integer() => exact_numeral(value, 0)?,
+        (LiteralKind::Bool, DataType::Boolean) => match value {
+            Scalar::Bool(value) => value.to_string(),
+            _ => return None,
+        },
+        (LiteralKind::ExactNumeric, integer) if integer.is_integer() => exact_numeral(value, 0)?,
         (
-            "literal_exactnumeric",
+            LiteralKind::ExactNumeric,
             DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale),
         ) => exact_numeral(value, *scale)?,
-        ("literal_exactnumeric" | "literal_double", DataType::Float64) => {
+        (LiteralKind::ExactNumeric | LiteralKind::Double, DataType::Float64) => {
             return double(value).map(|wide| ScalarValue::Float64(Some(wide)));
         }
-        ("literal_exactnumeric" | "literal_double", DataType::Float32) => {
+        (LiteralKind::ExactNumeric | LiteralKind::Double, DataType::Float32) => {
             let wide = double(value)?;
             let narrow = wide as f32;
             return (f64::from(narrow) == wide).then_some(ScalarValue::Float32(Some(narrow)));
         }
-        ("literal_string", DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
-        | ("literal_date", DataType::Date32 | DataType::Date64) => {
+        (LiteralKind::String, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+        | (LiteralKind::Date, DataType::Date32 | DataType::Date64) => {
             non_empty_str(value)?.to_string()
         }
-        ("literal_string", integer) if is_integer_text(literal, integer) => {
+        (LiteralKind::String, integer) if is_integer_text(literal, integer) => {
             non_empty_str(value)?.to_string()
         }
-        ("literal_timestamp", DataType::Timestamp(unit, _)) => exact_timestamp(value, *unit)?,
-        ("literal_binary", DataType::Binary) => {
+        (LiteralKind::Timestamp, DataType::Timestamp(unit, _)) => exact_timestamp(value, *unit)?,
+        (LiteralKind::Binary { .. }, DataType::Binary) => {
             return literal_binary_bytes(literal).map(|bytes| ScalarValue::Binary(Some(bytes)));
         }
-        ("literal_binary", DataType::FixedSizeBinary(width)) => {
+        (LiteralKind::Binary { .. }, DataType::FixedSizeBinary(width)) => {
             return literal_binary_bytes(literal)
                 .filter(|bytes| usize::try_from(*width).ok() == Some(bytes.len()))
                 .map(|bytes| ScalarValue::FixedSizeBinary(*width, Some(bytes)));
@@ -58,7 +62,7 @@ pub(super) fn exact_literal(literal: &Json, column: &DataType) -> Option<ScalarV
 
 /// Exasol compares a digits-only text literal with an integer column as that number, and the scan
 /// converts it by `is_session_free_integer_text`, so pruning converts it by the same rule.
-fn is_integer_text(literal: &Json, column: &DataType) -> bool {
+fn is_integer_text(literal: &Expr, column: &DataType) -> bool {
     match arrow_to_exasol_type(column) {
         ExasolType::Decimal(decimal) if decimal.scale() == 0 => {
             is_session_free_integer_text(literal, decimal.precision())
@@ -67,20 +71,20 @@ fn is_integer_text(literal: &Json, column: &DataType) -> bool {
     }
 }
 
-fn double(value: &Json) -> Option<f64> {
+fn double(value: &Scalar) -> Option<f64> {
     match value {
-        Json::Number(number) => number.as_f64(),
-        Json::String(text) => text.trim().parse().ok(),
+        Scalar::Number(number) => number.as_f64(),
+        Scalar::String(text) => text.trim().parse().ok(),
         _ => None,
     }
 }
 
 /// A plain `[+-]digits[.digits]` numeral whose nonzero fraction fits `scale`, with its trailing
 /// fraction zeros cut, since the string cast would round a finer one.
-fn exact_numeral(value: &Json, scale: i8) -> Option<String> {
+fn exact_numeral(value: &Scalar, scale: i8) -> Option<String> {
     let numeral = match value {
-        Json::String(numeral) => numeral.clone(),
-        Json::Number(number) => number.to_string(),
+        Scalar::String(numeral) => numeral.clone(),
+        Scalar::Number(number) => number.to_string(),
         _ => return None,
     };
     let unsigned = numeral.strip_prefix(['+', '-']).unwrap_or(&numeral);
@@ -102,7 +106,7 @@ fn exact_numeral(value: &Json, scale: i8) -> Option<String> {
 }
 
 /// The string cast truncates a fraction finer than `unit`, so such a literal does not convert.
-fn exact_timestamp(value: &Json, unit: TimeUnit) -> Option<String> {
+fn exact_timestamp(value: &Scalar, unit: TimeUnit) -> Option<String> {
     let text = non_empty_str(value)?;
     TimestampLiteral(text)
         .fits(timestamp_unit(unit))

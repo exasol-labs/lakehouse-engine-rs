@@ -2,8 +2,7 @@
 //! planners. This module names neither planner, so the two cannot drift apart.
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
-use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment};
+use vs_expression::{Column, Expr, SqlFragment};
 
 use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -42,7 +41,7 @@ pub(super) fn fold_aggregate_plan(
 pub(super) fn fold_nested_plans(
     plans: &mut Vec<AggregatePlan>,
     plan_types: &mut Vec<Option<ExasolType>>,
-    nested: &[(AggregatePlan, Json)],
+    nested: &[(AggregatePlan, Expr)],
     scan: ScanTranslator<'_>,
 ) {
     for (plan, agg) in nested {
@@ -63,51 +62,23 @@ pub(super) fn agg_sentinel_token(i: usize) -> String {
     quote_ident(&agg_sentinel_name(i))
 }
 
-pub(super) fn sentinel_column_node(i: usize) -> Json {
-    ColumnNode::to_json(&agg_sentinel_name(i), None, None)
-}
-
-/// Copies `node`, replacing each object subtree for which `substitute` returns `Some`; the walk
-/// does not descend into a replaced subtree.
-pub(super) fn substitute_subtrees(
-    node: &Json,
-    substitute: &mut impl FnMut(&Json) -> Option<Json>,
-) -> Json {
-    match node {
-        Json::Object(map) => substitute(node).unwrap_or_else(|| {
-            Json::Object(
-                map.iter()
-                    .map(|(key, value)| (key.clone(), substitute_subtrees(value, substitute)))
-                    .collect(),
-            )
-        }),
-        Json::Array(items) => Json::Array(
-            items
-                .iter()
-                .map(|value| substitute_subtrees(value, substitute))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-pub(super) fn is_aggregate_node(node: &Json) -> bool {
-    node.get("type").and_then(Json::as_str) == Some("function_aggregate")
+pub(super) fn sentinel_column_node(i: usize) -> Expr {
+    Expr::Column(Column::new(agg_sentinel_name(i)))
 }
 
 /// A column inside an aggregate is not residual. `residual_column` flags a bare column outside
 /// any aggregate: the merge wrapper exposes only `GK_*`/`PARTIAL_*`, so it cannot render there.
 pub(super) fn sentinelize_aggregates(
-    node: &Json,
-    aggregates: &mut Vec<Json>,
+    node: &Expr,
+    aggregates: &mut Vec<Expr>,
     residual_column: &mut bool,
-) -> Json {
-    substitute_subtrees(node, &mut |subtree| {
-        if is_aggregate_node(subtree) {
+) -> Expr {
+    node.substitute(&mut |subtree| {
+        if subtree.is_aggregate() {
             aggregates.push(subtree.clone());
             return Some(sentinel_column_node(aggregates.len() - 1));
         }
-        if ColumnNode::parse(subtree).is_some() {
+        if subtree.as_column().is_some() {
             *residual_column = true;
         }
         None
@@ -116,9 +87,9 @@ pub(super) fn sentinelize_aggregates(
 
 /// Each plan comes with its aggregate node, which [`fold_nested_plans`] types.
 pub(super) fn classify_scalar_over_aggregate(
-    node: &Json,
+    node: &Expr,
     scan: ScanTranslator<'_>,
-) -> Option<Vec<(AggregatePlan, Json)>> {
+) -> Option<Vec<(AggregatePlan, Expr)>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
@@ -135,7 +106,7 @@ pub(super) fn classify_scalar_over_aggregate(
 /// it cannot drift from the translator. A sentinel column has no type, so the scalar gets an exact
 /// type only where it does not depend on an aggregate's, such as under its own CAST.
 pub(super) fn render_scalar_over_merge(
-    node: &Json,
+    node: &Expr,
     plans: &[AggregatePlan],
     merged: &[String],
     scan: ScanTranslator<'_>,
@@ -145,7 +116,7 @@ pub(super) fn render_scalar_over_merge(
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    let SqlFragment { mut sql, ty } = scan.exasol_fragment(&sentinel_tree);
+    let SqlFragment { mut sql, ty } = scan.exasol_fragment(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, scan)?;
         let slot = plans.iter().position(|p| *p == plan)?;
@@ -170,17 +141,17 @@ const STAT_AGG_KINDS: &[(&str, AggKind)] = &[
     ("VAR_POP", AggKind::VarPop),
 ];
 
-fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
-    ColumnNode::parse(args?.first()?).map(|column| column.upper_name())
+fn column_from_first_arg(args: &[Expr]) -> Option<String> {
+    args.first()?.as_column().map(Column::upper_name)
 }
 
 /// `None` when there is no argument or it cannot be rendered.
 pub(super) fn arg_column_or_expr(
-    args: Option<&Vec<Json>>,
+    args: &[Expr],
     scan: ScanTranslator<'_>,
 ) -> Option<(Option<String>, Option<String>)> {
-    let arg = args.and_then(|a| a.first())?;
-    if let Some(column) = ColumnNode::parse(arg) {
+    let arg = args.first()?;
+    if let Some(column) = arg.as_column() {
         return Some((Some(column.upper_name()), None));
     }
     scan.expression(arg).map(|arg| (None, Some(arg.sql)))
@@ -189,10 +160,10 @@ pub(super) fn arg_column_or_expr(
 /// [`arg_column_or_expr`] for an aggregate the scan computes. A string column is an expression
 /// there, because the aggregate reads its empty strings as NULL.
 fn aggregate_argument(
-    args: Option<&Vec<Json>>,
+    args: &[Expr],
     scan: ScanTranslator<'_>,
 ) -> Option<(Option<String>, Option<String>)> {
-    let arg = args.and_then(|a| a.first())?;
+    let arg = args.first()?;
     if scan.exact_type(arg).is_some_and(|ty| ty.is_character()) {
         return scan.operand(arg).map(|arg| (None, Some(arg.sql)));
     }
@@ -202,23 +173,21 @@ fn aggregate_argument(
 /// `None` for any `distinct: true` item, an unsupported function, or an aggregate the scan does
 /// not compute. STDDEV/VARIANCE accept only a bare column: their (cnt, mean, m2) decomposition
 /// has no rendered-argument form, and a plan with no argument would fail inside the scan.
-pub(super) fn parse_agg_item(item: &Json, scan: ScanTranslator<'_>) -> Option<AggregatePlan> {
-    if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
+pub(super) fn parse_agg_item(item: &Expr, scan: ScanTranslator<'_>) -> Option<AggregatePlan> {
+    let Expr::Aggregate(call) = item else {
+        return None;
+    };
+    if call.distinct {
         return None;
     }
     // Typed as a whole, so a bare-column argument meets the same checks as an expression (#587).
     scan.expression(item)?;
 
-    let fn_name = item
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_uppercase();
-
-    let args = item.get("arguments").and_then(|a| a.as_array());
+    let fn_name = call.name.as_str();
+    let args = call.arguments.as_slice();
 
     if fn_name == "COUNT" {
-        return Some(match args.and_then(|a| a.first()) {
+        return Some(match args.first() {
             None => AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
