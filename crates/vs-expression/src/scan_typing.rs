@@ -57,6 +57,7 @@ pub(crate) enum Partial {
 
 const BOOLEAN: Inferred = Inferred::Exact(ExasolType::Boolean);
 const DATE: Inferred = Inferred::Exact(ExasolType::Date);
+const DOUBLE: Inferred = Inferred::Exact(ExasolType::DoublePrecision);
 
 impl Inferred {
     pub(crate) fn exact(self) -> Option<ExasolType> {
@@ -128,6 +129,8 @@ impl Inferred {
     fn union(self, other: Self, version: ExasolVersion) -> Self {
         let exact = match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => return ty,
+            // Exasol 8, 2025, and 2026 type a DOUBLE among numbers as DOUBLE, decimal literals too.
+            (DOUBLE, number) | (number, DOUBLE) if number.is_numeric() => return DOUBLE,
             (DATE, timestamp) | (timestamp, DATE) if timestamp.is_timestamp() => {
                 return match version {
                     ExasolVersion::Exasol8 => self,

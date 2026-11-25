@@ -1302,6 +1302,59 @@ fn branches_of_integers_and_other_types_unify_as_exasol_does() {
 }
 
 #[test]
+fn a_double_branch_among_numbers_makes_the_union_double() {
+    let double = Inferred::Exact(ExasolType::DoublePrecision);
+    let cases = [
+        (
+            "COALESCE over a DOUBLE and an integer literal",
+            case_when([is_not_null(col("F"))], [col("F"), num_lit(0)]),
+            double,
+        ),
+        (
+            "COALESCE over a DOUBLE and a decimal literal",
+            case_when([is_not_null(col("F"))], [col("F"), num_lit("2.5")]),
+            double,
+        ),
+        (
+            "GREATEST over a DOUBLE and a DECIMAL(9,2)",
+            scalar_fn("GREATEST", [col("F"), col("N")]),
+            double,
+        ),
+        (
+            "LEAST over a DOUBLE and a DOUBLE literal",
+            scalar_fn(
+                "LEAST",
+                [col("F"), lit("literal_double", "1.0000000000000000e+01")],
+            ),
+            double,
+        ),
+        (
+            "CASE over a DOUBLE and an integer literal",
+            case_when([col("B")], [col("F"), num_lit(1)]),
+            double,
+        ),
+        (
+            "GREATEST over an integer, a DECIMAL(9,2), and a DOUBLE",
+            scalar_fn("GREATEST", [col("I"), col("N"), col("F")]),
+            double,
+        ),
+        (
+            "CASE over NULL and a DOUBLE",
+            case_when([col("B")], [null_lit(), col("F")]),
+            double,
+        ),
+        (
+            "CASE over a DOUBLE and a DATE",
+            case_when([col("B")], [col("F"), col("D")]),
+            Inferred::Unknown,
+        ),
+    ];
+    for (label, expr, expected) in cases {
+        assert_eq!(type_of(&expr), expected, "{label}");
+    }
+}
+
+#[test]
 fn an_integer_branch_union_converts_to_text_by_its_widest_precision() {
     let union = || case_when([col("B")], [col("I"), num_lit(1)]);
     assert!(render(&cast_to(ExasolType::varchar(10), union())).is_ok());
