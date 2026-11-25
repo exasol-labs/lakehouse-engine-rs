@@ -35,14 +35,9 @@ fi
 
 echo "== [$(date +%H:%M:%S)] make_deletes_docker: authoring '${TARGET_NS}' from '${SOURCE_NS}' via Spark =="
 
-ICEBERG_VERSION="1.11.0"
-SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION}"
-
 # Keep in lockstep with scripts/spark-fixtures/run_fixtures.sh's SPARK_CONF.
 SPARK_CONF=(
   --master "local[*]"
-  --packages "$SPARK_PACKAGES"
-  --conf spark.jars.ivy=/tmp/ivy2
   --conf spark.sql.shuffle.partitions=1
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
   --conf spark.sql.catalog.rest_catalog=org.apache.iceberg.spark.SparkCatalog
@@ -65,7 +60,7 @@ docker run --rm \
   --network "$COMPOSE_NETWORK" \
   -e AWS_REGION=us-east-1 \
   -v "${SCRIPT_DIR}/../scripts/spark-fixtures:/fixtures:ro" \
-  apache/spark:4.1.1 \
+  exadockerci4/spark-lakehouse:4.1.1-iceberg-1 \
   /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" \
   -d "catalog=${CATALOG}" -d "source_ns=${SOURCE_NS}" -d "target_ns=${TARGET_NS}" \
   -f /fixtures/create_tpch_deletes.sql

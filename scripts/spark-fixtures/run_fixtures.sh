@@ -5,18 +5,10 @@
 # fixtures into tests/common/seed.rs and drop them from here.
 set -euo pipefail
 
-ICEBERG_VERSION="1.11.0"
-# hadoop-aws, pinned to the image's bundled Hadoop, serves only the INT96,
-# identity-partition, and name-mapping fixtures' native Parquet writes.
-HADOOP_AWS_VERSION="3.4.2"
-SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}"
-
+# The exadockerci4/spark-lakehouse Iceberg image bakes in the Iceberg runtime,
+# its AWS integration, and hadoop-aws, so the job downloads nothing.
 SPARK_CONF=(
   --master "local[*]"
-  --packages "$SPARK_PACKAGES"
-  # The image's non-root user has no home, so Ivy's default cache dir
-  # (derived from JVM user.home, not $HOME) is unwritable.
-  --conf spark.jars.ivy=/tmp/ivy2
   --conf spark.sql.shuffle.partitions=1
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
   --conf spark.sql.catalog.rest_catalog=org.apache.iceberg.spark.SparkCatalog
