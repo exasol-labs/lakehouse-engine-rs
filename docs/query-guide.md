@@ -24,7 +24,7 @@ A query runs well when:
 This page lists the rules that follow from this. Each rule shows a form to use and a form to
 avoid. [Capabilities](capabilities.md) has the technical details. The rules describe the current
 release: when the engine learns to run more, a rule gets relaxed and this page is updated. Last
-verified against lakehouse-engine 0.60.1 on Exasol 2025.1.
+verified against lakehouse-engine 0.61.0 on Exasol 2025.1.
 
 ## Quick reference
 
@@ -32,7 +32,8 @@ verified against lakehouse-engine 0.60.1 on Exasol 2025.1.
 |---|---|---|
 | `d >= DATE '2024-01-01' AND d < DATE '2025-01-01'` | `YEAR(d) = 2024` | A function around a column can't skip files. |
 | `d = DATE '2024-01-02'` | `d = '2024-01-02'` | Comparing a date with text runs in Exasol. |
-| A filter the engine can run on a small table of a join | Long text columns of the small tables | The engine joins one pair itself and prefers a small table it can filter. Long text rules a pair out. |
+| `WHERE p.p_brand = 'Brand#23'` on the small table of a join | `WHERE p.p_brand REGEXP_LIKE 'Brand#23'` | The engine joins one pair itself and prefers a small table it can filter. It can't run `REGEXP_LIKE`. |
+| `SELECT p.p_partkey, ...` from the small table of a join | `SELECT p.p_comment, ...` | When Exasol works on the joined rows further, a text column of the small table rules the pair out, unless `col = 'x'` or `col IN ('x', 'y')` limits it. |
 | `FROM a JOIN b ON ... JOIN c ON ...` | `FROM a, c, b` where `c` doesn't join `a` | Exasol then sends each table to the engine on its own. |
 | Filters on the optional side of a `LEFT JOIN` in a `WITH` clause | The same filters in `ON` | A filter in `ON` on that side doesn't reach the engine. |
 | `JOIN` on a unique key | `IN (SELECT ...)`, `EXISTS` | The engine can't run these. |
@@ -153,9 +154,14 @@ every other table on its own. A pair of tables is a broadcast join when:
   `a.k1 = b.k1 AND a.k2 = b.k2`, `a.k = b.k + 1`.
 - The smaller table's files are at most `JOIN_BROADCAST_MAX_BYTES` ([Tuning](tuning.md)),
   128 MiB by default.
-- With an aggregate, `GROUP BY`, `HAVING`, a third table, or a filter that runs in Exasol, every
-  column Exasol reads from the smaller table is a number, date, timestamp, or boolean, or text that
-  a filter limits to fixed values (`col = 'x'`, `col IN ('x', 'y')`).
+- The smaller table passes the column rule below, when that rule applies.
+
+The column rule applies when Exasol works on the joined rows further: the query has an aggregate,
+`GROUP BY`, `HAVING`, or a third table, or a filter the engine can't run (see [Filters](#filters)).
+Then every column Exasol reads from the smaller table must be one of these:
+
+- a number, date, timestamp, or boolean
+- text that a filter limits to fixed values: `col = 'x'` or `col IN ('x', 'y')`
 
 A filter in `ON` works like one in `WHERE`: it skips files, also when it compares the two tables
 (`a.x > b.y`). A filter the engine can't run, such as `d LIKE '2024%'` on a date, runs in Exasol
@@ -176,18 +182,35 @@ still a broadcast join. Put a calculation on the smaller table's side.
 
 ### In a join of three or more tables, filter a small table in the engine
 
-The engine joins one pair of tables itself. It prefers a pair whose smaller table has a filter the
-engine can run, because the join then removes rows of the larger table before they reach Exasol.
-A filter that runs in Exasol, such as `REGEXP_LIKE`, or a long text column of the small table makes
-the engine pick another pair.
+The engine joins one pair of tables itself. It prefers a pair whose smaller table has a filter of
+its own that the engine runs, because the join then removes rows of the larger table before they
+reach Exasol. Two things make the engine pick another pair:
 
-| Use | Avoid |
-|---|---|
-| `SELECT p.p_partkey, SUM(l.l_quantity) FROM lineitem l JOIN part p ON p.p_partkey = l.l_partkey JOIN supplier s ON s.s_suppkey = l.l_suppkey WHERE p.p_brand = 'Brand#23' GROUP BY p.p_partkey` | The same query with `WHERE p.p_brand REGEXP_LIKE 'Brand#23'` |
-| | The same query with `p.p_comment` instead of `p.p_partkey` |
+- A filter the engine can't run, such as `REGEXP_LIKE`, doesn't count as the small table's own
+  filter.
+- A text column that Exasol reads from the small table rules the pair out, unless a filter limits
+  it to fixed values (`col = 'x'`, `col IN ('x', 'y')`). Exasol reads a column for the select list,
+  for a join with another table, and for a filter it runs itself.
 
-The first query sends Exasol only the `lineitem` rows of brand 23. The others send every
-`lineitem` row.
+Use:
+
+```sql
+SELECT p.p_partkey, SUM(l.l_quantity)
+FROM lineitem l
+JOIN part p ON p.p_partkey = l.l_partkey
+JOIN supplier s ON s.s_suppkey = l.l_suppkey
+WHERE p.p_brand = 'Brand#23'
+GROUP BY p.p_partkey
+```
+
+Avoid these variants of it:
+
+- `WHERE p.p_brand REGEXP_LIKE 'Brand#23'`: the filter doesn't count, and Exasol reads the text
+  column `p_brand` to run it.
+- `p.p_comment` instead of `p.p_partkey`: Exasol reads the text column `p_comment`.
+
+The query sends Exasol only the `lineitem` rows of brand 23. The variants send every `lineitem`
+row.
 
 ### List comma-separated tables in join order
 

@@ -94,15 +94,18 @@ pub(super) fn exasol_runs_tail(fan_outs: usize, aggregates: bool, exasol_filters
 }
 
 /// Whether a two-leg broadcast can serve the request's window, so its pair may be broadcast at
-/// all (#675). Exasol renders the window of a join of more legs or of an aggregating request, as
-/// [`exasol_runs_tail`] decides. Otherwise the window must classify, and every sort key must be
-/// a column the select list projects, as the shards bind it.
+/// all (#675). Exasol renders the window when [`exasol_runs_tail`] holds, so `exasol_filters`
+/// says whether a WHERE conjunct is left for Exasol. Otherwise the window must classify, and
+/// every sort key must be a column the select list projects, as the shards bind it.
 pub(super) fn broadcast_serves_window(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
     leg_count: usize,
+    exasol_filters: bool,
 ) -> bool {
-    if leg_count > 2 || pushdown.aggregation_type().is_some() {
+    let aggregates = pushdown.aggregation_type().is_some();
+    // A broadcast plan holds one fan-out fewer than legs: the pair shares one.
+    if exasol_runs_tail(leg_count - 1, aggregates, exasol_filters) {
         return true;
     }
     let qualified = legs.qualify_request(pushdown);

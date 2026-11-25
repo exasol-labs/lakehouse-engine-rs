@@ -17,8 +17,8 @@ Applies the scan text conversion rule (`pushdown-types/pushdown-planning-scan-te
 
 ### Scenario: A join filter that converts a date to text runs in Exasol, and such a join key keeps the N-scan
 
-* *GIVEN* an inner equi-join whose WHERE filter or `ON` filter converts a DATE to text, such as `o_orderdate LIKE '2024-01-0%'`, or whose join key does, such as `ON TO_CHAR(o.o_orderdate) = c.c_label`
+* *GIVEN* an inner equi-join whose WHERE filter or `ON` filter converts a DATE to text, such as `o_orderdate LIKE '2024-01-0%'`, or whose join key does, such as `ON CAST(a.o_orderdate AS VARCHAR(20)) = CAST(b.o_orderdate AS VARCHAR(20))`
 * *WHEN* the adapter renders the join
 * *THEN* a filter that converts a DATE to text SHALL keep the broadcast plan and run in Exasol's `WHERE` over the broadcast fan-out (`pushdown/pushdown-declined-filter-self-apply`)
-* *AND* a join key that converts a DATE to text SHALL keep its pair off the broadcast, so a two-leg join takes the N-scan fallback, whose `ON` applies the conversion in Exasol, and a join of three or more legs broadcasts the next eligible pair (`pushdown-joins/pushdown-planning-join-multi-way`)
+* *AND* a join key that converts a DATE to text SHALL keep its pair off the broadcast, so a two-leg join takes the N-scan fallback, whose `ON` applies the conversion in Exasol, and a join of three or more legs broadcasts the next eligible pair (`pushdown-joins/pushdown-planning-join-multi-way`) and applies the conversion in Exasol's `ON`
 * *AND* the rows SHALL equal native Exasol under any `NLS_DATE_FORMAT`

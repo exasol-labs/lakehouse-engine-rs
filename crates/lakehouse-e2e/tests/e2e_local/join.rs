@@ -914,6 +914,14 @@ fn e2e_broadcast_join_declined_conjunct_runs_in_exasol_where() {
             2,
             format!("{select} WHERE {SECOND_IS_ZERO} ORDER BY o.O_ORDERKEY DESC LIMIT 3"),
         ),
+        // Exasol sorts, so a sort key outside the select list keeps the broadcast.
+        (
+            2,
+            format!(
+                "SELECT o.O_ORDERKEY FROM {ORDERS_JOIN} WHERE {SECOND_IS_ZERO} \
+                 ORDER BY c.C_CUSTKEY DESC, o.O_ORDERKEY LIMIT 3"
+            ),
+        ),
         (
             2,
             format!(
@@ -1049,8 +1057,14 @@ fn e2e_join_date_to_text_filter_runs_in_exasol_and_key_keeps_the_n_scan() {
     let filtered = |filter: &str| {
         format!("SELECT c.C_CUSTKEY, o.O_ORDERKEY, o.O_ORDERDATE FROM {ORDERS_JOIN} WHERE {filter}")
     };
-    let text_key = "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b \
-                    ON CAST(a.O_ORDERDATE AS VARCHAR(20)) = CAST(b.O_ORDERDATE AS VARCHAR(20))";
+    let text_key_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b \
+                         ON CAST(a.O_ORDERDATE AS VARCHAR(20)) = CAST(b.O_ORDERDATE AS VARCHAR(20))";
+    let text_key = format!("SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {text_key_join}");
+    // The text-key pair stays off the broadcast, so the customer pair is broadcast instead.
+    let three_legs = format!(
+        "SELECT a.O_ORDERKEY, b.O_ORDERKEY, c.C_CUSTKEY FROM {text_key_join} \
+         JOIN {{T}}.DIM_CUSTOMER c ON a.O_CUSTKEY = c.C_CUSTKEY"
+    );
 
     for (setting, own_format_filter) in
         [(DEFAULT_SESSION, ORDERDATE_LIKE), (DMY, ORDERDATE_LIKE_DMY)]
@@ -1070,9 +1084,23 @@ fn e2e_join_date_to_text_filter_runs_in_exasol_and_key_keeps_the_n_scan() {
                 "[{setting}] Exasol's WHERE over the broadcast fan-out applies {filter}: {pushed}"
             );
         }
-        if let Err(failure) = matching_pushdown(&mut conn, VS_NAME, PathCheck::NScan(2), text_key) {
+        if let Err(failure) = matching_pushdown(&mut conn, VS_NAME, PathCheck::NScan(2), &text_key)
+        {
             panic!("[{setting}] {failure}");
         }
+        let pushed = matching_pushdown(
+            &mut conn,
+            VS_NAME,
+            PathCheck::Has(BROADCAST_JOIN),
+            &three_legs,
+        )
+        .unwrap_or_else(|failure| panic!("[{setting}] {failure}"));
+        assert!(
+            pushed
+                .rsplit_once(" ON ")
+                .is_some_and(|(_, on)| on.contains("CAST(")),
+            "[{setting}] Exasol's ON applies the text-key conversion: {pushed}"
+        );
     }
 }
 

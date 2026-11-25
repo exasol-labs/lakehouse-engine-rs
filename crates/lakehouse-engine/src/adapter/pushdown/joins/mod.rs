@@ -236,9 +236,6 @@ fn broadcast_candidates(
     context: &PushdownContext<'_>,
 ) -> Result<Vec<LegGroup>, UdfError> {
     let legs = join.legs();
-    if !broadcast_serves_window(pushdown, &legs, sides.len()) {
-        return Ok(Vec::new());
-    }
     let trees: Vec<&Json> = pushdown.filter().map(flatten_conjuncts).unwrap_or_default();
     let conjuncts = trees
         .into_iter()
@@ -249,6 +246,10 @@ fn broadcast_candidates(
             })
         })
         .collect::<Result<Vec<_>, UdfError>>()?;
+    let declined = conjuncts.iter().any(|conjunct| !conjunct.renders);
+    if !broadcast_serves_window(pushdown, &legs, sides.len(), declined) {
+        return Ok(Vec::new());
+    }
     let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
     let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
     let above: Vec<&Json> = pushdown.clauses(&Clause::WRAPPER).collect();
