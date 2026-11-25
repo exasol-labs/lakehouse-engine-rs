@@ -16,8 +16,6 @@
 
 -- Each fixture runs in its own spark-sql process, so these SETs do not leak.
 SET spark.sql.parquet.outputTimestampType=INT96;
--- Without this, Spark 3.5 falls back to INT64.
-SET spark.sql.parquet.writeLegacyFormat=true;
 SET spark.sql.session.timeZone=UTC;
 
 CREATE NAMESPACE IF NOT EXISTS rest_catalog.e2e_lakehouse;
