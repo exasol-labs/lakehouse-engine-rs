@@ -5,11 +5,11 @@
 # fixtures into tests/common/seed.rs and drop them from here.
 set -euo pipefail
 
-ICEBERG_VERSION="1.10.1"
+ICEBERG_VERSION="1.11.0"
 # hadoop-aws, pinned to the image's bundled Hadoop, serves only the INT96,
 # identity-partition, and name-mapping fixtures' native Parquet writes.
-HADOOP_AWS_VERSION="3.3.4"
-SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}"
+HADOOP_AWS_VERSION="3.4.2"
+SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}"
 
 SPARK_CONF=(
   --master "local[*]"
