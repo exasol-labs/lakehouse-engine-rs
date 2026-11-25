@@ -55,7 +55,7 @@ services:
 
   # One-shot: Spark authors fixtures iceberg-rust cannot write (apache/iceberg-rust#340).
   spark-iceberg-fixtures:
-    image: apache/spark:4.1.1
+    image: exadockerci4/spark-lakehouse:4.1.1-iceberg-1
     depends_on:
       seaweedfs:
         condition: service_healthy

@@ -68,5 +68,6 @@ network-free at seed time (supporting the fail-not-skip contract).
   **10** rows (no DV at its latest snapshot). Use `table-with-dv-small` for a
   DV-applied assertion.
 - **Bespoke/custom-schema** DV or column-mapping tables (beyond these two) must be
-  authored with **Apache Spark + delta-spark 3.3.0** (Spark 3.5.x) — the same
-  one-shot pattern as `scripts/spark-fixtures/`. See SPIKE_UC_DELTA_HARNESS.md §Q3.
+  authored with the `exadockerci4/spark-lakehouse:4.1.1-delta-1` image (Spark
+  4.1.1 + Delta Lake 4.2.0, jars baked in) — the same one-shot pattern as
+  `scripts/spark-fixtures/`. See SPIKE_UC_DELTA_HARNESS.md §Q3.
