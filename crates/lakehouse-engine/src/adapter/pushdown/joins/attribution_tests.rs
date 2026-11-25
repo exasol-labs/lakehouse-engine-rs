@@ -117,44 +117,6 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
 }
 
 #[test]
-fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
-    let legs = JoinLegs::from_leaves(&[
-        leaf("FACT_ORDERS", Some("A")),
-        leaf("FACT_ORDERS", Some("B")),
-        leaf("FACT_ORDERS", Some("C")),
-    ]);
-    let condition = predicate_equal(
-        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
-        aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
-    );
-
-    assert_eq!(legs.attachment_leg(&condition), 2);
-}
-
-#[test]
-fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
-    let legs = self_join_legs();
-    let conjunct = predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
-
-    assert_eq!(legs.conjunct_leg(&conjunct), Some(1));
-}
-
-#[test]
-fn conjunct_leg_is_none_for_a_cross_leg_or_column_free_conjunct() {
-    let legs = self_join_legs();
-    let cross_leg = predicate_equal(
-        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
-        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
-    );
-
-    assert_eq!(legs.conjunct_leg(&cross_leg), None);
-    assert_eq!(
-        legs.conjunct_leg(&predicate_equal(num_lit("1"), num_lit("1"))),
-        None
-    );
-}
-
-#[test]
 fn leg_alias_is_the_wrapper_subquery_alias_of_that_leg() {
     let legs = JoinLegs::from_leaves(&[
         leaf("FACT_ORDERS", Some("A")),

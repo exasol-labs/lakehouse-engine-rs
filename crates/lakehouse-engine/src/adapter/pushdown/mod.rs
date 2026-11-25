@@ -81,8 +81,7 @@ mod joins;
 // Several re-exports are consumed only by tests and the reachability probe.
 #[allow(unused_imports)]
 pub(crate) use joins::{
-    DetectedJoin, JoinLeaf, JoinShape, JoinSides, RenderedJoinPushdown, ResolvedJoinSide,
-    detect_join, render_broadcast_join,
+    DetectedJoin, JoinLeaf, JoinShape, RenderedJoinPushdown, ResolvedJoinSide, detect_join,
 };
 use joins::{
     EmptyRelation, WherePlacement, ensure_columns_declared, plan_join,

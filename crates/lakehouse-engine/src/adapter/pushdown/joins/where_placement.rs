@@ -9,14 +9,15 @@ use super::super::context::PushdownContext;
 use super::super::request::PushdownRequest;
 use super::super::support::ScanTranslator;
 use super::attribution::JoinLegs;
+use super::plan::JoinPlan;
 use super::planning::ResolvedJoinSide;
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, leg_local_filter, screen_leg_filter,
+    ConditionPlacement, conjoin_filters, screen_leg_filter, screen_pair_filter,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub(in super::super) struct WherePlacement {
-    /// Per scanned leg, the rendered filter its scan applies.
+    /// Per fan-out in chain order, the rendered filter its scan applies.
     scans: Vec<Option<String>>,
     /// The raw conjuncts the wrapper applies, as Exasol sent them.
     wrapper: Option<Json>,
@@ -42,32 +43,35 @@ impl WherePlacement {
         }
     }
 
-    /// The WHERE of a request over one fan-out per leg. A conjunct reaches a leg's scan only when
-    /// it reads that leg alone and renders against that leg's own columns, because two legs may
-    /// declare one name with different types. Every other conjunct is the wrapper's.
-    pub(super) fn n_scan(
-        pushdown: &PushdownRequest,
+    /// The WHERE of a request over `plan`'s fan-outs, from where `conditions` places each
+    /// conjunct. A fan-out's local conjuncts render against its own legs' columns, because two
+    /// legs may declare one name with different types, and each one its scan declines is the
+    /// wrapper's, beside the residual no fan-out holds.
+    pub(super) fn of_plan(
+        conditions: &ConditionPlacement,
+        plan: &JoinPlan,
         legs: &JoinLegs,
         sides: &[ResolvedJoinSide],
         context: &PushdownContext<'_>,
     ) -> Result<Self, UdfError> {
-        let filter = pushdown.filter();
-        let mut scans = Vec::with_capacity(sides.len());
+        let mut scans = Vec::with_capacity(plan.fan_outs().len());
         let mut declined = None;
-        for (leg, side) in sides.iter().enumerate() {
-            let (scan, side_declined) = match filter.and_then(|f| leg_local_filter(f, legs, leg)) {
-                Some(side_local) => screen_leg_filter(&side_local, &side.column_types, context)?,
+        for (fan_out, local) in plan.fan_outs().iter().zip(&conditions.local) {
+            let (scan, fan_out_declined) = match local {
                 None => (None, None),
+                Some(local) if fan_out.is_plain() => {
+                    screen_leg_filter(local, &sides[fan_out.sharded].column_types, context)?
+                }
+                Some(local) => screen_pair_filter(local, legs, sides, context)?,
             };
-            // Disjoint by attribution, so no conjunct is double-applied.
-            declined = conjoin_filters(declined, side_declined);
+            // Disjoint by placement, so no conjunct is double-applied.
+            declined = conjoin_filters(declined, fan_out_declined);
             scans.push(scan);
         }
-        let wrapper = conjoin_filters(
-            filter.and_then(|f| cross_leg_residual_filter(f, legs)),
-            declined,
-        );
-        Ok(Self { scans, wrapper })
+        Ok(Self {
+            scans,
+            wrapper: conjoin_filters(conditions.residual.clone(), declined),
+        })
     }
 
     /// The wrapper applies the whole WHERE, as it does over a relation no scan feeds.
@@ -85,9 +89,9 @@ impl WherePlacement {
         }
     }
 
-    /// The filter leg `leg`'s scan applies.
-    pub(in super::super) fn scan_filter(&self, leg: usize) -> Option<String> {
-        self.scans.get(leg).cloned().flatten()
+    /// The filter the scan of the fan-out at chain position `fan_out` applies.
+    pub(in super::super) fn scan_filter(&self, fan_out: usize) -> Option<String> {
+        self.scans.get(fan_out).cloned().flatten()
     }
 
     /// The conjuncts the wrapper applies itself.

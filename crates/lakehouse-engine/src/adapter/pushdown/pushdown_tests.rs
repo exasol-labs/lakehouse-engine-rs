@@ -1736,7 +1736,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         total_bytes: 10,
         column_types: column_types(NO_COLUMNS),
     };
-    let sides = broadcast_sides(fact, dimension, 1);
+    let (sides, pair) = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(
         "\"LHS_T0\".\"CUSTOMER_KEY\" = \"LHS_T1\".\"CUSTOMER_KEY\"",
         &[ProjectedColumn {
@@ -1756,7 +1756,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         },
         ..base
     };
-    let join_sql = super::joins::build_broadcast_join_sql(&sides, &rendered, &tuning)
+    let join_sql = super::joins::build_pair_fan_out_sql(&sides, &pair, &rendered, &tuning)
         .expect("selecting the wire storage must succeed")
         .expect("a broadcast-eligible plan with an unbounded window must render");
     assert!(

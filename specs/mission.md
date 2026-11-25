@@ -33,7 +33,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
    - single-group and GROUP BY aggregation with partial/merge decomposition (node-local aggregate, then Exasol final aggregate) to minimize network transfer;
    - COUNT(DISTINCT) via per-shard DISTINCT row-scans counted by an outer Exasol-native COUNT(DISTINCT);
    - partition-equality and min/max range file pruning at plan time;
-   - broadcast-eligible inner equi-join pushdown (small-side broadcast fan-out, planned and executed node-locally), with a safe fallback to an unaccelerated wrapper for joins outside the broadcast contract. General and multi-way joins and query rewriting remain out of scope.
+   - broadcast-eligible inner equi-join pushdown (small-side broadcast fan-out, planned and executed node-locally): one eligible pair of an inner join of any number of tables is broadcast, every other table keeps its own fan-out that Exasol joins, and a join with no eligible pair takes a safe unaccelerated wrapper. General multi-way join optimization and query rewriting remain out of scope.
    - The `EXCLUDED_CAPABILITIES` property withholds named capabilities from the adapter, so Exasol evaluates them itself.
 7. **SQL expression translation**: scalar functions, date functions, and operators are translated into the pushed-down predicate, projection, and select-list shapes above, so pushdown reaches real-world SQL expressions and not only bare column references.
 
@@ -67,7 +67,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 - Engine-owned metadata persistence, snapshot tracking, and background refresh. The Exasol `REFRESH` and `SET PROPERTIES` statements are supported: they re-enumerate the source tables, and the engine keeps no state of its own. The only persisted data are the virtual schema's AdapterNotes, which Exasol stores at CREATE time
 - Automatic optimization, federated query optimizer
 - Background processes, scheduling, lakehouse serving
-- General and multi-way joins and complex query rewrites (only broadcast-eligible inner equi-joins are pushed down, see Core Capability 6)
+- General joins, multi-way join optimization beyond broadcasting one pair, and complex query rewrites (see Core Capability 6)
 - **Explicit non-goals (not building):** Reyden, Lakehouse RT, a DataFusion cluster scheduler, an Iceberg cache, a Databricks acceleration layer, a materialized query engine
 
 Every query is executed independently, starts from source metadata, and leaves no state behind. An export creates its namespace and table or appends to an existing table, and a failed export can leave data files in storage.

@@ -2,12 +2,12 @@
 //! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
 //! diff in one of them is always a regression, never an expected update.
 
-use super::joins::build_n_scan_join_sql;
 use super::test_support::{
-    NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types,
-    count_star, dispatch_base, dispatch_context, float_div, parsed_pushdown, pd, projected_columns,
-    pushdown_request, request_sides, request_typed, resolved_table, round_of, sample_storage,
-    scan_for, test_context, unqualified_shards, whole_request_emission, with_identifier_notes,
+    NO_COLUMNS, PushdownRequestBuilder, agg_item, agg_item_expr, column_types, count_star,
+    dispatch_base, dispatch_context, float_div, n_scan_sql_over, pair_plan_sql, parsed_pushdown,
+    pd, projected_columns, pushdown_request, request_typed, resolved_table, round_of,
+    sample_storage, scan_for, test_context, unqualified_shards, whole_request_emission,
+    with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -724,7 +724,7 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-use super::joins::build_broadcast_join_sql;
+use super::joins::LegGroup;
 
 fn two_table_join_request(filter: Option<Json>) -> (Json, Vec<ExasolType>) {
     let mut request = pushdown_request(
@@ -830,31 +830,27 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
 
     let (request, _) = two_table_join_request(None);
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(
+    let sides = request_typed(
+        &request,
+        &[resolved_customer_side(), resolved_orders_side()],
+    );
+    // ORDERS, leg 1, is the fact; CUSTOMER, leg 0, the dimension.
+    let broadcast_sql = pair_plan_sql(
         &parsed_pushdown(&request),
         &join,
-        &request_sides(&request, &join),
+        &sides,
+        &LegGroup::pair(1, 0),
         &test_context(),
     )
-    .expect("render_broadcast_join must not error for a well-formed request")
+    .expect("render_join_plan must not error for a well-formed request")
     .expect("a filterless equi-join must stay broadcast-eligible");
-    let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
-        .expect("selecting the wire storage must succeed")
-        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
     );
 
-    let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &join,
-        &request_typed(&request, &sides),
-        &test_context(),
-    )
-    .expect("build_n_scan_join_sql must succeed for this fixture");
+    let n_scan_sql = n_scan_sql_over(&parsed_pushdown(&request), &join, &sides, &test_context())
+        .expect("the N-scan must render for this fixture");
     assert_eq!(
         n_scan_sql,
         include_str!("testdata/dispatch_golden/filterless_n_scan_join.sql")
@@ -878,31 +874,27 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let renderable_filter = string_equal("CUSTOMER", "C_NAME", "ACME");
     let (request, _) = two_table_join_request(Some(renderable_filter));
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(
+    let sides = request_typed(
+        &request,
+        &[resolved_customer_side(), resolved_orders_side()],
+    );
+    // ORDERS, leg 1, is the fact; CUSTOMER, leg 0, the dimension.
+    let broadcast_sql = pair_plan_sql(
         &parsed_pushdown(&request),
         &join,
-        &request_sides(&request, &join),
+        &sides,
+        &LegGroup::pair(1, 0),
         &test_context(),
     )
-    .expect("render_broadcast_join must not error for a well-formed request")
+    .expect("render_join_plan must not error for a well-formed request")
     .expect("an equi-join with a rendering filter must stay broadcast-eligible");
-    let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
-    let broadcast_sql = build_broadcast_join_sql(&sides, &rendered, &test_context())
-        .expect("selecting the wire storage must succeed")
-        .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")
     );
 
-    let sides = vec![resolved_customer_side(), resolved_orders_side()];
-    let n_scan_sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &join,
-        &request_typed(&request, &sides),
-        &test_context(),
-    )
-    .expect("build_n_scan_join_sql must succeed for this fixture");
+    let n_scan_sql = n_scan_sql_over(&parsed_pushdown(&request), &join, &sides, &test_context())
+        .expect("the N-scan must render for this fixture");
     assert_eq!(
         n_scan_sql,
         include_str!("testdata/dispatch_golden/rendering_n_scan_join.sql")

@@ -6,7 +6,7 @@ Serves a pushed `ORDER BY`, `LIMIT`, and `OFFSET` over a join. The broadcast pat
 
 * The broadcast contract, Exasol postprocessing, and the leg binding are defined in `pushdown-joins/pushdown-planning-join`. The wrapper and its four entry points are defined in `pushdown-joins/pushdown-planning-join-fallback`.
 * The wrapper resolves its own `LIMIT` and `OFFSET` and renders them on its outer SELECT over limit-free, sort-free fan-out legs. A row limit that leaked into a leg would cap that leg's pre-join input and return wrong rows. A non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`).
-* The broadcast path declines, and this wrapper serves, for a request without Exasol postprocessing: a non-zero offset without `orderBy`, a non-column sort key other than a constant, an `orderBy` of constants only together with a non-zero offset, and a sort key absent from the broadcast projection (`pushdown-joins/pushdown-planning-join`).
+* The broadcast path declines, and this wrapper serves, for a two-leg request without Exasol postprocessing whose every WHERE conjunct the scan renders: a non-zero offset without `orderBy`, a non-column sort key other than a constant, an `orderBy` of constants only together with a non-zero offset, and a sort key absent from the broadcast projection (`pushdown-joins/pushdown-planning-join`).
 
 ## Scenarios
 
@@ -45,7 +45,7 @@ Serves a pushed `ORDER BY`, `LIMIT`, and `OFFSET` over a join. The broadcast pat
 
 ### Scenario: Ordering and window shapes the broadcast wrapper cannot serve decline to the unified fallback
 
-* *GIVEN* a `pushdown` request over a broadcast-eligible inner equi-join that requires no Exasol postprocessing, carrying one of: a `limit` with a NON-ZERO `limit.offset` and an absent or empty `orderBy`; an `orderBy` element that is an expression, an aggregate, or any non-`column` node other than a constant; an `orderBy` of constants only together with a NON-ZERO `limit.offset`; an `orderBy` element missing `isAscending` or `nullsLast`; or an `orderBy` element naming a column that is not a bare-column item of the broadcast projection
+* *GIVEN* a `pushdown` request over a broadcast-eligible two-leg inner equi-join that requires no Exasol postprocessing and whose every WHERE conjunct the scan renders, carrying one of: a `limit` with a NON-ZERO `limit.offset` and an absent or empty `orderBy`; an `orderBy` element that is an expression, an aggregate, or any non-`column` node other than a constant; an `orderBy` of constants only together with a NON-ZERO `limit.offset`; an `orderBy` element missing `isAscending` or `nullsLast`; or an `orderBy` element naming a column that is not a bare-column item of the broadcast projection
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL decline the broadcast plan and route the request to the unified unaccelerated fallback, whose qualified wrapper renders the ordering and the window table-qualified over the materialized join
 * *AND* every arm EXCEPT projection membership SHALL be decided from the `pushdown` request ALONE, BEFORE either side is sized and before the broadcast render runs
@@ -65,13 +65,13 @@ Serves a pushed `ORDER BY`, `LIMIT`, and `OFFSET` over a join. The broadcast pat
 
 ### Scenario: A fallback leg's fan-out scan spec never carries a row limit
 
-* *GIVEN* any request served by the unified unaccelerated fallback, for any N ≥ 2, carrying a `limit` with `numElements` = `n` and any combination of `orderBy`, `groupBy`, `having`, and `limit.offset`
-* *WHEN* the adapter builds each side's fan-out leg
-* *THEN* every leg's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and NO join block, so the leg emits every row the outer wrapper's join, ordering, and window still depend on
-* *AND* that guarantee SHALL be structural rather than conventional, and SHALL be delivered by the TYPE rather than by a call signature, a field visibility, or a comment: the broadcast path's per-shard post-join cap SHALL be a field of the JOIN BLOCK, so a scan spec carrying no join block has NO field on which a post-join cap could be set. A leg builder constructs no join block, so it cannot express a post-join cap at all, in-crate and out-of-crate, in debug builds and in release
-* *AND* the shard-invariant row-limit field the single-table scan paths use MUST NOT be set on any join-carrying spec, so the two meanings never share one field and no reader has to know which path a spec came from to know what a limit on it would mean
-* *AND* that structural property SHALL be pinned by a test asserting every fallback leg spec carries `limit` = absent, an EMPTY `order_by`, and NO join block, for a request that DOES carry a limit, an offset, and an `orderBy`, so the runtime consequence is checked as well as the type
-* *AND* the request's `LIMIT` and `OFFSET` SHALL be rendered ONLY on the outer wrapper SELECT, through the shared limit-and-offset seam
+* *GIVEN* a join request carrying a `limit` with `numElements` = `n` and any combination of `orderBy`, `groupBy`, `having`, and `limit.offset`
+* *AND* it is served by the unified unaccelerated fallback, for any N ≥ 2, or by a broadcast pair that leaves a join or a filter conjunct for Exasol
+* *WHEN* the adapter builds each fan-out
+* *THEN* every leg fan-out's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and NO join block, so the leg emits every row the outer wrapper's join, ordering, and window still depend on
+* *AND* the broadcast pair's scan spec SHALL carry `limit` = absent, an EMPTY `order_by`, and a join block with no post-join limit and no post-join ordering, so no shard cuts or sorts rows before Exasol's join or `WHERE` has run
+* *AND* the request's `LIMIT` and `OFFSET` SHALL be rendered ONLY on the outer wrapper SELECT
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
 ### Scenario: The qualified wrapper renders a renderable expression sort key on every entry point that reaches it
 

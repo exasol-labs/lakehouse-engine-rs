@@ -1,12 +1,12 @@
 use super::super::super::RefusedColumn;
 use super::super::super::support::collect_all_column_names;
+use super::super::plan::{JoinPlan, LegGroup};
 use super::super::planning::involved_table;
-use super::super::sql_builders::{
-    build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql, render_broadcast_join,
-};
+use super::super::sql_builders::{build_pair_fan_out_sql, build_side_fan_out_sql};
 use super::super::tests::{
     broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
-    equi_condition, join_request, legs_of, resolved_side, self_join_legs, two_scan_tuning,
+    equi_condition, join_request, legs_of, rendered_pair, resolved_side, self_join_legs,
+    two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::support::RowProjection;
@@ -35,14 +35,7 @@ fn join_condition_renders_via_translator() {
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
 
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &sides,
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = rendered_pair(&request, &sides).expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
         "each operand is qualified by its own leg's alias"
@@ -62,14 +55,8 @@ fn join_where_filter_spanning_both_sides_renders() {
     ]);
 
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("must render");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("must render");
     let filter = rendered
         .filter
         .expect("a cross-side WHERE filter must render");
@@ -303,14 +290,14 @@ fn join_projection_like_guard_reaches_join_select_list() {
     let (projection, _types) = direct_columns(&projection);
     assert!(
         wrapped,
-        "the wrapping flag is what declines the broadcast join to the N-scan \
-         fallback; a DATE-subject LIKE must set it: \
+        "the wrapping flag is what moves the select list to an Exasol SELECT over the \
+         broadcast fan-out; a DATE-subject LIKE must set it: \
          {projection:?}"
     );
 }
 
 #[test]
-fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
+fn fan_out_filter_of_one_leg_attributes_conjuncts_to_owning_leg() {
     let name = string_equal("CUSTOMER", "C_NAME", "ACME");
     let date = compare(
         "predicate_greater",
@@ -320,12 +307,12 @@ fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = and([name.clone(), date.clone()]);
 
     let legs = customer_orders_legs();
-    assert_eq!(leg_local_filter(&filter, &legs, 0), Some(name));
-    assert_eq!(leg_local_filter(&filter, &legs, 1), Some(date));
+    assert_eq!(fan_out_filter(&filter, &legs, 0), Some(name));
+    assert_eq!(fan_out_filter(&filter, &legs, 1), Some(date));
 }
 
 #[test]
-fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
+fn fan_out_filter_of_one_leg_withholds_cross_leg_and_or_conjuncts() {
     let filter = and([
         predicate_equal(
             table_col("CUSTOMER", "C_CUSTKEY"),
@@ -335,12 +322,12 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     ]);
     let legs = customer_orders_legs();
     assert_eq!(
-        leg_local_filter(&filter, &legs, 0),
+        fan_out_filter(&filter, &legs, 0),
         Some(string_equal("CUSTOMER", "C_NAME", "ACME")),
         "the cross-table conjunct must NOT be pushed to CUSTOMER"
     );
     assert!(
-        leg_local_filter(&filter, &legs, 1).is_none(),
+        fan_out_filter(&filter, &legs, 1).is_none(),
         "ORDERS is only referenced by the cross-leg conjunct, so nothing is leg-local to it"
     );
 
@@ -352,38 +339,38 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
             date_lit("1995-01-01"),
         ),
     ]);
-    assert!(leg_local_filter(&or_filter, &legs, 0).is_none());
-    assert!(leg_local_filter(&or_filter, &legs, 1).is_none());
+    assert!(fan_out_filter(&or_filter, &legs, 0).is_none());
+    assert!(fan_out_filter(&or_filter, &legs, 1).is_none());
 
     let one_side_or = or([
         string_equal("CUSTOMER", "C_NAME", "ACME"),
         string_equal("CUSTOMER", "C_NAME", "GLOBEX"),
     ]);
     assert!(
-        leg_local_filter(&one_side_or, &legs, 0).is_some(),
+        fan_out_filter(&one_side_or, &legs, 0).is_some(),
         "an OR over one leg alone is leg-local and prunable"
     );
-    assert!(leg_local_filter(&one_side_or, &legs, 1).is_none());
+    assert!(fan_out_filter(&one_side_or, &legs, 1).is_none());
 }
 
 #[test]
-fn leg_local_filter_handles_a_single_conjunct() {
+fn fan_out_filter_of_one_leg_handles_a_single_conjunct() {
     let single = string_equal("CUSTOMER", "C_NAME", "ACME");
     let legs = customer_orders_legs();
-    assert!(leg_local_filter(&single, &legs, 0).is_some());
-    assert!(leg_local_filter(&single, &legs, 1).is_none());
+    assert!(fan_out_filter(&single, &legs, 0).is_some());
+    assert!(fan_out_filter(&single, &legs, 1).is_none());
 }
 
 #[test]
-fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
+fn fan_out_filter_of_one_leg_attributes_shared_column_by_leg_not_name() {
     let id = compare("predicate_greater", table_col("EVENTS", "ID"), num_lit(5));
     let label = string_equal("LABELS", "LABEL", "x");
     let filter = and([id.clone(), label.clone()]);
 
     let legs = legs_of(&["EVENTS", "LABELS"]);
-    assert_eq!(leg_local_filter(&filter, &legs, 0), Some(id));
+    assert_eq!(fan_out_filter(&filter, &legs, 0), Some(id));
     assert_eq!(
-        leg_local_filter(&filter, &legs, 1),
+        fan_out_filter(&filter, &legs, 1),
         Some(label),
         "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name"
     );
@@ -403,7 +390,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     let fact_orders = column_types(&[("O_ORDERKEY", ExasolType::decimal(20, 0))]);
 
     let occurrence_a = scan_filter_sql(
-        &leg_local_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
+        &fan_out_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
         &fact_orders,
     )
     .expect("renders");
@@ -413,7 +400,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     );
 
     let occurrence_b = scan_filter_sql(
-        &leg_local_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
+        &fan_out_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
         &fact_orders,
     )
     .expect("renders");
@@ -491,7 +478,7 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
     let custkey_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
     let filter = and([date_like.clone(), custkey_like.clone()]);
 
-    let pruning = leg_local_filter(&filter, &customer_orders_legs(), 1)
+    let pruning = fan_out_filter(&filter, &customer_orders_legs(), 1)
         .expect("both conjuncts are ORDERS-leg-local");
     let (_, declined) = screen_leg_filter(
         &pruning,
@@ -874,7 +861,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("s3://w/l-0.parquet", 1000), ("s3://w/l-1.parquet", 1000)],
     );
     let dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    let sides = broadcast_sides(fact, dimension, 1);
+    let (sides, pair) = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(
         r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#,
         &[ProjectedColumn {
@@ -886,7 +873,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         cluster_nodes: 2,
         ..two_scan_tuning()
     };
-    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning)
+    let sql = build_pair_fan_out_sql(&sides, &pair, &rendered, &tuning)
         .expect("selecting the wire storage must succeed")
         .expect("an unbounded broadcast join must build");
 
@@ -905,7 +892,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_filter_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = compare(
         "predicate_greater",
@@ -913,14 +900,8 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
         date_lit("1995-01-01"),
     );
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &test_context(),
-    )
-    .expect("renders")
-    .expect("an equi-join renders");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("an equi-join renders");
     let filter = rendered.filter.expect("filter renders");
     assert!(
         filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
@@ -933,21 +914,15 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_condition_with_leg_alias() {
     let condition = predicate_equal(
         aliased_col("CUSTOMER", "C", "C_CUSTKEY"),
         aliased_col("ORDERS", "O", "O_CUSTKEY"),
     );
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("an equi-join must render, not decline");
+    let rendered = rendered_pair(&request, &request_sides(&request, &detected))
+        .expect("an equi-join must render, not decline");
     assert_eq!(
         rendered.condition,
         r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#
@@ -955,7 +930,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
 }
 
 #[test]
-fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alias() {
+fn pair_scan_replaces_native_table_alias_in_projection_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request = selecting(
         request,
@@ -968,14 +943,8 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
         )],
     );
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-        &test_context(),
-    )
-    .expect("renders")
-    .expect("an equi-join renders");
+    let rendered =
+        rendered_pair(&request, &request_sides(&request, &detected)).expect("an equi-join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
     match &rendered.projection[0].item {
         ProjectionItem::Expr { expr } => {
@@ -1022,7 +991,7 @@ fn unified_join_pushes_each_leg_local_filter_into_its_fan_out() {
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     );
 
-    let sql = build_n_scan_join_sql(
+    let sql = n_scan_sql_over(
         &parsed_pushdown(&request),
         &detected_join(&request),
         &customer_orders_sides(&request, 10, 100),
@@ -1064,14 +1033,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &c_name,
     );
 
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &sides,
-        &test_context(),
-    )
-    .expect("renderable join")
-    .expect("must render");
+    let rendered = rendered_pair(&request, &sides).expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
@@ -1081,4 +1043,80 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
+}
+
+#[test]
+fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
+    let legs = legs_of(&["CUSTOMER", "ORDERS", "LINEITEM"]);
+    let customer_orders = predicate_equal(
+        table_col("CUSTOMER", "C_CUSTKEY"),
+        table_col("ORDERS", "O_CUSTKEY"),
+    );
+    let orders_lineitem = predicate_equal(
+        table_col("ORDERS", "O_ORDERKEY"),
+        table_col("LINEITEM", "L_ORDERKEY"),
+    );
+    let customer_local = string_equal("CUSTOMER", "C_NAME", "ACME");
+    let orders_local = compare(
+        "predicate_greater",
+        table_col("ORDERS", "O_TOTAL"),
+        num_lit(5),
+    );
+    let lineitem_local = compare("predicate_less", table_col("LINEITEM", "L_QTY"), num_lit(9));
+    let in_pair = compare(
+        "predicate_less",
+        table_col("ORDERS", "O_DATE"),
+        table_col("LINEITEM", "L_SHIPDATE"),
+    );
+    let across = compare(
+        "predicate_less",
+        table_col("CUSTOMER", "C_SINCE"),
+        table_col("LINEITEM", "L_SHIPDATE"),
+    );
+    let filter = and([
+        customer_local.clone(),
+        orders_local.clone(),
+        lineitem_local.clone(),
+        in_pair.clone(),
+        across.clone(),
+        bool_lit(true),
+    ]);
+    let conditions = [customer_orders.clone(), orders_lineitem.clone()];
+
+    let pair = JoinPlan::broadcasting(3, &LegGroup::pair(2, 1));
+    let placement = place_conditions(Some(&filter), &conditions, &legs, &pair);
+    assert_eq!(placement.pair_keys, Some(orders_lineitem.clone()));
+    assert_eq!(placement.on, [vec![], vec![customer_orders.clone()]]);
+    assert_eq!(
+        placement.local,
+        [
+            Some(customer_local.clone()),
+            Some(and([
+                orders_local.clone(),
+                lineitem_local.clone(),
+                in_pair.clone(),
+                bool_lit(true),
+            ])),
+        ]
+    );
+    assert_eq!(placement.residual, Some(across.clone()));
+
+    let n_scan = place_conditions(Some(&filter), &conditions, &legs, &JoinPlan::n_scan(3));
+    assert_eq!(n_scan.pair_keys, None);
+    assert_eq!(
+        n_scan.on,
+        [vec![], vec![customer_orders], vec![orders_lineitem]]
+    );
+    assert_eq!(
+        n_scan.local,
+        [
+            Some(customer_local),
+            Some(orders_local),
+            Some(lineitem_local)
+        ]
+    );
+    assert_eq!(
+        n_scan.residual,
+        Some(and([in_pair, across, bool_lit(true)]))
+    );
 }

@@ -48,16 +48,6 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares: the full base row in table-column order for an absent or JSON-null `selectList`, and one column for an empty one, so the route never trips Exasol's positional `04000` validation
 * *AND* for an absent or JSON-null `selectList`, the fan-out SHALL emit the full base row, because Exasol validates the result positionally against the whole row
 
-### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
-
-* *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two legs, an equi-condition, a byte size at or below the broadcast threshold
-* *AND* the request carries a non-null `filter` whose DataFusion-bound render declines against the two legs' column metadata keyed by (relation alias, column)
-* *WHEN* the adapter renders the join pushdown
-* *THEN* the adapter SHALL decline the broadcast plan and fall through to the unified unaccelerated N-scan fallback, which applies the predicate itself, honouring the recorded broadcast contract that a filter the translator cannot render is served by the fallback
-* *AND* the adapter MUST NOT emit a broadcast plan whose scan spec carries no filter, because the broadcast SQL has no outer `WHERE` in which the predicate could be applied
-* *AND* the decline SHALL be a clean `Ok(None)`-shaped fall-through, NOT an error, matching the unrenderable-condition and widened-projection declines already on that path
-* *AND* the returned rows SHALL equal native Exasol evaluation of the same join
-
 ### Scenario: An N-scan side-local conjunct whose DataFusion render declines becomes a residual conjunct
 
 * *GIVEN* an N-scan unaccelerated join over N ≥ 2 involved tables whose WHERE filter carries a top-level conjunct that references only ONE table and whose DataFusion-bound render declines against THAT SIDE's own column metadata
@@ -87,4 +77,16 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* the per-shard scan spec of the qualified single-table wrapper's fan-out SHALL carry the conjunction of the rendered conjuncts as its `filter`, and the wrapper's `WHERE` SHALL carry the conjunction of the declined conjuncts, each rendered from its original request tree in the Exasol dialect
 * *AND* the fan-out's columns SHALL follow "The wrapper's fan-out emits only the columns the wrapper reads", so a column that only a rendered conjunct names is not emitted
 * *AND* the result SHALL equal native Exasol evaluation of the same query, for a row scan, an aggregate, a `GROUP BY`, a `COUNT(DISTINCT)`, and an `ORDER BY` with `LIMIT`
-* *AND* a broadcast-eligible join whose filter holds a declined conjunct SHALL still take the N-scan fallback, as "A broadcast-eligible join whose filter declines takes the N-scan fallback" states
+* *AND* a join with a broadcast pair whose filter holds a declined conjunct SHALL split the same way, as "A broadcast join applies a declined filter conjunct in Exasol's WHERE" states
+
+### Scenario: A broadcast join applies a declined filter conjunct in Exasol's WHERE
+
+* *GIVEN* an inner join `pushdown` request with a broadcast pair (`pushdown-joins/pushdown-planning-join`), of two legs or more
+* *AND* its filter holds a top-level conjunct over the pair's legs that the scan translator declines, such as `TO_CHAR(c.signup_date) LIKE '2024%'`
+* *WHEN* the adapter builds the pushdown SQL
+* *THEN* the adapter SHALL keep the broadcast pair
+* *AND* the pair's scan spec SHALL carry the conjunction of the conjuncts the scan translator renders as its `filter`, and Exasol's `WHERE` over the fan-outs SHALL carry each declined conjunct, rendered from its original request tree in the Exasol dialect, so each conjunct applies exactly once
+* *AND* the pair's fan-out SHALL emit every column a declined conjunct reads
+* *AND* the pair's join block SHALL carry no post-join limit and no post-join ordering, and Exasol SHALL apply the request's aggregation, `ORDER BY`, `LIMIT`, and `OFFSET` after its `WHERE`
+* *AND* a two-leg request SHALL keep the broadcast pair even when the shards could not serve its ordering (`pushdown-joins/pushdown-planning-join-ordering`), such as a sort key outside the select list, because Exasol runs the ordering, and the pair's fan-out SHALL emit every column the `ORDER BY` reads
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query, for a two-leg row scan, a two-leg `ORDER BY` with `LIMIT`, a two-leg `ORDER BY` on a column outside the select list, a two-leg aggregate, and a join of three legs

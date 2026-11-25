@@ -2,7 +2,7 @@
 //! [`PushdownRequest`], so which key holds a clause, and that a JSON-null clause is an absent one,
 //! is decided here once.
 
-use crate::types::exasol_type::{ExasolType, exasol_type_from_json, exasol_type_to_json};
+use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -245,22 +245,6 @@ impl PushdownRequest {
             }
         }
         Ok(self.rebuilt(json))
-    }
-
-    /// A request that selects `items`, typed `types`, under this request's WHERE and nothing else.
-    pub(super) fn selecting(
-        &self,
-        items: Vec<Json>,
-        types: &[ExasolType],
-    ) -> Result<Self, UdfError> {
-        let mut json = serde_json::json!({
-            "selectList": items,
-            "selectListDataTypes": types.iter().map(exasol_type_to_json).collect::<Vec<_>>(),
-        });
-        if let Some(filter) = self.filter() {
-            json[Clause::Filter.key()] = filter.clone();
-        }
-        Self::parse(json)
     }
 
     /// This request with `clause` replaced by `value`, its select list and checked types kept.

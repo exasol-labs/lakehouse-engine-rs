@@ -9,7 +9,7 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_JSON_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, EMPTY_STRING_FILES,
+    E2E_NAMESPACE, E2E_SUPPLIER_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE, EMPTY_STRING_FILES,
     EMPTY_STRING_NAMESPACE, build_seed_catalog, seed_all_types, seed_complex_types_probe,
     seed_distinct_probe, seed_empty_strings, seed_events, seed_high_card_probe,
     seed_ident_part_bytes, seed_json_docs, seed_typed_distinct_probe,
@@ -201,11 +201,11 @@ pub fn vs_lineitem_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_LINEITEM_TABLE)
 }
 
-/// Holds native copies of the fact, dimension, lineitem, events, and labels tables under their
-/// virtual names, so a join query that names its schema `{T}` runs over either.
+/// Holds native copies of the fact, dimension, lineitem, supplier, events, and labels tables
+/// under their virtual names, so a join query that names its schema `{T}` runs over either.
 pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
 
-/// Copies the fact, dimension, lineitem, events, and labels tables of `source_vs` into
+/// Copies the fact, dimension, lineitem, supplier, events, and labels tables of `source_vs` into
 /// [`JOIN_ORACLE`].
 pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
@@ -213,6 +213,7 @@ pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
         E2E_FACT_TABLE,
         E2E_DIM_TABLE,
         E2E_LINEITEM_TABLE,
+        E2E_SUPPLIER_TABLE,
         E2E_TABLE,
         E2E_TABLE_2,
     ] {
@@ -279,6 +280,16 @@ pub fn assert_single_table_wrapper(conn: &mut ExaConn, sql: &str) -> String {
     pushed
 }
 
+/// `sql` keeps its broadcast pair, and an outer Exasol SELECT computes its select list over the
+/// pair's fan-out.
+pub fn assert_broadcast_join_wrapper(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        has_broadcast_join_block(&pushed) && pushed.contains(" FROM (SELECT "),
+        "{sql} must keep the broadcast join under an Exasol SELECT: {pushed}"
+    );
+}
+
 /// Exasol computes the join in the N-scan wrapper, not in a broadcast scan.
 pub fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
     let pushed = explain_virtual_sql(conn, sql);
@@ -289,27 +300,32 @@ pub fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
 }
 
 pub fn emits_clause(pushed_sql: &str) -> String {
-    let marker = "EMITS (";
-    let start = pushed_sql
-        .find(marker)
+    let open = pushed_sql
+        .find("EMITS (")
         .unwrap_or_else(|| panic!("no EMITS clause in pushed SQL:\n{pushed_sql}"))
-        + marker.len();
-    let mut depth = 1i32;
-    let mut end = pushed_sql.len();
-    for (i, c) in pushed_sql[start..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
+        + "EMITS ".len();
+    parenthesized(pushed_sql, open).to_string()
+}
+
+/// The text between the parenthesis that opens at byte `open` of `sql` and the one that closes
+/// it, skipping parentheses inside quoted literals.
+pub fn parenthesized(sql: &str, open: usize) -> &str {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (offset, ch) in sql[open..].char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
                 depth -= 1;
                 if depth == 0 {
-                    end = start + i;
-                    break;
+                    return &sql[open + 1..open + offset];
                 }
             }
             _ => {}
         }
     }
-    pushed_sql[start..end].to_string()
+    panic!("the parenthesis at byte {open} never closes:\n{sql}");
 }
 
 pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";

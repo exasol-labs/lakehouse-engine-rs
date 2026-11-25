@@ -3,9 +3,8 @@ use std::collections::BTreeSet;
 
 use super::planning::{DetectedJoin, JoinLeaf};
 use crate::adapter::pushdown::request::{Clause, PushdownRequest};
-use crate::adapter::pushdown::scalar_over_agg::substitute_subtrees;
 use crate::adapter::pushdown::support::InvolvedColumns;
-use crate::scan::spec::{ColumnRef, relation_alias};
+use crate::scan::spec::relation_alias;
 use exasol_udf_sdk::error::UdfError;
 use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
 
@@ -103,26 +102,6 @@ impl JoinLegs {
         legs
     }
 
-    /// The highest referenced leg index: the earliest join point of a left-to-right chain with
-    /// every referenced leg in scope. Exasol pushes only a join whose condition references both
-    /// of its sides, so a condition always references a leg after the first.
-    pub(super) fn attachment_leg(&self, condition: &Json) -> usize {
-        match self.legs_referenced(condition).last() {
-            Some(&leg) if leg >= 1 => leg,
-            _ => panic!("Exasol pushes only a join condition that references both of its sides"),
-        }
-    }
-
-    /// `None` when the conjunct has no column or spans several legs; the caller then applies it
-    /// where every leg is in scope. Pruning a single-leg conjunct early is sound for an inner
-    /// join: a row failing it can never survive the join.
-    pub(super) fn conjunct_leg(&self, conjunct: &Json) -> Option<usize> {
-        match *Vec::from_iter(self.legs_referenced(conjunct)) {
-            [leg] => Some(leg),
-            _ => None,
-        }
-    }
-
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
     /// name is ambiguous once a table occurs on several legs. Apply it once, to a raw request
     /// tree: an `LHS_T{leg}` alias matches no leaf alias, so a self-join's output does not
@@ -131,18 +110,13 @@ impl JoinLegs {
         rewrite_table_aliases(expr, &mut |column| self.leg_alias(self.leg(column)))
     }
 
-    /// The `LHS_T{leg}_{COLUMN}` name a broadcast fan-out emits leg `leg`'s `column` as.
-    pub(super) fn fan_out_name(&self, leg: usize, column: &str) -> String {
-        ColumnRef::qualified(self.leg_alias(leg), column).output_name()
-    }
-
-    /// Replaces each `column` node with an unqualified one naming its broadcast fan-out output.
-    pub(super) fn to_fan_out_output(&self, expr: &Json) -> Json {
-        substitute_subtrees(expr, &mut |subtree| {
-            let column = ColumnNode::parse(subtree)?;
-            let name = self.fan_out_name(self.leg(column), &column.upper_name());
-            Some(ColumnNode::to_json(&name, None, None))
-        })
+    /// The request with its select list, WHERE, and ORDER BY qualified by leg, as a broadcast scan
+    /// renders them.
+    pub(super) fn qualify_request(&self, pushdown: &PushdownRequest) -> PushdownRequest {
+        pushdown.map_clauses(
+            &[Clause::SelectList, Clause::Filter, Clause::OrderBy],
+            |clause| self.qualify(clause),
+        )
     }
 
     /// Fails the request unless every column node of `pushdown` binds one leg and `declared[leg]`
