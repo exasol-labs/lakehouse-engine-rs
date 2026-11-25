@@ -37,33 +37,42 @@ fn a_two_leg_broadcast_serves_only_a_window_it_can_bind() {
     };
     let other_leg = || ordered(table_col("ORDERS", "O_CUSTKEY"));
     let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
-    // (case, request, legs, whether the broadcast serves its window)
+    // (case, request, legs, whether a conjunct is left for Exasol, whether the broadcast serves
+    // its window)
     let cases = [
         (
             "a projected sort key",
             ordered(table_col("CUSTOMER", "C_NAME")),
             2,
+            false,
             true,
         ),
-        ("a sort key of the other leg", other_leg(), 2, false),
+        ("a sort key of the other leg", other_leg(), 2, false, false),
         (
             "beside a conjunct left for Exasol",
             other_leg().filter(declined),
             2,
-            false,
+            true,
+            true,
         ),
         (
             "an aggregation",
             other_leg().group_by(vec![table_col("CUSTOMER", "C_NAME")]),
             2,
+            false,
             true,
         ),
-        ("three legs", other_leg(), 3, true),
+        ("three legs", other_leg(), 3, false, true),
     ];
-    for (case, request, leg_count, serves) in cases {
+    for (case, request, leg_count, exasol_filters, serves) in cases {
         let pushdown = parsed_pushdown(&request.build().0);
         assert_eq!(
-            broadcast_serves_window(&pushdown, &customer_orders_legs(), leg_count),
+            broadcast_serves_window(
+                &pushdown,
+                &customer_orders_legs(),
+                leg_count,
+                exasol_filters
+            ),
             serves,
             "{case}"
         );

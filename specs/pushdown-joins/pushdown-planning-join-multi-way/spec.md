@@ -5,7 +5,7 @@ Extends the broadcast inner equi-join (`pushdown-joins/pushdown-planning-join`) 
 ## Background
 
 * A broadcast pair, its fact and dimension legs, eligibility, and width-bounded columns are defined in `pushdown-joins/pushdown-planning-join`. A leg's own fan-out is the one the unified unaccelerated fallback scans (`pushdown-joins/pushdown-planning-join-fallback`).
-* Exasol stores the pair's rows before it joins them with the other legs, so in a join of three or more legs every dimension column the pair's fan-out emits must be width-bounded.
+* The pair's fan-out repeats each dimension column on every joined row. When a later step drops rows, such as Exasol's join with the other legs, a filter Exasol runs, or an aggregate, a dimension text column is sent for rows that never reach the result, so in a join of three or more legs every dimension column the pair's fan-out emits must be width-bounded.
 
 ## Scenarios
 
@@ -36,7 +36,7 @@ Extends the broadcast inner equi-join (`pushdown-joins/pushdown-planning-join`) 
 * *GIVEN* a `pushdown` request over an inner-join tree of three or more legs
 * *AND* a pair whose dimension exceeds `JOIN_BROADCAST_MAX_BYTES`, or whose fan-out would emit a dimension text column that is not width-bounded, such as `SELECT d.DESCRIPTION, …` with no literal condition on it
 * *WHEN* the adapter plans the request
-* *THEN* the adapter MUST NOT broadcast that pair, whether or not the request aggregates, because Exasol stores the pair's rows before it joins the other legs
+* *THEN* the adapter MUST NOT broadcast that pair, whether or not the request aggregates, because Exasol's join with the other legs can drop the rows that repeat that column
 * *AND* when no pair is eligible, the adapter SHALL serve the request through the unified unaccelerated fallback, with one fan-out per leg and no join block (`pushdown-joins/pushdown-planning-join-fallback`)
 * *AND* when the scan cannot render a pair's join keys or emitted columns, or an emitted output name is longer than Exasol's 128-character identifier limit, the adapter SHALL broadcast the next eligible pair in rank order, and every leg SHALL keep its own fan-out when no eligible pair renders
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query

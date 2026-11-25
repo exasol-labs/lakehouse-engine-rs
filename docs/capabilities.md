@@ -185,7 +185,7 @@ A pair is broadcast only when all of these hold:
 
 - Its smaller table is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)), and the scan can render its join keys.
 - When Exasol processes the joined rows further, because the query aggregates, groups, has a `HAVING`, joins a third table, or has a condition that runs in Exasol SQL, every smaller-table column Exasol reads is a `DECIMAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, or `BOOLEAN`, or text that a top-level `WHERE` limits to literals (`col = 'x'` or `col IN ('x', 'y')`). The broadcast repeats these columns on every joined row, so a long text column would send more data than separate scans. `SUBSTR` does not help, because the scan emits only plain columns.
-- In a two-table join that does not aggregate, every sort key is a projected column or a constant.
+- In a two-table join where each shard sorts and limits its own rows (see below), every sort key is a projected column or a constant.
 
 When several pairs qualify, the adapter prefers, in order: a smaller table with a filter of its own that the scan runs, a larger fact table, a smaller dimension table, and `FROM` order. If the scan cannot render the chosen pair, it takes the next one.
 
