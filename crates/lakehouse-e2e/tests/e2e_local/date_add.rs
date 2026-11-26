@@ -232,10 +232,9 @@ fn date_add_functions_match_native() {
     let errors = error_cases().into_iter().map(|case| (case, Expect::Error));
     let cases: Vec<_> = rows.chain(errors).collect();
 
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(case, expect)| mismatch(&mut conn, &table, case, *expect))
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (case, expect)| {
+        mismatch(conn, &table, case, *expect)
+    });
 
     assert!(
         failures.is_empty(),

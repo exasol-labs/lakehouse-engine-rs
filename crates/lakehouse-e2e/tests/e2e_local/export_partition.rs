@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
+use crate::common::exasol_ws::ExaConn;
+
 use crate::common::e2e_harness::{
     NO_SECRETS, VsProps, assert_holds_rows, assert_refused_before_reading, create_virtual_schema,
     exa_conn, export_error, exported_rows, failing_source, run_namespace, value_to_string,
@@ -99,8 +101,8 @@ fn misplaced(
 }
 
 /// The rows of `query` as text, NULL as `None`, sorted.
-fn sorted_rows(query: &str) -> Vec<Vec<Option<String>>> {
-    let columns = exa_conn().query_columns(query);
+fn sorted_rows(conn: &mut ExaConn, query: &str) -> Vec<Vec<Option<String>>> {
+    let columns = conn.query_columns(query);
     let count = columns.first().map_or(0, Vec::len);
     let mut rows: Vec<Vec<Option<String>>> = (0..count)
         .map(|row| {
@@ -158,13 +160,13 @@ fn rid_list(rids: &[i64]) -> String {
 
 /// Whether the rows `rids` of the native copy hold `literal` between the least and the greatest
 /// value of `column`, as a data file's column bounds of those rows would.
-fn bounds_hold(column: &str, literal: &str, rids: &[i64]) -> bool {
-    !exa_conn().query_columns(&format!(
+fn bounds_hold(conn: &mut ExaConn, column: &str, literal: &str, rids: &[i64]) -> bool {
+    let sql = format!(
         "SELECT COUNT(*) FROM {BY_VALUE_COPY} WHERE RID IN ({}) \
          HAVING MIN({column}) <= {literal} AND MAX({column}) >= {literal}",
         rid_list(rids)
-    ))[0]
-        .is_empty()
+    );
+    !conn.query_columns(&sql)[0].is_empty()
 }
 
 /// The fixture shape the placement and pruning tests need, read from the catalog and the
@@ -173,6 +175,7 @@ fn bounds_hold(column: &str, literal: &str, rids: &[i64]) -> bool {
 #[test]
 fn test_export_partition_fixture_shape() {
     setup();
+    let mut conn = exa_conn();
     for (table, spec) in [
         (BY_VALUE, pairs(&BY_VALUE_SPEC)),
         (BY_TIME, pairs(&BY_TIME_SPEC)),
@@ -216,9 +219,9 @@ fn test_export_partition_fixture_shape() {
             assert!(
                 spark[&a] == spark[&b]
                     && &spark[&a].1[field] != literal_bucket
-                    && bounds_hold(column, literal, &[a, b])
-                    && !bounds_hold(column, literal, &[a])
-                    && !bounds_hold(column, literal, &[b]),
+                    && bounds_hold(&mut conn, column, literal, &[a, b])
+                    && !bounds_hold(&mut conn, column, literal, &[a])
+                    && !bounds_hold(&mut conn, column, literal, &[b]),
                 "fixture guard: rids {a} and {b} must share a file of another bucket than \
                  {column} = {literal} and straddle the literal"
             );
@@ -230,6 +233,7 @@ fn test_export_partition_fixture_shape() {
 #[test]
 fn test_append_places_rows_like_spark() {
     setup();
+    let mut conn = exa_conn();
     let cases = [
         (BY_VALUE, "SINGLE_COMMIT = 'true'", BY_VALUE_ROWS),
         (BY_VALUE, "WRITERS_PER_NODE = '2'", BY_VALUE_ROWS),
@@ -241,10 +245,10 @@ fn test_append_places_rows_like_spark() {
         let case = format!("{table} with {options}");
         let spark = spark_partitions(table);
         let source = format!("(SELECT * FROM {})", read(table));
-        let before = sorted_rows(&format!("SELECT * FROM {}", read(table)));
+        let before = sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(table)));
 
         let sql = EXPORT_DIRECT.export(&source, &qualified(table), options);
-        assert_eq!(exported_rows(&mut exa_conn(), &sql), rows, "{case}");
+        assert_eq!(exported_rows(&mut conn, &sql), rows, "{case}");
 
         let files = data_file_partitions(NAMESPACE, table, AddedBy::Export);
         assert!(!files.is_empty(), "{case}: the export wrote no data file");
@@ -254,7 +258,7 @@ fn test_append_places_rows_like_spark() {
             "{case}"
         );
         assert_eq!(
-            sorted_rows(&format!("SELECT * FROM {}", read(table))),
+            sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(table))),
             appended(&before, &before),
             "{case}"
         );
@@ -265,6 +269,7 @@ fn test_append_places_rows_like_spark() {
 #[test]
 fn test_null_partition_columns_land_in_null_partitions() {
     setup();
+    let mut conn = exa_conn();
     let cases = [
         (BY_VALUE, BY_VALUE_NULL_RIDS, BY_VALUE_ALL_NULL_RIDS),
         (BY_TIME, BY_TIME_NULL_RIDS, BY_TIME_ALL_NULL_RIDS),
@@ -278,11 +283,11 @@ fn test_null_partition_columns_land_in_null_partitions() {
             null_rids.start(),
             null_rids.end()
         );
-        let source_rows = sorted_rows(&format!("SELECT * FROM {source}"));
-        let before = sorted_rows(&format!("SELECT * FROM {}", read(table)));
+        let source_rows = sorted_rows(&mut conn, &format!("SELECT * FROM {source}"));
+        let before = sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(table)));
 
         let sql = EXPORT_DIRECT.export(&source, &qualified(table), "SINGLE_COMMIT = 'true'");
-        exported_rows(&mut exa_conn(), &sql);
+        exported_rows(&mut conn, &sql);
 
         let files = data_file_partitions(NAMESPACE, table, AddedBy::Export);
         assert_eq!(
@@ -303,7 +308,7 @@ fn test_null_partition_columns_land_in_null_partitions() {
              {all_null:?}"
         );
         assert_eq!(
-            sorted_rows(&format!("SELECT * FROM {}", read(table))),
+            sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(table))),
             appended(&before, &source_rows),
             "{table}: every NULL reads back as NULL"
         );
@@ -314,13 +319,14 @@ fn test_null_partition_columns_land_in_null_partitions() {
 #[test]
 fn test_partition_filter_prunes_exported_files() {
     setup();
+    let mut conn = exa_conn();
     let spark = spark_partitions(BY_VALUE);
     let sql = EXPORT_DIRECT.export(
         &format!("(SELECT * FROM {})", read(BY_VALUE)),
         &qualified(BY_VALUE),
         "SINGLE_COMMIT = 'true'",
     );
-    exported_rows(&mut exa_conn(), &sql);
+    exported_rows(&mut conn, &sql);
     let files = data_file_partitions(NAMESPACE, BY_VALUE, AddedBy::Export);
 
     for (field, (column, literal, literal_rid)) in BY_VALUE_FILTERS.iter().enumerate() {
@@ -329,7 +335,8 @@ fn test_partition_filter_prunes_exported_files() {
         let mut expected: Vec<&str> = files
             .iter()
             .filter(|file| {
-                &file.partition[field].1 == partition && bounds_hold(column, literal, &file.rids)
+                &file.partition[field].1 == partition
+                    && bounds_hold(&mut conn, column, literal, &file.rids)
             })
             .map(|file| file.path.as_str())
             .collect();
@@ -337,7 +344,7 @@ fn test_partition_filter_prunes_exported_files() {
             "SELECT RID FROM {} WHERE {column} = {literal}",
             read(BY_VALUE)
         );
-        let pushed = explain_virtual_pushdown_sql(&mut exa_conn(), &query);
+        let pushed = explain_virtual_pushdown_sql(&mut conn, &query);
         let mut scanned: Vec<&str> = files
             .iter()
             .filter(|file| pushed.contains(file.path.rsplit('/').next().unwrap()))
@@ -351,11 +358,12 @@ fn test_partition_filter_prunes_exported_files() {
             "{case}: no export file holds the literal"
         );
         assert_eq!(scanned, expected, "{case}: {pushed}");
-        let source_rows = sorted_rows(&format!(
-            "SELECT RID FROM {BY_VALUE_COPY} WHERE {column} = {literal}"
-        ));
+        let source_rows = sorted_rows(
+            &mut conn,
+            &format!("SELECT RID FROM {BY_VALUE_COPY} WHERE {column} = {literal}"),
+        );
         assert_eq!(
-            sorted_rows(&query),
+            sorted_rows(&mut conn, &query),
             appended(&source_rows, &source_rows),
             "{case}: the Spark rows and the exported rows of the native query"
         );
@@ -366,6 +374,7 @@ fn test_partition_filter_prunes_exported_files() {
 #[test]
 fn test_append_writes_under_current_spec() {
     setup();
+    let mut conn = exa_conn();
     let spark = spark_partitions(EVOLVED);
     let metadata = local_table_metadata(NAMESPACE, EVOLVED);
     let current_spec = metadata["default-spec-id"].as_i64().unwrap() as i32;
@@ -375,12 +384,12 @@ fn test_append_writes_under_current_spec() {
         EVOLVED_CURRENT_RIDS.start(),
         EVOLVED_CURRENT_RIDS.end()
     );
-    let source_rows = sorted_rows(&format!("SELECT * FROM {source}"));
-    let before = sorted_rows(&format!("SELECT * FROM {}", read(EVOLVED)));
+    let source_rows = sorted_rows(&mut conn, &format!("SELECT * FROM {source}"));
+    let before = sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(EVOLVED)));
 
     let sql = EXPORT_DIRECT.export(&source, &qualified(EVOLVED), "SINGLE_COMMIT = 'true'");
     assert_eq!(
-        exported_rows(&mut exa_conn(), &sql),
+        exported_rows(&mut conn, &sql),
         EVOLVED_CURRENT_RIDS.clone().count() as i64
     );
 
@@ -391,7 +400,7 @@ fn test_append_writes_under_current_spec() {
     );
     assert_eq!(misplaced(&files, |rid| spark.get(&rid).cloned()), []);
     assert_eq!(
-        sorted_rows(&format!("SELECT * FROM {}", read(EVOLVED))),
+        sorted_rows(&mut conn, &format!("SELECT * FROM {}", read(EVOLVED))),
         appended(&before, &source_rows)
     );
 }

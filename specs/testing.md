@@ -60,6 +60,7 @@ Test code gets the same design care as production code. A test reads as the one 
 
 - A new test module of the Local Docker suite is declared in `crates/lakehouse-e2e/tests/e2e_local/main.rs`. A module file the suite does not declare never compiles and never runs.
 - Each suite runs with `--test-threads=1`, because all tests of one binary share one provisioning.
+- Within one test, the cases of a case table run on several sessions at once through `case_failures` or `map_cases`, because a case mostly waits for Exasol's UDF VMs. Such a case changes nothing another case reads. A case that writes shared state, counts proxy-log lines, reads its own session's profile, or runs an export stays in a serial loop.
 
 ### Failure contract
 

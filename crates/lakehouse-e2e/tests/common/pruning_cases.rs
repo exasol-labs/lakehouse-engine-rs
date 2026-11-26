@@ -2,7 +2,7 @@
 //! binary provisions its format's copy of the fixture; these checks are shared by every format.
 
 use super::e2e_harness::{
-    Expect, PathCheck, SCAN_FILTER, SCAN_SCRIPT_NAME, isolated_pushdown_statement,
+    Expect, PathCheck, SCAN_FILTER, SCAN_SCRIPT_NAME, case_failures, isolated_pushdown_statement,
     native_copy_mismatch, parse_int, value_to_string,
 };
 use super::exasol_ws::ExaConn;
@@ -423,7 +423,7 @@ const CASES: &[Case] = &[
 ];
 
 /// `None` when the case holds; otherwise every failed assertion, with the plan.
-fn case_failures(conn: &mut ExaConn, format: Format, case: &Case) -> Option<String> {
+fn case_mismatch(conn: &mut ExaConn, format: Format, case: &Case) -> Option<String> {
     let predicate = case.predicate;
     let table = format.table();
     let select = format!("SELECT ID FROM {table} WHERE {predicate} ORDER BY ID");
@@ -495,22 +495,24 @@ const CLOCK_CASES: &[Case] = &[
 ];
 
 /// Runs every case against `format`'s virtual schema, which the caller's setup has created,
-/// and fails once with every failed case.
-pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
-    assert_listed_cases_hold(conn, format, CASES);
+/// on sessions that `connect` opens, and fails once with every failed case.
+pub fn assert_cases_hold(connect: impl Fn() -> ExaConn + Sync, format: Format) {
+    assert_listed_cases_hold(connect, format, CASES);
 }
 
 /// [`assert_cases_hold`] over the clock and time zone literal cases.
-pub fn assert_clock_cases_hold(conn: &mut ExaConn, format: Format) {
-    assert_listed_cases_hold(conn, format, CLOCK_CASES);
+pub fn assert_clock_cases_hold(connect: impl Fn() -> ExaConn + Sync, format: Format) {
+    assert_listed_cases_hold(connect, format, CLOCK_CASES);
 }
 
-fn assert_listed_cases_hold(conn: &mut ExaConn, format: Format, cases: &[Case]) {
-    let failures: Vec<String> = cases
+fn assert_listed_cases_hold(connect: impl Fn() -> ExaConn + Sync, format: Format, cases: &[Case]) {
+    let cases: Vec<&Case> = cases
         .iter()
         .filter(|case| !(case.typed_partition && matches!(format, Format::Hive)))
-        .filter_map(|case| case_failures(conn, format, case))
         .collect();
+    let failures = case_failures(&cases, connect, |conn, case| {
+        case_mismatch(conn, format, case)
+    });
     assert!(
         failures.is_empty(),
         "{} of {} pruning cases failed:\n{}",
@@ -572,13 +574,45 @@ impl Format {
     }
 }
 
-fn oracle_mismatch(conn: &mut ExaConn, query: &str, format: Format) -> Option<String> {
+/// One statement-level check of the aggregate matrices.
+enum Check {
+    /// The query returns the oracle's rows.
+    Oracle(String),
+    /// The query scans exactly when files remain.
+    Path { query: String, pruned: bool },
+    /// The query returns the oracle's rows on the split path, or else in the wrapper.
+    Shape { query: String, split: bool },
+}
+
+impl Check {
+    fn mismatch(&self, conn: &mut ExaConn, format: Format) -> Option<String> {
+        match self {
+            Check::Oracle(query) => oracle_mismatch(conn, query, format, PathCheck::Unchecked),
+            Check::Path { query, pruned } => path_mismatch(conn, query, format, *pruned),
+            Check::Shape { query, split } => {
+                let path = if *split {
+                    PathCheck::Split
+                } else {
+                    PathCheck::Wrapper
+                };
+                oracle_mismatch(conn, query, format, path)
+            }
+        }
+    }
+}
+
+fn oracle_mismatch(
+    conn: &mut ExaConn,
+    query: &str,
+    format: Format,
+    path: PathCheck<'_>,
+) -> Option<String> {
     native_copy_mismatch(
         conn,
         &format.table(),
         PRUNING_ORACLE_TABLE,
         query,
-        PathCheck::Unchecked,
+        path,
         Expect::Rows,
     )
 }
@@ -588,6 +622,14 @@ fn path_mismatch(conn: &mut ExaConn, query: &str, format: Format, pruned: bool) 
     (plan.contains(SCAN_SCRIPT_NAME) == pruned).then(|| {
         format!("`{query}` must scan exactly when files remain (pruned: {pruned}): {plan}")
     })
+}
+
+fn check_failures(
+    checks: &[Check],
+    connect: impl Fn() -> ExaConn + Sync,
+    format: Format,
+) -> Vec<String> {
+    case_failures(checks, connect, |conn, check| check.mismatch(conn, format))
 }
 
 const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
@@ -609,41 +651,31 @@ const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
     ("SELECT SUM(K) / 2 FROM {T} WHERE {F}", true),
 ];
 
-fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) -> Option<String> {
-    let path = if split {
-        PathCheck::Split
-    } else {
-        PathCheck::Wrapper
-    };
-    native_copy_mismatch(
-        conn,
-        &format.table(),
-        PRUNING_ORACLE_TABLE,
-        query,
-        path,
-        Expect::Rows,
-    )
-}
-
-pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
+pub fn assert_single_group_aggregates_match_oracle(
+    connect: impl Fn() -> ExaConn + Sync,
+    format: Format,
+) {
     let pruned = format.prunes_every_file().iter().map(|f| (*f, true));
     let scanned = [(NO_ROW_SCANNED, false), (ROWS_SCANNED, false)];
-    let mut failures = Vec::new();
+    let mut checks = Vec::new();
     for (query, split) in SINGLE_GROUP_SHAPES {
         let query = query.replace("{F}", ROWS_SCANNED);
-        failures.extend(shape_mismatch(conn, &query, format, *split));
+        checks.push(Check::Shape {
+            query,
+            split: *split,
+        });
     }
     for (filter, pruned) in pruned.chain(scanned) {
-        let probe = format!("SELECT COUNT(*), 'X' FROM {{T}} WHERE {filter}");
-        failures.extend(path_mismatch(conn, &probe, format, pruned));
+        let query = format!("SELECT COUNT(*), 'X' FROM {{T}} WHERE {filter}");
+        checks.push(Check::Path { query, pruned });
         for having in HAVINGS {
             for select in SINGLE_GROUP_SELECTS {
                 let query = format!("SELECT {select} FROM {{T}} WHERE {filter}{having}");
-                failures.extend(oracle_mismatch(conn, &query, format));
+                checks.push(Check::Oracle(query));
             }
             for shape in NESTED_SHAPES {
                 let query = shape.replace("{F}", filter).replace("{H}", having);
-                failures.extend(oracle_mismatch(conn, &query, format));
+                checks.push(Check::Oracle(query));
             }
         }
     }
@@ -651,34 +683,31 @@ pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: F
         .iter()
         .map(|shape| shape.replace("{F}", DECLINED_FILTER).replace("{H}", ""))
         .collect();
-    for query in &declined {
-        failures.extend(oracle_mismatch(conn, query, format));
+    checks.extend(declined.iter().cloned().map(Check::Oracle));
+    for filter in format.prunes_every_file() {
+        let join = format!("FROM {{T}} A JOIN {{T}} B ON A.ID = B.ID WHERE A.{filter}");
+        checks.push(Check::Path {
+            query: format!("SELECT COUNT(*) {join}"),
+            pruned: true,
+        });
+        for having in HAVINGS {
+            let having = having.replace("(ID)", "(A.ID)");
+            for select in JOIN_SELECTS {
+                checks.push(Check::Oracle(format!("SELECT {select} {join}{having}")));
+            }
+            let nested = format!("SELECT COUNT(*) FROM (SELECT SUM(B.ID) {join}{having})");
+            checks.push(Check::Oracle(nested));
+        }
     }
+    let mut failures = check_failures(&checks, &connect, format);
     // A declined filter returns the rows a pushed one would, so only the plan tells them apart.
-    let plan = isolated_pushdown_statement(conn, &declined[0].replace("{T}", &format.table()));
+    let plan =
+        isolated_pushdown_statement(&mut connect(), &declined[0].replace("{T}", &format.table()));
     if !OuterWhere.holds(&plan) {
         failures.push(format!(
             "`{}` must apply its filter in the outer WHERE: {plan}",
             declined[0]
         ));
-    }
-    for filter in format.prunes_every_file() {
-        let join = format!("FROM {{T}} A JOIN {{T}} B ON A.ID = B.ID WHERE A.{filter}");
-        failures.extend(path_mismatch(
-            conn,
-            &format!("SELECT COUNT(*) {join}"),
-            format,
-            true,
-        ));
-        for having in HAVINGS {
-            let having = having.replace("(ID)", "(A.ID)");
-            for select in JOIN_SELECTS {
-                let query = format!("SELECT {select} {join}{having}");
-                failures.extend(oracle_mismatch(conn, &query, format));
-            }
-            let nested = format!("SELECT COUNT(*) FROM (SELECT SUM(B.ID) {join}{having})");
-            failures.extend(oracle_mismatch(conn, &nested, format));
-        }
     }
     assert!(
         failures.is_empty(),
@@ -716,25 +745,35 @@ const GROUPED_SHAPES: &[(&str, bool)] = &[
 
 const GROUPED_HAVINGS: &[&str] = &["", " HAVING COUNT(*) > 0"];
 
-pub fn assert_grouped_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
+pub fn assert_grouped_aggregates_match_oracle(
+    connect: impl Fn() -> ExaConn + Sync,
+    format: Format,
+) {
     let pruned = format.prunes_every_file().iter().map(|f| (*f, true));
     let scanned = [(NO_ROW_SCANNED, false), (ROWS_SCANNED, false)];
-    let mut failures = Vec::new();
+    let mut checks = Vec::new();
     for (query, split) in GROUPED_SHAPES {
         let query = query.replace("{F}", "K IS NOT NULL").replace("{H}", "");
-        failures.extend(shape_mismatch(conn, &query, format, *split));
+        checks.push(Check::Shape {
+            query,
+            split: *split,
+        });
     }
     for (filter, pruned) in pruned.chain(scanned) {
         for (query, _) in GROUPED_SHAPES {
             for having in GROUPED_HAVINGS {
                 let query = query.replace("{F}", filter).replace("{H}", having);
                 if having.is_empty() {
-                    failures.extend(path_mismatch(conn, &query, format, pruned));
+                    checks.push(Check::Path {
+                        query: query.clone(),
+                        pruned,
+                    });
                 }
-                failures.extend(oracle_mismatch(conn, &query, format));
+                checks.push(Check::Oracle(query));
             }
         }
     }
+    let failures = check_failures(&checks, connect, format);
     assert!(
         failures.is_empty(),
         "{} grouped queries failed:\n{}",

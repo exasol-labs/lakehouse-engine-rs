@@ -2729,7 +2729,7 @@ fn footer_statistics(footer: &ParquetMetaData, column: &str) -> (Option<(Stat, S
 #[test]
 fn delta_pruning_keeps_every_file_with_a_matching_row() {
     setup();
-    assert_cases_hold(&mut exa_conn(), Format::Delta);
+    assert_cases_hold(exa_conn, Format::Delta);
 }
 
 /// Scenario: A partition value compares under its column's declared type
@@ -2740,7 +2740,7 @@ fn delta_pruning_keeps_every_file_with_a_matching_row() {
 #[test]
 fn unity_parquet_partition_pruning_keeps_every_file_with_a_matching_row() {
     setup();
-    assert_cases_hold(&mut exa_conn(), Format::UnityParquet);
+    assert_cases_hold(exa_conn, Format::UnityParquet);
 }
 
 /// Scenario: A partition value compares under its column's declared type
@@ -2790,7 +2790,7 @@ fn unity_parquet_partitions_compare_under_every_declared_type() {
 #[test]
 fn delta_single_group_aggregates_match_the_oracle() {
     setup();
-    assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
+    assert_single_group_aggregates_match_oracle(exa_conn, Format::Delta);
 }
 
 /// Scenario: A nested aggregate over an expression declines the split
@@ -2800,7 +2800,7 @@ fn delta_single_group_aggregates_match_the_oracle() {
 #[test]
 fn delta_grouped_aggregates_match_the_oracle() {
     setup();
-    assert_grouped_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
+    assert_grouped_aggregates_match_oracle(exa_conn, Format::Delta);
 }
 
 const VS_PROXY: &str = "UNITY_PROXY_VS";

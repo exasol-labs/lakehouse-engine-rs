@@ -2944,10 +2944,9 @@ fn e2e_declined_conjunct_keeps_the_other_conjuncts_in_the_scan() {
         "fixture precondition: ID 1 must match the LIKE, so a scan that drops `ID > 1` returns \
          a row the native copy does not"
     );
-    let failures: Vec<String> = DECLINED_CONJUNCT_CASES
-        .iter()
-        .filter_map(|case| declined_conjunct_mismatch(&mut conn, &typed, case))
-        .collect();
+    let failures = case_failures(&DECLINED_CONJUNCT_CASES, exa_conn, |conn, case| {
+        declined_conjunct_mismatch(conn, &typed, case)
+    });
 
     assert!(
         failures.is_empty(),
@@ -3709,26 +3708,27 @@ fn e2e_split_aggregate_columns_match_native_oracle() {
 
     let typed = typed_table();
     create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
-    let mut failures: Vec<String> = SPLIT_AGGREGATE_CASES
-        .iter()
-        .filter_map(|(query, path)| {
-            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
-        })
-        .collect();
+    let mut failures = case_failures(SPLIT_AGGREGATE_CASES, exa_conn, |conn, (query, path)| {
+        native_copy_mismatch(conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
+    });
 
     let char_pad = vs_char_pad_table();
     create_full_native_copy(&mut conn, &char_pad);
     let char_cases = char_cast_cases();
-    failures.extend(char_cases.iter().filter_map(|(query, expect)| {
-        native_copy_mismatch(
-            &mut conn,
-            &char_pad,
-            NATIVE_COPY,
-            query,
-            PathCheck::Wrapper,
-            *expect,
-        )
-    }));
+    failures.extend(case_failures(
+        &char_cases,
+        exa_conn,
+        |conn, (query, expect)| {
+            native_copy_mismatch(
+                conn,
+                &char_pad,
+                NATIVE_COPY,
+                query,
+                PathCheck::Wrapper,
+                *expect,
+            )
+        },
+    ));
 
     assert!(
         failures.is_empty(),
@@ -3895,12 +3895,9 @@ fn e2e_to_timestamp_reads_text_as_native_does() {
         })
         .chain(TO_TIMESTAMP_EDGE_CASES.iter().copied())
         .collect();
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(query, path, expect)| {
-            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, *expect)
-        })
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (query, path, expect)| {
+        native_copy_mismatch(conn, &typed, NATIVE_COPY, query, *path, *expect)
+    });
     assert!(
         failures.is_empty(),
         "{} of {} cases differ:\n{}",

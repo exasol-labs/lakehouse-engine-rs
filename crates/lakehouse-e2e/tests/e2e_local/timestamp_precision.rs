@@ -689,19 +689,16 @@ fn date_addition_over_a_nanosecond_timestamp_runs_in_the_scan() {
         ]
     })
     .collect();
-    let failures: Vec<String> = queries
-        .iter()
-        .filter_map(|query| {
-            native_copy_mismatch(
-                &mut conn,
-                &qualified,
-                NATIVE_COPY,
-                query,
-                PathCheck::Has("vs_add_"),
-                Expect::Rows,
-            )
-        })
-        .collect();
+    let failures = case_failures(&queries, exa_conn, |conn, query| {
+        native_copy_mismatch(
+            conn,
+            &qualified,
+            NATIVE_COPY,
+            query,
+            PathCheck::Has("vs_add_"),
+            Expect::Rows,
+        )
+    });
 
     assert!(
         failures.is_empty(),
@@ -788,19 +785,16 @@ fn date_trunc_outside_the_nanosecond_range_fails_in_the_scan() {
         "SELECT ID, DATE_TRUNC('second', ADD_DAYS(TS, 2900000)) FROM {T}",
         "SELECT ID, ADD_DAYS(DATE_TRUNC('month', CAST(TS AS DATE)), 1) FROM {T}",
     ];
-    let failures: Vec<String> = row_cases
-        .iter()
-        .filter_map(|query| {
-            native_copy_mismatch(
-                &mut conn,
-                &qualified,
-                NATIVE_COPY,
-                query,
-                PathCheck::Has("date_trunc"),
-                Expect::Rows,
-            )
-        })
-        .collect();
+    let failures = case_failures(&row_cases, exa_conn, |conn, query| {
+        native_copy_mismatch(
+            conn,
+            &qualified,
+            NATIVE_COPY,
+            query,
+            PathCheck::Has("date_trunc"),
+            Expect::Rows,
+        )
+    });
     assert!(
         failures.is_empty(),
         "DATE_TRUNC must run in the scan and match native:\n{}",

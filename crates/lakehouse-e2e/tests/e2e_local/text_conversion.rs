@@ -473,9 +473,8 @@ const ERROR_CASES: &[Case] = &[
     },
 ];
 
-fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
-    let mut conn = exa_session(case.setting);
-    native_copy_mismatch(&mut conn, table, NATIVE_COPY, case.query, case.path, expect)
+fn mismatch(conn: &mut ExaConn, table: &str, case: &Case, expect: Expect) -> Option<String> {
+    native_copy_mismatch(conn, table, NATIVE_COPY, case.query, case.path, expect)
         .map(|failure| format!("[{}] {failure}", case.setting))
 }
 
@@ -629,20 +628,34 @@ fn string_function_numeric_arguments_match_native() {
 /// Native Exasol returns rows for `cases` and raises an error for `error_cases`.
 fn assert_cases_match_native(table: &str, columns: &str, cases: &[Case], error_cases: &[Case]) {
     create_native_copy(&mut exa_conn(), table, columns);
-    let cases = cases
+    let cases: Vec<(&Case, Expect)> = cases
         .iter()
         .map(|case| (case, Expect::Rows))
-        .chain(error_cases.iter().map(|case| (case, Expect::Error)));
-    let failures: Vec<String> = cases
-        .clone()
-        .filter_map(|(case, expect)| mismatch(table, case, expect))
+        .chain(error_cases.iter().map(|case| (case, Expect::Error)))
+        .collect();
+    let mut settings: Vec<&str> = cases.iter().map(|(case, _)| case.setting).collect();
+    settings.sort_unstable();
+    settings.dedup();
+    let failures: Vec<String> = settings
+        .into_iter()
+        .flat_map(|setting| {
+            let in_setting: Vec<_> = cases
+                .iter()
+                .filter(|(case, _)| case.setting == setting)
+                .collect();
+            case_failures(
+                &in_setting,
+                || exa_session(setting),
+                |conn, (case, expect)| mismatch(conn, table, case, *expect),
+            )
+        })
         .collect();
 
     assert!(
         failures.is_empty(),
         "{} of {} cases differ:\n{}",
         failures.len(),
-        cases.count(),
+        cases.len(),
         failures.join("\n")
     );
 }
