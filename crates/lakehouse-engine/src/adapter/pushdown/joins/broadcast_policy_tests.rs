@@ -95,7 +95,7 @@ impl Graph {
             conditions: &self.conditions,
             conjuncts: &conjuncts,
             above: &above,
-            output: OutputContract::Items,
+            output: &OutputContract::Items(self.above.clone()),
             aggregates: self.aggregates,
             max_bytes: 100,
         })

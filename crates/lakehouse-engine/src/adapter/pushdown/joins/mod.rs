@@ -67,7 +67,7 @@ pub(crate) fn ensure_columns_declared(
 /// the other side's same-named column. `SELECT *` names no column, so it charges every one.
 fn ensure_no_side_refuses_a_referenced_column(
     request: &AdapterRequest,
-    output: OutputContract,
+    output: &OutputContract,
     sides: &[ResolvedJoinSide],
 ) -> Result<(), UdfError> {
     for side in sides {
@@ -79,7 +79,7 @@ fn ensure_no_side_refuses_a_referenced_column(
                     .iter()
                     .map(|column| column.column_name.to_uppercase()),
             ),
-            OutputContract::AnyOneColumn | OutputContract::Items => {}
+            OutputContract::AnyOneColumn | OutputContract::Items(_) => {}
         }
         ensure_no_touched_column_is_refused(&touched, &side.scan.refused_columns)?;
     }

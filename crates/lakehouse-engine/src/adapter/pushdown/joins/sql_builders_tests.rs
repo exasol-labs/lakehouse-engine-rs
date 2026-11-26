@@ -991,7 +991,7 @@ fn leg_naming_renders_a_scalar_over_aggregates_qualified() {
             scalar_fn(
                 "FLOAT_DIV",
                 [
-                    scalar_fn("MULT", [lit("literal_double", 100.0), sum_case]),
+                    scalar_fn("MULT", [lit("literal_double", "100.0"), sum_case]),
                     count_star,
                 ],
             ),

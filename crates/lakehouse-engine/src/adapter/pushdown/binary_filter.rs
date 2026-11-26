@@ -3,7 +3,7 @@
 //! which Parquet statistics prune and which returns the same rows.
 
 use arrow::datatypes::DataType;
-use vs_expression::{Column, CompareOp, Expr, Literal, LiteralKind, Scalar};
+use vs_expression::{Column, CompareOp, Expr, Literal};
 
 use super::support::{ColumnTypes, column_ref};
 use crate::scan::raw_bytes_alias;
@@ -93,10 +93,10 @@ fn byte_comparison(node: &Expr, columns: &ColumnTypes) -> Option<Expr> {
                 CompareOp::NotEqual | CompareOp::Less | CompareOp::LessEqual
             );
             if layout == BinaryLayout::Variable && admits_empty {
-                let empty = Literal::new(
-                    LiteralKind::Binary { width: None },
-                    Scalar::String(String::new()),
-                );
+                let empty = Literal::Binary {
+                    hex: String::new(),
+                    width: None,
+                };
                 let non_empty = Expr::compare(
                     CompareOp::NotEqual,
                     raw_bytes(&column),
@@ -134,10 +134,10 @@ fn byte_literal(node: &Expr, layout: BinaryLayout) -> Option<Expr> {
             Some(u64::try_from(width).ok()?)
         }
     };
-    Some(Expr::Literal(Literal::new(
-        LiteralKind::Binary { width },
-        Scalar::String(digits.to_string()),
-    )))
+    Some(Expr::Literal(Literal::Binary {
+        hex: digits.to_string(),
+        width,
+    }))
 }
 
 /// For format-level pruning: retypes each hex literal a binary column is compared with, at any
@@ -189,11 +189,10 @@ fn retype_binary_literals(node: &mut Expr, columns: &ColumnTypes) {
 
 /// The bytes of a binary literal that [`with_binary_literals`] wrote.
 pub(crate) fn literal_binary_bytes(node: &Expr) -> Option<Vec<u8>> {
-    let literal = node.as_literal()?;
-    if !matches!(literal.kind, LiteralKind::Binary { .. }) {
+    let Literal::Binary { hex, .. } = node.as_literal()? else {
         return None;
-    }
-    hex::decode(literal.value.as_str()?).ok()
+    };
+    hex::decode(hex).ok()
 }
 
 #[cfg(test)]

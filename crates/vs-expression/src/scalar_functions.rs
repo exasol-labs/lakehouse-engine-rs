@@ -1,5 +1,5 @@
-//! The one table of translated scalar functions: how the renderer emits each in both dialects, and
-//! how the scan's typed pass types it. The DataFusion dialect declines a name absent here.
+//! The one table of translated scalar functions: how each renders for Exasol and for the scan,
+//! and how the scan's typed pass types it. The scan declines a name absent here.
 
 use crate::CHECKED_INT_DIV_FN;
 
@@ -8,9 +8,8 @@ pub(crate) enum ExasolForm {
     /// `<NAME>(<rendered args>)` with no arity check: Exasol emitted the call, so
     /// re-emitting it verbatim cannot be wrong.
     VerbatimCall,
-    /// The per-name arm owns both dialects: the Exasol form is not a plain call
-    /// (operator, `CASE`, per-dialect CAST target), or the DataFusion side is not
-    /// (`MOD` renders as `%`).
+    /// The Exasol form has its own arm: it is not a plain call (operator, `CASE`, CAST), or it
+    /// is arity-checked (`MOD`).
     Shaped,
 }
 
@@ -80,7 +79,7 @@ pub(crate) struct ScalarFunction {
     /// Text arguments that are parameters, not values: a format model or a unit.
     pub(crate) parameters: &'static [usize],
     pub(crate) result: ResultRule,
-    /// The DataFusion function of a same-arity call the renderer's generic arm emits.
+    /// The DataFusion function of a same-arity call the scan's generic arm emits.
     pub(crate) datafusion_call: Option<&'static str>,
 }
 
@@ -148,8 +147,7 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::shaped("CONCAT").typed(T::All, R::Text),
         F::shaped("CASE"),
         // VerbatimCall: applied to every remaining name uniformly, not only where the
-        // DataFusion rendering fails on Exasol. DataFusion's `signum` does not exist in
-        // Exasol, and the gate precedes the whole name match, because the math arm matches SIGN.
+        // DataFusion form fails on Exasol, as `signum` does.
         F::verbatim("ABS").typed(T::Never, R::Arithmetic),
         F::verbatim("FLOOR").typed(T::Never, R::NumberOverNumbers),
         F::verbatim("CEIL").typed(T::Never, R::NumberOverNumbers),

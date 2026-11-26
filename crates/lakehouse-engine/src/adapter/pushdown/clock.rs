@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use exasol_udf_sdk::error::UdfError;
 use vs_expression::timestamp::TimestampLiteral;
-use vs_expression::{Expr, Literal, LiteralKind, Scalar, ScalarCall, short};
+use vs_expression::{Expr, Literal, ScalarCall, short};
 
 use crate::adapter::time_zone::TimeZone;
 use crate::types::exasol_type::ExasolType;
@@ -61,7 +61,7 @@ impl StatementClock {
     pub(super) fn fold(&self, pushdown: &PushdownRequest) -> Result<PushdownRequest, UdfError> {
         let keep_instant = |tstz| Ok(tstz_literal(tstz));
         let wall_clock = |tstz| self.wall_clock_literal(tstz);
-        pushdown.try_map_expressions(&Clause::ALL, |clause, index, tree| {
+        let mut folded = pushdown.try_map_expressions(&Clause::ALL, |clause, index, tree| {
             let tstz: &dyn Fn(Tstz) -> Result<Expr, UdfError> =
                 match (clause, pushdown.select_type(index)) {
                     (Clause::SelectList, Some(ExasolType::TimestampWithLocalTimeZone { .. })) => {
@@ -70,7 +70,9 @@ impl StatementClock {
                     _ => &wall_clock,
                 };
             tree.try_rewrite(&mut |node| self.folded(node, tstz))
-        })
+        })?;
+        folded.drop_constant_sort_keys();
+        Ok(folded)
     }
 
     /// The literal in place of `node`, `None` for a node that is no clock call or TSTZ literal.
@@ -81,15 +83,9 @@ impl StatementClock {
     ) -> Result<Option<Expr>, UdfError> {
         let call = match node {
             Expr::Scalar(call) => call,
-            Expr::Literal(Literal {
-                kind: LiteralKind::TimestampUtc | LiteralKind::LocalTimeZoneTimestamp,
-                value,
-            }) => {
-                return match value {
-                    Scalar::String(value) => tstz(parse_tstz(value)?).map(Some),
-                    _ => Ok(None),
-                };
-            }
+            Expr::Literal(
+                Literal::TimestampUtc(value) | Literal::LocalTimeZoneTimestamp(value),
+            ) => return tstz(parse_tstz(value)?).map(Some),
             _ => return Ok(None),
         };
         let utc = self.instant.naive_utc();
@@ -126,10 +122,11 @@ fn precision(call: &ScalarCall) -> Result<usize, UdfError> {
     let Some(argument) = call.arguments.first() else {
         return Ok(DEFAULT_DIGITS);
     };
-    argument
-        .as_literal()
-        .and_then(|literal| literal.value.as_str())
-        .and_then(|value| value.parse::<usize>().ok())
+    let digits = match argument.as_literal() {
+        Some(Literal::ExactNumeric(value)) => value.parse::<usize>().ok(),
+        _ => None,
+    };
+    digits
         .filter(|digits| *digits <= MAX_DIGITS)
         .ok_or_else(|| {
             UdfError::User(format!(
@@ -150,25 +147,20 @@ fn parse_tstz(value: &str) -> Result<Tstz, UdfError> {
 }
 
 fn date_literal(wall_clock: NaiveDateTime) -> Expr {
-    literal(
-        LiteralKind::Date,
+    Expr::Literal(Literal::Date(
         wall_clock.date().format("%Y-%m-%d").to_string(),
-    )
+    ))
 }
 
 fn timestamp_literal(wall_clock: NaiveDateTime, digits: usize) -> Expr {
-    literal(LiteralKind::Timestamp, timestamp_text(wall_clock, digits))
+    Expr::Literal(Literal::Timestamp(timestamp_text(wall_clock, digits)))
 }
 
 fn tstz_literal(tstz: Tstz) -> Expr {
-    literal(
-        LiteralKind::LocalTimeZoneTimestamp,
-        timestamp_text(tstz.utc, tstz.digits),
-    )
-}
-
-fn literal(kind: LiteralKind, value: String) -> Expr {
-    Expr::Literal(Literal::new(kind, Scalar::String(value)))
+    Expr::Literal(Literal::LocalTimeZoneTimestamp(timestamp_text(
+        tstz.utc,
+        tstz.digits,
+    )))
 }
 
 /// Truncated, not rounded, to `digits`, as Exasol truncates its clock.

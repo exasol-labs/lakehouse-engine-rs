@@ -1,9 +1,8 @@
-//! The typed expression tree of a pushdown request. [`crate::parse_expression`] is its only
+//! The typed expression tree of a pushdown request. [`crate::parse_request`] is its only
 //! reader of request JSON; every renderer, walker, and rewrite works on this tree.
 //!
-//! Every walk visits a node's children in the alphabetical order of their wire keys (`arguments`,
-//! `basis`, `escapeChar`, `expression`, `left`, `pattern`, `results`, `right`), the order the
-//! golden fixtures pin for the emitted columns and aggregate slots.
+//! Every walk visits a node's children in the order SQL writes them, which is the order of the
+//! emitted columns and aggregate slots.
 
 use std::convert::Infallible;
 
@@ -51,100 +50,31 @@ pub enum Expr {
     },
     JsonValue(JsonValueCall),
     Aggregate(AggregateCall),
-    /// A node only the scan's typed pass writes, rendered only in the DataFusion dialect.
-    Scan(ScanNode),
 }
 
-/// A literal as Exasol sent it: its kind and its raw value, which renders as sent.
+/// A literal, its value checked at parse. Exasol sends a boolean as a JSON boolean, every other
+/// value as text, and a NULL of any type, `''` included, as `literal_null`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Literal {
-    pub kind: LiteralKind,
-    pub value: Scalar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiteralKind {
+pub enum Literal {
     Null,
-    Bool,
-    String,
-    Double,
-    ExactNumeric,
-    Date,
-    Timestamp,
+    Bool(bool),
+    String(String),
+    /// `literal_double` in the text Exasol sent, such as `1.0000000000000001e+300`.
+    Double(String),
+    /// `literal_exactnumeric` in the text Exasol sent, such as `-5` or `0.1`.
+    ExactNumeric(String),
+    Date(String),
+    Timestamp(String),
     /// `literal_timestamp_utc`, a UTC timestamp value.
-    TimestampUtc,
+    TimestampUtc(String),
     /// `literal_timestamputc`, Exasol's `TIMESTAMP WITH LOCAL TIME ZONE` literal.
-    LocalTimeZoneTimestamp,
+    LocalTimeZoneTimestamp(String),
     /// A hex string retyped as bytes for a binary column, never sent by Exasol. A `width` types it
     /// `FixedSizeBinary`.
     Binary {
+        hex: String,
         width: Option<u64>,
     },
-}
-
-/// A literal's value. Absent and JSON null are both `Null`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scalar {
-    Null,
-    Bool(bool),
-    Number(serde_json::Number),
-    String(String),
-}
-
-impl Scalar {
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::String(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// The value as SQL text: a string as is, a number or boolean in its JSON spelling, NULL empty.
-    pub fn text(&self) -> String {
-        match self {
-            Self::Null => String::new(),
-            Self::Bool(value) => value.to_string(),
-            Self::Number(number) => number.to_string(),
-            Self::String(text) => text.clone(),
-        }
-    }
-}
-
-impl Literal {
-    pub fn new(kind: LiteralKind, value: Scalar) -> Self {
-        Self { kind, value }
-    }
-
-    pub fn null() -> Self {
-        Self::new(LiteralKind::Null, Scalar::Null)
-    }
-
-    pub fn string(value: impl Into<String>) -> Self {
-        Self::new(LiteralKind::String, Scalar::String(value.into()))
-    }
-
-    pub fn bool(value: bool) -> Self {
-        Self::new(LiteralKind::Bool, Scalar::Bool(value))
-    }
-
-    /// Exasol's NULL: a `literal_null`, or any literal without a value.
-    pub fn is_null(&self) -> bool {
-        self.kind == LiteralKind::Null || self.value.is_null()
-    }
-
-    /// A `literal_bool` holds `true`, `"true"`, `"TRUE"`, or `1`; anything else is FALSE.
-    pub fn is_true(&self) -> bool {
-        match &self.value {
-            Scalar::Bool(value) => *value,
-            Scalar::String(text) => text == "true" || text == "TRUE",
-            Scalar::Number(number) => number.as_i64() == Some(1),
-            Scalar::Null => false,
-        }
-    }
 }
 
 /// A `column` node.
@@ -225,8 +155,6 @@ pub struct ScalarCall {
     /// Uppercased.
     pub name: String,
     pub arguments: Vec<Expr>,
-    /// The fractional digits a `TO_TIMESTAMP` keeps, which only the typed pass knows.
-    pub(crate) timestamp_digits: Option<u8>,
 }
 
 impl ScalarCall {
@@ -234,7 +162,6 @@ impl ScalarCall {
         Self {
             name: name.to_uppercase(),
             arguments,
-            timestamp_digits: None,
         }
     }
 }
@@ -282,32 +209,6 @@ pub struct AggregateCall {
     pub distinct: bool,
 }
 
-/// A node the typed pass writes. Only this crate builds or reads one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanNode {
-    pub(crate) kind: ScanKind,
-    pub(crate) argument: Box<Expr>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanKind {
-    /// An integer operand converted to text.
-    IntegerText,
-    /// A boolean operand converted to Exasol's `TRUE`/`FALSE`.
-    BooleanText,
-    /// A boolean operand converted to Exasol's 1 or 0, which DataFusion does not do
-    /// (apache/datafusion#16797).
-    BooleanNumber,
-    /// A string function's numeric argument as the `Int64` DataFusion requires, rounded as Exasol
-    /// rounds it.
-    IntegerArgument { round: bool, negative_is_null: bool },
-    /// The seconds of its argument with `fraction` fractional digits.
-    Second { fraction: u8 },
-    /// Its text argument with an empty string read as NULL, because Exasol has no empty string
-    /// and DataFusion keeps one as a value (#203).
-    EmptyAsNull,
-}
-
 /// The children of `$node` as `&` or, given `mut`, `&mut` references: one definition, so the
 /// shared and the mutable walks visit the same children in the same order.
 macro_rules! children_of {
@@ -321,8 +222,8 @@ macro_rules! children_of {
                 children.push(&$($m)? **inner);
             }
             Expr::InList { expression, values } => {
-                children.extend(values);
                 children.push(&$($m)? **expression);
+                children.extend(values);
             }
             Expr::Between {
                 expression,
@@ -334,21 +235,26 @@ macro_rules! children_of {
                 pattern,
                 escape,
             } => {
+                children.extend([&$($m)? **expression, &$($m)? **pattern]);
                 if let Some(escape) = escape {
                     children.push(&$($m)? **escape);
                 }
-                children.extend([&$($m)? **expression, &$($m)? **pattern]);
             }
             Expr::Scalar(call) => children.extend(&$($m)? call.arguments),
             Expr::Extract { argument, .. } | Expr::Cast { argument, .. } => {
                 children.push(&$($m)? **argument);
             }
             Expr::Case(case) => {
-                children.extend(&$($m)? case.whens);
                 if let Some(basis) = &$($m)? case.basis {
                     children.push(&$($m)? **basis);
                 }
-                children.extend(&$($m)? case.results);
+                // Each WHEN before its THEN, the ELSE last.
+                let mut results = (&$($m)? case.results).into_iter();
+                for when in &$($m)? case.whens {
+                    children.push(when);
+                    children.extend(results.next());
+                }
+                children.extend(results);
             }
             Expr::JsonValue(call) => {
                 children.extend([&$($m)? *call.document, &$($m)? *call.path]);
@@ -359,20 +265,12 @@ macro_rules! children_of {
                 }
             }
             Expr::Aggregate(call) => children.extend(&$($m)? call.arguments),
-            Expr::Scan(scan) => children.push(&$($m)? *scan.argument),
         }
         children
     }};
 }
 
 impl Expr {
-    pub(crate) fn scan(kind: ScanKind, argument: Expr) -> Self {
-        Self::Scan(ScanNode {
-            kind,
-            argument: Box::new(argument),
-        })
-    }
-
     pub fn compare(op: CompareOp, left: Expr, right: Expr) -> Self {
         Self::Compare {
             op,
@@ -398,10 +296,7 @@ impl Expr {
     /// The value of a `literal_string`.
     pub fn as_string_literal(&self) -> Option<&str> {
         match self {
-            Self::Literal(Literal {
-                kind: LiteralKind::String,
-                value,
-            }) => value.as_str(),
+            Self::Literal(Literal::String(value)) => Some(value),
             _ => None,
         }
     }
@@ -410,7 +305,7 @@ impl Expr {
         matches!(self, Self::Aggregate(_))
     }
 
-    /// The child expressions in the alphabetical order of their wire keys (see the module doc).
+    /// The child expressions in the order SQL writes them (see the module doc).
     pub fn children(&self) -> Vec<&Expr> {
         children_of!(self)
     }
@@ -503,11 +398,6 @@ impl Expr {
             _ => Some(Self::And(kept)),
         }
     }
-}
-
-/// Takes `node` out of its place, leaving a NULL literal.
-pub(crate) fn take(node: &mut Expr) -> Expr {
-    std::mem::replace(node, Expr::Literal(Literal::null()))
 }
 
 #[cfg(test)]

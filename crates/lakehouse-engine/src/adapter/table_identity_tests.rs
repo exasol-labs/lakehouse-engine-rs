@@ -40,7 +40,6 @@ fn a_missing_or_unreadable_note_fails_naming_the_table_and_refresh() {
         request_with_note("ORDERS", json!("\"a.b\"")),
         request_with_note("ORDERS", json!("{}")),
         request_with_note("ORDERS", json!("{\"name\": 7}")),
-        request_with_note("ORDERS", json!({"name": "a.b"})),
     ];
     for request in unreadable {
         let message = user_message(read_identifier(&request, "ORDERS").unwrap_err());

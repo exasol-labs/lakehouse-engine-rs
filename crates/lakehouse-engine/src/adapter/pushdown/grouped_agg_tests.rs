@@ -1309,7 +1309,7 @@ fn round_pct_over_aggregates() -> serde_json::Value {
             scalar_fn(
                 "FLOAT_DIV",
                 [
-                    scalar_fn("MULT", [lit("literal_double", 100.0), returned]),
+                    scalar_fn("MULT", [lit("literal_double", "100.0"), returned]),
                     count_star(),
                 ],
             ),
@@ -2269,7 +2269,7 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
     let having = compare(
         "predicate_greater",
         agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
-        lit("literal_double", 5.0),
+        lit("literal_double", "5.0"),
     );
     let plans = vec![AggregatePlan {
         kind: AggKind::StddevSamp,

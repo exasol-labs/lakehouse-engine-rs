@@ -123,10 +123,16 @@ pub(crate) fn scan_filter_sql(filter: &impl Tree, col_types: &ColumnTypes) -> Op
     WherePlacement::single_scan(scan_over(col_types), &filter_only_request(filter)).scan_filter(0)
 }
 
+/// A `pushdownRequest` object, parsed as [`AdapterRequest::parse`] parses it.
+pub(crate) fn parse_pushdown(pushdown: &Json) -> Result<PushdownRequest, UdfError> {
+    let request = AdapterRequest::parse(&serde_json::json!({"pushdownRequest": pushdown}))?;
+    Ok(request.pushdown().clone())
+}
+
 /// A `SELECT *` request whose only clause is `filter`.
 pub(crate) fn filter_only_request(filter: &impl Tree) -> PushdownRequest {
     // The placeholder filter only marks the clause, which the map then replaces.
-    PushdownRequest::parse(&serde_json::json!({
+    parse_pushdown(&serde_json::json!({
         "selectListDataTypes": [],
         "filter": {"type": "literal_bool", "value": false},
     }))
@@ -757,7 +763,7 @@ pub(super) fn pair_plan_sql(
 /// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
 /// returns only its JSON or whose select list a test replaced in place.
 pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
-    PushdownRequest::parse(&pd(request)).expect("the fixture declares a valid selectListDataTypes")
+    parse_pushdown(&pd(request)).expect("the fixture declares a valid selectListDataTypes")
 }
 
 /// The aggregate plan the planners build for the select-list `item`, `None` when it declines.
@@ -830,7 +836,7 @@ pub(super) fn project_first_table(
     pushdown_req: &Json,
 ) -> Result<RowProjection, UdfError> {
     project_row(
-        &PushdownRequest::parse(pushdown_req)?,
+        &parse_pushdown(pushdown_req)?,
         &first_table_column_types(request),
     )
 }

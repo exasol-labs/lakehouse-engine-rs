@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use vs_expression::{CompareOp, Expr, Scalar};
+use vs_expression::{CompareOp, Expr};
 
 pub(super) fn holds(op: CompareOp, ordering: Ordering) -> bool {
     match op {
@@ -17,9 +17,8 @@ pub(super) fn column_name(node: &Expr) -> Option<&str> {
 }
 
 /// Exasol reads `''` as NULL, so an empty string constrains nothing.
-pub(super) fn non_empty_str(value: &Scalar) -> Option<&str> {
-    let s = value.as_str()?;
-    (!s.is_empty()).then_some(s)
+pub(super) fn non_empty_str(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// An AND/OR node's operands; `None` when empty, since an empty OR would prune every file.

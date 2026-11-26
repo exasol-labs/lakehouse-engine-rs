@@ -2319,7 +2319,10 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "a selectList with items",
             one_item(),
-            Ok((OutputContract::Items, vec![ExasolType::decimal(20, 0)])),
+            Ok((
+                OutputContract::Items(vec![ast(&table_col("T", "ID"))]),
+                vec![ExasolType::decimal(20, 0)],
+            )),
         ),
         (
             "an absent selectList",
@@ -2351,8 +2354,8 @@ fn select_list_data_types_check_answers_per_request_shape() {
     ];
     for (shape, request, expected) in cases {
         // Unchecked: several shapes are ones Exasol never sends, which the parse must refuse.
-        let parsed = PushdownRequest::parse(&request.build_unchecked().0["pushdownRequest"])
-            .map(|parsed| (parsed.output(), parsed.select_types().to_vec()));
+        let parsed = parse_pushdown(&request.build_unchecked().0["pushdownRequest"])
+            .map(|parsed| (parsed.output().clone(), parsed.select_types().to_vec()));
         match (parsed, expected) {
             (Ok(parsed), Ok(expected)) => assert_eq!(parsed, expected, "{shape}"),
             (Err(UdfError::User(message)), Err(named)) => {
@@ -2454,7 +2457,7 @@ fn involved_column_with_an_unparsable_type_fails() {
     let invalid = serde_json::json!({"type": "char", "size": 2001});
     let cases = [
         (Some(invalid.clone()), invalid.to_string()),
-        (None, "ID declares no dataType".to_string()),
+        (None, "columns[0].dataType is missing".to_string()),
     ];
     for (data_type, named) in cases {
         let (mut request, _) = pushdown_request("T", &[("ID", ExasolType::decimal(20, 0))]).build();
@@ -2558,7 +2561,7 @@ fn parse_drops_constant_sort_keys() {
     // Each literal type the adapter advertises.
     let constants = [
         num_lit(2),
-        lit("literal_double", 1.5),
+        lit("literal_double", "1.5"),
         str_lit("a"),
         null_lit(),
         bool_lit(true),

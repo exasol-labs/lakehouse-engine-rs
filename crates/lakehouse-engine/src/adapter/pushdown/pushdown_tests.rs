@@ -705,7 +705,7 @@ fn dispatch_with(
     logical_schema: Vec<LogicalField>,
     scan_storage: &ScanStorage,
 ) -> Result<Json, UdfError> {
-    let pushdown = PushdownRequest::parse(&pd(request))?;
+    let pushdown = parse_pushdown(&pd(request))?;
     build_dispatch_sql(
         &AdapterRequest::parse(request)?,
         &pushdown,

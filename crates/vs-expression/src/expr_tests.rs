@@ -9,15 +9,22 @@ fn column_names(expr: &Expr) -> Vec<&str> {
 }
 
 #[test]
-fn columns_lists_every_column_in_alphabetical_wire_key_order() {
-    // `arguments` sorts before `basis` and `results`, and an IN list's values before its subject.
+fn columns_lists_every_column_in_the_order_sql_writes_them() {
+    // A CASE lists its basis, each WHEN before its THEN, and the ELSE last.
     let expr = ast(&case_of(
         col("BASIS"),
-        [in_list(col("SUBJECT"), [col("VALUE")])],
-        [scalar_fn("ADD", [table_col("T", "A"), num_lit(1)])],
+        [in_list(col("SUBJECT"), [col("VALUE")]), col("WHEN2")],
+        [
+            scalar_fn("ADD", [table_col("T", "A"), num_lit(1)]),
+            col("THEN2"),
+            col("ELSE"),
+        ],
     ));
 
-    assert_eq!(column_names(&expr), ["VALUE", "SUBJECT", "BASIS", "A"]);
+    assert_eq!(
+        column_names(&expr),
+        ["BASIS", "SUBJECT", "VALUE", "A", "WHEN2", "THEN2", "ELSE"]
+    );
 }
 
 #[test]
@@ -95,35 +102,4 @@ fn conjoin_returns_none_one_conjunct_or_their_and() {
         Expr::conjoin(vec![a.clone(), b.clone()]),
         Some(Expr::And(vec![a, b]))
     );
-}
-
-#[test]
-fn a_literal_without_a_value_is_null() {
-    assert!(Literal::new(LiteralKind::String, Scalar::Null).is_null());
-    assert!(Literal::null().is_null());
-    assert!(!Literal::string("").is_null());
-}
-
-#[test]
-fn a_bool_literal_is_true_only_for_the_spellings_exasol_uses() {
-    for value in [
-        Scalar::Bool(true),
-        Scalar::String("TRUE".into()),
-        Scalar::Number(1.into()),
-    ] {
-        assert!(
-            Literal::new(LiteralKind::Bool, value.clone()).is_true(),
-            "{value:?}"
-        );
-    }
-    for value in [
-        Scalar::Bool(false),
-        Scalar::String("yes".into()),
-        Scalar::Null,
-    ] {
-        assert!(
-            !Literal::new(LiteralKind::Bool, value.clone()).is_true(),
-            "{value:?}"
-        );
-    }
 }

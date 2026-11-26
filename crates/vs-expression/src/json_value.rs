@@ -3,7 +3,7 @@
 use exasol_udf_sdk::error::UdfError;
 
 use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE};
-use crate::expr::{Expr, JsonBehavior, JsonValueCall, LiteralKind, Scalar};
+use crate::expr::{JsonBehavior, JsonValueCall, Literal};
 use crate::scan_typing::decline;
 use crate::short;
 
@@ -77,7 +77,6 @@ pub(crate) enum Fallback {
 }
 
 pub(crate) struct ScanJsonValue<'a> {
-    pub(crate) document: &'a Expr,
     pub(crate) path: &'a str,
     pub(crate) returning: Returning,
     pub(crate) on_empty: Fallback,
@@ -108,7 +107,6 @@ impl<'a> ScanJsonValue<'a> {
             }
         };
         Ok(Self {
-            document: &call.document,
             path,
             returning,
             on_empty: fallback(call.on_empty.as_ref(), returning)?,
@@ -137,23 +135,14 @@ fn fallback(behavior: Option<&JsonBehavior>, returning: Returning) -> Result<Fal
         Some(JsonBehavior::Default(expression)) => expression,
     };
     let fallback = match (expression.as_literal(), returning) {
-        (Some(literal), _) if literal.kind == LiteralKind::Null => Some(Fallback::Null),
-        (Some(literal), Returning::Text { max_chars }) if literal.kind == LiteralKind::String => {
-            literal
-                .value
-                .as_str()
-                .filter(|text| text.chars().count() <= max_chars as usize)
-                .map(|text| match text {
-                    "" => Fallback::Null,
-                    text => Fallback::Text(text.to_string()),
-                })
+        (Some(Literal::Null), _) => Some(Fallback::Null),
+        (Some(Literal::String(text)), Returning::Text { max_chars }) => {
+            (text.chars().count() <= max_chars as usize).then(|| match text.as_str() {
+                "" => Fallback::Null,
+                text => Fallback::Text(text.to_string()),
+            })
         }
-        (Some(literal), Returning::Boolean) if literal.kind == LiteralKind::Bool => {
-            match literal.value {
-                Scalar::Bool(value) => Some(Fallback::Boolean(value)),
-                _ => None,
-            }
-        }
+        (Some(Literal::Bool(value)), Returning::Boolean) => Some(Fallback::Boolean(*value)),
         _ => None,
     };
     fallback.ok_or_else(|| {

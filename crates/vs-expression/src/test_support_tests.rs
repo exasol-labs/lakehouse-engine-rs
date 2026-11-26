@@ -4,7 +4,8 @@
 //! Dependent crates enable `test-support`.
 
 use crate::exasol_type::{ExasolType, exasol_type_to_json};
-use crate::{Column, ColumnTypeLookup, Expr, Literal, LiteralKind, Scalar, parse_expression};
+use crate::parse::parse_expression;
+use crate::{Column, ColumnTypeLookup, Expr, Literal};
 use serde_json::{Map, Value as Json, json};
 
 /// Column types by name, matched case-insensitively. The default knows no column.
@@ -80,8 +81,14 @@ pub fn lit(kind: &str, value: impl Into<Json>) -> Json {
     node(kind, [("value", value.into())])
 }
 
+/// Exasol sends a number's digits as a string, so a number given here is written as one.
 pub fn num_lit(value: impl Into<Json>) -> Json {
-    lit("literal_exactnumeric", value)
+    let digits = match value.into() {
+        Json::Number(number) => number.to_string(),
+        Json::String(digits) => digits,
+        other => panic!("{other} is no numeric literal value"),
+    };
+    lit("literal_exactnumeric", digits)
 }
 
 pub fn str_lit(value: &str) -> Json {
@@ -107,18 +114,18 @@ pub fn timestamp_lit(value: &str) -> Json {
 /// A hex literal retyped as bytes, as the binary-filter rewrite writes it.
 /// Exasol never sends one, so it is built as a tree, not parsed from a node.
 pub fn binary_lit(hex: &str) -> Expr {
-    Expr::Literal(Literal::new(
-        LiteralKind::Binary { width: None },
-        Scalar::String(hex.into()),
-    ))
+    Expr::Literal(Literal::Binary {
+        hex: hex.into(),
+        width: None,
+    })
 }
 
 /// [`binary_lit`] for a fixed-length binary column `width` bytes wide.
 pub fn fixed_binary_lit(hex: &str, width: u64) -> Expr {
-    Expr::Literal(Literal::new(
-        LiteralKind::Binary { width: Some(width) },
-        Scalar::String(hex.into()),
-    ))
+    Expr::Literal(Literal::Binary {
+        hex: hex.into(),
+        width: Some(width),
+    })
 }
 
 pub fn compare(kind: &str, left: Json, right: Json) -> Json {

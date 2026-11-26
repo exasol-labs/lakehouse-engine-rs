@@ -334,7 +334,7 @@ pub(super) fn leg_columns_named_in<'a>(
 /// fan-out whose clauses name none, so its first leg then emits one placeholder, never its row,
 /// which may hold a refused column.
 pub(super) fn fan_out_emission(
-    output: OutputContract,
+    output: &OutputContract,
     above: &[&Expr],
     legs: &JoinLegs,
     scanned: &[(usize, &ColumnTypes)],
@@ -344,7 +344,7 @@ pub(super) fn fan_out_emission(
         .iter()
         .map(|&(leg, cols)| match output {
             OutputContract::WholeRow => cols.named(|_| true),
-            OutputContract::AnyOneColumn | OutputContract::Items => {
+            OutputContract::AnyOneColumn | OutputContract::Items(_) => {
                 let named = leg_columns_named_in(above.iter().copied(), legs, leg, cols);
                 cols.named(|column| named.get(column).is_some())
             }
@@ -360,7 +360,7 @@ pub(super) fn fan_out_emission(
 
 /// [`fan_out_emission`] of a fan-out that scans the one leg `leg`.
 pub(super) fn leg_emission(
-    output: OutputContract,
+    output: &OutputContract,
     above: &[&Expr],
     legs: &JoinLegs,
     leg: usize,

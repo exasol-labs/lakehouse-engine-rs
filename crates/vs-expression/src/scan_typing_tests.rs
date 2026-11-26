@@ -4,13 +4,6 @@ use crate::test_support::*;
 use crate::{CHECKED_INT_DIV_FN, SqlFragment};
 use serde_json::Value as Json;
 
-/// Compares a typed tree with the request node of the tree it should equal.
-impl PartialEq<Json> for Expr {
-    fn eq(&self, other: &Json) -> bool {
-        *self == ast(other)
-    }
-}
-
 fn columns() -> TypedColumns {
     typed_columns(&[
         ("D", ExasolType::Date),
@@ -941,23 +934,19 @@ fn a_fractional_function_of_integers_is_not_integer_text() {
 }
 
 fn type_of(expr: &Json) -> Inferred {
-    let ty = ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
-        .type_scan_tree(&ast(expr))
-        .unwrap()
-        .1;
-    assert_eq!(
-        ScanTyping::new(&columns(), ExasolVersion::Exasol2025).infer_type(&ast(expr)),
-        ty,
-        "{expr}"
-    );
+    let columns = columns();
+    let typing = ScanTyping::new(&columns, ExasolVersion::Exasol2025);
+    let ty = typing.infer_type(&ast(expr));
+    // The pass that writes the SQL types every node it renders the same way.
+    if let Ok((_, scan_type)) = typing.type_scan_tree(&ast(expr)) {
+        assert_eq!(scan_type, ty, "{expr}");
+    }
     ty
 }
 
-fn typed(expr: &Json) -> Expr {
-    ScanTyping::new(&columns(), ExasolVersion::Exasol2025)
-        .type_scan_tree(&ast(expr))
-        .unwrap()
-        .0
+/// The scan SQL of `expr`, which must render.
+fn scan_sql(expr: &Json) -> String {
+    render(expr).unwrap_or_else(|err| panic!("{expr} must render: {err:?}"))
 }
 
 /// A `TIMESTAMP(precision)` whose values hold `digits` fractional digits.
@@ -1251,24 +1240,13 @@ fn version_dependent_forms_take_each_versions_type() {
 #[test]
 fn exasol_8_brings_a_timestamp_after_a_date_to_the_date() {
     let expr = case_when([col("B")], [col("D"), col("TS3")]);
-    let typed = ScanTyping::new(&columns(), ExasolVersion::Exasol8)
-        .type_scan_tree(&ast(&expr))
+    let sql = ScanTyping::new(&columns(), ExasolVersion::Exasol8)
+        .render_expression(&ast(&expr))
         .unwrap()
-        .0;
-    let Expr::Case(case) = typed else {
-        panic!("a CASE types as a CASE: {typed:?}");
-    };
-    assert_eq!(case.results[0], col("D"));
-    assert!(
-        matches!(
-            case.results[1],
-            Expr::Cast {
-                target: ExasolType::Date,
-                ..
-            }
-        ),
-        "{:?}",
-        case.results[1]
+        .sql;
+    assert_eq!(
+        sql,
+        r#"(CASE WHEN "B" THEN "D" ELSE CAST("TS3" AS DATE) END)"#
     );
 }
 
@@ -1622,26 +1600,17 @@ fn a_date_addition_computes_in_the_unit_that_holds_its_argument() {
 #[test]
 fn overprecise_timestamp_literal_is_floored_to_the_column_precision() {
     let lit = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
+    let floor = scan_sql(&timestamp_lit("2025-06-01 00:00:00.123"));
+    let column = r#""TS3""#;
     for (op, mirrored, want_op, want_right) in [
-        ("predicate_equal", false, "predicate_notequal", col("TS3")),
-        ("predicate_notequal", false, "predicate_equal", col("TS3")),
-        ("predicate_less", false, "predicate_lessequal", floor()),
-        ("predicate_lessequal", false, "predicate_lessequal", floor()),
-        ("predicate_greater", false, "predicate_greater", floor()),
-        (
-            "predicate_greaterequal",
-            false,
-            "predicate_greater",
-            floor(),
-        ),
-        ("predicate_less", true, "predicate_greater", floor()),
-        (
-            "predicate_greaterequal",
-            true,
-            "predicate_lessequal",
-            floor(),
-        ),
+        ("predicate_equal", false, "<>", column),
+        ("predicate_notequal", false, "=", column),
+        ("predicate_less", false, "<=", floor.as_str()),
+        ("predicate_lessequal", false, "<=", floor.as_str()),
+        ("predicate_greater", false, ">", floor.as_str()),
+        ("predicate_greaterequal", false, ">", floor.as_str()),
+        ("predicate_less", true, ">", floor.as_str()),
+        ("predicate_greaterequal", true, "<=", floor.as_str()),
     ] {
         let filter = if mirrored {
             compare(op, lit(), col("TS3"))
@@ -1649,8 +1618,8 @@ fn overprecise_timestamp_literal_is_floored_to_the_column_precision() {
             compare(op, col("TS3"), lit())
         };
         assert_eq!(
-            typed(&filter),
-            compare(want_op, col("TS3"), want_right),
+            scan_sql(&filter),
+            format!("({column} {want_op} {want_right})"),
             "{op} mirrored={mirrored}"
         );
     }
@@ -1664,8 +1633,12 @@ fn timestamp_literal_within_the_operand_precision_is_unchanged() {
         ("TS9", "2025-06-01 00:00:00.123456789"),
         ("TS0", "2025-06-01 00:00:00"),
     ] {
-        let filter = predicate_equal(col(column), timestamp_lit(value));
-        assert_eq!(typed(&filter), filter, "{column} = {value}");
+        let literal = timestamp_lit(value);
+        assert_eq!(
+            scan_sql(&predicate_equal(col(column), literal.clone())),
+            format!(r#"("{column}" = {})"#, scan_sql(&literal)),
+            "{column} = {value}"
+        );
     }
 }
 
@@ -1673,120 +1646,125 @@ fn timestamp_literal_within_the_operand_precision_is_unchanged() {
 fn between_and_in_with_an_overprecise_timestamp_expand_to_floored_comparisons() {
     let fits = || timestamp_lit("2025-06-01 00:00:00.122");
     let over = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
+    let fits_sql = scan_sql(&fits());
+    let floor_sql = scan_sql(&timestamp_lit("2025-06-01 00:00:00.123"));
 
     assert_eq!(
-        typed(&between(col("TS3"), fits(), over())),
-        and([
-            compare("predicate_greaterequal", col("TS3"), fits()),
-            compare("predicate_lessequal", col("TS3"), floor())
-        ])
+        scan_sql(&between(col("TS3"), fits(), over())),
+        format!(r#"(("TS3" >= {fits_sql}) AND ("TS3" <= {floor_sql}))"#)
     );
     assert_eq!(
-        typed(&in_list(col("TS3"), [over(), fits()])),
-        or([
-            compare("predicate_notequal", col("TS3"), col("TS3")),
-            predicate_equal(col("TS3"), fits())
-        ])
+        scan_sql(&in_list(col("TS3"), [over(), fits()])),
+        format!(r#"(("TS3" <> "TS3") OR ("TS3" = {fits_sql}))"#)
     );
-    let fitting_in = in_list(col("TS3"), [fits()]);
-    assert_eq!(typed(&fitting_in), fitting_in);
+    assert_eq!(
+        scan_sql(&in_list(col("TS3"), [fits()])),
+        format!(r#"("TS3" IN ({fits_sql}))"#)
+    );
 }
 
 #[test]
 fn overprecise_timestamp_literal_against_a_date_addition_is_floored_to_its_precision() {
     let call = || scalar_fn("ADD_HOURS", [col("D"), num_lit(1)]);
-    // The typed pass casts the call's first argument to the type it computes in.
-    let typed_call = || {
-        scalar_fn(
-            "ADD_HOURS",
-            [cast_to(ExasolType::Date, col("D")), num_lit(1)],
-        )
-    };
     let over = || timestamp_lit("2024-01-01 01:00:00.0000001");
-    let floor = || timestamp_lit("2024-01-01 01:00:00");
     let fits = || timestamp_lit("2024-01-02 01:00:00");
-    let never_equal = || compare("predicate_notequal", typed_call(), typed_call());
+    // The call renders as it does alone: only the comparison around it changes.
+    let call_sql = scan_sql(&call());
+    assert_eq!(call_sql, r#"vs_add_hours(CAST("D" AS DATE), 1)"#);
+    let floor_sql = scan_sql(&timestamp_lit("2024-01-01 01:00:00"));
+    let fits_sql = scan_sql(&fits());
+    let never_equal = format!("({call_sql} <> {call_sql})");
 
     for (shape, filter, expected) in [
-        ("=", predicate_equal(call(), over()), never_equal()),
-        ("= mirrored", predicate_equal(over(), call()), never_equal()),
+        ("=", predicate_equal(call(), over()), never_equal.clone()),
+        (
+            "= mirrored",
+            predicate_equal(over(), call()),
+            never_equal.clone(),
+        ),
         (
             "= a literal finer than the TIMESTAMP(0) result",
             predicate_equal(call(), timestamp_lit("2024-01-01 01:00:00.123456")),
-            never_equal(),
+            never_equal.clone(),
         ),
         (
             ">=",
             compare("predicate_greaterequal", call(), over()),
-            compare("predicate_greater", typed_call(), floor()),
+            format!("({call_sql} > {floor_sql})"),
         ),
         (
             ">= mirrored",
             compare("predicate_greaterequal", over(), call()),
-            compare("predicate_lessequal", typed_call(), floor()),
+            format!("({call_sql} <= {floor_sql})"),
         ),
         (
             "BETWEEN",
             between(call(), over(), fits()),
-            and([
-                compare("predicate_greater", typed_call(), floor()),
-                compare("predicate_lessequal", typed_call(), fits()),
-            ]),
+            format!("(({call_sql} > {floor_sql}) AND ({call_sql} <= {fits_sql}))"),
         ),
         (
             "IN",
             in_list(call(), [over(), fits()]),
-            or([never_equal(), predicate_equal(typed_call(), fits())]),
+            format!("({never_equal} OR ({call_sql} = {fits_sql}))"),
+        ),
+        (
+            "= a literal that fits",
+            predicate_equal(call(), fits()),
+            format!("({call_sql} = {fits_sql})"),
+        ),
+        (
+            "= a literal that fits, mirrored",
+            predicate_equal(fits(), call()),
+            format!("({fits_sql} = {call_sql})"),
+        ),
+        (
+            ">= a literal that fits",
+            compare("predicate_greaterequal", call(), fits()),
+            format!("({call_sql} >= {fits_sql})"),
+        ),
+        (
+            "BETWEEN literals that fit",
+            between(call(), fits(), fits()),
+            format!("({call_sql} BETWEEN {fits_sql} AND {fits_sql})"),
+        ),
+        (
+            "IN a literal that fits",
+            in_list(call(), [fits()]),
+            format!("({call_sql} IN ({fits_sql}))"),
         ),
     ] {
-        assert_eq!(typed(&filter), expected, "{shape}");
+        assert_eq!(scan_sql(&filter), expected, "{shape}");
     }
 
     // ADD_MINUTES over a DATE is a TIMESTAMP(0); ADD_DAYS and ADD_WEEKS are a DATE, which
     // compares at the literal's unit.
+    let over_sql = scan_sql(&over());
     for (name, floored) in [
         ("ADD_MINUTES", true),
         ("ADD_DAYS", false),
         ("ADD_WEEKS", false),
     ] {
-        let typed_call = scalar_fn(name, [cast_to(ExasolType::Date, col("D")), num_lit(1)]);
+        let call = scalar_fn(name, [col("D"), num_lit(1)]);
+        let call_sql = scan_sql(&call);
         let expected = if floored {
-            compare("predicate_notequal", typed_call.clone(), typed_call)
+            format!("({call_sql} <> {call_sql})")
         } else {
-            predicate_equal(cast_to(ExasolType::timestamp(9), typed_call), over())
+            format!("(CAST({call_sql} AS TIMESTAMP(9)) = {over_sql})")
         };
-        assert_eq!(
-            typed(&predicate_equal(
-                scalar_fn(name, [col("D"), num_lit(1)]),
-                over()
-            )),
-            expected,
-            "{name}"
-        );
+        assert_eq!(scan_sql(&predicate_equal(call, over())), expected, "{name}");
     }
 
-    let unchanged: [fn(Json, Json) -> Json; 5] = [
-        |call, literal| predicate_equal(call, literal),
-        |call, literal| predicate_equal(literal, call),
-        |call, literal| compare("predicate_greaterequal", call, literal),
-        |call, literal| between(call, literal.clone(), literal),
-        |call, literal| in_list(call, [literal]),
-    ];
-    for shape in unchanged {
-        let expected = shape(typed_call(), fits());
-        assert_eq!(typed(&shape(call(), fits())), expected, "{expected}");
-    }
-    let nanosecond_call = |argument| scalar_fn("ADD_DAYS", [argument, num_lit(1)]);
-    let nanosecond_literal = || timestamp_lit("2024-01-02 00:00:00.000000001");
+    let nanosecond_call = scalar_fn("ADD_DAYS", [col("TS9"), num_lit(1)]);
+    let nanosecond_literal = timestamp_lit("2024-01-02 00:00:00.000000001");
     assert_eq!(
-        typed(&predicate_equal(
-            nanosecond_call(col("TS9")),
-            nanosecond_literal()
+        scan_sql(&predicate_equal(
+            nanosecond_call.clone(),
+            nanosecond_literal.clone()
         )),
-        predicate_equal(
-            nanosecond_call(cast_to(ExasolType::timestamp(9), col("TS9"))),
-            nanosecond_literal()
+        format!(
+            "({} = {})",
+            scan_sql(&nanosecond_call),
+            scan_sql(&nanosecond_literal)
         )
     );
 }
@@ -1798,19 +1776,13 @@ fn a_literal_against_a_unified_timestamp_is_floored_to_the_unified_precision() {
         case_when([col("B")], [col("TS0"), col("TS3")]),
         timestamp_lit("2024-01-01 00:00:00.0005"),
     );
-    let typed_union = case_when(
-        [col("B")],
-        [
-            cast_to(ExasolType::timestamp(3), col("TS0")),
-            cast_to(ExasolType::timestamp(3), col("TS3")),
-        ],
-    );
+    let union =
+        r#"(CASE WHEN "B" THEN CAST("TS0" AS TIMESTAMP(3)) ELSE CAST("TS3" AS TIMESTAMP(3)) END)"#;
     assert_eq!(
-        typed(&filter),
-        compare(
-            "predicate_greater",
-            typed_union,
-            timestamp_lit("2024-01-01 00:00:00.000")
+        scan_sql(&filter),
+        format!(
+            "({union} > {})",
+            scan_sql(&timestamp_lit("2024-01-01 00:00:00.000"))
         )
     );
 }
@@ -2149,42 +2121,4 @@ fn string_function_numeric_arguments_convert_to_int64() {
         );
     }
     assert!(render(&scalar_fn("LPAD", [col("S"), col("UNKNOWN")])).is_err());
-}
-
-#[test]
-fn every_typed_child_resolves_through_slot() {
-    let nodes = [
-        ast(&and([col("A"), col("B")])),
-        ast(&or([col("A"), col("B")])),
-        ast(&scalar_fn("ABS", [col("A")])),
-        ast(&agg_item_expr("SUM", col("A"), false)),
-        ast(&extract("YEAR", col("A"))),
-        ast(&cast_to(ExasolType::Date, col("A"))),
-        ast(&json_value(col("A"), "$.a")),
-        ast(&case_when(
-            [predicate_equal(col("A"), num_lit(1))],
-            [str_lit("x"), str_lit("y")],
-        )),
-        ast(&case_of(col("A"), [num_lit(1)], [str_lit("x")])),
-        ast(&in_list(col("A"), [num_lit(1), num_lit(2)])),
-        ast(&not(col("A"))),
-        ast(&is_null(col("A"))),
-        ast(&is_not_null(col("A"))),
-        ast(&between(col("A"), num_lit(1), num_lit(2))),
-        ast(&like(col("A"), "x%")),
-        ast(&predicate_equal(col("A"), col("B"))),
-        Expr::scan(ScanKind::BooleanNumber, ast(&col("A"))),
-    ];
-    for node in nodes {
-        let children = typed_children(&node);
-        assert!(!children.is_empty(), "{node:?}");
-        for (field, index, child) in children {
-            let mut copy = node.clone();
-            assert_eq!(
-                slot(&mut copy, field, index).as_deref(),
-                Some(child),
-                "{field:?}[{index:?}] of {node:?}"
-            );
-        }
-    }
 }

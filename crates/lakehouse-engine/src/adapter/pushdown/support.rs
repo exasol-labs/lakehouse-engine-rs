@@ -704,7 +704,7 @@ pub(super) fn project_columns(
             let one = emitted.projection().into_iter().take(1).collect();
             return Ok(RowProjection::Direct(one));
         }
-        OutputContract::Items => pushdown.select_items().unwrap_or_default(),
+        OutputContract::Items(items) => items,
     };
 
     let mut projected = Vec::with_capacity(list.len());
@@ -774,7 +774,7 @@ fn is_pushable_expression_node(node: &Expr) -> bool {
         | Expr::Between { .. }
         | Expr::IsNull(_)
         | Expr::IsNotNull(_) => true,
-        Expr::Literal(_) | Expr::Column(_) | Expr::Aggregate(_) | Expr::Scan(_) => false,
+        Expr::Literal(_) | Expr::Column(_) | Expr::Aggregate(_) => false,
     }
 }
 

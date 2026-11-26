@@ -1,7 +1,7 @@
 use crate::types::exasol_type::ExasolType;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
-use vs_expression::{CompareOp, Expr, LiteralKind};
+use vs_expression::{CompareOp, Expr};
 
 use super::super::request::OutputContract;
 use super::super::support::ColumnTypes;
@@ -29,7 +29,7 @@ pub(super) struct JoinGraph<'a> {
     pub conjuncts: &'a [WhereConjunct<'a>],
     /// The select list, `GROUP BY`, `HAVING`, and `ORDER BY`.
     pub above: &'a [&'a Expr],
-    pub output: OutputContract,
+    pub output: &'a OutputContract,
     /// Exasol postprocessing: the request aggregates, groups, or carries a HAVING.
     pub aggregates: bool,
     pub max_bytes: u64,
@@ -94,7 +94,7 @@ fn eligible(graph: &JoinGraph<'_>, pair: &LegGroup) -> bool {
 /// The dimension columns Exasol reads over `plan`: those of the clauses above it, of the join
 /// conditions the pair's scan does not run, and of the conjuncts left for Exasol's WHERE.
 fn dimension_reads(graph: &JoinGraph<'_>, plan: &JoinPlan, dimension: usize) -> ColumnTypes {
-    if graph.output == OutputContract::WholeRow {
+    if *graph.output == OutputContract::WholeRow {
         return graph.columns[dimension].narrowed(|_| true);
     }
     let filter = Expr::conjoin(graph.conjuncts.iter().map(|c| c.tree.clone()).collect());
@@ -138,10 +138,7 @@ fn width_bounded(graph: &JoinGraph<'_>, dimension: usize, read: &ColumnTypes) ->
 /// `col IN ('x', 'y')`, limits to string literals. Exasol applies a declined one only after the
 /// fan-out has emitted the column, so it bounds nothing.
 fn literal_bounded_columns(graph: &JoinGraph<'_>, leg: usize) -> HashSet<String> {
-    let is_literal = |node: &Expr| {
-        node.as_literal()
-            .is_some_and(|literal| literal.kind == LiteralKind::String)
-    };
+    let is_literal = |node: &Expr| node.as_string_literal().is_some();
     let leg_column = |node: &Expr| {
         node.as_column()
             .filter(|column| graph.legs.leg(column) == leg)

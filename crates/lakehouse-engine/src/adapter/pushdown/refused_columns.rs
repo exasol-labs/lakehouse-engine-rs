@@ -28,7 +28,7 @@ pub(super) fn ensure_no_refused_column_referenced(
                     .map(|column| column.column_name.to_uppercase()),
             );
         }
-        OutputContract::AnyOneColumn | OutputContract::Items => {}
+        OutputContract::AnyOneColumn | OutputContract::Items(_) => {}
     }
 
     ensure_no_touched_column_is_refused(&touched, refused)

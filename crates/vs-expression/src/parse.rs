@@ -1,5 +1,6 @@
-//! The one reader of a pushdown request's expression JSON. A node the [`Expr`] model cannot
-//! represent fails here, with an error that names its field, so no renderer or planner meets one.
+//! The reader of a pushdown request's JSON, crate-private so that [`crate::parse_request`] is the
+//! only way in. A node the [`Expr`] model cannot represent fails here, with an error that names its
+//! field, so no renderer or planner meets one.
 
 use exasol_udf_sdk::error::UdfError;
 use serde_json::{Map, Value as Json};
@@ -7,22 +8,23 @@ use serde_json::{Map, Value as Json};
 use crate::exasol_type::{ExasolType, exasol_type_from_json};
 use crate::expr::{
     AggregateCall, CaseExpr, Column, CompareOp, Expr, JsonBehavior, JsonValueCall, Literal,
-    LiteralKind, Scalar, ScalarCall,
+    ScalarCall,
 };
 
 /// The node at `path` of the pushdown request, such as `filter` or `selectList[2]`.
-pub fn parse_expression(node: &Json, path: &str) -> Result<Expr, UdfError> {
+pub(crate) fn parse_expression(node: &Json, path: &str) -> Result<Expr, UdfError> {
     RequestNode::at(node, path)?.expr()
 }
 
 /// A malformed request: what is wrong with the field at `path`.
-pub fn invalid_field(path: &str, problem: &str) -> UdfError {
+fn invalid_field(path: &str, problem: &str) -> UdfError {
     UdfError::User(format!("the pushdown request's {path} {problem}"))
 }
 
 /// One JSON object of the request and where it sits; every field it reads fails naming its path.
-/// The request root sits at the empty path, so its fields read by their bare key.
-pub struct RequestNode<'a> {
+/// The request root sits at the empty path, so its fields read by their bare key. No accessor
+/// hands out the JSON itself, so a caller reads a field only as a checked value.
+pub(crate) struct RequestNode<'a> {
     map: &'a Map<String, Json>,
     path: String,
 }
@@ -33,7 +35,7 @@ impl<'a> RequestNode<'a> {
     }
 
     /// The object `node` at `path`, such as `from` or `orderBy[0]`.
-    pub fn object(node: &'a Json, path: &str) -> Result<Self, UdfError> {
+    pub(crate) fn object(node: &'a Json, path: &str) -> Result<Self, UdfError> {
         Self::of(node, path, "is not an object")
     }
 
@@ -54,21 +56,21 @@ impl<'a> RequestNode<'a> {
         }
     }
 
-    pub fn invalid(&self, key: &str, problem: &str) -> UdfError {
+    pub(crate) fn invalid(&self, key: &str, problem: &str) -> UdfError {
         invalid_field(&self.field_path(key), problem)
     }
 
     /// `None` for an absent or JSON-null field.
-    pub fn get(&self, key: &str) -> Option<&'a Json> {
+    fn get(&self, key: &str) -> Option<&'a Json> {
         self.map.get(key).filter(|value| !value.is_null())
     }
 
-    pub fn text(&self, key: &str) -> Result<&'a str, UdfError> {
+    pub(crate) fn text(&self, key: &str) -> Result<&'a str, UdfError> {
         self.optional_text(key)?
             .ok_or_else(|| self.invalid(key, "is missing"))
     }
 
-    pub fn optional_text(&self, key: &str) -> Result<Option<&'a str>, UdfError> {
+    pub(crate) fn optional_text(&self, key: &str) -> Result<Option<&'a str>, UdfError> {
         match self.get(key) {
             None => Ok(None),
             Some(Json::String(text)) => Ok(Some(text)),
@@ -76,7 +78,7 @@ impl<'a> RequestNode<'a> {
         }
     }
 
-    pub fn flag(&self, key: &str) -> Result<bool, UdfError> {
+    pub(crate) fn flag(&self, key: &str) -> Result<bool, UdfError> {
         match self.get(key) {
             None => Err(self.invalid(key, "is missing")),
             Some(Json::Bool(value)) => Ok(*value),
@@ -85,7 +87,7 @@ impl<'a> RequestNode<'a> {
     }
 
     /// `None` when the field is absent.
-    pub fn whole_number(&self, key: &str) -> Result<Option<u64>, UdfError> {
+    pub(crate) fn whole_number(&self, key: &str) -> Result<Option<u64>, UdfError> {
         self.get(key)
             .map(|value| {
                 value
@@ -96,19 +98,27 @@ impl<'a> RequestNode<'a> {
     }
 
     /// The object at `key`, which must be present.
-    pub fn field(&self, key: &str) -> Result<Self, UdfError> {
+    pub(crate) fn field(&self, key: &str) -> Result<Self, UdfError> {
         self.optional_field(key)?
             .ok_or_else(|| self.invalid(key, "is missing"))
     }
 
-    pub fn optional_field(&self, key: &str) -> Result<Option<Self>, UdfError> {
+    pub(crate) fn optional_field(&self, key: &str) -> Result<Option<Self>, UdfError> {
         self.get(key)
             .map(|value| Self::object(value, &self.field_path(key)))
             .transpose()
     }
 
+    /// The object at `key` as a request root of its own, so its fields read by their bare key.
+    pub(crate) fn root(&self, key: &str) -> Result<Self, UdfError> {
+        Ok(Self {
+            map: self.field(key)?.map,
+            path: String::new(),
+        })
+    }
+
     /// The objects of the array at `key`; an absent array is empty.
-    pub fn objects(&self, key: &str) -> Result<Vec<Self>, UdfError> {
+    pub(crate) fn objects(&self, key: &str) -> Result<Vec<Self>, UdfError> {
         self.array(key)?
             .iter()
             .enumerate()
@@ -116,7 +126,7 @@ impl<'a> RequestNode<'a> {
             .collect()
     }
 
-    pub fn child(&self, key: &str) -> Result<Expr, UdfError> {
+    pub(crate) fn child(&self, key: &str) -> Result<Expr, UdfError> {
         let value = self
             .get(key)
             .ok_or_else(|| self.invalid(key, "is missing"))?;
@@ -127,19 +137,24 @@ impl<'a> RequestNode<'a> {
         self.child(key).map(Box::new)
     }
 
-    pub fn optional_child(&self, key: &str) -> Result<Option<Expr>, UdfError> {
+    pub(crate) fn optional_child(&self, key: &str) -> Result<Option<Expr>, UdfError> {
         self.get(key)
             .map(|value| parse_expression(value, &self.field_path(key)))
             .transpose()
     }
 
     /// The expressions of the array at `key`; an absent array is empty.
-    pub fn list(&self, key: &str) -> Result<Vec<Expr>, UdfError> {
+    pub(crate) fn list(&self, key: &str) -> Result<Vec<Expr>, UdfError> {
         self.array(key)?
             .iter()
             .enumerate()
             .map(|(i, item)| parse_expression(item, &format!("{}[{i}]", self.field_path(key))))
             .collect()
+    }
+
+    /// [`Self::list`], `None` for an absent array, which an empty one is not.
+    pub(crate) fn optional_list(&self, key: &str) -> Result<Option<Vec<Expr>>, UdfError> {
+        self.get(key).map(|_| self.list(key)).transpose()
     }
 
     fn array(&self, key: &str) -> Result<&'a [Json], UdfError> {
@@ -166,17 +181,37 @@ impl<'a> RequestNode<'a> {
         }
     }
 
-    fn data_type(&self, key: &str) -> Result<ExasolType, UdfError> {
+    pub(crate) fn data_type(&self, key: &str) -> Result<ExasolType, UdfError> {
         let value = self
             .get(key)
             .ok_or_else(|| self.invalid(key, "is missing"))?;
         exasol_type_from_json(value).map_err(|err| self.invalid(key, &format!("is invalid: {err}")))
     }
 
+    /// The types of the `dataType` array at `key`, `None` for an absent array.
+    pub(crate) fn optional_data_types(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<ExasolType>>, UdfError> {
+        if self.get(key).is_none() {
+            return Ok(None);
+        }
+        self.array(key)?
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                exasol_type_from_json(entry).map_err(|err| {
+                    self.invalid(&format!("{key}[{i}]"), &format!("is invalid: {err}"))
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+
     fn expr(&self) -> Result<Expr, UdfError> {
         let kind = self.text("type")?;
-        if let Some(kind) = literal_kind(kind) {
-            return self.literal(kind);
+        if let Some(literal) = self.literal(kind)? {
+            return Ok(Expr::Literal(literal));
         }
         if let Some(op) = compare_op(kind) {
             return Ok(Expr::compare(op, self.child("left")?, self.child("right")?));
@@ -232,15 +267,24 @@ impl<'a> RequestNode<'a> {
         })
     }
 
-    fn literal(&self, kind: LiteralKind) -> Result<Expr, UdfError> {
-        let value = match self.get("value") {
-            None => Scalar::Null,
-            Some(Json::Bool(value)) => Scalar::Bool(*value),
-            Some(Json::Number(number)) => Scalar::Number(number.clone()),
-            Some(Json::String(text)) => Scalar::String(text.clone()),
-            Some(_) => return Err(self.invalid("value", "is not a scalar")),
+    /// The literal of node type `kind`, `None` for any other node type.
+    fn literal(&self, kind: &str) -> Result<Option<Literal>, UdfError> {
+        let text = |literal: fn(String) -> Literal| {
+            let value = self.text("value")?;
+            Ok(Some(literal(value.to_string())))
         };
-        Ok(Expr::Literal(Literal::new(kind, value)))
+        match kind {
+            "literal_null" => Ok(Some(Literal::Null)),
+            "literal_bool" => Ok(Some(Literal::Bool(self.flag("value")?))),
+            "literal_string" => text(Literal::String),
+            "literal_double" => text(Literal::Double),
+            "literal_exactnumeric" => text(Literal::ExactNumeric),
+            "literal_date" => text(Literal::Date),
+            "literal_timestamp" => text(Literal::Timestamp),
+            "literal_timestamp_utc" => text(Literal::TimestampUtc),
+            "literal_timestamputc" => text(Literal::LocalTimeZoneTimestamp),
+            _ => Ok(None),
+        }
     }
 
     /// Exasol may send a CAST as a `function_scalar` named `CAST`, beside `function_scalar_cast`.
@@ -309,21 +353,6 @@ impl<'a> RequestNode<'a> {
             }
         }))
     }
-}
-
-fn literal_kind(kind: &str) -> Option<LiteralKind> {
-    Some(match kind {
-        "literal_null" => LiteralKind::Null,
-        "literal_bool" => LiteralKind::Bool,
-        "literal_string" => LiteralKind::String,
-        "literal_double" => LiteralKind::Double,
-        "literal_exactnumeric" => LiteralKind::ExactNumeric,
-        "literal_date" => LiteralKind::Date,
-        "literal_timestamp" => LiteralKind::Timestamp,
-        "literal_timestamp_utc" => LiteralKind::TimestampUtc,
-        "literal_timestamputc" => LiteralKind::LocalTimeZoneTimestamp,
-        _ => return None,
-    })
 }
 
 fn compare_op(kind: &str) -> Option<CompareOp> {

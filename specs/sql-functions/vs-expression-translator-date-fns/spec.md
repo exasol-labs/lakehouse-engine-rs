@@ -35,7 +35,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `EXTRACT(<FIELD> FROM <source_sql>)` with the field name rendered as a bare keyword, NOT single-quoted, and the source rendered recursively in the Exasol dialect
 * *AND* the rendered fragment MUST NOT contain `date_part`, because Exasol has no `DATE_PART` function and the fragment is parsed by Exasol's own core engine (`function or script DATE_PART not found`, SQL code 42000)
-* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or `The untyped DataFusion walker declines SECOND` in `sql-functions/vs-expression-translator-second` for a `SECOND` field
+* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or the scenarios of `sql-functions/vs-expression-translator-second` for a `SECOND` field
 
 ### Scenario: Field-shortcut date functions translate to date_part of the matching field
 
@@ -50,7 +50,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<arg_sql>)` using the function's own uppercased Exasol name, with the argument rendered recursively in the Exasol dialect
 * *AND* the rendered fragment MUST NOT contain `date_part`
-* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or `The untyped DataFusion walker declines SECOND` in `sql-functions/vs-expression-translator-second` for `SECOND`
+* *AND* the DataFusion-dialect rendering of the same node SHALL follow the preceding scenario, or the scenarios of `sql-functions/vs-expression-translator-second` for `SECOND`
 
 ### Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
 

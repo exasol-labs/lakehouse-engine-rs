@@ -222,7 +222,7 @@ fn render_pair(
 /// What the pair's fan-out emits per leg, empty for a leg outside it: the columns `above` names,
 /// or one join key of its first leg in FROM-tree order when they name none.
 fn pair_emission(
-    output: OutputContract,
+    output: &OutputContract,
     above: &[&Expr],
     legs: &JoinLegs,
     sides: &[ResolvedJoinSide],
@@ -338,7 +338,7 @@ fn n_scan_join_select_items(
             let row = n_full_row_items(emitted, naming);
             return Ok(row.into_iter().take(1).collect());
         }
-        OutputContract::Items => pushdown.select_items().unwrap_or_default(),
+        OutputContract::Items(items) => items,
     };
     let cols_per_leg: Vec<&ColumnTypes> = emitted.iter().map(Emitted::columns).collect();
     let fragments = list

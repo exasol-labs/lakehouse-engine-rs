@@ -89,7 +89,7 @@ fn a_leg_without_an_identifier_note_is_err() {
         .remove("adapterNotes");
     let err = detect_join(
         &adapter_request(&request),
-        &PushdownRequest::parse(&request["pushdownRequest"]).expect("the request parses"),
+        &parse_pushdown(&request["pushdownRequest"]).expect("the request parses"),
     )
     .expect_err("LINEITEM has no note: must be Err, not a decline");
     let message = err.to_string();

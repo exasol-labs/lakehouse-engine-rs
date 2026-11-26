@@ -113,11 +113,10 @@ pub(super) fn broadcast_serves_window(
         JoinWindowPlan::BroadcastUnservable => false,
         JoinWindowPlan::Unbounded | JoinWindowPlan::BareLimit(_) => true,
         JoinWindowPlan::Ordered { keys, .. } => {
-            let projected: Vec<_> = match pushdown.output() {
+            let projected: Vec<_> = match qualified.output() {
                 OutputContract::WholeRow => return true,
-                OutputContract::AnyOneColumn | OutputContract::Items => qualified
-                    .select_items()
-                    .unwrap_or_default()
+                OutputContract::AnyOneColumn => Vec::new(),
+                OutputContract::Items(items) => items
                     .iter()
                     .filter_map(|item| item.as_column().map(column_ref))
                     .collect(),

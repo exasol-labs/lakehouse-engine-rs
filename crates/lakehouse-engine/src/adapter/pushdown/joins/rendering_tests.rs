@@ -600,11 +600,13 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
     let address_filter = string_equal("CUSTOMER", "C_ADDRESS", "z");
     let order_key = table_col("ORDERS", "O_ORDERKEY");
     let legs = customer_orders_legs();
-    use OutputContract::{AnyOneColumn, Items, WholeRow};
+    use OutputContract::{AnyOneColumn, WholeRow};
+    // The emission reads the items from the clauses above the leg, never from the contract.
+    let items = || OutputContract::Items(Vec::new());
     let cases: [LegEmissionCase; 11] = [
         (
             "named columns keep the declaration order",
-            Items,
+            items(),
             &[&name, &condition, &address_filter],
             0,
             &[],
@@ -612,7 +614,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a leg emits only its own columns",
-            Items,
+            items(),
             &[&name, &condition],
             1,
             &[],
@@ -660,7 +662,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a leg only the other leg's clauses name emits one column, not its row",
-            Items,
+            items(),
             &[&order_key],
             0,
             &["C_NAME"],
@@ -668,7 +670,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "an unnamed second leg skips a refused first column",
-            Items,
+            items(),
             &[&name],
             1,
             &["O_ORDERKEY"],
@@ -676,7 +678,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a named refused column is an adapter error",
-            Items,
+            items(),
             &[&name],
             0,
             &["C_NAME"],
@@ -695,7 +697,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         let columns = customer_orders_columns(refused);
         let above: Vec<Expr> = above.iter().map(|node| ast(node)).collect();
         let above: Vec<&Expr> = above.iter().collect();
-        let emitted = leg_emission(output, &above, &legs, leg, &columns[leg]);
+        let emitted = leg_emission(&output, &above, &legs, leg, &columns[leg]);
         match (emitted_names(emitted.map(|leg| vec![leg])), expected) {
             (Ok(names), Ok(expected)) => assert_eq!(names, [expected], "{case}"),
             (Err(message), Err(fragment)) => {
@@ -754,7 +756,7 @@ fn a_fan_out_over_several_legs_emits_one_placeholder_for_all_of_them() {
         let above: Vec<Expr> = above.iter().map(|node| ast(node)).collect();
         let above: Vec<&Expr> = above.iter().collect();
         let emitted = fan_out_emission(
-            OutputContract::Items,
+            &OutputContract::Items(Vec::new()),
             &above,
             &legs,
             &[(0, &columns[0]), (1, &columns[1])],

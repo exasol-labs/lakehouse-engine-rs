@@ -33,14 +33,56 @@ fn a_cast_sent_as_a_scalar_function_parses_as_a_cast() {
 }
 
 #[test]
-fn an_absent_or_null_literal_value_is_null() {
-    for node in [
-        json!({"type": "literal_string"}),
-        json!({"type": "literal_string", "value": null}),
+fn a_literal_parses_to_the_value_its_type_names() {
+    let text = |kind: &str| lit(kind, "2024-03-01 09:00:00.000");
+    let value = || "2024-03-01 09:00:00.000".to_string();
+    for (node, literal) in [
+        (null_lit(), Literal::Null),
+        (bool_lit(true), Literal::Bool(true)),
+        (str_lit(""), Literal::String(String::new())),
+        (
+            lit("literal_double", "1e+300"),
+            Literal::Double("1e+300".into()),
+        ),
+        (num_lit("-0.5"), Literal::ExactNumeric("-0.5".into())),
+        (date_lit("2024-03-01"), Literal::Date("2024-03-01".into())),
+        (text("literal_timestamp"), Literal::Timestamp(value())),
+        (
+            text("literal_timestamp_utc"),
+            Literal::TimestampUtc(value()),
+        ),
+        (
+            text("literal_timestamputc"),
+            Literal::LocalTimeZoneTimestamp(value()),
+        ),
     ] {
         assert_eq!(
             parse_expression(&node, "filter").unwrap(),
-            Expr::Literal(Literal::new(LiteralKind::String, Scalar::Null))
+            Expr::Literal(literal),
+            "{node}"
+        );
+    }
+}
+
+/// Scenario: A literal whose value is not of its type fails the request
+#[test]
+fn a_literal_whose_value_is_not_of_its_type_fails_naming_the_field() {
+    for (node, problem) in [
+        (lit("literal_bool", "banana"), "is not a boolean"),
+        (lit("literal_bool", "TRUE"), "is not a boolean"),
+        (lit("literal_bool", 1), "is not a boolean"),
+        (json!({"type": "literal_bool"}), "is missing"),
+        (lit("literal_exactnumeric", 1), "is not a string"),
+        (lit("literal_double", 1.5), "is not a string"),
+        (json!({"type": "literal_string"}), "is missing"),
+        (lit("literal_string", Json::Null), "is missing"),
+        (json!({"type": "literal_date"}), "is missing"),
+        (lit("literal_timestamp", true), "is not a string"),
+    ] {
+        assert_eq!(
+            parse_error(&node),
+            format!("the pushdown request's filter.value {problem}"),
+            "{node}"
         );
     }
 }
@@ -81,7 +123,7 @@ fn a_malformed_node_fails_naming_its_field() {
                 col("A"),
                 json!({"type": "literal_string", "value": [1]}),
             )]),
-            "the pushdown request's filter.expressions[0].right.value is not a scalar",
+            "the pushdown request's filter.expressions[0].right.value is not a string",
         ),
         (
             json!({"type": "predicate_like_regexp", "expression": col("A")}),

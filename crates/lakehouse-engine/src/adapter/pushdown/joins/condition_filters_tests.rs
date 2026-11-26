@@ -2,8 +2,8 @@ use super::super::attribution::JoinLegs;
 use super::super::planning::{DetectedJoin, JoinLeaf};
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, and, ast, compare, num_lit, or, predicate_equal, scalar_fn, str_lit, table_col,
-    table_ref, table_ref_as,
+    aliased_col, and, ast, compare, num_lit, or, parse_pushdown, predicate_equal, scalar_fn,
+    str_lit, table_col, table_ref, table_ref_as,
 };
 use serde_json::Value as Json;
 
@@ -54,7 +54,7 @@ fn request(from: Json, filter: Option<Json>) -> PushdownRequest {
     if let Some(filter) = filter {
         json["filter"] = filter;
     }
-    PushdownRequest::parse(&json).expect("a whole-row request")
+    parse_pushdown(&json).expect("a whole-row request")
 }
 
 fn ab_key() -> Json {

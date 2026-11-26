@@ -1,6 +1,6 @@
 use crate::scan::spec::{AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered};
 use crate::types::exasol_type::ExasolType;
-use vs_expression::{Column, Expr, LiteralKind, SqlFragment};
+use vs_expression::{Column, Expr, Literal, SqlFragment};
 
 use super::context::Shards;
 
@@ -62,7 +62,8 @@ pub struct GroupedAggregateDetection {
 /// Shared by `detect_group_by_aggregates` and `project_columns` so the two
 /// lists cannot drift apart (#52).
 pub(super) fn is_literal_selectlist_item(item: &Expr) -> bool {
-    matches!(item, Expr::Literal(literal) if !matches!(literal.kind, LiteralKind::Binary { .. }))
+    item.as_literal()
+        .is_some_and(|literal| !matches!(literal, Literal::Binary { .. }))
 }
 
 /// `None` on any unsupported shape; the caller falls back to single-group detection
