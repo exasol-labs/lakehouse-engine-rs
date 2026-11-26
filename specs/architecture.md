@@ -78,7 +78,7 @@
 - `LAKEHOUSE_EXPORT(...)`: SET script with two roles. Exasol calls its export hook for `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = 'true'|'false'] [ALLOW_HTTP = 'true'|'false'] [PARTITION_BY = '<fields>']`. The SELECT the hook returns calls it as the writer, `LAKEHOUSE_EXPORT(<writer spec>, <source columns>...)`, which returns its group's row count as `DECIMAL(18,0)`
 - install.sh CLI: `install.sh --account-id <id> --database-id <id> --profile <p>` for SaaS, or `--dsn`, `--host`, `--target`, `--deployment`, `--bfs-*`, `--schema`, `--lakehouse-version`, `--slc-version`, `--arch`, `--skip-slc`
 - Release asset: `lakehouse-engine.tar.gz` on GitHub releases, installed to BucketFS at `udf/liblakehouse_engine.so`
-- Makefile: `cross-udf-build`, `test`, `test-e2e`, `test-e2e-lakekeeper`, `test-e2e-azure`, `test-e2e-glue`, `test-e2e-unity`, `<stack>-start`, `<stack>-wait`, `<stack>-up`, and `<stack>-down` for the E2E stacks `e2e`, `lakekeeper`, `azure`, `unity`, and `glue`, `install-slc`, `bench`
+- Makefile: `cross-udf-build`, `test`, `test-e2e`, `test-e2e-lakekeeper`, `test-e2e-azure`, `test-e2e-glue`, `test-e2e-unity`, `<stack>-pull`, `<stack>-start`, `<stack>-wait`, `<stack>-up`, `<stack>-logs`, and `<stack>-down` for the E2E stacks `e2e`, `lakekeeper`, `azure`, `unity`, and `glue`, `install-slc`, `bench`
 
 ## Constraints
 

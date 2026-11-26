@@ -1,18 +1,36 @@
 name: E2E setup
 description: >
-  Common preparation shared by the e2e, e2e-lakekeeper, e2e-unity, e2e-azure and e2e-glue jobs.
-  Callers must run `actions/checkout` themselves before this action.
+  Common preparation shared by the e2e, e2e-azure and e2e-glue jobs: starts the job's stack, then
+  installs Rust, restores the build cache, and downloads the .so while Exasol boots. Callers must
+  run `actions/checkout` themselves before this action, and `make <stack>-wait` after it.
 inputs:
-  arch:
-    description: The runner's architecture, `x86_64` or `aarch64`; selects the `.so` artifact and the build cache.
-    default: x86_64
+  stack:
+    description: The stack that scripts/e2e-stack.sh starts, such as `e2e` or `lakekeeper`.
+    required: true
 runs:
   using: composite
   steps:
-    # Must precede the cache restore: restoring onto a tight runner disk can ENOSPC (#121).
+    # Must precede the pull and the cache restore: a tight runner disk can ENOSPC (#121).
     - name: Free disk space
       shell: bash
       run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+    # Without this every UDF fails with "VM crashed" (22002): Exasol's nschroot
+    # sandbox needs CAP_SYS_ADMIN in an unprivileged user namespace, which Ubuntu
+    # 24.04's apparmor_restrict_unprivileged_userns=1 denies even when --privileged.
+    - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+      shell: bash
+      run: |
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        sysctl kernel.apparmor_restrict_unprivileged_userns
+
+    - name: Pull stack images
+      shell: bash
+      run: make ${{ inputs.stack }}-pull
+
+    - name: Start stack
+      shell: bash
+      run: make ${{ inputs.stack }}-start
 
     - name: Install Rust 1.98.1
       uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
@@ -28,25 +46,16 @@ runs:
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The arm64 unit-test job writes the aarch64 tree; rust-cache adds the platform to the key.
       with:
-        shared-key: ${{ inputs.arch == 'aarch64' && 'workspace-arm64' || 'workspace-rlib' }}
+        shared-key: ${{ runner.arch == 'ARM64' && 'workspace-arm64' || 'workspace-rlib' }}
         save-if: "false"
 
     # The download's mtime is newer than the sources, so make treats the .so as current.
     - name: Download liblakehouse_engine.so
       uses: actions/download-artifact@v8
       with:
-        name: lakehouse-engine-so-${{ inputs.arch }}
+        name: lakehouse-engine-so-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
         path: target/release/
 
     - name: Forbid make from rebuilding the .so
       shell: bash
       run: echo "REBUILD_SO=0" >> "$GITHUB_ENV"
-
-    # Without this every UDF fails with "VM crashed" (22002): Exasol's nschroot
-    # sandbox needs CAP_SYS_ADMIN in an unprivileged user namespace, which Ubuntu
-    # 24.04's apparmor_restrict_unprivileged_userns=1 denies even when --privileged.
-    - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
-      shell: bash
-      run: |
-        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        sysctl kernel.apparmor_restrict_unprivileged_userns

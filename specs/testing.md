@@ -52,8 +52,8 @@ Test code gets the same design care as production code. A test reads as the one 
 | Suite | Cargo feature | Test binaries | Make targets | CI job (check name) | Stack | In `release` needs |
 |-------|---------------|---------------|-------------|---------------------|-------|--------------------|
 | Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, plus one check per older Exasol version and `E2E (Nano, arm64)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
-| Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make lakekeeper-up test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
-| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make unity-up test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
+| Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make lakekeeper-up test-e2e-lakekeeper` | `e2e` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
+| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make unity-up test-e2e-unity` | `e2e` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
 | Azure | `azure-e2e` | `e2e_azure_test` | `make azure-up test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
 | Glue | `glue-e2e` | `e2e_glue_test` | `make glue-up test-e2e-glue` | `e2e-glue` (`E2E (Glue)`) | Local Exasol and forward proxy plus a real AWS Glue Data Catalog and S3 bucket | no |
 | Cloud (opt-in) | `cloud-e2e` | `cloud_e2e_test` | none | none | A real Exasol cluster plus the AWS Glue Iceberg REST catalog | no |
@@ -177,9 +177,9 @@ Test code gets the same design care as production code. A test reads as the one 
 ### Make targets and CI
 
 - Every E2E Make target depends on `cross-udf-build`, so no suite runs against a stale `.so`. With `REBUILD_SO=0`, a missing or stale `.so` fails the target instead of rebuilding it.
-- Each stack in § E2E suites has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
-- Every E2E CI job needs only `build-so`, so a draft pull request skips it. It sets `REBUILD_SO=0` and runs its suite and stack through the Make targets. It compiles the suite between `<stack>-start` and `<stack>-wait`, with the same cargo flags as the Make test target, so compilation overlaps Exasol's boot.
-- The `e2e` job runs the local suite once per supported Exasol major version, each leg selecting its image through `EXASOL_IMAGE`. The leg on the newest docker-db version carries the required check name `E2E`, and `release` needs every leg. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
+- Each stack in § E2E suites has `<stack>-pull` for the images of the services it starts, `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, `<stack>-logs` for failure diagnostics, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands and each stack's service list. No test target starts its stack.
+- Every E2E CI job needs only `build-so`, so a draft pull request skips it. Every one runs the same steps through the Make targets: the shared setup pulls and starts its stack, then installs Rust, restores the build cache, and downloads the `.so` with `REBUILD_SO=0` while Exasol boots. The job compiles the suite through its Make test target with `E2E_CARGO_FLAGS=--no-run`, waits for the stack, and runs the suite.
+- The `e2e` job has one leg per release-gating suite, each selecting its image through `EXASOL_IMAGE`. It runs the local suite once per supported Exasol major version, and the Lakekeeper and Unity Catalog suites on the newest docker-db version, because catalog integrations do not vary with the engine version. The local leg on the newest docker-db version carries the required check name `E2E`, and `release` needs every leg. `E2E (Azure)` and `E2E (Glue)` are the separate jobs `e2e-azure` and `e2e-glue`, because they hold cloud secrets.
 - A further `e2e` leg, `E2E (Nano, arm64)`, runs the local suite on Exasol Nano on an arm64 runner with the aarch64 `.so`.
 - `E2E (Azure)` and `E2E (Glue)` are neither required nor in `release`'s needs, so a cloud outage or a rotated key blocks no merge and no release.
 - The `arm64` job runs `cargo test --workspace`. Only the Nano leg runs an E2E suite on arm64 in CI.

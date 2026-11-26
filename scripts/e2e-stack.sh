@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <e2e|lakekeeper|azure|unity|glue> <start|wait|up|down>" >&2
+  echo "usage: $0 <e2e|lakekeeper|azure|unity|glue> <pull|start|wait|up|logs|down>" >&2
   exit 2
 }
 [[ $# -eq 2 ]] || usage
@@ -13,11 +13,29 @@ action=$2
 
 cd "$(dirname "$0")/.."
 
+# `services` lists every service the stack starts, so `pull` fetches only their images.
+lakekeeper_services=(keycloak lakekeeper-db openfga-db openfga-migrate openfga lakekeeper-migrate lakekeeper)
 case "$stack" in
-  e2e | glue) files=(-f docker-compose.yml) ;;
-  lakekeeper) files=(-f docker-compose.yml -f docker-compose.lakekeeper.yml) ;;
-  azure) files=(-f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml) ;;
-  unity) files=(-f docker-compose.yml -f docker-compose.unity.yml) ;;
+  e2e)
+    files=(-f docker-compose.yml)
+    services=(exasol proxy seaweedfs iceberg-rest spark-iceberg-fixtures)
+    ;;
+  glue)
+    files=(-f docker-compose.yml)
+    services=(exasol proxy)
+    ;;
+  lakekeeper)
+    files=(-f docker-compose.yml -f docker-compose.lakekeeper.yml)
+    services=(exasol proxy seaweedfs iceberg-rest "${lakekeeper_services[@]}")
+    ;;
+  azure)
+    files=(-f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml)
+    services=(exasol proxy "${lakekeeper_services[@]}")
+    ;;
+  unity)
+    files=(-f docker-compose.yml -f docker-compose.unity.yml)
+    services=(exasol proxy seaweedfs unitycatalog)
+    ;;
   *) usage ;;
 esac
 
@@ -138,13 +156,25 @@ wait_services() {
   esac
 }
 
+# Failure diagnostics: the state of every service and the tail of its log.
+logs() {
+  compose ps -a
+  local service
+  for service in "${services[@]}"; do
+    echo "=== $service logs ==="
+    compose logs --tail 100 "$service"
+  done
+}
+
 case "$action" in
+  pull) compose pull --quiet "${services[@]}" ;;
   start) start ;;
   wait) wait_healthy ;;
   up)
     start
     wait_healthy
     ;;
+  logs) logs ;;
   down) compose down -v ;;
   *) usage ;;
 esac
