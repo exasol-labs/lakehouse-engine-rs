@@ -8,8 +8,8 @@ use crate::common::e2e_harness::{
     assert_query_fails, assert_refused_column, assert_text_columns, assert_type_matrix,
     case_failures, column_adapter_notes, create_native_copy, create_virtual_schema_with_password,
     declared_type, error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    identifier_note, native_copy_mismatch, note_of, nullable_text, parse_int, parse_numeric,
-    partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
+    identifier_note, map_cases, native_copy_mismatch, note_of, nullable_text, parse_int,
+    parse_numeric, partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
     try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
@@ -2176,7 +2176,7 @@ fn numeric_expressions_match_native_exasol() {
         "the DOUBLE = DECIMAL join must take the broadcast path"
     );
 
-    for template in [
+    let templates = [
         "SELECT K FROM {T} WHERE X = 0.1 ORDER BY K",
         "SELECT K FROM {T} WHERE D < X ORDER BY K",
         "SELECT K FROM {T} WHERE W > X AND K < 10 ORDER BY K",
@@ -2225,9 +2225,10 @@ fn numeric_expressions_match_native_exasol() {
          AND K BETWEEN 299 AND 302 ORDER BY K",
         "SELECT K, W - 123456789012345678901234567890.1 FROM {T} \
          WHERE K BETWEEN 1501 AND 1503 ORDER BY K",
-    ] {
-        assert_same_as_native(&mut conn, template, false);
-    }
+    ];
+    map_cases(&templates, exa_conn, |conn, template| {
+        assert_same_as_native(conn, template, false)
+    });
     // Native AVG over DECIMAL is not correctly rounded and the split merge sums in another
     // order, so the two agree only to a few ULPs.
     assert_matches_native(&mut conn, "AVG(W)", "WHERE K <= 50", 0, 1e-15);

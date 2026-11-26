@@ -458,13 +458,10 @@ fn scan_date_part(unit: &str) -> String {
 
 type NativeCase<'a> = (String, PathCheck<'a>, Expect);
 
-fn native_copy_mismatches(conn: &mut ExaConn, table: &str, cases: &[NativeCase]) -> Vec<String> {
-    cases
-        .iter()
-        .filter_map(|(query, path, expect)| {
-            native_copy_mismatch(conn, table, NATIVE_COPY, query, *path, *expect)
-        })
-        .collect()
+fn native_copy_mismatches(table: &str, cases: &[NativeCase]) -> Vec<String> {
+    case_failures(cases, exa_conn, |conn, (query, path, expect)| {
+        native_copy_mismatch(conn, table, NATIVE_COPY, query, *path, *expect)
+    })
 }
 
 /// Scenario: SECOND and EXTRACT(SECOND) return native results through the virtual schema
@@ -584,7 +581,7 @@ fn second_and_extract_second_match_a_native_copy() {
     }
     let probe = qualified_probe();
     create_native_copy(&mut conn, &probe, "TS, TSTZ, TS_NS");
-    let mut failures = native_copy_mismatches(&mut conn, &probe, &cases);
+    let mut failures = native_copy_mismatches(&probe, &cases);
 
     // Every probe value sits at second 0, so these rows compare the whole-second part.
     lakehouse_vs();
@@ -611,11 +608,7 @@ fn second_and_extract_second_match_a_native_copy() {
     .into_iter()
     .map(|(query, marker)| (query.to_string(), PathCheck::Has(marker), Expect::Rows))
     .collect();
-    failures.extend(native_copy_mismatches(
-        &mut conn,
-        &all_types,
-        &whole_second_cases,
-    ));
+    failures.extend(native_copy_mismatches(&all_types, &whole_second_cases));
 
     assert!(
         failures.is_empty(),

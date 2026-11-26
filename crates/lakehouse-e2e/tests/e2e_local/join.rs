@@ -2395,10 +2395,12 @@ fn e2e_join_with_on_filters_takes_the_broadcast_path_and_matches_native() {
         format!("SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {SELF_JOIN} AND b.O_ORDERKEY > 5"),
         declined.clone(),
     ];
-    let mut failures: Vec<String> = broadcast
-        .iter()
-        .flat_map(|query| broadcast_mismatches(&mut conn, 2, query))
-        .collect();
+    let mut failures: Vec<String> = map_cases(&broadcast, exa_conn, |conn, query| {
+        broadcast_mismatches(conn, 2, query)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     let pushed = isolated_pushdown_statement(&mut conn, &declined.replace("{T}", VS_NAME));
     if !exasol_where_holds(&pushed, "SECOND(") {
         failures.push(format!(

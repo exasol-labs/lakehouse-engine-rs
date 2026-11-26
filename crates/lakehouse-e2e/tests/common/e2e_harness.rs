@@ -1370,13 +1370,13 @@ pub fn assert_filters_match_native_copy(
             })
             .unwrap_or_default()
     };
-    for filter in filters {
-        assert_eq!(
-            ids(conn, table, filter),
-            ids(conn, NATIVE_COPY, filter),
-            "WHERE {filter} on {table} must select the rows native Exasol selects"
-        );
-    }
+    let failures = case_failures(filters, exa_conn, |conn, filter| {
+        let (actual, native) = (ids(conn, table, filter), ids(conn, NATIVE_COPY, filter));
+        (actual != native).then(|| {
+            format!("WHERE {filter} on {table} selects {actual:?}, native Exasol {native:?}")
+        })
+    });
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Each query names its table as `{T}`. It must return over the virtual `table` what it returns
@@ -1388,23 +1388,20 @@ pub fn assert_queries_match_native_copy(
     queries: &[&str],
 ) {
     create_native_copy(conn, table, columns);
-    assert_no_native_mismatch(conn, table, queries);
+    assert_no_native_mismatch(table, queries);
 }
 
-fn assert_no_native_mismatch(conn: &mut ExaConn, table: &str, queries: &[&str]) {
-    let failures: Vec<String> = queries
-        .iter()
-        .filter_map(|query| {
-            native_copy_mismatch(
-                conn,
-                table,
-                NATIVE_COPY,
-                query,
-                PathCheck::Unchecked,
-                Expect::Rows,
-            )
-        })
-        .collect();
+fn assert_no_native_mismatch(table: &str, queries: &[&str]) {
+    let failures = case_failures(queries, exa_conn, |conn, query| {
+        native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            query,
+            PathCheck::Unchecked,
+            Expect::Rows,
+        )
+    });
     assert!(
         failures.is_empty(),
         "over {table}, {} queries differ from native Exasol:\n{}",
@@ -1479,7 +1476,7 @@ pub fn assert_binary_columns_match_native_copy(
         })
         .collect();
     let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
-    assert_no_native_mismatch(conn, table, &queries);
+    assert_no_native_mismatch(table, &queries);
 }
 
 /// A lowercase hex `literal` of the column's width compares `column`'s raw bytes, which Parquet
