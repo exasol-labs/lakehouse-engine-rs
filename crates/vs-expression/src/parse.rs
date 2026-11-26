@@ -10,6 +10,7 @@ use crate::expr::{
     AggregateCall, CaseExpr, Column, CompareOp, Expr, JsonBehavior, JsonValueCall, Literal,
     ScalarCall,
 };
+use crate::scalar_functions::{Arguments, MANY, aggregate_arguments, scalar_arguments};
 
 /// The node at `path` of the pushdown request, such as `filter` or `selectList[2]`.
 pub(crate) fn parse_expression(node: &Json, path: &str) -> Result<Expr, UdfError> {
@@ -249,15 +250,7 @@ impl<'a> RequestNode<'a> {
             },
             "function_scalar_case" => self.case()?,
             "function_scalar_json_value" => self.json_value()?,
-            "function_aggregate" => Expr::Aggregate(AggregateCall {
-                name: self.text("name")?.to_uppercase(),
-                arguments: self.list("arguments")?,
-                distinct: match self.get("distinct") {
-                    None => false,
-                    Some(Json::Bool(distinct)) => *distinct,
-                    Some(_) => return Err(self.invalid("distinct", "is not a boolean")),
-                },
-            }),
+            "function_aggregate" => self.aggregate()?,
             other => {
                 return Err(self.invalid(
                     "type",
@@ -293,7 +286,52 @@ impl<'a> RequestNode<'a> {
         if name.eq_ignore_ascii_case("CAST") {
             return self.cast();
         }
-        Ok(Expr::Scalar(ScalarCall::new(name, self.list("arguments")?)))
+        let takes = scalar_arguments(name);
+        let arguments = self.call_arguments("scalar function", name, takes)?;
+        Ok(Expr::Scalar(ScalarCall::new(name, arguments)))
+    }
+
+    fn aggregate(&self) -> Result<Expr, UdfError> {
+        let name = self.text("name")?;
+        let takes = aggregate_arguments(name);
+        Ok(Expr::Aggregate(AggregateCall {
+            arguments: self.call_arguments("aggregate function", name, takes)?,
+            name: name.to_uppercase(),
+            distinct: match self.get("distinct") {
+                None => false,
+                Some(Json::Bool(distinct)) => *distinct,
+                Some(_) => return Err(self.invalid("distinct", "is not a boolean")),
+            },
+        }))
+    }
+
+    /// The arguments of a call of `name`, whose argument counts are `takes`, `None` for a function
+    /// the adapter does not translate. A missing `arguments` is a call without any.
+    fn call_arguments(
+        &self,
+        function: &str,
+        name: &str,
+        takes: Option<Arguments>,
+    ) -> Result<Vec<Expr>, UdfError> {
+        let Some(takes) = takes else {
+            return Err(self.invalid(
+                "name",
+                &format!("names the {function} {name}, which the adapter does not translate"),
+            ));
+        };
+        let arguments = self.list("arguments")?;
+        if !takes.contains(&arguments.len()) {
+            return Err(self.invalid(
+                "arguments",
+                &format!(
+                    "holds {} arguments, but {} takes {}",
+                    arguments.len(),
+                    name.to_uppercase(),
+                    argument_counts(&takes)
+                ),
+            ));
+        }
+        Ok(arguments)
     }
 
     fn cast(&self) -> Result<Expr, UdfError> {
@@ -365,6 +403,14 @@ fn compare_op(kind: &str) -> Option<CompareOp> {
         "predicate_greaterequal" => CompareOp::GreaterEqual,
         _ => return None,
     })
+}
+
+fn argument_counts(takes: &Arguments) -> String {
+    match (*takes.start(), *takes.end()) {
+        (fewest, MANY) => format!("at least {fewest}"),
+        (fewest, most) if fewest == most => fewest.to_string(),
+        (fewest, most) => format!("{fewest} to {most}"),
+    }
 }
 
 #[cfg(test)]

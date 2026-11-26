@@ -367,3 +367,22 @@ fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
         "only the retyped literal names bytes"
     );
 }
+
+#[test]
+fn junctions_of_many_terms_nest_as_a_balanced_tree_in_term_order() {
+    let id_is = |value: i32| Reference::new("id").equal_to(Datum::int(value));
+    let terms = || (1..=5).map(id_is).collect::<Vec<_>>();
+    assert_eq!(
+        IcebergTarget::or(terms()),
+        id_is(1).or(id_is(2)).or(id_is(3).or(id_is(4))).or(id_is(5))
+    );
+    assert_eq!(
+        IcebergTarget::and(terms()),
+        id_is(1)
+            .and(id_is(2))
+            .and(id_is(3).and(id_is(4)))
+            .and(id_is(5))
+    );
+    assert_eq!(IcebergTarget::or(Vec::new()), Predicate::AlwaysFalse);
+    assert_eq!(IcebergTarget::and(Vec::new()), Predicate::AlwaysTrue);
+}

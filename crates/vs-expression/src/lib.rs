@@ -64,8 +64,22 @@ pub(crate) fn compare_sql(op: CompareOp, left: &str, right: &str) -> String {
     format!("({left} {} {right})", op.sql())
 }
 
-/// An `AND` or `OR` of rendered operands. `empty` is its value over no operand.
+/// The most operands one flat `AND` or `OR` joins. DataFusion parses a flat junction into a chain
+/// one level deeper per operand and walks it recursively, so thousands overflow the scan's stack.
+const FLAT_JUNCTION_OPERANDS: usize = 32;
+
+/// An `AND` or `OR` of rendered operands. `empty` is its value over no operand. More operands than
+/// one flat junction joins nest as flat junctions of flat junctions.
 pub(crate) fn junction_sql(mut parts: Vec<String>, op: &str, empty: &str) -> String {
+    while parts.len() > FLAT_JUNCTION_OPERANDS {
+        let mut operands = parts.into_iter().peekable();
+        let mut groups = Vec::new();
+        while operands.peek().is_some() {
+            let group = operands.by_ref().take(FLAT_JUNCTION_OPERANDS).collect();
+            groups.push(junction_sql(group, op, empty));
+        }
+        parts = groups;
+    }
     match parts.len() {
         0 => empty.to_string(),
         1 => parts.remove(0),

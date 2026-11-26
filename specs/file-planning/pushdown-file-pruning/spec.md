@@ -107,3 +107,10 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * *THEN* the adapter SHALL translate the filter on `A` against field id 1, the id the column notes declare for `A`, so pruning keeps the file whose field-id-1 bounds admit 7
 * *AND* the query SHALL return the rows whose field-id-1 value is 7, the same rows it returns before the rename
 * *AND* a filter on a declared column whose field id the scanned snapshot's schema no longer carries SHALL prune no file for that conjunct, and the query SHALL still apply the full filter above the scan
+
+### Scenario: A filter of thousands of OR terms returns its rows
+
+* *GIVEN* an Iceberg table and a query whose WHERE clause joins 6,000 equalities on one column with `OR`
+* *WHEN* the user runs the query
+* *THEN* the query SHALL return the rows that match one of the equalities
+* *AND* the adapter SHALL push the filter to the scan, and neither the adapter nor the scan SHALL fail the query because of the number of OR terms

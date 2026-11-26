@@ -36,9 +36,18 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is absent from the crate's one declaration of translated `function_scalar` names (for example `SUBSTRING`), whether or not a per-name rendering arm exists for that name
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return an error reading `unsupported scalar function: <NAME>`, the same error an unrecognised name raises
-* *AND* `ScanTyping::render_expression` SHALL return an error for the same node without panicking
-* *AND* the declaration lookup MUST happen before any per-name rendering arm is reached, so an arm added without a declaration entry is unreachable and cannot emit DataFusion SQL on the Exasol path
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, exactly as it does for any other untranslated name
+* *AND* the scan dialect SHALL return an error for the same node without panicking
+* *AND* a name absent from the declaration SHALL NOT render as DataFusion SQL on the Exasol path, even when a per-name rendering exists for it
+* *AND* the adapter SHALL fail a pushdown request that carries such a node before any translator renders it (`A function call the adapter does not translate fails the request`)
+
+### Scenario: A function call the adapter does not translate fails the request
+
+* *GIVEN* a `function_scalar` node whose `name` is neither a translated scalar function nor a clock function the adapter folds into a literal, or a `function_aggregate` node whose `name` is not an aggregate the adapter advertises, or a call whose `arguments` hold a count its function does not take, where a missing `arguments` counts as none
+* *WHEN* the adapter parses the pushdown request
+* *THEN* the adapter SHALL fail the query with an error that names the node's `name` field and the function for an untranslated name, or the node's `arguments` field, the function, and the argument counts it takes for a wrong argument count
+* *AND* the adapter MUST NOT render the call, so no name or argument list it did not check reaches the Exasol or the scan SQL
+* *AND* only `COUNT`, for `COUNT(*)`, and the clock functions `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, and `SYSTIMESTAMP` SHALL take no arguments
+* *AND* this state SHALL be unreachable for a request Exasol sends, because Exasol sends only the functions the adapter advertises, with argument counts Exasol itself accepts
 
 ### Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 

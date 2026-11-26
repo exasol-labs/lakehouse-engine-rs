@@ -64,22 +64,37 @@ impl StatisticsTarget for IcebergTarget {
     }
 
     fn and(predicates: Vec<Predicate>) -> Predicate {
-        predicates
-            .into_iter()
-            .reduce(Predicate::and)
-            .unwrap_or(Predicate::AlwaysTrue)
+        balanced(predicates, Predicate::and).unwrap_or(Predicate::AlwaysTrue)
     }
 
     fn or(predicates: Vec<Predicate>) -> Predicate {
-        predicates
-            .into_iter()
-            .reduce(Predicate::or)
-            .unwrap_or(Predicate::AlwaysFalse)
+        balanced(predicates, Predicate::or).unwrap_or(Predicate::AlwaysFalse)
     }
 
     fn not(predicate: Predicate) -> Predicate {
         predicate.negate()
     }
+}
+
+/// Joins `predicates` pairwise into a tree of logarithmic depth. Iceberg junctions are binary and
+/// the scan planner walks them recursively, so a left-deep chain of thousands of terms overflows
+/// the adapter's stack.
+fn balanced(
+    mut predicates: Vec<Predicate>,
+    join: fn(Predicate, Predicate) -> Predicate,
+) -> Option<Predicate> {
+    while predicates.len() > 1 {
+        let mut pairs = predicates.into_iter();
+        let mut joined = Vec::with_capacity(pairs.len().div_ceil(2));
+        while let Some(left) = pairs.next() {
+            joined.push(match pairs.next() {
+                Some(right) => join(left, right),
+                None => left,
+            });
+        }
+        predicates = joined;
+    }
+    predicates.pop()
 }
 
 fn arrow_type(primitive: &PrimitiveType) -> Option<DataType> {

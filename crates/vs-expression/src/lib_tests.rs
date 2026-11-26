@@ -16,6 +16,12 @@ fn scan_sql(expr: &Expr) -> Result<String, UdfError> {
         .map(|fragment| fragment.sql)
 }
 
+/// A call the request parse refuses, built past it to test the translators' own gate.
+fn unparsed_call(name: &str, arguments: impl IntoIterator<Item = Json>) -> Expr {
+    let arguments = arguments.into_iter().map(|argument| ast(&argument));
+    Expr::Scalar(ScalarCall::new(name, arguments.collect()))
+}
+
 fn render_expression_exasol(node: &Json) -> String {
     crate::render_expression_exasol(&ast(node)).expect("the Exasol dialect renders the node")
 }
@@ -218,6 +224,52 @@ fn renders_empty_and_as_true() {
 fn renders_empty_or_as_false() {
     let expr = or([]);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
+}
+
+/// A junction of more than 32 terms nests flat groups of 32, so its depth grows by one level
+/// per 32-fold growth instead of one level per term.
+#[test]
+fn a_junction_of_more_than_32_terms_nests_groups_of_32() {
+    let equal = |value: usize| format!(r#"("ID" = {value})"#);
+    let group = |terms: Vec<String>, op: &str| format!("({})", terms.join(op));
+    let groups = |count: usize, op: &str| -> Vec<String> {
+        (0..count)
+            .map(|first| group((32 * first..32 * first + 32).map(equal).collect(), op))
+            .collect()
+    };
+    let cases = [
+        (32, group((0..32).map(equal).collect(), " OR ")),
+        (
+            33,
+            group(vec![groups(1, " OR ").remove(0), equal(32)], " OR "),
+        ),
+        (
+            65,
+            group([groups(2, " OR "), vec![equal(64)]].concat(), " OR "),
+        ),
+        (
+            32 * 33,
+            group(
+                vec![
+                    group(groups(32, " OR "), " OR "),
+                    groups(33, " OR ").remove(32),
+                ],
+                " OR ",
+            ),
+        ),
+    ];
+    let terms = |count: usize| (0..count).map(|value| predicate_equal(col("id"), num_lit(value)));
+    for (count, expected) in cases {
+        assert_eq!(
+            render_expression(&or(terms(count))).unwrap(),
+            expected,
+            "{count} terms"
+        );
+    }
+    assert_eq!(
+        render_expression(&and(terms(33))).unwrap(),
+        group(vec![groups(1, " AND ").remove(0), equal(32)], " AND ")
+    );
 }
 
 #[test]
@@ -889,24 +941,52 @@ fn renders_mod_as_function_call_in_exasol_dialect() {
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
 }
 
+/// The string functions that take more than one argument: the call, its Exasol-dialect SQL,
+/// and its scan SQL.
+fn multi_argument_string_calls() -> [(Json, &'static str, &'static str); 6] {
+    [
+        (
+            scalar_fn("REPEAT", [col("s"), num_lit(3)]),
+            r#"REPEAT("S", 3)"#,
+            r#"nullif(repeat(nullif("S", ''), 3), '')"#,
+        ),
+        (
+            scalar_fn("LPAD", [col("s"), num_lit(3)]),
+            r#"LPAD("S", 3)"#,
+            r#"nullif(lpad(nullif("S", ''), 3), '')"#,
+        ),
+        (
+            scalar_fn("RPAD", [col("s"), num_lit(3), str_lit("x")]),
+            r#"RPAD("S", 3, 'x')"#,
+            r#"nullif(rpad(nullif("S", ''), 3, 'x'), '')"#,
+        ),
+        (
+            scalar_fn("LEFT", [col("s"), num_lit(3)]),
+            r#"LEFT("S", 3)"#,
+            r#"nullif(left(nullif("S", ''), 3), '')"#,
+        ),
+        (
+            scalar_fn("RIGHT", [col("s"), num_lit(3)]),
+            r#"RIGHT("S", 3)"#,
+            r#"nullif(right(nullif("S", ''), 3), '')"#,
+        ),
+        (
+            scalar_fn("TRANSLATE", [col("s"), str_lit("ab"), str_lit("xy")]),
+            r#"TRANSLATE("S", 'ab', 'xy')"#,
+            r#"nullif(translate(nullif("S", ''), 'ab', 'xy'), '')"#,
+        ),
+    ]
+}
+
 /// Scenario: String scalar functions translate to DataFusion string calls
 #[test]
 fn renders_string_scalar_functions() {
     let text_results = [
-        "LOWER",
-        "UPPER",
-        "TRIM",
-        "LTRIM",
-        "RTRIM",
-        "REPEAT",
-        "REVERSE",
-        "LPAD",
-        "RPAD",
-        "INITCAP",
-        "LEFT",
-        "RIGHT",
-        "TRANSLATE",
+        "LOWER", "UPPER", "TRIM", "LTRIM", "RTRIM", "REVERSE", "INITCAP",
     ];
+    for (expr, _, scan) in multi_argument_string_calls() {
+        assert_eq!(typed_scan(&expr).unwrap(), scan, "{expr}");
+    }
     for name in text_results {
         let expr = scalar_fn(name, [col("s")]);
         assert_eq!(
@@ -1013,16 +1093,6 @@ fn renders_concat_single_argument() {
 }
 
 #[test]
-fn concat_without_arguments_errors_in_the_datafusion_dialect() {
-    assert_eq!(
-        render_expression(&scalar_fn("CONCAT", []))
-            .unwrap_err()
-            .to_string(),
-        "function_scalar CONCAT requires at least 1 argument, got 0"
-    );
-}
-
-#[test]
 fn renders_case_when() {
     let expr = scalar_fn(
         "CASE",
@@ -1109,22 +1179,6 @@ fn renders_nested_greatest_guard_referencing_the_inner_case_twice() {
         render_expression(&expr).unwrap(),
         r#"CASE WHEN CASE WHEN "A" IS NULL OR "B" IS NULL THEN NULL ELSE greatest("A", "B") END IS NULL OR "C" IS NULL THEN NULL ELSE greatest(CASE WHEN "A" IS NULL OR "B" IS NULL THEN NULL ELSE greatest("A", "B") END, "C") END"#
     );
-}
-
-#[test]
-fn greatest_and_least_without_arguments_error() {
-    for name in ["GREATEST", "LEAST"] {
-        for expr in [
-            scalar_fn(name, []),
-            json!({"type": "function_scalar", "name": name}),
-        ] {
-            assert_eq!(
-                render_expression(&expr).unwrap_err().to_string(),
-                format!("function_scalar {name} requires at least 1 argument"),
-                "{expr}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -1411,10 +1465,12 @@ fn regexp_scalar_functions_decline_in_the_datafusion_dialect() {
         "REGEXP_INSTR",
         "REGEXP_COUNT",
     ];
+    let columns = typed_columns(&[("s", ExasolType::WIDEST_VARCHAR)]);
+    let scan = ScanTyping::new(&columns, ExasolVersion::Exasol2025);
     for name in unsupported {
-        let expr = scalar_fn(name, [col("s"), str_lit("a+")]);
+        let expr = unparsed_call(name, [col("s"), str_lit("a+")]);
         assert!(
-            scan_over_text("s", &expr).is_err(),
+            scan.render_expression(&expr).is_err(),
             "the scan must decline {name}"
         );
     }
@@ -1438,8 +1494,7 @@ fn bitwise_operator_functions_fall_through() {
         "BIT_TO_NUM",
     ];
     for name in unsupported {
-        let expr = scalar_fn(name, [col("a"), col("b")]);
-        let err = render_expression(&expr).unwrap_err();
+        let err = scan_sql(&unparsed_call(name, [col("a"), col("b")])).unwrap_err();
         let err_string = err.to_string();
         // Pinned to the generic text: an arity-checking arm would also name the function.
         assert!(
@@ -1455,23 +1510,18 @@ fn bitwise_operator_functions_fall_through() {
 
 #[test]
 fn undeclared_scalar_function_declines_in_the_datafusion_dialect() {
-    // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup and
-    // declaration checked before `arguments`.
+    // The last row pins the declaration check before any arity check.
     let cases = [
-        ("SUBSTRING", scalar_fn("SUBSTRING", [col("a")])),
-        ("SOUNDEX", scalar_fn("SOUNDEX", [col("a")])),
-        ("SUBSTRING", scalar_fn("substring", [col("a")])),
-        (
-            "SUBSTRING",
-            json!({"type": "function_scalar", "name": "SUBSTRING"}),
-        ),
+        ("SUBSTRING", unparsed_call("SUBSTRING", [col("a")])),
+        ("SOUNDEX", unparsed_call("SOUNDEX", [col("a")])),
+        ("SUBSTRING", unparsed_call("SUBSTRING", [])),
     ];
     for (declined_name, expr) in cases {
         let expected = format!("unsupported scalar function: {declined_name}");
         assert_eq!(
-            render_expression(&expr).unwrap_err().to_string(),
+            scan_sql(&expr).unwrap_err().to_string(),
             expected,
-            "DataFusion dialect must decline the undeclared node {expr}"
+            "DataFusion dialect must decline the undeclared node {expr:?}"
         );
     }
 }
@@ -1491,10 +1541,11 @@ fn unsupported_date_functions_decline_in_the_datafusion_dialect() {
         "POSIX_TIME",
     ];
     for name in unsupported {
-        let expr = scalar_fn(name, [col("x")]);
         let expected = format!("unsupported scalar function: {name}");
         assert_eq!(
-            render_expression(&expr).unwrap_err().to_string(),
+            scan_sql(&unparsed_call(name, [col("x")]))
+                .unwrap_err()
+                .to_string(),
             expected,
             "the DataFusion dialect must decline {name}"
         );
@@ -1693,16 +1744,10 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
         ("TRIM", "s", text_result("trim")),
         ("LTRIM", "s", text_result("ltrim")),
         ("RTRIM", "s", text_result("rtrim")),
-        ("REPEAT", "s", text_result("repeat")),
         ("REVERSE", "s", text_result("reverse")),
-        ("LPAD", "s", text_result("lpad")),
-        ("RPAD", "s", text_result("rpad")),
         ("ASCII", "s", integer_result("ascii")),
         ("CHR", "n", from_code("chr")),
         ("INITCAP", "s", text_result("initcap")),
-        ("LEFT", "s", text_result("left")),
-        ("RIGHT", "s", text_result("right")),
-        ("TRANSLATE", "s", text_result("translate")),
         ("LENGTH", "s", integer_result("character_length")),
         ("OCTET_LENGTH", "s", integer_result("octet_length")),
         ("UNICODE", "s", integer_result("ascii")),
@@ -1716,6 +1761,10 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
             "the Exasol dialect must render {exasol_name} verbatim"
         );
         assert_eq!(typed_scan(&expr).unwrap(), scan, "the scan's {exasol_name}");
+    }
+
+    for (expr, exasol, _) in multi_argument_string_calls() {
+        assert_eq!(render_expression_exasol(&expr), exasol);
     }
 
     let replace = scalar_fn("REPLACE", [col("s"), str_lit("U")]);
@@ -1893,12 +1942,6 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
             vec![col("s"), str_lit("YYYY-MM-DD HH24:MI")],
             r#"TO_DATE("S", 'YYYY-MM-DD HH24:MI')"#,
         ),
-        (
-            "TO_TIMESTAMP",
-            vec![col("s"), str_lit("YYYY-MM-DD"), str_lit("extra")],
-            r#"TO_TIMESTAMP("S", 'YYYY-MM-DD', 'extra')"#,
-        ),
-        ("TO_DATE", vec![], "TO_DATE()"),
     ];
     for (name, arguments, exasol_sql) in cases {
         let expr = scalar_fn(name, arguments);

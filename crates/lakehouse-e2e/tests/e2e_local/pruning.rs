@@ -16,7 +16,7 @@ use crate::common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
     oracle_statements, write_pruning_hive_copy,
 };
-use crate::common::seed::seed_pruning_cases;
+use crate::common::seed::{E2E_HIGH_CARD_TABLE, HIGH_CARD_ROWS, seed_pruning_cases};
 use crate::common::stack::{
     CatalogConnectionPassword, iceberg_catalog_url, local_stack_connection_password,
 };
@@ -169,4 +169,30 @@ fn clock_and_tstz_filters_prune_files() {
         "{partitioned} must prune every file: {plan}"
     );
     assert_eq!(conn.query_row_count(&partitioned), 0, "{partitioned}");
+}
+
+/// Scenario: A filter of thousands of OR terms returns its rows
+#[test]
+fn a_filter_of_thousands_of_or_terms_returns_its_rows() {
+    // The adapter and the scan crashed at about 5,000 terms when each nested one level per term.
+    const TERMS: i64 = 6_000;
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let even_ids = (0..TERMS).map(|k| format!("ID = {}", 2 * k));
+    let query = format!(
+        "SELECT COUNT(*) FROM {} WHERE {}",
+        vs_table(LAKEHOUSE_VS, E2E_HIGH_CARD_TABLE),
+        even_ids.collect::<Vec<_>>().join(" OR ")
+    );
+    // The seed holds the ids 1 to HIGH_CARD_ROWS.
+    let expected = (1..=HIGH_CARD_ROWS as i64)
+        .filter(|id| id % 2 == 0 && *id < 2 * TERMS)
+        .count() as i64;
+
+    let plan = isolated_pushdown_statement(&mut conn, &query);
+    assert!(
+        plan.contains(SCAN_SCRIPT_NAME),
+        "the OR filter must reach the scan: {plan}"
+    );
+    assert_eq!(conn.query_scalar_i64(&query), expected);
 }

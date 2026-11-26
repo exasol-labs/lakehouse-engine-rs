@@ -156,3 +156,84 @@ fn a_malformed_node_fails_naming_its_field() {
         assert_eq!(parse_error(&node), expected, "{node}");
     }
 }
+
+/// Scenario: A function call the adapter does not translate fails the request
+#[test]
+fn a_call_of_an_unknown_function_or_of_a_wrong_argument_count_fails_naming_the_field() {
+    let cases = [
+        (
+            scalar_fn("NO_SUCH_FN", [col("A")]),
+            "the pushdown request's filter.name names the scalar function NO_SUCH_FN, which the adapter does not translate",
+        ),
+        (
+            scalar_fn("UPPER(A)) OR (1=1", [col("A")]),
+            "the pushdown request's filter.name names the scalar function UPPER(A)) OR (1=1, which the adapter does not translate",
+        ),
+        (
+            scalar_fn("UPPER", []),
+            "the pushdown request's filter.arguments holds 0 arguments, but UPPER takes 1",
+        ),
+        (
+            json!({"type": "function_scalar", "name": "LOWER"}),
+            "the pushdown request's filter.arguments holds 0 arguments, but LOWER takes 1",
+        ),
+        (
+            scalar_fn("UPPER", [col("A"), col("A"), col("A")]),
+            "the pushdown request's filter.arguments holds 3 arguments, but UPPER takes 1",
+        ),
+        (
+            scalar_fn("SUBSTR", [col("A")]),
+            "the pushdown request's filter.arguments holds 1 arguments, but SUBSTR takes 2 to 3",
+        ),
+        (
+            scalar_fn("CONCAT", []),
+            "the pushdown request's filter.arguments holds 0 arguments, but CONCAT takes at least 1",
+        ),
+        (
+            scalar_fn("CURRENT_DATE", [num_lit(3)]),
+            "the pushdown request's filter.arguments holds 1 arguments, but CURRENT_DATE takes 0",
+        ),
+        (
+            agg_item_expr("NO_SUCH_AGG", col("A"), false),
+            "the pushdown request's filter.name names the aggregate function NO_SUCH_AGG, which the adapter does not translate",
+        ),
+        (
+            agg_item_expr("COUNT(*) + MAX", col("A"), false),
+            "the pushdown request's filter.name names the aggregate function COUNT(*) + MAX, which the adapter does not translate",
+        ),
+        (
+            json!({"type": "function_aggregate", "name": "SUM"}),
+            "the pushdown request's filter.arguments holds 0 arguments, but SUM takes 1",
+        ),
+        (
+            json!({"type": "function_aggregate", "name": "SUM", "arguments": [col("A"), col("B")]}),
+            "the pushdown request's filter.arguments holds 2 arguments, but SUM takes 1",
+        ),
+        (
+            json!({"type": "function_aggregate", "name": "COUNT", "arguments": [col("A"), col("B")]}),
+            "the pushdown request's filter.arguments holds 2 arguments, but COUNT takes 0 to 1",
+        ),
+    ];
+    for (node, expected) in cases {
+        assert_eq!(parse_error(&node), expected, "{node}");
+    }
+}
+
+#[test]
+fn a_call_of_each_argument_count_exasol_sends_parses() {
+    let cases = [
+        count_star(),
+        agg_item_expr("COUNT", col("A"), true),
+        agg_item_expr("var_pop", col("A"), false),
+        scalar_fn("CURRENT_DATE", []),
+        scalar_fn("CURRENT_TIMESTAMP", []),
+        scalar_fn("SYSTIMESTAMP", [num_lit(6)]),
+        scalar_fn("upper", [col("A")]),
+        scalar_fn("INSTR", [col("A"), str_lit("a"), num_lit(1), num_lit(2)]),
+        scalar_fn("CONCAT", [col("A"), col("B"), col("C"), col("D")]),
+        scalar_fn("GREATEST", [col("A")]),
+    ];
+    for node in cases {
+        assert!(parse_expression(&node, "filter").is_ok(), "{node}");
+    }
+}

@@ -734,17 +734,3 @@ fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
          limit, or each shard's partial aggregate would be zeroed out: {common}"
     );
 }
-
-#[test]
-fn a_declined_sort_key_the_exasol_dialect_cannot_render_fails_the_request() {
-    let pushdown = parse_pushdown(&serde_json::json!({
-        "selectListDataTypes": [],
-        "orderBy": [order_by_element(scalar_fn("ADD", [col("ID")]), true, true)],
-    }))
-    .expect("the request parses");
-
-    match parse_order_by_keys(&pushdown) {
-        Err(UdfError::User(message)) => assert!(message.contains("ADD"), "{message}"),
-        other => panic!("a one-argument ADD must fail the request, got {other:?}"),
-    }
-}

@@ -1560,14 +1560,6 @@ fn unmatched_date_addition_forms_decline() {
                 scalar_fn(name, [col("D"), count]),
             ));
         }
-        cases.push((
-            format!("{name} with one argument"),
-            scalar_fn(name, [col("D")]),
-        ));
-        cases.push((
-            format!("{name} with three arguments"),
-            scalar_fn(name, [col("D"), num_lit(1), num_lit(2)]),
-        ));
     }
     for (label, expr) in cases {
         assert!(
@@ -2048,7 +2040,6 @@ fn replace_reads_a_null_search_as_no_match_and_a_null_replacement_as_empty() {
         render(&scalar_fn("REPLACE", [col("S"), col("S10"), null_lit()])).unwrap(),
         r#"nullif(CASE WHEN nullif("S10", '') IS NULL THEN nullif("S", '') ELSE replace(nullif("S", ''), nullif("S10", ''), coalesce(NULL, '')) END, '')"#
     );
-    assert!(render(&scalar_fn("REPLACE", [col("S")])).is_err());
 }
 
 #[test]

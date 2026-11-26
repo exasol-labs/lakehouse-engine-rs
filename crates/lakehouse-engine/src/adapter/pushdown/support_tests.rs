@@ -2581,12 +2581,12 @@ fn parse_drops_constant_sort_keys() {
             )
         })
         .collect();
-    let random = order_by_element(scalar_fn("RAND", Vec::<Json>::new()), true, true);
+    let clock = order_by_element(scalar_fn("CURRENT_DATE", Vec::<Json>::new()), true, true);
     cases.extend([
         (
-            vec![random.clone(), id_key.clone()],
+            vec![clock.clone(), id_key.clone()],
             None,
-            Some(vec![random, id_key.clone()]),
+            Some(vec![clock, id_key.clone()]),
         ),
         (Vec::new(), Some(2), Some(Vec::new())),
         (vec![order_by_element(num_lit(2), true, true)], None, None),
