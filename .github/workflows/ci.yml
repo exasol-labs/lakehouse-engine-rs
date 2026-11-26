@@ -317,7 +317,7 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  # One leg per release-gating suite: the local suite once per supported Exasol
+  # Every release-gating suite: the local suite once per supported Exasol
   # version and on Nano (the arm64 path of Apple Silicon contributors), and the
   # Lakekeeper and Unity Catalog suites. `name:` comes from the matrix, so each
   # leg keeps its exact check name. Every leg has the same steps.

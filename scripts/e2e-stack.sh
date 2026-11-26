@@ -13,7 +13,8 @@ action=$2
 
 cd "$(dirname "$0")/.."
 
-# `services` lists every service the stack starts, so `pull` fetches only their images.
+# `services` lists every service the stack starts, so `pull` fetches only their images. A service
+# missing here is still pulled, implicitly, by `start`.
 lakekeeper_services=(keycloak lakekeeper-db openfga-db openfga-migrate openfga lakekeeper-migrate lakekeeper)
 case "$stack" in
   e2e)
@@ -109,16 +110,16 @@ start() {
 # Some Compose releases reject `up --wait` on a service without a healthcheck, which Nano
 # lacks, so Nano's exasol starts without waiting and wait_nano_sql probes it instead.
 up_wait() {
-  local services=() service
+  local waited=() service
   for service in "$@"; do
     if [[ "$EXASOL_FLAVOR" == nano && "$service" == exasol ]]; then
       compose up -d exasol
     else
-      services+=("$service")
+      waited+=("$service")
     fi
   done
-  if ((${#services[@]})); then
-    compose up -d --wait "${services[@]}"
+  if ((${#waited[@]})); then
+    compose up -d --wait "${waited[@]}"
   fi
 }
 
@@ -156,14 +157,10 @@ wait_services() {
   esac
 }
 
-# Failure diagnostics: the state of every service and the tail of its log.
+# Failure diagnostics: the state and the log tail of every service the stack ran.
 logs() {
   compose ps -a
-  local service
-  for service in "${services[@]}"; do
-    echo "=== $service logs ==="
-    compose logs --tail 100 "$service"
-  done
+  compose logs --tail 100
 }
 
 case "$action" in

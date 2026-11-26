@@ -29,6 +29,7 @@ runs:
         echo "--- last 40 kernel lines (fallback) ---"
         sudo dmesg --ctime | tail -40 || true
         make "$STACK-logs" || true
+        # Compose finds the stack's containers by project, so the base file alone reaches `exasol`.
         echo "=== exasql crash logs ==="
         docker compose exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
         echo "=== collecting /exa/logs tree for artifact ==="
