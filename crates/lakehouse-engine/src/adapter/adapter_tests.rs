@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::properties::PROP_DF_BATCH_SIZE;
 use crate::adapter::pushdown::test_support::{
-    NO_COLUMNS, customer_orders_join, pushdown_request, table_col,
+    NO_COLUMNS, adapter_request, customer_orders_join, pushdown_request, table_col,
 };
 use crate::adapter::pushdown::test_support::{
     named_table, with_delta_notes, with_iceberg_notes, with_identifier_notes,
@@ -544,7 +544,7 @@ fn pushdown_without_an_identifier_note_fails_naming_refresh() {
         .expect("an involved table")
         .remove("adapterNotes");
 
-    let message = resolve_pushdown_identifier(&request)
+    let message = resolve_pushdown_identifier(&adapter_request(&request))
         .unwrap_err()
         .to_string();
     assert!(
@@ -561,7 +561,7 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 
     assert_eq!(
-        resolve_pushdown_identifier(&request).unwrap(),
+        resolve_pushdown_identifier(&adapter_request(&request)).unwrap(),
         "prod.finance.orders",
         "ORDERS must resolve to prod.finance.orders"
     );
@@ -589,7 +589,7 @@ fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
 }
 
 /// A pushdown request over the one listed virtual table named `name`.
-fn pushdown_over(tables: &impl serde::Serialize, name: &str) -> Json {
+fn pushdown_over(tables: &impl serde::Serialize, name: &str) -> AdapterRequest {
     let tables = serde_json::to_value(tables).unwrap();
     let table = tables
         .as_array()
@@ -598,7 +598,11 @@ fn pushdown_over(tables: &impl serde::Serialize, name: &str) -> Json {
         .find(|table| table["name"] == name)
         .unwrap_or_else(|| panic!("no listed table {name}: {tables}"))
         .clone();
-    json!({"type": "pushdown", "involvedTables": [table]})
+    adapter_request(&json!({
+        "type": "pushdown",
+        "involvedTables": [table],
+        "pushdownRequest": {"selectListDataTypes": []},
+    }))
 }
 
 fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {

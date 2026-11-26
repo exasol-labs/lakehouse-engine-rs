@@ -1,6 +1,6 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{col, like, like_escape, str_lit};
-use serde_json::json;
+use crate::adapter::pushdown::test_support::{ast, col, like, like_escape, str_lit};
+use serde_json::{Value as Json, json};
 
 fn pattern(pattern: &str, escape: char) -> LikePattern {
     LikePattern::parse(pattern, escape).expect("the pattern parses")
@@ -14,7 +14,21 @@ fn prefix(prefix: &str, exact: bool) -> Option<LikeBound> {
 }
 
 fn bound_of(node: &Json) -> Option<LikeBound> {
-    like_operands(node)?.1.bound()
+    like_of(node)?.1.bound()
+}
+
+/// The operands of the LIKE `node`, as the pruning parse reads them.
+fn like_of(node: &Json) -> Option<(String, LikePattern)> {
+    let Expr::Like {
+        expression,
+        pattern,
+        escape,
+    } = ast(node)
+    else {
+        panic!("not a LIKE: {node}");
+    };
+    like_operands(&expression, &pattern, escape.as_deref())
+        .map(|(column, pattern)| (column.to_string(), pattern))
 }
 
 #[test]
@@ -100,11 +114,11 @@ fn a_like_pattern_matches_as_exasol_does() {
 fn like_operands_need_a_bare_column_and_string_literals() {
     let mut null_escape = like(col("S"), "a%");
     null_escape["escapeChar"] = json!({"type": "literal_null"});
-    assert!(like_operands(&like(col("S"), "a%")).is_some());
-    assert!(like_operands(&like_escape(col("S"), "a%", "!")).is_some());
-    assert!(like_operands(&like_escape(col("S"), "a%", "!!")).is_none());
-    assert!(like_operands(&null_escape).is_none());
-    assert!(like_operands(&like(str_lit("x"), "a%")).is_none());
+    assert!(like_of(&like(col("S"), "a%")).is_some());
+    assert!(like_of(&like_escape(col("S"), "a%", "!")).is_some());
+    assert!(like_of(&like_escape(col("S"), "a%", "!!")).is_none());
+    assert!(like_of(&null_escape).is_none());
+    assert!(like_of(&like(str_lit("x"), "a%")).is_none());
 }
 
 /// An empty fold must answer no constraint, since the formats' empty AND is true and their

@@ -1,11 +1,10 @@
 use crate::types::exasol_type::ExasolType;
-use serde_json::Value as Json;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
-use vs_expression::ColumnNode;
+use vs_expression::{CompareOp, Expr};
 
 use super::super::request::OutputContract;
-use super::super::support::{ColumnTypes, conjoin, flatten_conjuncts};
+use super::super::support::ColumnTypes;
 use super::attribution::JoinLegs;
 use super::condition_filters::join_key_legs;
 use super::plan::{JoinPlan, LegGroup, exasol_runs_tail};
@@ -13,7 +12,7 @@ use super::rendering::{fan_out_holds, leg_columns_named_in, place_conditions};
 
 /// One top-level conjunct of the WHERE, and whether the scan renders it.
 pub(super) struct WhereConjunct<'a> {
-    pub tree: &'a Json,
+    pub tree: &'a Expr,
     pub renders: bool,
 }
 
@@ -26,11 +25,11 @@ pub(super) struct JoinGraph<'a> {
     /// Per leg, its declared columns.
     pub columns: &'a [&'a ColumnTypes],
     /// Every join condition, its filters already moved to WHERE.
-    pub conditions: &'a [Json],
+    pub conditions: &'a [Expr],
     pub conjuncts: &'a [WhereConjunct<'a>],
     /// The select list, `GROUP BY`, `HAVING`, and `ORDER BY`.
-    pub above: &'a [&'a Json],
-    pub output: OutputContract,
+    pub above: &'a [&'a Expr],
+    pub output: &'a OutputContract,
     /// Exasol postprocessing: the request aggregates, groups, or carries a HAVING.
     pub aggregates: bool,
     pub max_bytes: u64,
@@ -60,7 +59,7 @@ fn candidate_pairs(graph: &JoinGraph<'_>) -> BTreeSet<(usize, usize)> {
     graph
         .conditions
         .iter()
-        .flat_map(flatten_conjuncts)
+        .flat_map(Expr::conjuncts)
         .filter_map(|conjunct| join_key_legs(conjunct, graph.legs))
         .collect()
 }
@@ -95,10 +94,10 @@ fn eligible(graph: &JoinGraph<'_>, pair: &LegGroup) -> bool {
 /// The dimension columns Exasol reads over `plan`: those of the clauses above it, of the join
 /// conditions the pair's scan does not run, and of the conjuncts left for Exasol's WHERE.
 fn dimension_reads(graph: &JoinGraph<'_>, plan: &JoinPlan, dimension: usize) -> ColumnTypes {
-    if graph.output == OutputContract::WholeRow {
+    if *graph.output == OutputContract::WholeRow {
         return graph.columns[dimension].narrowed(|_| true);
     }
-    let filter = conjoin(graph.conjuncts.iter().map(|c| c.tree.clone()).collect());
+    let filter = Expr::conjoin(graph.conjuncts.iter().map(|c| c.tree.clone()).collect());
     let placed = place_conditions(filter.as_ref(), graph.conditions, graph.legs, plan);
     let declined = graph
         .conjuncts
@@ -139,39 +138,37 @@ fn width_bounded(graph: &JoinGraph<'_>, dimension: usize, read: &ColumnTypes) ->
 /// `col IN ('x', 'y')`, limits to string literals. Exasol applies a declined one only after the
 /// fan-out has emitted the column, so it bounds nothing.
 fn literal_bounded_columns(graph: &JoinGraph<'_>, leg: usize) -> HashSet<String> {
-    let is_literal =
-        |node: &Json| node.get("type").and_then(|t| t.as_str()) == Some("literal_string");
-    let leg_column = |node: &Json| {
-        ColumnNode::parse(node)
-            .filter(|column| graph.legs.leg(*column) == leg)
+    let is_literal = |node: &Expr| node.as_string_literal().is_some();
+    let leg_column = |node: &Expr| {
+        node.as_column()
+            .filter(|column| graph.legs.leg(column) == leg)
             .map(|column| column.ascii_upper_name())
     };
     graph
         .conjuncts
         .iter()
         .filter(|conjunct| conjunct.renders)
-        .filter_map(|conjunct| {
-            let conjunct = conjunct.tree;
-            match conjunct.get("type")?.as_str()? {
-                "predicate_equal" => {
-                    let (left, right) = (conjunct.get("left")?, conjunct.get("right")?);
-                    if is_literal(right) {
-                        leg_column(left)
-                    } else if is_literal(left) {
-                        leg_column(right)
-                    } else {
-                        None
-                    }
+        .filter_map(|conjunct| match conjunct.tree {
+            Expr::Compare {
+                op: CompareOp::Equal,
+                left,
+                right,
+            } => {
+                if is_literal(right) {
+                    leg_column(left)
+                } else if is_literal(left) {
+                    leg_column(right)
+                } else {
+                    None
                 }
-                "predicate_in_constlist" => {
-                    let values = conjunct.get("arguments")?.as_array()?;
-                    if values.is_empty() || !values.iter().all(is_literal) {
-                        return None;
-                    }
-                    leg_column(conjunct.get("expression")?)
-                }
-                _ => None,
             }
+            Expr::InList { expression, values } => {
+                if values.is_empty() || !values.iter().all(is_literal) {
+                    return None;
+                }
+                leg_column(expression)
+            }
+            _ => None,
         })
         .collect()
 }

@@ -1,6 +1,7 @@
 use crate::adapter::pushdown::test_support::connection_storage;
 use crate::adapter::pushdown::test_support::{col, predicate_equal, str_lit};
 use delta_kernel::schema::DataType as DeltaType;
+use serde_json::Value as Json;
 
 use super::super::ResolvedScan;
 use super::*;

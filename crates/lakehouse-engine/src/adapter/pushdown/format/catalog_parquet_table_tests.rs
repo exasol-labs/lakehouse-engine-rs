@@ -1,10 +1,11 @@
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
-    UNREACHABLE_CATALOG, and, assert_mentions, catalog_table, closed_port_storage, compare,
+    UNREACHABLE_CATALOG, and, assert_mentions, ast, catalog_table, closed_port_storage, compare,
     connection_storage, date_lit, declared_notes, glue_catalog_table, involved_notes,
     nullable_field, num_lit, object_endpoint, or, predicate_equal, resolve_declared, sales_col,
     sales_equal, sample_storage, sigv4_creds, unauthenticated_creds, unity_column, user_message,
 };
+use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
 use super::super::ResolvedScan;
@@ -720,7 +721,7 @@ fn keep_under(
         .iter()
         .map(|(name, arrow_type)| (name.to_string(), arrow_type.clone()))
         .collect();
-    let predicate = PartitionPredicate::from_filter(Some(filter), &declared);
+    let predicate = PartitionPredicate::from_filter(Some(&ast(filter)), &declared);
     move |values| predicate.keeps(values)
 }
 

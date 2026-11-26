@@ -4,9 +4,8 @@ use super::super::plan::{JoinPlan, LegGroup};
 use super::super::planning::involved_table;
 use super::super::sql_builders::{build_pair_fan_out_sql, build_side_fan_out_sql};
 use super::super::tests::{
-    broadcast_projection, customer_orders_legs, customer_orders_sides, detected_join,
-    equi_condition, join_request, legs_of, rendered_pair, resolved_side, self_join_legs,
-    two_scan_tuning,
+    broadcast_projection, customer_orders_legs, customer_orders_sides, equi_condition,
+    join_request, legs_of, rendered_pair, resolved_side, self_join_legs, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::support::RowProjection;
@@ -14,6 +13,7 @@ use crate::adapter::pushdown::test_support::*;
 use crate::adapter::pushdown::{ProjectedColumn, PushdownContext};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 #[test]
 fn join_condition_renders_via_translator() {
@@ -28,7 +28,7 @@ fn join_condition_renders_via_translator() {
     let both_legs = column_types(&both_legs);
     assert_eq!(
         scan_over(&both_legs)
-            .expression(&equi_condition())
+            .expression(&ast(&equi_condition()))
             .map(|fragment| fragment.sql)
             .as_deref(),
         Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
@@ -307,8 +307,8 @@ fn fan_out_filter_of_one_leg_attributes_conjuncts_to_owning_leg() {
     let filter = and([name.clone(), date.clone()]);
 
     let legs = customer_orders_legs();
-    assert_eq!(fan_out_filter(&filter, &legs, 0), Some(name));
-    assert_eq!(fan_out_filter(&filter, &legs, 1), Some(date));
+    assert_eq!(fan_out_filter(&ast(&filter), &legs, 0), Some(ast(&name)));
+    assert_eq!(fan_out_filter(&ast(&filter), &legs, 1), Some(ast(&date)));
 }
 
 #[test]
@@ -322,12 +322,12 @@ fn fan_out_filter_of_one_leg_withholds_cross_leg_and_or_conjuncts() {
     ]);
     let legs = customer_orders_legs();
     assert_eq!(
-        fan_out_filter(&filter, &legs, 0),
-        Some(string_equal("CUSTOMER", "C_NAME", "ACME")),
+        fan_out_filter(&ast(&filter), &legs, 0),
+        Some(ast(&string_equal("CUSTOMER", "C_NAME", "ACME"))),
         "the cross-table conjunct must NOT be pushed to CUSTOMER"
     );
     assert!(
-        fan_out_filter(&filter, &legs, 1).is_none(),
+        fan_out_filter(&ast(&filter), &legs, 1).is_none(),
         "ORDERS is only referenced by the cross-leg conjunct, so nothing is leg-local to it"
     );
 
@@ -339,26 +339,26 @@ fn fan_out_filter_of_one_leg_withholds_cross_leg_and_or_conjuncts() {
             date_lit("1995-01-01"),
         ),
     ]);
-    assert!(fan_out_filter(&or_filter, &legs, 0).is_none());
-    assert!(fan_out_filter(&or_filter, &legs, 1).is_none());
+    assert!(fan_out_filter(&ast(&or_filter), &legs, 0).is_none());
+    assert!(fan_out_filter(&ast(&or_filter), &legs, 1).is_none());
 
     let one_side_or = or([
         string_equal("CUSTOMER", "C_NAME", "ACME"),
         string_equal("CUSTOMER", "C_NAME", "GLOBEX"),
     ]);
     assert!(
-        fan_out_filter(&one_side_or, &legs, 0).is_some(),
+        fan_out_filter(&ast(&one_side_or), &legs, 0).is_some(),
         "an OR over one leg alone is leg-local and prunable"
     );
-    assert!(fan_out_filter(&one_side_or, &legs, 1).is_none());
+    assert!(fan_out_filter(&ast(&one_side_or), &legs, 1).is_none());
 }
 
 #[test]
 fn fan_out_filter_of_one_leg_handles_a_single_conjunct() {
     let single = string_equal("CUSTOMER", "C_NAME", "ACME");
     let legs = customer_orders_legs();
-    assert!(fan_out_filter(&single, &legs, 0).is_some());
-    assert!(fan_out_filter(&single, &legs, 1).is_none());
+    assert!(fan_out_filter(&ast(&single), &legs, 0).is_some());
+    assert!(fan_out_filter(&ast(&single), &legs, 1).is_none());
 }
 
 #[test]
@@ -368,10 +368,10 @@ fn fan_out_filter_of_one_leg_attributes_shared_column_by_leg_not_name() {
     let filter = and([id.clone(), label.clone()]);
 
     let legs = legs_of(&["EVENTS", "LABELS"]);
-    assert_eq!(fan_out_filter(&filter, &legs, 0), Some(id));
+    assert_eq!(fan_out_filter(&ast(&filter), &legs, 0), Some(ast(&id)));
     assert_eq!(
-        fan_out_filter(&filter, &legs, 1),
-        Some(label),
+        fan_out_filter(&ast(&filter), &legs, 1),
+        Some(ast(&label)),
         "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name"
     );
 }
@@ -390,7 +390,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     let fact_orders = column_types(&[("O_ORDERKEY", ExasolType::decimal(20, 0))]);
 
     let occurrence_a = scan_filter_sql(
-        &fan_out_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
+        &fan_out_filter(&ast(&filter), &legs, 0).expect("occurrence A's conjunct is leg-local"),
         &fact_orders,
     )
     .expect("renders");
@@ -400,7 +400,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     );
 
     let occurrence_b = scan_filter_sql(
-        &fan_out_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
+        &fan_out_filter(&ast(&filter), &legs, 1).expect("occurrence B's conjunct is leg-local"),
         &fact_orders,
     )
     .expect("renders");
@@ -419,10 +419,12 @@ fn orders_local_rendering_conjunct() -> Json {
     )
 }
 
-fn orders_col_types() -> Vec<(String, ExasolType)> {
-    involved_table(&join_request(Json::Null, equi_condition()), "ORDERS")
-        .unwrap()
-        .types
+/// `screen_leg_filter` over the ORDERS leg of the customer-orders join.
+fn screen_orders(filter: &Expr) -> (Option<String>, Option<Expr>) {
+    let request = adapter_request(&join_request(Json::Null, equi_condition()));
+    let orders = involved_table(&request, "ORDERS");
+    screen_leg_filter(filter, &column_types(&orders.types), &test_context())
+        .expect("every column of the leg filter binds the leg")
 }
 
 #[test]
@@ -432,9 +434,7 @@ fn screen_leg_filter_renders_the_accepted_set_bare() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) =
-        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
-            .expect("every column of the leg filter binds the leg");
+    let (leg, declined) = screen_orders(&ast(&filter));
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -456,9 +456,7 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) =
-        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
-            .expect("every column of the leg filter binds the leg");
+    let (leg, declined) = screen_orders(&ast(&filter));
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -467,7 +465,7 @@ fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
     );
     assert_eq!(
         declined,
-        Some(date_like),
+        Some(ast(&date_like)),
         "the declined half is the raw tree"
     );
 }
@@ -478,19 +476,14 @@ fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
     let custkey_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
     let filter = and([date_like.clone(), custkey_like.clone()]);
 
-    let pruning = fan_out_filter(&filter, &customer_orders_legs(), 1)
+    let pruning = fan_out_filter(&ast(&filter), &customer_orders_legs(), 1)
         .expect("both conjuncts are ORDERS-leg-local");
-    let (_, declined) = screen_leg_filter(
-        &pruning,
-        &column_types(&orders_col_types()),
-        &test_context(),
-    )
-    .expect("every column of the leg filter binds the leg");
+    let (_, declined) = screen_orders(&pruning);
 
-    assert_eq!(declined, Some(date_like.clone()));
+    assert_eq!(declined, Some(ast(&date_like)));
     assert_eq!(
         pruning,
-        and([date_like, custkey_like]),
+        ast(&and([date_like, custkey_like])),
         "pruning keeps the declined conjunct, raw"
     );
 }
@@ -502,12 +495,10 @@ fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) =
-        screen_leg_filter(&filter, &column_types(&orders_col_types()), &test_context())
-            .expect("every column of the leg filter binds the leg");
+    let (leg, declined) = screen_orders(&ast(&filter));
 
     assert_eq!(leg, None);
-    assert_eq!(declined, Some(filter));
+    assert_eq!(declined, Some(ast(&filter)));
 }
 
 #[test]
@@ -516,7 +507,7 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let numbered_filter = like(table_col("NUMBERED", "SHARED_KEY"), "1995%");
     let screen = |filter: &Json, exa_type: ExasolType| {
         screen_leg_filter(
-            filter,
+            &ast(filter),
             &column_types(&[("SHARED_KEY", exa_type)]),
             &test_context(),
         )
@@ -525,7 +516,7 @@ fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
     assert_eq!(
         screen(&dated_filter, ExasolType::Date),
-        (None, Some(dated_filter.clone())),
+        (None, Some(ast(&dated_filter))),
         "a DATE's text depends on NLS_DATE_FORMAT, so the DATE side declines"
     );
     let (numeric_leg, numeric_declined) = screen(&numbered_filter, ExasolType::decimal(20, 0));
@@ -609,11 +600,13 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
     let address_filter = string_equal("CUSTOMER", "C_ADDRESS", "z");
     let order_key = table_col("ORDERS", "O_ORDERKEY");
     let legs = customer_orders_legs();
-    use OutputContract::{AnyOneColumn, Items, WholeRow};
+    use OutputContract::{AnyOneColumn, WholeRow};
+    // The emission reads the items from the clauses above the leg, never from the contract.
+    let items = || OutputContract::Items(Vec::new());
     let cases: [LegEmissionCase; 11] = [
         (
             "named columns keep the declaration order",
-            Items,
+            items(),
             &[&name, &condition, &address_filter],
             0,
             &[],
@@ -621,7 +614,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a leg emits only its own columns",
-            Items,
+            items(),
             &[&name, &condition],
             1,
             &[],
@@ -669,7 +662,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a leg only the other leg's clauses name emits one column, not its row",
-            Items,
+            items(),
             &[&order_key],
             0,
             &["C_NAME"],
@@ -677,7 +670,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "an unnamed second leg skips a refused first column",
-            Items,
+            items(),
             &[&name],
             1,
             &["O_ORDERKEY"],
@@ -685,7 +678,7 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
         ),
         (
             "a named refused column is an adapter error",
-            Items,
+            items(),
             &[&name],
             0,
             &["C_NAME"],
@@ -702,7 +695,9 @@ fn a_leg_emits_the_columns_named_above_it_or_one_readable_placeholder() {
     ];
     for (case, output, above, leg, refused, expected) in cases {
         let columns = customer_orders_columns(refused);
-        let emitted = leg_emission(output, above, &legs, leg, &columns[leg]);
+        let above: Vec<Expr> = above.iter().map(|node| ast(node)).collect();
+        let above: Vec<&Expr> = above.iter().collect();
+        let emitted = leg_emission(&output, &above, &legs, leg, &columns[leg]);
         match (emitted_names(emitted.map(|leg| vec![leg])), expected) {
             (Ok(names), Ok(expected)) => assert_eq!(names, [expected], "{case}"),
             (Err(message), Err(fragment)) => {
@@ -758,9 +753,11 @@ fn a_fan_out_over_several_legs_emits_one_placeholder_for_all_of_them() {
     for (case, above, prefer, refused, expected) in cases {
         let columns = customer_orders_columns(refused);
         let prefer = columns[0].narrowed(|column| prefer.contains(&column.name.as_str()));
+        let above: Vec<Expr> = above.iter().map(|node| ast(node)).collect();
+        let above: Vec<&Expr> = above.iter().collect();
         let emitted = fan_out_emission(
-            OutputContract::Items,
-            above,
+            &OutputContract::Items(Vec::new()),
+            &above,
             &legs,
             &[(0, &columns[0]), (1, &columns[1])],
             &prefer,
@@ -781,14 +778,14 @@ fn column_collectors_keep_divergent_case_folding() {
     let expr = table_col("CUSTOMER", "straße");
 
     let mut unicode_folded = std::collections::HashSet::new();
-    collect_all_column_names(&expr, &mut unicode_folded);
+    collect_all_column_names(&ast(&expr), &mut unicode_folded);
     assert_eq!(
         unicode_folded,
         std::collections::HashSet::from(["STRASSE".to_string()]),
         "collect_all_column_names folds ß to SS via Unicode to_uppercase"
     );
 
-    let ascii_folded = possible_side_column_names(&expr, "CUSTOMER");
+    let ascii_folded = possible_side_column_names(&filter_only_request(&expr), "CUSTOMER");
     assert_eq!(
         ascii_folded,
         std::collections::HashSet::from(["STRAßE".to_string()]),
@@ -1029,7 +1026,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let detected = detected_join(&request);
     let mut sides = request_sides(&request, &detected);
     sides[0].column_types = declared_column_types(
-        &involved_table(&request, "CUSTOMER").unwrap().types,
+        &involved_table(&adapter_request(&request), "CUSTOMER").types,
         &c_name,
     );
 
@@ -1039,7 +1036,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types, &test_context())
+    let (leg, declined) = screen_leg_filter(&ast(&filter), &sides[0].column_types, &test_context())
         .expect("every column of the leg filter binds the leg");
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
@@ -1081,6 +1078,28 @@ fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
         across.clone(),
         bool_lit(true),
     ]);
+    let [
+        customer_orders,
+        orders_lineitem,
+        customer_local,
+        orders_local,
+        lineitem_local,
+        in_pair,
+        across,
+        filter,
+        true_literal,
+    ] = [
+        customer_orders,
+        orders_lineitem,
+        customer_local,
+        orders_local,
+        lineitem_local,
+        in_pair,
+        across,
+        filter,
+        bool_lit(true),
+    ]
+    .map(|node| ast(&node));
     let conditions = [customer_orders.clone(), orders_lineitem.clone()];
 
     let pair = JoinPlan::broadcasting(3, &LegGroup::pair(2, 1));
@@ -1091,11 +1110,11 @@ fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
         placement.local,
         [
             Some(customer_local.clone()),
-            Some(and([
+            Some(Expr::And(vec![
                 orders_local.clone(),
                 lineitem_local.clone(),
                 in_pair.clone(),
-                bool_lit(true),
+                true_literal.clone(),
             ])),
         ]
     );
@@ -1117,6 +1136,6 @@ fn placement_puts_each_conjunct_in_exactly_one_fan_out_or_the_residual() {
     );
     assert_eq!(
         n_scan.residual,
-        Some(and([in_pair, across, bool_lit(true)]))
+        Some(Expr::And(vec![in_pair, across, true_literal]))
     );
 }

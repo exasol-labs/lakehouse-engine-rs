@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use exasol_udf_sdk::error::UdfError;
-use serde_json::{Value as Json, json};
 use vs_expression::timestamp::TimestampLiteral;
+use vs_expression::{Expr, Literal, ScalarCall, short};
 
 use crate::adapter::time_zone::TimeZone;
 use crate::types::exasol_type::ExasolType;
@@ -58,75 +58,52 @@ impl StatementClock {
     /// Exasol shows a projected TSTZ value in the session zone, so a select-list item it types
     /// TSTZ keeps the UTC instant, which the Exasol dialect converts into `SESSIONTIMEZONE`.
     /// Everywhere else a TSTZ value compares as the plain wall clock of the folding zone.
-    pub(super) fn fold(&self, pushdown: PushdownRequest) -> Result<PushdownRequest, UdfError> {
-        pushdown.try_map_clauses(&Clause::ALL, |clause, value| match clause {
-            Clause::SelectList => {
-                let mut items = value.as_array_mut().into_iter().flatten().enumerate();
-                items.try_for_each(|(index, item)| match pushdown.select_type(index) {
-                    Some(ExasolType::TimestampWithLocalTimeZone { .. }) => {
-                        self.walk(item, &|tstz| Ok(tstz_literal(tstz)))
+    pub(super) fn fold(&self, pushdown: &PushdownRequest) -> Result<PushdownRequest, UdfError> {
+        let keep_instant = |tstz| Ok(tstz_literal(tstz));
+        let wall_clock = |tstz| self.wall_clock_literal(tstz);
+        let mut folded = pushdown.try_map_expressions(&Clause::ALL, |clause, index, tree| {
+            let tstz: &dyn Fn(Tstz) -> Result<Expr, UdfError> =
+                match (clause, pushdown.select_type(index)) {
+                    (Clause::SelectList, Some(ExasolType::TimestampWithLocalTimeZone { .. })) => {
+                        &keep_instant
                     }
-                    _ => self.walk(item, &|tstz| self.wall_clock_literal(tstz)),
-                })
-            }
-            _ => self.walk(value, &|tstz| self.wall_clock_literal(tstz)),
-        })
-    }
-
-    fn walk(
-        &self,
-        node: &mut Json,
-        tstz: &dyn Fn(Tstz) -> Result<Json, UdfError>,
-    ) -> Result<(), UdfError> {
-        if let Some(folded) = self.folded(node, tstz)? {
-            *node = folded;
-            return Ok(());
-        }
-        match node {
-            Json::Array(items) => items.iter_mut().try_for_each(|item| self.walk(item, tstz)),
-            Json::Object(fields) => fields
-                .values_mut()
-                .try_for_each(|value| self.walk(value, tstz)),
-            _ => Ok(()),
-        }
+                    _ => &wall_clock,
+                };
+            tree.try_rewrite(&mut |node| self.folded(node, tstz))
+        })?;
+        folded.drop_constant_sort_keys();
+        Ok(folded)
     }
 
     /// The literal in place of `node`, `None` for a node that is no clock call or TSTZ literal.
     fn folded(
         &self,
-        node: &Json,
-        tstz: &dyn Fn(Tstz) -> Result<Json, UdfError>,
-    ) -> Result<Option<Json>, UdfError> {
-        let field = |key| node.get(key).and_then(Json::as_str);
-        match field("type") {
-            Some("function_scalar") => {}
-            Some("literal_timestamputc" | "literal_timestamp_utc") => {
-                return match node.get("value") {
-                    Some(Json::String(value)) => tstz(parse_tstz(value)?).map(Some),
-                    _ => Ok(None),
-                };
-            }
+        node: &Expr,
+        tstz: &dyn Fn(Tstz) -> Result<Expr, UdfError>,
+    ) -> Result<Option<Expr>, UdfError> {
+        let call = match node {
+            Expr::Scalar(call) => call,
+            Expr::Literal(
+                Literal::TimestampUtc(value) | Literal::LocalTimeZoneTimestamp(value),
+            ) => return tstz(parse_tstz(value)?).map(Some),
             _ => return Ok(None),
-        }
-        let Some(name) = field("name").map(str::to_ascii_uppercase) else {
-            return Ok(None);
         };
         let utc = self.instant.naive_utc();
-        Ok(Some(match name.as_str() {
+        Ok(Some(match call.name.as_str() {
             "CURRENT_DATE" => date_literal(self.folding_zone()?.wall_clock(self.instant)),
             "SYSDATE" => date_literal(self.tz_zone()?.wall_clock(self.instant)),
             "SYSTIMESTAMP" => {
-                timestamp_literal(self.tz_zone()?.wall_clock(self.instant), precision(node)?)
+                timestamp_literal(self.tz_zone()?.wall_clock(self.instant), precision(call)?)
             }
             "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" => tstz(Tstz {
                 utc,
-                digits: precision(node)?,
+                digits: precision(call)?,
             })?,
             _ => return Ok(None),
         }))
     }
 
-    fn wall_clock_literal(&self, tstz: Tstz) -> Result<Json, UdfError> {
+    fn wall_clock_literal(&self, tstz: Tstz) -> Result<Expr, UdfError> {
         let wall_clock = self.folding_zone()?.wall_clock(tstz.utc.and_utc());
         Ok(timestamp_literal(wall_clock, tstz.digits))
     }
@@ -141,18 +118,20 @@ impl StatementClock {
 }
 
 /// Exasol 2025 sends the precision of `SYSTIMESTAMP(6)` as the one argument; Exasol 8 sends none.
-fn precision(call: &Json) -> Result<usize, UdfError> {
-    let Some(argument) = call.pointer("/arguments/0") else {
+fn precision(call: &ScalarCall) -> Result<usize, UdfError> {
+    let Some(argument) = call.arguments.first() else {
         return Ok(DEFAULT_DIGITS);
     };
-    argument
-        .get("value")
-        .and_then(Json::as_str)
-        .and_then(|value| value.parse::<usize>().ok())
+    let digits = match argument.as_literal() {
+        Some(Literal::ExactNumeric(value)) => value.parse::<usize>().ok(),
+        _ => None,
+    };
+    digits
         .filter(|digits| *digits <= MAX_DIGITS)
         .ok_or_else(|| {
             UdfError::User(format!(
-                "clock function precision {argument} is no whole number from 0 to {MAX_DIGITS}"
+                "clock function precision {} is no whole number from 0 to {MAX_DIGITS}",
+                short(argument)
             ))
         })
 }
@@ -167,16 +146,21 @@ fn parse_tstz(value: &str) -> Result<Tstz, UdfError> {
     Ok(Tstz { utc, digits })
 }
 
-fn date_literal(wall_clock: NaiveDateTime) -> Json {
-    json!({"type": "literal_date", "value": wall_clock.date().format("%Y-%m-%d").to_string()})
+fn date_literal(wall_clock: NaiveDateTime) -> Expr {
+    Expr::Literal(Literal::Date(
+        wall_clock.date().format("%Y-%m-%d").to_string(),
+    ))
 }
 
-fn timestamp_literal(wall_clock: NaiveDateTime, digits: usize) -> Json {
-    json!({"type": "literal_timestamp", "value": timestamp_text(wall_clock, digits)})
+fn timestamp_literal(wall_clock: NaiveDateTime, digits: usize) -> Expr {
+    Expr::Literal(Literal::Timestamp(timestamp_text(wall_clock, digits)))
 }
 
-fn tstz_literal(tstz: Tstz) -> Json {
-    json!({"type": "literal_timestamputc", "value": timestamp_text(tstz.utc, tstz.digits)})
+fn tstz_literal(tstz: Tstz) -> Expr {
+    Expr::Literal(Literal::LocalTimeZoneTimestamp(timestamp_text(
+        tstz.utc,
+        tstz.digits,
+    )))
 }
 
 /// Truncated, not rounded, to `digits`, as Exasol truncates its clock.

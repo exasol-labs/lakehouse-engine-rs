@@ -1,8 +1,9 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, col, count_star, float_div, round_of, scalar_fn,
-    typed_scan,
+    AGGREGATED, EXASOL_TYPE_SPELLINGS, agg_item, agg_plan, ast, col, count_star, float_div,
+    round_of, scalar_fn, typed_scan,
 };
+use serde_json::Value as Json;
 
 /// The translator these node-level units take: the aggregate fixtures' columns and the key a
 /// grouped caller counts.
@@ -16,12 +17,26 @@ fn scan() -> ScanTranslator<'static> {
     )
 }
 
+fn sum_x() -> Json {
+    agg_item("SUM", Some("X"), false)
+}
+
 fn sum_over_count() -> Json {
-    float_div(agg_item("SUM", Some("X"), false), count_star())
+    float_div(sum_x(), count_star())
 }
 
 fn plan_of(node: &Json) -> AggregatePlan {
-    parse_agg_item(node, scan()).expect("test fixture aggregate must parse to a plan")
+    agg_plan(node, scan()).expect("test fixture aggregate must parse to a plan")
+}
+
+fn classify(node: &Json) -> Option<Vec<(AggregatePlan, Expr)>> {
+    classify_scalar_over_aggregate(&ast(node), scan())
+}
+
+/// The SQL `node` renders over the merge wrapper, `None` when it declines.
+fn render(node: &Json, plans: &[AggregatePlan], merged: &[&str]) -> Option<String> {
+    let merged: Vec<String> = merged.iter().map(|sql| sql.to_string()).collect();
+    render_scalar_over_merge(&ast(node), plans, &merged, scan()).map(|rendered| rendered.sql)
 }
 
 #[test]
@@ -29,18 +44,8 @@ fn fold_collapses_structurally_equal_plans_into_one_slot() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
-    let first = fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
-    let second = fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
+    let first = fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
+    let second = fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
 
     assert_eq!(first, second, "the same aggregate must reuse its slot");
     assert_eq!(
@@ -56,12 +61,7 @@ fn fold_keeps_structurally_different_aggregates_in_separate_slots() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
-    let sum = fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
+    let sum = fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
     let count = fold_aggregate_plan(&mut plans, &mut types, plan_of(&count_star()), None);
 
     assert_eq!((sum, count), (0, 1));
@@ -73,12 +73,7 @@ fn fold_leaves_a_nested_only_occurrence_untyped() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
-    fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
+    fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
 
     assert_eq!(types, vec![None]);
 }
@@ -88,16 +83,11 @@ fn fold_declared_type_overwrites_a_slot_created_by_a_nested_occurrence() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
-    fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
+    fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
     let slot = fold_aggregate_plan(
         &mut plans,
         &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
+        plan_of(&sum_x()),
         Some(ExasolType::decimal(18, 2)),
     );
 
@@ -117,15 +107,10 @@ fn fold_keeps_a_declared_type_when_a_nested_occurrence_follows_it() {
     fold_aggregate_plan(
         &mut plans,
         &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
+        plan_of(&sum_x()),
         Some(ExasolType::decimal(18, 2)),
     );
-    fold_aggregate_plan(
-        &mut plans,
-        &mut types,
-        plan_of(&agg_item("SUM", Some("X"), false)),
-        None,
-    );
+    fold_aggregate_plan(&mut plans, &mut types, plan_of(&sum_x()), None);
 
     assert_eq!(types, vec![Some(ExasolType::decimal(18, 2))]);
 }
@@ -136,20 +121,14 @@ fn sentinelize_replaces_each_aggregate_and_collects_it_in_encounter_order() {
     let mut aggregates = Vec::new();
     let mut residual = false;
 
-    let tree = sentinelize_aggregates(&node, &mut aggregates, &mut residual);
+    let tree = sentinelize_aggregates(&ast(&node), &mut aggregates, &mut residual);
 
     assert!(!residual, "no bare column sits outside the aggregates");
+    assert_eq!(aggregates, vec![ast(&sum_x()), ast(&count_star())]);
+    let quotient = tree.children()[0];
     assert_eq!(
-        aggregates,
-        vec![agg_item("SUM", Some("X"), false), count_star()]
-    );
-    assert_eq!(
-        tree["arguments"][0]["arguments"][0],
-        sentinel_column_node(0)
-    );
-    assert_eq!(
-        tree["arguments"][0]["arguments"][1],
-        sentinel_column_node(1)
+        quotient.children(),
+        [&sentinel_column_node(0), &sentinel_column_node(1)]
     );
 }
 
@@ -158,22 +137,18 @@ fn sentinelize_does_not_treat_a_column_inside_an_aggregate_as_residual() {
     let mut aggregates = Vec::new();
     let mut residual = false;
 
-    sentinelize_aggregates(
-        &round_of(agg_item("SUM", Some("X"), false), 2),
-        &mut aggregates,
-        &mut residual,
-    );
+    sentinelize_aggregates(&ast(&round_of(sum_x(), 2)), &mut aggregates, &mut residual);
 
     assert!(!residual);
 }
 
 #[test]
 fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
-    let node = scalar_fn("ADD", [agg_item("SUM", Some("X"), false), col("Y")]);
+    let node = scalar_fn("ADD", [sum_x(), col("Y")]);
     let mut aggregates = Vec::new();
     let mut residual = false;
 
-    sentinelize_aggregates(&node, &mut aggregates, &mut residual);
+    sentinelize_aggregates(&ast(&node), &mut aggregates, &mut residual);
 
     assert!(
         residual,
@@ -185,17 +160,14 @@ fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
 fn classify_returns_the_nested_plans_in_encounter_order() {
     let node = round_of(sum_over_count(), 2);
 
-    let plans = classify_scalar_over_aggregate(&node, scan())
+    let plans = classify(&node)
         .expect("ROUND(SUM(x) / COUNT(*), 2) must classify as a scalar-over-aggregate");
 
     assert_eq!(
         plans,
         vec![
-            (
-                plan_of(&agg_item("SUM", Some("X"), false)),
-                agg_item("SUM", Some("X"), false)
-            ),
-            (plan_of(&count_star()), count_star()),
+            (plan_of(&sum_x()), ast(&sum_x())),
+            (plan_of(&count_star()), ast(&count_star())),
         ]
     );
 }
@@ -203,65 +175,51 @@ fn classify_returns_the_nested_plans_in_encounter_order() {
 #[test]
 fn classify_declines_a_node_with_no_nested_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(col("X"), 2), scan()).is_none(),
+        classify(&round_of(col("X"), 2)).is_none(),
         "a plain scalar over a column is not a scalar-over-aggregate"
     );
 }
 
 #[test]
 fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
-    let plans = classify_scalar_over_aggregate(&agg_item("SUM", Some("X"), false), scan())
-        .expect("a bare aggregate is structurally decomposable");
+    let plans = classify(&sum_x()).expect("a bare aggregate is structurally decomposable");
 
-    assert_eq!(
-        plans,
-        vec![(
-            plan_of(&agg_item("SUM", Some("X"), false)),
-            agg_item("SUM", Some("X"), false)
-        )]
-    );
+    assert_eq!(plans, vec![(plan_of(&sum_x()), ast(&sum_x()))]);
 }
 
 #[test]
 fn classify_declines_a_distinct_inner_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(agg_item("SUM", Some("X"), true), 2), scan())
-            .is_none(),
+        classify(&round_of(agg_item("SUM", Some("X"), true), 2)).is_none(),
         "an undecomposable DISTINCT inner aggregate must decline the whole item"
     );
 }
 
 #[test]
 fn classify_declines_a_residual_column_outside_the_aggregate() {
-    let node = scalar_fn("ADD", [agg_item("SUM", Some("X"), false), col("Y")]);
+    let node = scalar_fn("ADD", [sum_x(), col("Y")]);
 
-    assert!(classify_scalar_over_aggregate(&node, scan()).is_none());
+    assert!(classify(&node).is_none());
 }
 
 #[test]
 fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     let node = round_of(sum_over_count(), 2);
-    let plans = vec![
-        plan_of(&count_star()),
-        plan_of(&agg_item("SUM", Some("X"), false)),
-    ];
-    let merged = vec!["<MERGED_COUNT>".to_string(), "<MERGED_SUM>".to_string()];
+    let plans = vec![plan_of(&count_star()), plan_of(&sum_x())];
 
-    let sql = render_scalar_over_merge(&node, &plans, &merged, scan())
-        .expect("a classified scalar-over-aggregate must render over the merge wrapper")
-        .sql;
+    let sql = render(&node, &plans, &["<MERGED_COUNT>", "<MERGED_SUM>"])
+        .expect("a classified scalar-over-aggregate must render over the merge wrapper");
 
     assert_eq!(sql, "ROUND((<MERGED_SUM> / <MERGED_COUNT>), 2)");
 }
 
 #[test]
 fn render_leaves_no_sentinel_token_behind() {
-    let node = round_of(agg_item("SUM", Some("X"), false), 2);
-    let plans = vec![plan_of(&agg_item("SUM", Some("X"), false))];
+    let node = round_of(sum_x(), 2);
+    let plans = vec![plan_of(&sum_x())];
 
-    let sql = render_scalar_over_merge(&node, &plans, &["<MERGED_SUM>".to_string()], scan())
-        .expect("a single-aggregate item must render")
-        .sql;
+    let sql =
+        render(&node, &plans, &["<MERGED_SUM>"]).expect("a single-aggregate item must render");
 
     assert!(
         !sql.contains(&agg_sentinel_token(0)),
@@ -271,25 +229,22 @@ fn render_leaves_no_sentinel_token_behind() {
 
 #[test]
 fn render_declines_an_aggregate_absent_from_the_plans() {
-    let node = round_of(agg_item("SUM", Some("X"), false), 2);
+    let node = round_of(sum_x(), 2);
     let plans = vec![plan_of(&count_star())];
 
     assert!(
-        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], scan()).is_none(),
+        render(&node, &plans, &["<MERGED_COUNT>"]).is_none(),
         "an aggregate with no merge slot cannot be rendered"
     );
 }
 
 #[test]
 fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
-    let node = round_of(agg_item("SUM", Some("X"), false), 2);
-    let plans = vec![
-        plan_of(&count_star()),
-        plan_of(&agg_item("SUM", Some("X"), false)),
-    ];
+    let node = round_of(sum_x(), 2);
+    let plans = vec![plan_of(&count_star()), plan_of(&sum_x())];
 
     assert!(
-        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], scan()).is_none(),
+        render(&node, &plans, &["<MERGED_COUNT>"]).is_none(),
         "a merged list not aligned with plans must decline, not panic"
     );
 }
@@ -297,7 +252,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
 #[test]
 fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     let node = round_of(sum_over_count(), 2);
-    let nested = classify_scalar_over_aggregate(&node, scan())
+    let nested = classify(&node)
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg_item("COUNT", Some("L_ORDERKEY"), false))];
@@ -330,23 +285,16 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
          SUM(X) and COUNT(*) get slots"
     );
 
-    let grouped_merged = vec![
-        "SUM(\"PARTIAL_count_l_orderkey_0\")".to_string(),
-        "SUM(\"PARTIAL_sum_1\")".to_string(),
-        "SUM(\"PARTIAL_count_2\")".to_string(),
-    ];
-    let single_group_merged = vec![
-        "SUM(\"PARTIAL_sum_1\")".to_string(),
-        "SUM(\"PARTIAL_count_2\")".to_string(),
-    ];
-
-    let grouped_sql = render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, scan())
-        .expect("the grouped-shaped caller must render")
-        .sql;
-    let single_group_sql =
-        render_scalar_over_merge(&node, &single_group_plans, &single_group_merged, scan())
-            .expect("the single-group-shaped caller must render")
-            .sql;
+    let sum = r#"SUM("PARTIAL_sum_1")"#;
+    let count = r#"SUM("PARTIAL_count_2")"#;
+    let grouped_sql = render(
+        &node,
+        &grouped_plans,
+        &[r#"SUM("PARTIAL_count_l_orderkey_0")"#, sum, count],
+    )
+    .expect("the grouped-shaped caller must render");
+    let single_group_sql = render(&node, &single_group_plans, &[sum, count])
+        .expect("the single-group-shaped caller must render");
 
     assert_eq!(
         grouped_sql, single_group_sql,

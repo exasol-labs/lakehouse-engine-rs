@@ -13,7 +13,7 @@ use lakehouse_catalog::{
     load_table_any_auth, parse_table_ident, read_iceberg_metadata_file, redact_credentials,
     redact_error_text, resolve_vended_storage,
 };
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::iceberg_predicate::to_iceberg_predicate;
 use super::{ConnectionStorage, LoadedTable, PlannedFiles, UdfFuture};
@@ -135,7 +135,7 @@ impl LoadedTable for IcebergTable {
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
-        filter_json: Option<&'a Json>,
+        filter: Option<&'a Expr>,
     ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let metadata = self.table.metadata();
@@ -148,7 +148,7 @@ impl LoadedTable for IcebergTable {
             let scanned = metadata
                 .current_snapshot()
                 .map(|_| metadata.current_schema().clone());
-            let predicate = filter_json
+            let predicate = filter
                 .zip(scanned)
                 .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
             let tasks = plan_file_tasks(

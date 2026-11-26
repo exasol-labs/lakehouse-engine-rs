@@ -1,4 +1,5 @@
 use super::super::joins::{WherePlacement, build_qualified_single_table_fallback_sql};
+use super::super::request::{AdapterRequest, SortElement};
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
@@ -1014,7 +1015,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     // Mirrors the `mod.rs` Case 2/3 guard.
 
     let sql = build_qualified_single_table_fallback_sql(
-        &request,
+        &adapter_request(&request),
         &pushdown,
         count_distinct_base_spec().common,
         &column_types(&all_cols),
@@ -1904,18 +1905,19 @@ fn selectlist_like_inside_case_over_decimal_routes_to_the_wrapper() {
 }
 
 #[test]
-fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
-    let node = col("STRAßE");
+fn a_column_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
+    let node = ast(&col("STRAßE"));
+    let column = node.as_column().expect("a column");
     let unicode_folded = [("STRASSE".to_string(), ExasolType::WIDEST_VARCHAR)];
     let ascii_folded = [("STRAßE".to_string(), ExasolType::WIDEST_VARCHAR)];
 
     assert_eq!(
-        column_exa_type(&node, &column_types(&unicode_folded)),
+        column_types(&unicode_folded).column_type(column),
         Some(ExasolType::WIDEST_VARCHAR),
         "`STRAßE`.to_uppercase() is `STRASSE`, the key `involved_columns` builds"
     );
     assert_eq!(
-        column_exa_type(&node, &column_types(&ascii_folded)),
+        column_types(&ascii_folded).column_type(column),
         None,
         "`to_ascii_uppercase` leaves `STRAßE`, which the Unicode fold cannot match"
     );
@@ -2297,7 +2299,9 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "an invalid entry",
             one_item().select_list_data_types(Some(serde_json::json!([invalid_entry]))),
-            Err(invalid_entry.to_string()),
+            Err(format!(
+                "selectListDataTypes[0] is invalid: invalid Exasol dataType {invalid_entry}"
+            )),
         ),
         (
             "more entries than items",
@@ -2315,7 +2319,10 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "a selectList with items",
             one_item(),
-            Ok((OutputContract::Items, vec![ExasolType::decimal(20, 0)])),
+            Ok((
+                OutputContract::Items(vec![ast(&table_col("T", "ID"))]),
+                vec![ExasolType::decimal(20, 0)],
+            )),
         ),
         (
             "an absent selectList",
@@ -2335,7 +2342,7 @@ fn select_list_data_types_check_answers_per_request_shape() {
         (
             "a selectList that is no array",
             pushdown_request("T", &columns).field("selectList", "*"),
-            Err("neither an array nor absent".into()),
+            Err("selectList is not an array".into()),
         ),
         (
             "an empty selectList beside an aggregationType",
@@ -2347,8 +2354,8 @@ fn select_list_data_types_check_answers_per_request_shape() {
     ];
     for (shape, request, expected) in cases {
         // Unchecked: several shapes are ones Exasol never sends, which the parse must refuse.
-        let parsed = PushdownRequest::parse(request.build_unchecked().0["pushdownRequest"].clone())
-            .map(|parsed| (parsed.output(), parsed.select_types().to_vec()));
+        let parsed = parse_pushdown(&request.build_unchecked().0["pushdownRequest"])
+            .map(|parsed| (parsed.output().clone(), parsed.select_types().to_vec()));
         match (parsed, expected) {
             (Ok(parsed), Ok(expected)) => assert_eq!(parsed, expected, "{shape}"),
             (Err(UdfError::User(message)), Err(named)) => {
@@ -2450,7 +2457,7 @@ fn involved_column_with_an_unparsable_type_fails() {
     let invalid = serde_json::json!({"type": "char", "size": 2001});
     let cases = [
         (Some(invalid.clone()), invalid.to_string()),
-        (None, "ID declares no dataType".to_string()),
+        (None, "columns[0].dataType is missing".to_string()),
     ];
     for (data_type, named) in cases {
         let (mut request, _) = pushdown_request("T", &[("ID", ExasolType::decimal(20, 0))]).build();
@@ -2464,7 +2471,7 @@ fn involved_column_with_an_unparsable_type_fails() {
                     .remove("dataType");
             }
         }
-        match involved_columns(&request, |tables| tables.first()).err() {
+        match AdapterRequest::parse(&request).err() {
             Some(UdfError::User(message)) => assert!(message.contains(&named), "{message}"),
             other => panic!("the column must fail with {named}, got {other:?}"),
         }
@@ -2475,7 +2482,7 @@ fn involved_column_with_an_unparsable_type_fails() {
 fn selectlist_tstz_literal_wraps_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
-        typed_scan(NO_COLUMNS).expression(&literal).is_some(),
+        typed_scan(NO_COLUMNS).expression(&ast(&literal)).is_some(),
         "literal_timestamp_utc must render through the scan translator"
     );
     let projection = projected(id_name_request().item(
@@ -2494,7 +2501,7 @@ fn selectlist_tstz_literal_wraps_via_emits_type_gate() {
 fn selectlist_real_wire_name_tstz_literal_wraps_and_routes() {
     let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
-        typed_scan(NO_COLUMNS).expression(&literal).is_none(),
+        typed_scan(NO_COLUMNS).expression(&ast(&literal)).is_none(),
         "the DataFusion dialect must keep declining the real wire name (#242): \
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"
@@ -2518,13 +2525,13 @@ fn a_translator_over_a_column_that_binds_no_entry_fails_naming_it() {
     let wrong_relation = alias_col("LHS_T2", "X");
 
     for (tree, column) in [(undeclared, "Y"), (wrong_relation, "X")] {
-        let error = ScanTranslator::over(&universe, ExasolVersion::Exasol2025, &[&tree])
+        let error = ScanTranslator::over(&universe, ExasolVersion::Exasol2025, &[&ast(&tree)])
             .expect_err("a column no entry binds is an adapter bug, never a decline");
         assert_mentions(&user_message(error), &[column]);
     }
 }
 
-fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Vec<Json> {
+fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Vec<SortElement> {
     let mut request = pushdown_request("EVENTS", &[("ID", ExasolType::decimal(18, 0))])
         .column(col("ID"))
         .order_by(Json::Array(keys.to_vec()));
@@ -2534,22 +2541,32 @@ fn parsed_order_by(keys: &[Json], offset: Option<u64>) -> Vec<Json> {
     request.build_pushdown().order_by().to_vec()
 }
 
+/// The `orderBy` elements `keys` declare, constant keys kept.
+fn sort_elements(keys: &[Json]) -> Vec<SortElement> {
+    keys.iter()
+        .map(|key| SortElement {
+            expression: ast(&key["expression"]),
+            ascending: key["isAscending"].as_bool().expect("isAscending"),
+            nulls_last: key["nullsLast"].as_bool().expect("nullsLast"),
+        })
+        .collect()
+}
+
 /// Sort keys, the request's offset, and the `orderBy` that remains.
 type SortKeyCase = (Vec<Json>, Option<u64>, Option<Vec<Json>>);
 
 #[test]
 fn parse_drops_constant_sort_keys() {
     let id_key = order_by_element(table_col("EVENTS", "ID"), true, true);
-    // A literal type Exasol sends, plus `literal_interval`, which the select-list literal list omits.
+    // Each literal type the adapter advertises.
     let constants = [
         num_lit(2),
-        lit("literal_double", 1.5),
+        lit("literal_double", "1.5"),
         str_lit("a"),
         null_lit(),
         bool_lit(true),
         date_lit("2024-01-01"),
         timestamp_lit("2024-01-01 00:00:00"),
-        lit("literal_interval", "1"),
     ];
     let mut cases: Vec<SortKeyCase> = constants
         .iter()
@@ -2564,12 +2581,12 @@ fn parse_drops_constant_sort_keys() {
             )
         })
         .collect();
-    let random = order_by_element(scalar_fn("RAND", Vec::<Json>::new()), true, true);
+    let clock = order_by_element(scalar_fn("CURRENT_DATE", Vec::<Json>::new()), true, true);
     cases.extend([
         (
-            vec![random.clone(), id_key.clone()],
+            vec![clock.clone(), id_key.clone()],
             None,
-            Some(vec![random, id_key.clone()]),
+            Some(vec![clock, id_key.clone()]),
         ),
         (Vec::new(), Some(2), Some(Vec::new())),
         (vec![order_by_element(num_lit(2), true, true)], None, None),
@@ -2596,7 +2613,7 @@ fn parse_drops_constant_sort_keys() {
     for (keys, offset, expected) in cases {
         assert_eq!(
             parsed_order_by(&keys, offset),
-            expected.unwrap_or_default(),
+            sort_elements(&expected.unwrap_or_default()),
             "keys {keys:?}, offset {offset:?}"
         );
     }

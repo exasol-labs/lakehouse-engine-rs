@@ -1,5 +1,5 @@
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::ResolvedScan;
 use super::binary_filter::with_binary_literals;
@@ -62,7 +62,7 @@ impl<'a> TableScanResolver<'a> {
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
-        filter_json: Option<&Json>,
+        filter: Option<&Expr>,
         involved: &InvolvedColumns<'_>,
     ) -> Result<(ResolvedScan, ColumnTypes), UdfError> {
         self.require_admitted(table_identifier)?;
@@ -74,10 +74,9 @@ impl<'a> TableScanResolver<'a> {
             self.context.binary_as_string,
         );
         // Retyped so every reader prunes binary comparisons on the raw bytes.
-        let filter_json =
-            filter_json.map(|filter| with_binary_literals(filter.clone(), &column_types));
+        let filter = filter.map(|filter| with_binary_literals(filter.clone(), &column_types));
         let loaded = self.statement.loaded_table(table_identifier).await?;
-        let scan = ResolvedScan::resolve(loaded.as_ref(), declared, filter_json.as_ref()).await?;
+        let scan = ResolvedScan::resolve(loaded.as_ref(), declared, filter.as_ref()).await?;
         Ok((scan, column_types))
     }
 

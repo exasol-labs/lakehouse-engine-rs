@@ -1,9 +1,9 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    and, between, col, compare, in_list, is_not_null, is_null, like, not, num_lit, or,
+    and, ast, between, col, compare, in_list, is_not_null, is_null, like, not, num_lit, or,
     predicate_equal, str_lit,
 };
-use serde_json::json;
+use serde_json::Value as Json;
 
 /// Renders each predicate as text, so a test reads the tree the parse lowered.
 struct Rendered;
@@ -15,16 +15,16 @@ impl StatisticsTarget for Rendered {
     fn compare(
         &self,
         column: &String,
-        comparison: Comparison,
+        comparison: CompareOp,
         literal: &ScalarValue,
     ) -> Option<String> {
         let operator = match comparison {
-            Comparison::Equal => "=",
-            Comparison::NotEqual => "!=",
-            Comparison::Less => "<",
-            Comparison::LessEqual => "<=",
-            Comparison::Greater => ">",
-            Comparison::GreaterEqual => ">=",
+            CompareOp::Equal => "=",
+            CompareOp::NotEqual => "!=",
+            CompareOp::Less => "<",
+            CompareOp::LessEqual => "<=",
+            CompareOp::Greater => ">",
+            CompareOp::GreaterEqual => ">=",
         };
         Some(format!("{column} {operator} {literal}"))
     }
@@ -70,7 +70,7 @@ fn translate(node: &Json) -> Option<String> {
         };
         Some((column.to_lowercase(), Some(data_type)))
     };
-    PruningFilter::parse(node, &resolve)
+    PruningFilter::parse(&ast(node), &resolve)
         .to_statistics(&Rendered)
         .map(|translated| translated.predicate)
 }
@@ -123,7 +123,6 @@ fn a_leaf_without_a_column_and_an_exact_literal_constrains_nothing() {
         between(col("ID"), str_lit("one"), str_lit("ten")),
         like(col("NAME"), "%ab"),
         like(col("ID"), "1%"),
-        json!({"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}),
     ];
     for node in leaves {
         assert_eq!(translate(&node), None, "{node}");

@@ -10,7 +10,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use vs_expression::test_support::{TypedColumns, lit};
+use vs_expression::test_support::{TypedColumns, ast, lit};
 
 const FAR_FUTURE: &str = "9999-12-31 23:59:59";
 
@@ -46,7 +46,7 @@ fn rendered_fragment(node_type: &str) -> String {
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
-    .render_expression(&lit(node_type, FAR_FUTURE))
+    .render_expression(&ast(&lit(node_type, FAR_FUTURE)))
     .expect("render_expression must translate the timestamp literal node")
     .sql
 }

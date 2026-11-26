@@ -246,13 +246,6 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     )
 }
 
-pub(super) fn detected_join(request: &Json) -> DetectedJoin {
-    match detect_join(request, &parsed_pushdown(request)).expect("detected join shape") {
-        JoinShape::Join(join) => join,
-        other => panic!("expected Join, got {other:?}"),
-    }
-}
-
 /// The scan of two-leg `request`'s pair, leg 0 the dimension, as `render_join_plan` renders it
 /// with the window in the shards. `None` when it declines or Exasol runs the tail.
 pub(super) fn rendered_pair(
@@ -283,9 +276,9 @@ pub(super) fn rendered_pair(
 
 /// The legs production binds for `request`: its join's legs, or its one table's.
 pub(super) fn request_legs(request: &Json) -> JoinLegs {
-    match detect_join(request, &parsed_pushdown(request)).expect("a plannable request") {
+    match join_shape(request) {
         JoinShape::Join(join) => join.legs(),
-        JoinShape::NotAJoin => JoinLegs::for_single_scan(request),
+        JoinShape::NotAJoin => JoinLegs::for_single_scan(&adapter_request(request)),
     }
 }
 
@@ -302,7 +295,7 @@ pub(super) fn broadcast_projection(request: &Json) -> RowProjection {
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
     let qualified =
-        parsed_pushdown(request).map_clauses(&Clause::ALL, |clause| legs.qualify(clause));
+        parsed_pushdown(request).map_expressions(&Clause::ALL, |tree| legs.qualify(tree));
     project_row(&qualified, &leg_types).expect("projectable")
 }
 

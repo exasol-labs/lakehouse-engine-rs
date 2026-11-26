@@ -5,11 +5,10 @@ use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Schema};
-use serde_json::Value as Json;
+use vs_expression::{CompareOp, Expr};
 
 use crate::scan::spec::LogicalField;
 
-use super::filter_json::Comparison;
 use super::literal::UTC;
 use super::pruning_filter::{PruningFilter, StatisticsTarget};
 
@@ -24,18 +23,18 @@ impl StatisticsTarget for IcebergTarget {
     fn compare(
         &self,
         (reference, primitive): &Self::Column,
-        comparison: Comparison,
+        comparison: CompareOp,
         literal: &ScalarValue,
     ) -> Option<Predicate> {
         let reference = reference.clone();
         let datum = datum(literal, primitive)?;
         Some(match comparison {
-            Comparison::Equal => reference.equal_to(datum),
-            Comparison::NotEqual => reference.not_equal_to(datum),
-            Comparison::Less => reference.less_than(datum),
-            Comparison::LessEqual => reference.less_than_or_equal_to(datum),
-            Comparison::Greater => reference.greater_than(datum),
-            Comparison::GreaterEqual => reference.greater_than_or_equal_to(datum),
+            CompareOp::Equal => reference.equal_to(datum),
+            CompareOp::NotEqual => reference.not_equal_to(datum),
+            CompareOp::Less => reference.less_than(datum),
+            CompareOp::LessEqual => reference.less_than_or_equal_to(datum),
+            CompareOp::Greater => reference.greater_than(datum),
+            CompareOp::GreaterEqual => reference.greater_than_or_equal_to(datum),
         })
     }
 
@@ -65,22 +64,37 @@ impl StatisticsTarget for IcebergTarget {
     }
 
     fn and(predicates: Vec<Predicate>) -> Predicate {
-        predicates
-            .into_iter()
-            .reduce(Predicate::and)
-            .unwrap_or(Predicate::AlwaysTrue)
+        balanced(predicates, Predicate::and).unwrap_or(Predicate::AlwaysTrue)
     }
 
     fn or(predicates: Vec<Predicate>) -> Predicate {
-        predicates
-            .into_iter()
-            .reduce(Predicate::or)
-            .unwrap_or(Predicate::AlwaysFalse)
+        balanced(predicates, Predicate::or).unwrap_or(Predicate::AlwaysFalse)
     }
 
     fn not(predicate: Predicate) -> Predicate {
         predicate.negate()
     }
+}
+
+/// Joins `predicates` pairwise into a tree of logarithmic depth. Iceberg junctions are binary and
+/// the scan planner walks them recursively, so a left-deep chain of thousands of terms overflows
+/// the adapter's stack.
+fn balanced(
+    mut predicates: Vec<Predicate>,
+    join: fn(Predicate, Predicate) -> Predicate,
+) -> Option<Predicate> {
+    while predicates.len() > 1 {
+        let mut pairs = predicates.into_iter();
+        let mut joined = Vec::with_capacity(pairs.len().div_ceil(2));
+        while let Some(left) = pairs.next() {
+            joined.push(match pairs.next() {
+                Some(right) => join(left, right),
+                None => left,
+            });
+        }
+        predicates = joined;
+    }
+    predicates.pop()
 }
 
 fn arrow_type(primitive: &PrimitiveType) -> Option<DataType> {
@@ -136,7 +150,7 @@ fn datum(literal: &ScalarValue, primitive: &PrimitiveType) -> Option<Datum> {
 /// `None` means no constraint: the caller must pass all files, never none. `scanned` is the schema
 /// the scan binds the predicate against; a column whose `declared` field id it lacks imposes none.
 pub(super) fn to_iceberg_predicate(
-    filter_json: &Json,
+    filter: &Expr,
     declared: &[LogicalField],
     scanned: &Schema,
 ) -> Option<Predicate> {
@@ -154,7 +168,7 @@ pub(super) fn to_iceberg_predicate(
         let column = (Reference::new(name), primitive.clone());
         Some((column, arrow_type(primitive)))
     };
-    PruningFilter::parse(filter_json, &resolve)
+    PruningFilter::parse(filter, &resolve)
         .to_statistics(&IcebergTarget)
         .map(|translated| translated.predicate)
 }

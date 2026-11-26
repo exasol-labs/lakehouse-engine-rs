@@ -10,6 +10,7 @@ use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
@@ -68,7 +69,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let mut keys = parse_order_by_keys(&pushdown);
+        let mut keys =
+            parse_order_by_keys(&pushdown).expect("the Exasol dialect renders every sort key");
         sort_by_select_items(&mut keys, &pushdown, &projection);
         extend_projection_with_sort_keys(&mut projection, &keys, &emitted)
             .expect("the fan-out emits every sort key");

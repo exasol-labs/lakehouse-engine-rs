@@ -9,6 +9,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * Exasol's wire node type for a UTC timestamp literal is `literal_timestamputc`. The capability name is `LITERAL_TIMESTAMP_UTC`.
 * Exasol's `TIMESTAMP` literal has no offset field, so the Exasol dialect never appends `+00:00`. The wire value is already UTC-normalized, and Iceberg `timestamptz` maps to plain Exasol `TIMESTAMP`.
 * Exasol reads the naive side of a `TIMESTAMP` versus `TIMESTAMP WITH LOCAL TIME ZONE` comparison as session-local. A bare UTC literal compared against a plain `TIMESTAMP` column therefore gives a wrong result, so the Exasol dialect converts it with `CONVERT_TZ` into the session zone.
+* Exasol sends a `literal_bool` value as a JSON boolean and every other literal value as a JSON string. It sends a NULL of any type, `CAST(NULL AS <type>)` and `''` included, as `literal_null`, which carries no value. This was measured on 2026.2.0.
 
 ## Scenarios
 
@@ -26,7 +27,6 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *AND* in the DataFusion dialect `literal_timestamp` SHALL render as `arrow_cast('YYYY-MM-DD HH:MI:SS', 'Timestamp(Microsecond, None)')`, or with `Timestamp(Nanosecond, None)` when its value has more than 6 significant fractional digits (`pushdown-types/pushdown-planning-timestamp-literal-precision`), and `literal_timestamp_utc` SHALL render as `arrow_cast('YYYY-MM-DD HH:MI:SS+00:00', 'Timestamp(Microsecond, Some("UTC"))')`, never as a bare `TIMESTAMP '…'`, which DataFusion types as nanoseconds
 * *AND* in the DataFusion dialect `literal_timestamputc` SHALL decline, because its comparison depends on the session zone; a comparison with it reaches the scan only as the plain timestamp literal that `pushdown/pushdown-planning-clock-functions` puts in its place
 * *AND* in the Exasol dialect `literal_timestamp` SHALL render as bare `TIMESTAMP '<value>'`, and `literal_timestamp_utc` and `literal_timestamputc` SHALL render as `CAST(CONVERT_TZ(TIMESTAMP '<value>', 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)`, so Exasol shows the UTC value in the caller's session zone and a projected literal returns the session's native value, and MUST NOT render `arrow_cast`, which Exasol rejects
-* *AND* a null timestamp value SHALL render as bare `NULL` in both dialects, because `TIMESTAMP NULL` is a syntax error on Exasol
 * *AND* the translator SHALL single-quote the timestamp value and escape internal single-quotes by doubling, exactly as for `literal_string`, so no literal value produces an SQL injection vector
 
 ### Scenario: Plain timestamp literals render as bare Exasol TIMESTAMP literals in the Exasol dialect
@@ -34,8 +34,14 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *GIVEN* a VS expression node of type `literal_timestamp` (the plain, non-TSTZ timestamp literal, `literal_timestamp_utc`/`literal_timestamputc` are TSTZ literals, covered by the preceding scenario's `CAST(CONVERT_TZ(...) AS TIMESTAMP WITH LOCAL TIME ZONE)` rendering, not by this one)
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `TIMESTAMP '<value>'` with the value single-quoted and internal single-quotes escaped by doubling, exactly as for `literal_string`, and the fragment MUST NOT contain `arrow_cast`, which Exasol rejects with `function or script ARROW_CAST not found` (SQL code 42000)
-* *AND* a node whose `value` is absent or JSON `null` SHALL render as the bare `NULL` keyword in the Exasol dialect, because `TIMESTAMP NULL` is an Exasol syntax error (`unexpected TIMESTAMP_`, SQL code 42000, verified on live Exasol 2025.2.1)
-* *AND* the DataFusion dialect SHALL render that same absent-or-`null` `value` as `arrow_cast(NULL, 'Timestamp(Microsecond, None)')`, identical to the preceding scenario, so the microsecond-typing guarantee the node-local scan depends on holds
+
+### Scenario: A literal whose value is not of its type fails the request
+
+* *GIVEN* a `literal_bool` node whose `value` is absent, JSON `null`, or not a JSON boolean, or any other literal node but `literal_null` whose `value` is absent, JSON `null`, or not a JSON string
+* *WHEN* the adapter parses the pushdown request
+* *THEN* the adapter SHALL fail the query with an error that names the node's `value` field
+* *AND* the adapter MUST NOT read such a value as NULL, as FALSE, or as any other default
+* *AND* this state SHALL be unreachable for a request Exasol sends (Background)
 
 ### Scenario: Far-future timestamp literals survive DataFusion optimization against a microsecond column
 

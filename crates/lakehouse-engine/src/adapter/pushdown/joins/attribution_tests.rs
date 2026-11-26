@@ -1,15 +1,17 @@
 use super::super::tests::self_join_legs;
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, aliased_col, assert_mentions, col, customer_orders_join, inner_join,
-    num_lit, order_by_element, predicate_equal, pushdown_request, request_check, scalar_fn,
-    table_col, table_ref_as, user_message,
+    PushdownRequestBuilder, aliased_col, assert_mentions, ast, col, customer_orders_join,
+    inner_join, num_lit, order_by_element, predicate_equal, pushdown_request, request_check,
+    scalar_fn, table_col, table_ref_as, user_message,
 };
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 impl super::JoinLegs {
     fn resolve(&self, node: &Json) -> Option<usize> {
-        self.leg_of(ColumnNode::parse(node).expect("a named column node"))
+        let tree = ast(node);
+        self.leg_of(tree.as_column().expect("a named column node"))
     }
 }
 
@@ -80,27 +82,29 @@ fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
 
-    let qualified = legs.qualify(&condition);
+    let qualified = legs.qualify(&ast(&condition));
 
     assert_eq!(
-        qualified["left"]["tableAlias"],
-        Json::String("LHS_T0".into())
-    );
-    assert_eq!(
-        qualified["right"]["tableAlias"],
-        Json::String("LHS_T1".into())
+        qualified,
+        ast(&predicate_equal(
+            aliased_col("FACT_ORDERS", "LHS_T0", "O_ORDERKEY"),
+            aliased_col("FACT_ORDERS", "LHS_T1", "O_ORDERKEY"),
+        ))
     );
 }
 
 #[test]
 fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
     let legs = two_table_legs();
-    let expr = aliased_col("ORDERS", "O", "O_CUSTKEY");
+    let expr = ast(&aliased_col("ORDERS", "O", "O_CUSTKEY"));
 
     let qualified = legs.qualify(&expr);
 
-    assert_eq!(qualified["tableAlias"], Json::String("LHS_T1".into()));
-    assert_eq!(expr["tableAlias"], Json::String("O".into()));
+    assert_eq!(
+        qualified,
+        ast(&aliased_col("ORDERS", "LHS_T1", "O_CUSTKEY"))
+    );
+    assert_eq!(expr, ast(&aliased_col("ORDERS", "O", "O_CUSTKEY")));
 }
 
 #[test]
@@ -108,11 +112,14 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     let legs = self_join_legs();
     let expr = scalar_fn("UPPER", [aliased_col("FACT_ORDERS", "B", "O_COMMENT")]);
 
-    let qualified = legs.qualify(&expr);
+    let qualified = legs.qualify(&ast(&expr));
 
     assert_eq!(
-        qualified["arguments"][0]["tableAlias"],
-        Json::String("LHS_T1".into())
+        qualified,
+        ast(&scalar_fn(
+            "UPPER",
+            [aliased_col("FACT_ORDERS", "LHS_T1", "O_COMMENT")]
+        ))
     );
 }
 

@@ -1,10 +1,12 @@
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, agg_item_expr, and, is_not_null, order_by_element, predicate_equal,
-    pushdown_request, scalar_fn, str_lit, table_col, unread_refused, user_message,
+    PushdownRequestBuilder, agg_item_expr, and, case_when, is_not_null, order_by_element,
+    parsed_pushdown, predicate_equal, pushdown_request, scalar_fn, str_lit, table_col,
+    unread_refused, user_message,
 };
 
 use super::*;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 fn shape_col() -> RefusedColumn {
     unread_refused("Parquet", "shape_col", None, "geometry")
@@ -48,8 +50,7 @@ fn a_request_touching_no_refused_column_is_admitted() {
         .build()
         .0;
 
-    let gated =
-        ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()]);
+    let gated = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[shape_col()]);
 
     assert!(
         gated.is_ok(),
@@ -69,7 +70,7 @@ fn a_table_with_no_refused_column_admits_every_request() {
         .build()
         .0;
 
-    let gated = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[]);
+    let gated = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[]);
 
     assert!(
         gated.is_ok(),
@@ -88,10 +89,10 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
             predicate_equal(
                 scalar_fn(
                     "UPPER",
-                    [serde_json::json!({
-                        "type": "function_scalar_case",
-                        "arguments": [column_node("SHAPE_COL")],
-                    })],
+                    [case_when(
+                        [is_not_null(column_node("SHAPE_COL"))],
+                        [str_lit("a")],
+                    )],
                 ),
                 str_lit("x"),
             ),
@@ -100,7 +101,7 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[shape_col()])
         .expect_err("a filter reaching SHAPE_COL at any depth must be refused");
 
     let message = user_message(err);
@@ -119,8 +120,7 @@ fn an_aggregate_that_names_no_column_is_admitted() {
         .build()
         .0;
 
-    let gated =
-        ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()]);
+    let gated = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[shape_col()]);
 
     assert!(
         gated.is_ok(),
@@ -141,7 +141,7 @@ fn an_aggregate_whose_argument_names_a_refused_column_is_refused() {
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[shape_col()])
         .expect_err("an aggregate whose argument names the refused column must be refused");
 
     assert!(
@@ -166,8 +166,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
         .0;
 
     let err = ensure_no_refused_column_referenced(
-        &request,
-        OutputContract::Items,
+        &parsed_pushdown(&request),
         &[shape_col(), refused_column("variant_col", VARIANT_REASON)],
     )
     .expect_err("a request reaching two refused columns must be refused");
@@ -195,8 +194,7 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         .build()
         .0;
 
-    let gated =
-        ensure_no_refused_column_referenced(&nested_request, OutputContract::Items, &refused);
+    let gated = ensure_no_refused_column_referenced(&parsed_pushdown(&nested_request), &refused);
     assert!(
         gated.is_ok(),
         "a rendered nested column must not be gated, got: {:?}",
@@ -210,7 +208,7 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&binary_request, OutputContract::Items, &refused)
+    let err = ensure_no_refused_column_referenced(&parsed_pushdown(&binary_request), &refused)
         .expect_err("a request naming SHAPE_COL must still be refused");
     assert!(user_message(err).contains(&shape_col().reason));
 }
@@ -224,7 +222,7 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
         .build()
         .0;
 
-    let err = ensure_no_refused_column_referenced(&request, OutputContract::Items, &[shape_col()])
+    let err = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &[shape_col()])
         .expect_err("the request's case must not decide whether the gate matches");
 
     assert!(
@@ -242,7 +240,7 @@ fn select_star_is_refused_with_every_refused_columns_reason() {
         .0;
     let refused = [shape_col(), refused_column("variant_col", VARIANT_REASON)];
 
-    let err = ensure_no_refused_column_referenced(&request, OutputContract::WholeRow, &refused)
+    let err = ensure_no_refused_column_referenced(&parsed_pushdown(&request), &refused)
         .expect_err("SELECT * emits every declared column, so each refused one refuses it");
 
     let message = user_message(err);

@@ -26,7 +26,7 @@ fn empty_sql(
         &pushdown,
         &projection,
         scan,
-        &EmptyRelation::single_scan(request, emitted),
+        &EmptyRelation::single_scan(&adapter_request(request), emitted),
         &test_context(),
     )
     .expect("the empty result must build")["sql"]

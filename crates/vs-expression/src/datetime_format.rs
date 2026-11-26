@@ -1,7 +1,6 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::Value as Json;
 
 /// The conversion that parses with the format. Only `Timestamp` admits time elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,13 +13,6 @@ pub(crate) enum FormatTarget {
 // `FFn` without its dot declines: chrono reads no undotted fraction of 1 to n digits.
 static PARTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i-u)\.FF[369]|HH24|YYYY|MM|MI|DD|SS|[-/.,;:_ ]").unwrap());
-
-/// The format model of a `literal_string` format argument.
-pub(crate) fn format_literal(format: &Json) -> Option<&str> {
-    (format.get("type")?.as_str()? == "literal_string")
-        .then(|| format.get("value")?.as_str())
-        .flatten()
-}
 
 /// Translates an Exasol format model to a strftime pattern. `None` means no exact strftime
 /// equivalent exists, so the caller declines.

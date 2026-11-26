@@ -1,111 +1,41 @@
-use serde_json::Value as Json;
 use std::cmp::Ordering;
-use vs_expression::ColumnNode;
+use vs_expression::{CompareOp, Expr};
 
-#[derive(Clone, Copy, Debug)]
-pub(in crate::adapter::pushdown) enum Comparison {
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-}
-
-impl Comparison {
-    pub(in crate::adapter::pushdown) fn from_node_type(kind: &str) -> Option<Self> {
-        Some(match kind {
-            "predicate_equal" => Self::Equal,
-            "predicate_notequal" => Self::NotEqual,
-            "predicate_less" => Self::Less,
-            "predicate_lessequal" => Self::LessEqual,
-            "predicate_greater" => Self::Greater,
-            "predicate_greaterequal" => Self::GreaterEqual,
-            _ => return None,
-        })
-    }
-
-    pub(in crate::adapter::pushdown) fn node_type(self) -> &'static str {
-        match self {
-            Self::Equal => "predicate_equal",
-            Self::NotEqual => "predicate_notequal",
-            Self::Less => "predicate_less",
-            Self::LessEqual => "predicate_lessequal",
-            Self::Greater => "predicate_greater",
-            Self::GreaterEqual => "predicate_greaterequal",
-        }
-    }
-
-    pub(in crate::adapter::pushdown) fn with_operands_swapped(self) -> Self {
-        match self {
-            Self::Less => Self::Greater,
-            Self::LessEqual => Self::GreaterEqual,
-            Self::Greater => Self::Less,
-            Self::GreaterEqual => Self::LessEqual,
-            symmetric => symmetric,
-        }
-    }
-
-    pub(super) fn holds(self, ordering: Ordering) -> bool {
-        match self {
-            Self::Equal => ordering == Ordering::Equal,
-            Self::NotEqual => ordering != Ordering::Equal,
-            Self::Less => ordering == Ordering::Less,
-            Self::LessEqual => ordering != Ordering::Greater,
-            Self::Greater => ordering == Ordering::Greater,
-            Self::GreaterEqual => ordering != Ordering::Less,
-        }
+pub(super) fn holds(op: CompareOp, ordering: Ordering) -> bool {
+    match op {
+        CompareOp::Equal => ordering == Ordering::Equal,
+        CompareOp::NotEqual => ordering != Ordering::Equal,
+        CompareOp::Less => ordering == Ordering::Less,
+        CompareOp::LessEqual => ordering != Ordering::Greater,
+        CompareOp::Greater => ordering == Ordering::Greater,
+        CompareOp::GreaterEqual => ordering != Ordering::Less,
     }
 }
 
-fn column_name(node: &Json) -> Option<&str> {
-    ColumnNode::parse(node).map(|column| column.name)
+pub(super) fn column_name(node: &Expr) -> Option<&str> {
+    node.as_column().map(|column| column.name.as_str())
 }
 
 /// Exasol reads `''` as NULL, so an empty string constrains nothing.
-pub(super) fn non_empty_str(value: &Json) -> Option<&str> {
-    let s = value.as_str()?;
-    (!s.is_empty()).then_some(s)
+pub(super) fn non_empty_str(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// An AND/OR node's operands; `None` when empty, since an empty OR would prune every file.
-pub(super) fn operands(node: &Json) -> Option<&[Json]> {
-    non_empty(node.get("expressions")?)
+pub(super) fn operands(items: &[Expr]) -> Option<&[Expr]> {
+    (!items.is_empty()).then_some(items)
 }
 
 /// The comparison is normalized to read with the column on the left.
-pub(super) fn comparison_operands(
-    node: &Json,
-    comparison: Comparison,
-) -> Option<(&str, &Json, Comparison)> {
-    let left = node.get("left")?;
-    let right = node.get("right")?;
+pub(super) fn comparison_operands<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    comparison: CompareOp,
+) -> Option<(&'a str, &'a Expr, CompareOp)> {
     if let Some(column) = column_name(left) {
         return Some((column, right, comparison));
     }
-    Some((
-        column_name(right)?,
-        left,
-        comparison.with_operands_swapped(),
-    ))
-}
-
-pub(super) fn subject_column(node: &Json) -> Option<&str> {
-    column_name(node.get("expression")?)
-}
-
-/// `None` when empty, since an empty IN would prune every file.
-pub(super) fn in_operands(node: &Json) -> Option<(&str, &[Json])> {
-    Some((subject_column(node)?, non_empty(node.get("arguments")?)?))
-}
-
-pub(super) fn between_operands(node: &Json) -> Option<(&str, Option<&Json>, Option<&Json>)> {
-    Some((subject_column(node)?, node.get("left"), node.get("right")))
-}
-
-fn non_empty(array: &Json) -> Option<&[Json]> {
-    let items = array.as_array()?;
-    (!items.is_empty()).then_some(items.as_slice())
+    Some((column_name(right)?, left, comparison.mirrored()))
 }
 
 /// A pruning predicate implied by the filter node it translates. Only an exact one may be negated,
@@ -194,21 +124,21 @@ pub(super) enum LikeBound {
 const DEFAULT_LIKE_ESCAPE: char = '\\';
 
 /// The column and pattern of a `LIKE` over a bare column and a string pattern.
-pub(super) fn like_operands(node: &Json) -> Option<(&str, LikePattern)> {
-    fn string(literal: &Json) -> Option<&str> {
-        (literal.get("type")?.as_str()? == "literal_string").then_some(())?;
-        literal.get("value")?.as_str()
-    }
-    let escape = match node.get("escapeChar") {
+pub(super) fn like_operands<'a>(
+    expression: &'a Expr,
+    pattern: &Expr,
+    escape: Option<&Expr>,
+) -> Option<(&'a str, LikePattern)> {
+    let escape = match escape {
         None => DEFAULT_LIKE_ESCAPE,
         Some(escape) => {
-            let mut chars = string(escape)?.chars();
+            let mut chars = escape.as_string_literal()?.chars();
             let escape = chars.next()?;
             chars.next().is_none().then_some(escape)?
         }
     };
-    let pattern = LikePattern::parse(string(node.get("pattern")?)?, escape)?;
-    Some((subject_column(node)?, pattern))
+    let pattern = LikePattern::parse(pattern.as_string_literal()?, escape)?;
+    Some((column_name(expression)?, pattern))
 }
 
 impl LikePattern {
@@ -278,5 +208,5 @@ impl LikePattern {
 }
 
 #[cfg(test)]
-#[path = "filter_json_tests.rs"]
+#[path = "filter_operands_tests.rs"]
 mod tests;

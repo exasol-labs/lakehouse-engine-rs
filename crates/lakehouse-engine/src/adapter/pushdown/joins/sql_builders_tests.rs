@@ -1,10 +1,10 @@
-use super::super::planning::{JoinLeaf, JoinShape, classify_join_window, detect_join};
+use super::super::planning::{JoinLeaf, JoinShape, classify_join_window};
 use super::super::render_resolved_join;
 use super::super::rendering::LegNaming;
 use super::super::tests::{
     broadcast_projection, built_join, customer_orders_request, customer_orders_request_declaring,
-    customer_orders_request_over, customer_orders_sides, detected_join, equi_condition,
-    join_request, legs_from_leaves, nq3_join_request, rendered_pair, request_legs, resolved_side,
+    customer_orders_request_over, customer_orders_sides, equi_condition, join_request,
+    legs_from_leaves, nq3_join_request, rendered_pair, request_legs, resolved_side,
     self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
@@ -346,11 +346,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
 #[test]
 fn n_scan_produces_qualified_n_scan_wrapper() {
     let request = three_table_join_request();
-    let multi =
-        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
-            JoinShape::Join(m) => m,
-            other => panic!("expected Join, got {other:?}"),
-        };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
         resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
@@ -392,11 +388,7 @@ fn n_scan_produces_qualified_n_scan_wrapper() {
 #[test]
 fn n_scan_for_q1_shape_supplier_nation_region() {
     let request = q1_join_request();
-    let multi =
-        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
-            JoinShape::Join(m) => m,
-            other => panic!("expected Join, got {other:?}"),
-        };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 10)]),
         resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
@@ -429,11 +421,7 @@ fn n_scan_for_q1_shape_supplier_nation_region() {
 #[test]
 fn n_scan_for_nq3_shape_part_partsupp_supplier_nation() {
     let request = nq3_join_request();
-    let multi =
-        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
-            JoinShape::Join(m) => m,
-            other => panic!("expected Join, got {other:?}"),
-        };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("PART", vec![("s3://w/p-0.parquet", 10)]),
         resolved_side("PARTSUPP", vec![("s3://w/ps-0.parquet", 40)]),
@@ -517,11 +505,7 @@ fn n_scan_renders_qualified_when_three_tables_share_column_name() {
             ("TAGS", "lh.tags"),
         ],
     );
-    let multi =
-        match detect_join(&request, &parsed_pushdown(&request)).expect("detected join shape") {
-            JoinShape::Join(m) => m,
-            other => panic!("expected Join, got {other:?}"),
-        };
+    let multi = detected_join(&request);
     let sides = vec![
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
@@ -1007,7 +991,7 @@ fn leg_naming_renders_a_scalar_over_aggregates_qualified() {
             scalar_fn(
                 "FLOAT_DIV",
                 [
-                    scalar_fn("MULT", [lit("literal_double", 100.0), sum_case]),
+                    scalar_fn("MULT", [lit("literal_double", "100.0"), sum_case]),
                     count_star,
                 ],
             ),
@@ -1015,7 +999,9 @@ fn leg_naming_renders_a_scalar_over_aggregates_qualified() {
         ],
     );
 
-    let sql = LegNaming::relations(3).render(&item, &legs);
+    let sql = LegNaming::relations(3)
+        .render(&ast(&item), &legs)
+        .expect("the Exasol dialect renders the item");
     assert!(
         sql.contains(r#"SUM(CASE WHEN ("LHS_T2"."L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
         "the nested SUM(CASE ...) must render with its column table-qualified: {sql}"
@@ -1032,19 +1018,25 @@ fn leg_naming_renders_a_top_level_aggregate_qualified() {
 
     let sum = agg_item_expr("SUM", table_col("ORDERS", "O_TOTALPRICE"), false);
     assert_eq!(
-        LegNaming::relations(3).render(&sum, &legs),
+        LegNaming::relations(3)
+            .render(&ast(&sum), &legs)
+            .expect("the Exasol dialect renders the item"),
         r#"SUM("LHS_T1"."O_TOTALPRICE")"#
     );
 
     let count_star = count_star();
     assert_eq!(
-        LegNaming::relations(3).render(&count_star, &legs),
+        LegNaming::relations(3)
+            .render(&ast(&count_star), &legs)
+            .expect("the Exasol dialect renders the item"),
         "COUNT(*)"
     );
 
     let count_distinct = agg_item_expr("COUNT", table_col("CUSTOMER", "C_CUSTKEY"), true);
     assert_eq!(
-        LegNaming::relations(3).render(&count_distinct, &legs),
+        LegNaming::relations(3)
+            .render(&ast(&count_distinct), &legs)
+            .expect("the Exasol dialect renders the item"),
         r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#
     );
 }
@@ -1063,7 +1055,9 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
         ),
         true,
     );
-    let sql = LegNaming::relations(3).render(&item, &legs);
+    let sql = LegNaming::relations(3)
+        .render(&ast(&item), &legs)
+        .expect("the Exasol dialect renders the item");
     assert!(
         sql.contains("CHAR(20) ASCII"),
         "Exasol-parsed qualified wrapper needs the declared length-qualified \
@@ -1689,7 +1683,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         ..Default::default()
     };
     let actual = build_qualified_single_table_fallback_sql(
-        &request,
+        &adapter_request(&request),
         &pushdown_req,
         fan_out_spec,
         &first_table_column_types(&request),
@@ -1806,7 +1800,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
          never IRRELEVANT_COL"
     );
     let gsql = build_qualified_single_table_fallback_sql(
-        &grouped_request,
+        &adapter_request(&grouped_request),
         &grouped_req,
         fan_out_base(),
         &column_types(&grouped_all),
@@ -1851,7 +1845,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
     let ssql = build_qualified_single_table_fallback_sql(
-        &sg_request,
+        &adapter_request(&sg_request),
         &sg_req,
         fan_out_base(),
         &column_types(&sg_all),
@@ -1969,7 +1963,7 @@ fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfEr
     };
     let pushdown = parsed_pushdown(&request);
     qualified_single_table_fallback_pushdown(
-        &request,
+        &adapter_request(&request),
         &pushdown,
         &base,
         &single_scan_placement(&request),
@@ -2139,7 +2133,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 fn seam_trailing(request: &Json) -> Result<String, UdfError> {
     let events = emitting(&column_types(&events_columns()));
     let (pushdown, legs) = planned(request);
-    let leg_count = match detect_join(request, &pushdown).expect("a plannable request") {
+    let leg_count = match join_shape(request) {
         JoinShape::Join(join) => join.tables.len(),
         JoinShape::NotAJoin => 1,
     };

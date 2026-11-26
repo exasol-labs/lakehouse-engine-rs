@@ -1,9 +1,9 @@
 use crate::adapter::table_identity::read_identifier;
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::super::ResolvedScan;
-use super::super::request::PushdownRequest;
+use super::super::request::{AdapterRequest, FromClause, PushdownRequest};
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{ColumnTypes, InvolvedColumns, involved_columns};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
@@ -24,7 +24,7 @@ pub(crate) struct JoinLeaf {
 pub(crate) struct DetectedJoin {
     /// Stable left-to-right tree order.
     pub tables: Vec<JoinLeaf>,
-    pub conditions: Vec<Json>,
+    pub conditions: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,37 +37,35 @@ pub(crate) enum JoinShape {
 /// alias-less occurrence, a leg identity of its own. Exasol pushes only the inner equi-joins
 /// the adapter advertises, so every join node is inner with both sides and a condition.
 fn collect_join_tree(
-    node: &Json,
+    node: &FromClause,
     leaves: &mut Vec<(String, Option<String>)>,
-    conditions: &mut Vec<Json>,
+    conditions: &mut Vec<Expr>,
 ) {
-    if node["type"] == "join" {
-        collect_join_tree(&node["left"], leaves, conditions);
-        collect_join_tree(&node["right"], leaves, conditions);
-        conditions.push(node["condition"].clone());
-        return;
+    match node {
+        FromClause::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            collect_join_tree(left, leaves, conditions);
+            collect_join_tree(right, leaves, conditions);
+            conditions.push(condition.clone());
+        }
+        FromClause::Table { name, alias } => leaves.push((name.clone(), alias.clone())),
     }
-    let name = node["name"]
-        .as_str()
-        .expect("Exasol names the table of every join leaf");
-    let alias = node["alias"].as_str().map(str::to_string);
-    leaves.push((name.to_string(), alias));
 }
 
 /// No equi-condition gate here: only broadcast eligibility (in `broadcast_policy`) requires one;
 /// the N-scan fallback renders any inner condition. A leaf without a readable identifier note is
 /// the same stale-schema condition the single-table path reports, so a hard `Err`.
 pub(crate) fn detect_join(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
 ) -> Result<JoinShape, UdfError> {
-    let from = match pushdown.from() {
-        Some(from) => from,
-        None => return Ok(JoinShape::NotAJoin),
-    };
-    if from.get("type").and_then(|t| t.as_str()) != Some("join") {
+    let Some(from @ FromClause::Join { .. }) = pushdown.from() else {
         return Ok(JoinShape::NotAJoin);
-    }
+    };
 
     let mut leaves = Vec::new();
     let mut conditions = Vec::new();
@@ -124,18 +122,16 @@ impl ResolvedJoinSide {
 }
 
 /// All sides share one per-request `resolver`, so a join costs no more catalog auth
-/// round-trips than a single scan. `filter_json` is the leg-local sub-predicate
+/// round-trips than a single scan. `filter` is the leg-local sub-predicate
 /// ([`super::rendering::fan_out_filter`]); pruning by it is sound for an inner join.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,
     resolver: &TableScanResolver<'_>,
-    filter_json: Option<&Json>,
+    filter: Option<&Expr>,
     involved: &InvolvedColumns<'_>,
 ) -> Result<ResolvedJoinSide, UdfError> {
-    let (resolved, column_types) = resolver
-        .resolve(table_identifier, filter_json, involved)
-        .await?;
+    let (resolved, column_types) = resolver.resolve(table_identifier, filter, involved).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         table_identifier.to_string(),
@@ -146,14 +142,10 @@ pub(super) async fn resolve_one_join_side(
 
 /// One leg's column types and notes from the same pass.
 pub(in super::super) fn involved_table<'r>(
-    request: &'r Json,
+    request: &'r AdapterRequest,
     table_name: &str,
-) -> Result<InvolvedColumns<'r>, UdfError> {
-    involved_columns(request, |tables| {
-        tables
-            .iter()
-            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
-    })
+) -> InvolvedColumns<'r> {
+    involved_columns(request.involved_table(table_name))
 }
 
 /// The window of a request that does not aggregate. [`Self::BroadcastUnservable`] falls through

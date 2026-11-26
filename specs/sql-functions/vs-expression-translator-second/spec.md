@@ -10,13 +10,6 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Scenarios
 
-### Scenario: The untyped DataFusion walker declines SECOND
-
-* *GIVEN* a `function_scalar` node named `SECOND`, or a `function_scalar_extract` node whose `toExtract` field is `SECOND`
-* *WHEN* `render_expression` processes the node
-* *THEN* it SHALL decline the node, because only the typed pass knows the argument's precision
-* *AND* `ScanTyping::render_expression` SHALL render a one-argument `SECOND(x)` or `EXTRACT(SECOND FROM x)` per `SECOND keeps the fraction of its argument's declared precision`
-
 ### Scenario: SECOND keeps the fraction of its argument's declared precision
 
 * *GIVEN* `SECOND(x)` or `EXTRACT(SECOND FROM x)` whose argument `x` has the exact type `TIMESTAMP(p)` in the typed scan pass: a column, a `CAST` to `TIMESTAMP(p)` with p of 0, 3, 6, or 9 (the only CAST precisions the DataFusion dialect renders), `DATE_TRUNC`, `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` over a TIMESTAMP, a timestamp literal, or a `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, or `LEAST` over only timestamps

@@ -1,17 +1,15 @@
 use std::collections::HashSet;
 
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 
 use super::RefusedColumn;
-use super::request::OutputContract;
+use super::request::{Clause, OutputContract, PushdownRequest};
 use super::support::collect_all_column_names;
 
-/// Columns are collected by one blind recursive walk over the whole `request`, so a later
-/// pushdown capability is gated automatically. `SELECT *` names no column, so it charges every one.
+/// Columns are collected by one walk over every clause of the request, so a later pushdown
+/// capability is gated automatically. `SELECT *` names no column, so it charges every one.
 pub(super) fn ensure_no_refused_column_referenced(
-    request: &Json,
-    output: OutputContract,
+    pushdown: &PushdownRequest,
     refused: &[RefusedColumn],
 ) -> Result<(), UdfError> {
     if refused.is_empty() {
@@ -19,8 +17,10 @@ pub(super) fn ensure_no_refused_column_referenced(
     }
 
     let mut touched: HashSet<String> = HashSet::new();
-    collect_all_column_names(request, &mut touched);
-    match output {
+    for tree in pushdown.expressions(&Clause::ALL) {
+        collect_all_column_names(tree, &mut touched);
+    }
+    match pushdown.output() {
         OutputContract::WholeRow => {
             touched.extend(
                 refused
@@ -28,7 +28,7 @@ pub(super) fn ensure_no_refused_column_referenced(
                     .map(|column| column.column_name.to_uppercase()),
             );
         }
-        OutputContract::AnyOneColumn | OutputContract::Items => {}
+        OutputContract::AnyOneColumn | OutputContract::Items(_) => {}
     }
 
     ensure_no_touched_column_is_refused(&touched, refused)

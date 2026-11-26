@@ -3,7 +3,7 @@ use std::sync::Arc;
 use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
@@ -56,14 +56,14 @@ impl LoadedTable for DeltaTable {
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
-        filter_json: Option<&'a Json>,
+        filter: Option<&'a Expr>,
     ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let snapshot = Arc::clone(&self.snapshot);
             let declared = declared.clone();
-            let filter_json = filter_json.cloned();
+            let filter = filter.cloned();
             let files =
-                off_the_runtime(move || declared_files(&snapshot, &declared, filter_json.as_ref()))
+                off_the_runtime(move || declared_files(&snapshot, &declared, filter.as_ref()))
                     .await
                     .map_err(|error| redacted(error, &self.effective_storage.secret_values()))?;
             Ok(PlannedFiles {
@@ -91,7 +91,7 @@ async fn off_the_runtime<T: Send + 'static>(
 fn declared_files(
     snapshot: &DeltaSnapshot,
     declared: &DeclaredSchema,
-    filter_json: Option<&Json>,
+    filter: Option<&Expr>,
 ) -> Result<Vec<FileEntry>, UdfError> {
     let schema = snapshot.schema();
     ensure_binding_keys_follow_mode(declared, snapshot.column_mapping_mode())?;
@@ -102,7 +102,7 @@ fn declared_files(
         .iter()
         .filter_map(|field| Some((field.name.as_str(), snapshot_field(&schema, field)?)))
         .collect();
-    let prune = filter_json
+    let prune = filter
         .and_then(|filter| to_delta_predicate(filter, &columns))
         .map(Arc::new);
     let mapped = snapshot.column_mapping_mode() != ColumnMappingMode::None;

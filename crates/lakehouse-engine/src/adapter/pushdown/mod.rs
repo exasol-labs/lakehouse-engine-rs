@@ -20,6 +20,7 @@ mod binary_filter;
 pub(crate) use binary_filter::literal_binary_bytes;
 
 mod request;
+pub(crate) use request::AdapterRequest;
 use request::Clause;
 pub use request::PushdownRequest;
 
@@ -31,7 +32,6 @@ pub use support::{
 use support::{
     Emitted, RowProjection, involved_columns, project_columns, projection_items, pushdown_response,
 };
-use vs_expression::strip_table_alias;
 
 mod clock;
 pub(crate) use clock::{StatementClock, statement_instant};
@@ -104,19 +104,13 @@ pub(crate) mod test_support;
 mod dispatch_golden;
 
 pub(crate) async fn handle_pushdown(
-    request: &Json,
+    request: &AdapterRequest,
     statement: &StatementCatalog,
     permission: &PermissionCheck,
     catalog: &CatalogProps,
     context: &PushdownContext<'_>,
 ) -> Result<Json, UdfError> {
-    let pushdown = PushdownRequest::parse(
-        request
-            .get("pushdownRequest")
-            .cloned()
-            .unwrap_or(Json::Null),
-    )?;
-    let pushdown = context.clock.fold(pushdown)?;
+    let pushdown = context.clock.fold(request.pushdown())?;
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table.
@@ -128,9 +122,9 @@ pub(crate) async fn handle_pushdown(
     }
 
     // Strip every `tableAlias` after the join gate and before any read (#193).
-    let pushdown = pushdown.map_clauses(&Clause::ALL, strip_table_alias);
+    let pushdown = pushdown.map_expressions(&Clause::ALL, |tree| tree.strip_table_alias());
 
-    let involved = involved_columns(request, |tables| tables.first())?;
+    let involved = involved_columns(request.involved_tables().first());
     ensure_columns_declared(request, &pushdown, None, &[&involved])?;
 
     let limit = pushdown.limit();
@@ -148,11 +142,11 @@ pub(crate) async fn handle_pushdown(
     let scan = ScanTranslator::over(
         &col_types,
         context.version,
-        &pushdown.clauses(&Clause::ALL).collect::<Vec<_>>(),
+        &pushdown.expressions(&Clause::ALL),
     )?;
     // Before the zero-files early return: a refused column must error, never yield an empty
     // result.
-    ensure_no_refused_column_referenced(request, pushdown.output(), &resolved.refused_columns)?;
+    ensure_no_refused_column_referenced(&pushdown, &resolved.refused_columns)?;
     // Every column the request names, the row scan's projection and sort keys among them.
     let emitted = single_table_emission(
         request,
@@ -196,7 +190,7 @@ pub(crate) async fn handle_pushdown(
 /// the WHERE it renders.
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_sql(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     projection: RowProjection,
     emitted: &Emitted,
@@ -375,7 +369,7 @@ fn build_dispatch_sql(
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let mut keys = parse_order_by_keys(pushdown);
+        let mut keys = parse_order_by_keys(pushdown)?;
         topn::sort_by_select_items(&mut keys, pushdown, &projection);
         topn::extend_projection_with_sort_keys(&mut projection, &keys, emitted)?;
         keys

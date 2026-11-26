@@ -1,12 +1,17 @@
 use super::*;
+use crate::adapter::pushdown::test_support::parse_pushdown;
 use serde_json::json;
 
-fn request(fields: Json) -> PushdownRequest {
-    let mut json = json!({"selectListDataTypes": []});
+/// `base` with each of `fields` set.
+fn with(mut base: Json, fields: Json) -> Json {
     for (key, value) in fields.as_object().expect("fields are an object") {
-        json[key] = value.clone();
+        base[key] = value.clone();
     }
-    PushdownRequest::parse(json).expect("the fixture parses")
+    base
+}
+
+fn request(fields: Json) -> PushdownRequest {
+    parse_pushdown(&with(json!({"selectListDataTypes": []}), fields)).expect("the fixture parses")
 }
 
 #[test]
@@ -34,5 +39,5 @@ fn a_json_null_clause_is_an_absent_clause() {
     assert_eq!(pushdown.filter(), None);
     assert_eq!(pushdown.having(), None);
     assert!(pushdown.group_by().is_empty());
-    assert_eq!(pushdown.clauses(&Clause::ALL).count(), 0);
+    assert_eq!(pushdown.expressions(&Clause::ALL).len(), 0);
 }

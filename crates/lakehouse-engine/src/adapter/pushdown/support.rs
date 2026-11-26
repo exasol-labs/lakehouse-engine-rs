@@ -8,19 +8,19 @@ use crate::scan::spec::{
     AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec,
     ScanStorage, StorageBackend, render_order_by_clause,
 };
-use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
+use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, ExasolVersion, ScanTyping, SqlFragment, conjoin_scan_filters,
-    walk_column_nodes,
+    Column, ColumnTypeLookup, CompareOp, ExasolVersion, Expr, ScanTyping, SqlFragment,
+    conjoin_scan_filters,
 };
 
 use super::RefusedColumn;
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
 use super::context::Shards;
-use super::request::{OutputContract, PushdownRequest};
+use super::request::{InvolvedTable, OutputContract, PushdownRequest};
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
@@ -337,60 +337,36 @@ impl InvolvedColumns<'_> {
     }
 }
 
-/// The invariant every type lookup of a request column relies on once [`ScanTranslator::over`]
-/// has built the translator over that request.
-pub(super) const BOUND_BY_TRANSLATOR: &str =
-    "ScanTranslator::over binds every column of the request it renders";
-
-/// Reads each column's name, Exasol type, and note in one pass. A column missing `name` is
-/// skipped. A missing or invalid `dataType` fails the request: the adapter declared every column
-/// itself, so no defaulted type may stand in for it.
-pub(super) fn involved_columns<'r>(
-    request: &'r Json,
-    select_table: impl FnOnce(&'r [Json]) -> Option<&'r Json>,
-) -> Result<InvolvedColumns<'r>, UdfError> {
-    let table = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .and_then(|tables| select_table(tables));
+/// One involved table's columns in declaration order, with their notes. No table declares none.
+pub(super) fn involved_columns(table: Option<&InvolvedTable>) -> InvolvedColumns<'_> {
+    let Some(table) = table else {
+        return InvolvedColumns::default();
+    };
     let (types, columns) = table
-        .and_then(|t| t.get("columns"))
-        .and_then(|c| c.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|column| Some((column.get("name")?.as_str()?, column)))
-        .map(|(name, column)| {
-            let data_type = column
-                .get("dataType")
-                .ok_or_else(|| {
-                    UdfError::User(format!("involved column {name} declares no dataType"))
-                })
-                .and_then(exasol_type_from_json)?;
-            let note = column.get("adapterNotes").and_then(|note| note.as_str());
-            Ok(((name.to_uppercase(), data_type), (name, note)))
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                (column.name.to_uppercase(), column.data_type),
+                (column.name.as_str(), column.adapter_notes.as_deref()),
+            )
         })
-        .collect::<Result<Vec<_>, UdfError>>()?
-        .into_iter()
         .unzip();
-    Ok(InvolvedColumns {
+    InvolvedColumns {
         types,
         notes: TableNotes {
-            table: table
-                .and_then(|t| t.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or_default(),
+            table: &table.name,
             columns,
         },
-    })
+    }
 }
 
 /// The (relation alias, column) pair a `column` node names.
-pub(super) fn column_node_ref(node: &Json) -> Option<ColumnRef> {
-    let column = ColumnNode::parse(node)?;
-    Some(ColumnRef {
-        relation: column.table_alias.map(str::to_string),
+pub(super) fn column_ref(column: &Column) -> ColumnRef {
+    ColumnRef {
+        relation: column.table_alias.clone(),
         name: column.upper_name(),
-    })
+    }
 }
 
 /// An entry with a relation alias binds only its own relation's column, so a column name two
@@ -583,8 +559,8 @@ impl ColumnTypes {
         self.entry(column).map(|(_, column_type)| column_type)
     }
 
-    pub(super) fn resolve(&self, node: &Json) -> Option<&(ColumnRef, ColumnType)> {
-        self.entry(&column_node_ref(node)?)
+    pub(super) fn resolve(&self, column: &Column) -> Option<&(ColumnRef, ColumnType)> {
+        self.entry(&column_ref(column))
     }
 
     fn entry(&self, column: &ColumnRef) -> Option<&(ColumnRef, ColumnType)> {
@@ -594,29 +570,10 @@ impl ColumnTypes {
     }
 }
 
-/// The Exasol type of the column `node` names; `None` when it names no column of `col_types`.
-fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
-    col_types
-        .resolve(node)
-        .map(|(_, column_type)| column_type.exa_type)
-}
-
-/// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps
-/// it off the per-shard scan.
-fn contains_aggregate_node(node: &Json) -> bool {
-    match node {
-        Json::Object(map) => {
-            map.get("type").and_then(|t| t.as_str()) == Some("function_aggregate")
-                || map.values().any(contains_aggregate_node)
-        }
-        Json::Array(items) => items.iter().any(contains_aggregate_node),
-        _ => false,
-    }
-}
-
 impl ColumnTypeLookup for ColumnTypes {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        column_exa_type(column, self)
+    fn column_type(&self, column: &Column) -> Option<ExasolType> {
+        self.resolve(column)
+            .map(|(_, column_type)| column_type.exa_type)
     }
 }
 
@@ -636,24 +593,18 @@ impl<'a> ScanTranslator<'a> {
     pub(super) fn over(
         columns: &'a ColumnTypes,
         version: ExasolVersion,
-        trees: &[&Json],
+        trees: &[&Expr],
     ) -> Result<Self, UdfError> {
-        for tree in trees {
-            let mut unbound = None;
-            walk_column_nodes(tree, &mut |column| {
-                let column = ColumnRef {
-                    relation: column.table_alias.map(str::to_string),
-                    name: column.upper_name(),
-                };
-                if unbound.is_none() && columns.get(&column).is_none() {
-                    unbound = Some(column.name);
-                }
-            });
-            if let Some(name) = unbound {
-                return Err(UdfError::User(format!(
-                    "internal adapter error: column {name} binds no column of the scanned tables"
-                )));
-            }
+        let unbound = trees
+            .iter()
+            .flat_map(|tree| tree.columns())
+            .map(column_ref)
+            .find(|column| columns.get(column).is_none());
+        if let Some(column) = unbound {
+            return Err(UdfError::User(format!(
+                "internal adapter error: column {} binds no column of the scanned tables",
+                column.name
+            )));
         }
         Ok(Self { columns, version })
     }
@@ -666,17 +617,17 @@ impl<'a> ScanTranslator<'a> {
         ScanTyping::new(self.columns, self.version)
     }
 
-    pub(super) fn exact_type(self, node: &Json) -> Option<ExasolType> {
+    pub(super) fn exact_type(self, node: &Expr) -> Option<ExasolType> {
         self.typing().exact_type(node)
     }
 
     /// The Exasol-dialect `expr` with its exact type, for an item Exasol computes.
-    pub(super) fn exasol_fragment(self, expr: &Json) -> SqlFragment {
+    pub(super) fn exasol_fragment(self, expr: &Expr) -> Result<SqlFragment, UdfError> {
         self.typing().exasol_fragment(expr)
     }
 
     /// `None` declines: the caller applies the expression in Exasol or declines the shape.
-    pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
+    pub(super) fn expression(self, expr: &Expr) -> Option<SqlFragment> {
         self.typing()
             .render_expression(&compare_binary_bytes(expr.clone(), self.columns))
             .ok()
@@ -684,19 +635,19 @@ impl<'a> ScanTranslator<'a> {
 
     /// [`Self::expression`] for an operand the caller renders a computation around, such as an
     /// aggregate argument.
-    pub(super) fn operand(self, expr: &Json) -> Option<SqlFragment> {
+    pub(super) fn operand(self, expr: &Expr) -> Option<SqlFragment> {
         self.typing().render_operand(expr).ok()
     }
 
     /// `None` declines the whole filter, whose conjuncts may still render one by one through
     /// [`Self::screen_conjuncts`].
-    pub(super) fn filter(self, filter: &Json) -> Option<String> {
+    pub(super) fn filter(self, filter: &Expr) -> Option<String> {
         self.typing()
             .render_filter(&compare_binary_bytes(filter.clone(), self.columns))
             .ok()
     }
 
-    fn conjunct(self, conjunct: &Json) -> Option<String> {
+    fn conjunct(self, conjunct: &Expr) -> Option<String> {
         self.typing()
             .render_conjunct(&compare_binary_bytes(conjunct.clone(), self.columns))
             .ok()
@@ -708,50 +659,18 @@ impl<'a> ScanTranslator<'a> {
     /// conjunct to the tree the scan renders, so a declined conjunct keeps its original form.
     pub(super) fn screen_conjuncts(
         self,
-        filter: &Json,
-        scanned: impl Fn(&Json) -> Json,
-    ) -> (Option<String>, Option<Json>) {
+        filter: &Expr,
+        scanned: impl Fn(&Expr) -> Expr,
+    ) -> (Option<String>, Option<Expr>) {
         let mut rendered = Vec::new();
         let mut declined = Vec::new();
-        for conjunct in flatten_conjuncts(filter) {
+        for conjunct in filter.conjuncts() {
             match self.conjunct(&scanned(conjunct)) {
                 Some(sql) => rendered.push(sql),
                 None => declined.push(conjunct.clone()),
             }
         }
-        (conjoin_scan_filters(rendered), conjoin(declined))
-    }
-}
-
-/// The top-level conjuncts of `filter`, nested `AND` nodes flattened. Each `OR` or `NOT` stays
-/// one conjunct, so an `OR` spanning legs stays withheld from every leg.
-pub(super) fn flatten_conjuncts(filter: &Json) -> Vec<&Json> {
-    let mut conjuncts = Vec::new();
-    push_conjuncts(filter, &mut conjuncts);
-    conjuncts
-}
-
-fn push_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
-    if filter.get("type").and_then(|t| t.as_str()) == Some("predicate_and")
-        && let Some(exprs) = filter.get("expressions").and_then(|e| e.as_array())
-    {
-        for expr in exprs {
-            push_conjuncts(expr, out);
-        }
-        return;
-    }
-    out.push(filter);
-}
-
-/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
-pub(super) fn conjoin(mut kept: Vec<Json>) -> Option<Json> {
-    match kept.len() {
-        0 => None,
-        1 => kept.pop(),
-        _ => Some(serde_json::json!({
-            "type": "predicate_and",
-            "expressions": kept,
-        })),
+        (conjoin_scan_filters(rendered), Expr::conjoin(declined))
     }
 }
 
@@ -785,25 +704,23 @@ pub(super) fn project_columns(
             let one = emitted.projection().into_iter().take(1).collect();
             return Ok(RowProjection::Direct(one));
         }
-        OutputContract::Items => pushdown.select_items().unwrap_or_default(),
+        OutputContract::Items(items) => items,
     };
 
     let mut projected = Vec::with_capacity(list.len());
     for (i, e) in list.iter().enumerate() {
         // An aggregate at any depth must never be evaluated per shard: its value would be an
         // unmerged partial (#194).
-        if contains_aggregate_node(e) {
+        if e.any(&Expr::is_aggregate) {
             return Ok(RowProjection::Wrapped);
         }
-        let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match item_type {
-            "column" => {
-                let column = column_node_ref(e).expect(BOUND_BY_TRANSLATOR);
-                projected.push(emitted.project(&column)?);
+        match e {
+            Expr::Column(column) => {
+                projected.push(emitted.project(&column_ref(column))?);
             }
             // A literal is pushed positionally so the emitted arity equals the select-list
             // arity (#190). The EMITS column type must equal Exasol's declared type.
-            t if is_literal_selectlist_item(t) || is_pushable_expression_node(t) => {
+            e if is_literal_selectlist_item(e) || is_pushable_expression_node(e) => {
                 match (scan.expression(e), pushdown.emittable_select_type(i)) {
                     (Some(fragment), Some(exa_type)) => projected.push(ProjectedColumn {
                         item: ProjectionItem::Expr { expr: fragment.sql },
@@ -819,12 +736,10 @@ pub(super) fn project_columns(
 }
 
 pub(super) fn collect_all_column_names(
-    value: &Json,
+    value: &Expr,
     names: &mut std::collections::HashSet<String>,
 ) {
-    walk_column_nodes(value, &mut |column| {
-        names.insert(column.upper_name());
-    });
+    names.extend(value.columns().into_iter().map(Column::upper_name));
 }
 
 /// Callers must render their own `ORDER BY` first: Exasol rejects `OFFSET` without
@@ -841,29 +756,26 @@ pub(super) fn pushdown_response(sql: String) -> Json {
     serde_json::json!({"type": "pushdown", "sql": sql})
 }
 
-/// Every non-literal node type the scan renders, except `predicate_greater[equal]`:
-/// Exasol normalises `a > b` to `b < a`.
-fn is_pushable_expression_node(node_type: &str) -> bool {
-    matches!(
-        node_type,
-        "function_scalar"
-            | "function_scalar_cast"
-            | "function_scalar_extract"
-            | "function_scalar_case"
-            | "function_scalar_json_value"
-            | "predicate_equal"
-            | "predicate_less"
-            | "predicate_lessequal"
-            | "predicate_like"
-            | "predicate_and"
-            | "predicate_or"
-            | "predicate_not"
-            | "predicate_in_constlist"
-            | "predicate_between"
-            | "predicate_is_null"
-            | "predicate_is_not_null"
-            | "predicate_notequal"
-    )
+/// Every non-literal node the scan renders, except `a > b` and `a >= b`: Exasol normalises
+/// `a > b` to `b < a`.
+fn is_pushable_expression_node(node: &Expr) -> bool {
+    match node {
+        Expr::Compare { op, .. } => !matches!(op, CompareOp::Greater | CompareOp::GreaterEqual),
+        Expr::Scalar(_)
+        | Expr::Cast { .. }
+        | Expr::Extract { .. }
+        | Expr::Case(_)
+        | Expr::JsonValue(_)
+        | Expr::Like { .. }
+        | Expr::And(_)
+        | Expr::Or(_)
+        | Expr::Not(_)
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => true,
+        Expr::Literal(_) | Expr::Column(_) | Expr::Aggregate(_) => false,
+    }
 }
 
 /// The one builder of a pushdown output select list: each item is cast to its declared type

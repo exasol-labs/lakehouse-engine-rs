@@ -1,12 +1,12 @@
 use arrow::datatypes::DataType;
 use datafusion::scalar::ScalarValue;
-use serde_json::Value as Json;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use vs_expression::{CompareOp, Expr};
 
 use crate::scan::{non_null_partition_value, partition_scalar};
 
-use super::filter_json::Comparison;
+use super::filter_operands::holds;
 use super::pruning_filter::PruningFilter;
 
 /// A file is kept iff TRUE is reachable at the root; an untranslatable node reaches every truth
@@ -19,7 +19,7 @@ pub(super) struct PartitionPredicate {
 impl PartitionPredicate {
     /// `declared` types the partition columns (uppercase fold); an undeclared one compares as
     /// `utf8`, the type direct storage declares. `None` keeps every file.
-    pub(super) fn from_filter(filter_json: Option<&Json>, declared: &[(String, DataType)]) -> Self {
+    pub(super) fn from_filter(filter: Option<&Expr>, declared: &[(String, DataType)]) -> Self {
         let resolve = |column: &str| {
             let column = column.to_uppercase();
             let declared = declared
@@ -29,7 +29,7 @@ impl PartitionPredicate {
             Some((column, Some(declared)))
         };
         Self {
-            root: filter_json.map_or(PruningFilter::Opaque, |node| {
+            root: filter.map_or(PruningFilter::Opaque, |node| {
                 PruningFilter::parse(node, &resolve)
             }),
         }
@@ -101,7 +101,7 @@ fn reachable(
         PruningFilter::InList { column, literals } => of_value(column, &|value| {
             literals
                 .iter()
-                .map(|literal| compared(value, Comparison::Equal, literal))
+                .map(|literal| compared(value, CompareOp::Equal, literal))
                 .fold(Reachable::exactly(Some(false)), Reachable::or)
         }),
         PruningFilter::NullTest { column, is_null } => partition_value(values, column)
@@ -124,9 +124,9 @@ fn reachable(
     }
 }
 
-fn compared(value: &str, comparison: Comparison, literal: &ScalarValue) -> Reachable {
+fn compared(value: &str, comparison: CompareOp, literal: &ScalarValue) -> Reachable {
     typed_ordering(value, literal).map_or(Reachable::ANY, |ordering| {
-        Reachable::exactly(Some(comparison.holds(ordering)))
+        Reachable::exactly(Some(holds(comparison, ordering)))
     })
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{col, pushdown_request};
+use crate::adapter::pushdown::test_support::{agg_item_expr, col, pushdown_request, scalar_fn};
 use crate::types::exasol_type::ExasolType;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
@@ -621,5 +621,44 @@ fn excluded_capabilities_are_withheld_in_advertised_order() {
             full_list_without(withheld),
             "{value:?}"
         );
+    }
+}
+
+/// The request parse accepts only the functions it declares, so an advertised function it does
+/// not declare would fail every query that uses it.
+#[test]
+fn every_advertised_function_parses_with_some_argument_count() {
+    // These capabilities arrive as node types of their own, or as the COUNT aggregate.
+    const NOT_A_CALL_NAME: [&str; 6] = [
+        "FN_CAST",
+        "FN_CASE",
+        "FN_EXTRACT",
+        "FN_JSON_VALUE",
+        "FN_AGG_COUNT_STAR",
+        "FN_AGG_COUNT_DISTINCT",
+    ];
+    let call = |capability: &str, count: usize| {
+        let arguments = vec![col("A"); count];
+        match capability.strip_prefix("FN_AGG_") {
+            Some(name) => match arguments.first() {
+                Some(argument) => agg_item_expr(name, argument.clone(), false),
+                None => serde_json::json!({"type": "function_aggregate", "name": name}),
+            },
+            None => scalar_fn(&capability["FN_".len()..], arguments),
+        }
+    };
+    let functions = CAPABILITIES.iter().filter(|capability| {
+        capability.starts_with("FN_")
+            && !capability.starts_with("FN_PRED_")
+            && !NOT_A_CALL_NAME.contains(capability)
+    });
+    for capability in functions {
+        let parses = (0..=4).any(|count| {
+            let (request, _) = pushdown_request("T", &[("A", ExasolType::WIDEST_VARCHAR)])
+                .filter(call(capability, count))
+                .build_unchecked();
+            vs_expression::parse_request(&request).is_ok()
+        });
+        assert!(parses, "no call of the advertised {capability} parses");
     }
 }

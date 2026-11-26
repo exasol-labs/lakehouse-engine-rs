@@ -1,5 +1,5 @@
 use crate::scan::spec::AggregatePlan;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::grouped_agg::is_literal_selectlist_item;
 use super::request::PushdownRequest;
@@ -19,8 +19,8 @@ pub enum SingleGroupItem {
     /// `node` is kept verbatim because the merge rewrite re-walks it to substitute
     /// each nested aggregate's merged expression.
     ScalarOverAggregate {
-        node: Json,
-        nested: Vec<(AggregatePlan, Json)>,
+        node: Expr,
+        nested: Vec<(AggregatePlan, Expr)>,
     },
 }
 
@@ -45,7 +45,7 @@ pub fn detect_aggregates(
 
     let mut items = Vec::with_capacity(list.len());
     for (select_index, item) in list.iter().enumerate() {
-        let resolved = if item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate") {
+        let resolved = if item.is_aggregate() {
             pushdown.emittable_select_type(select_index)?;
             match parse_count_distinct(item, scan) {
                 Some(distinct) => SingleGroupItem::Distinct(distinct),
@@ -53,9 +53,10 @@ pub fn detect_aggregates(
             }
         } else {
             // A constant, such as a folded clock function, carries no aggregate to merge.
-            let nested = match item.get("type").and_then(Json::as_str) {
-                Some(kind) if is_literal_selectlist_item(kind) => Vec::new(),
-                _ => classify_scalar_over_aggregate(item, scan)?,
+            let nested = if is_literal_selectlist_item(item) {
+                Vec::new()
+            } else {
+                classify_scalar_over_aggregate(item, scan)?
             };
             SingleGroupItem::ScalarOverAggregate {
                 node: item.clone(),
@@ -145,20 +146,14 @@ pub(super) fn is_lone_count_distinct(items: &[SingleGroupItem]) -> bool {
 
 /// `None` when the item is not a distinct `COUNT` or its argument cannot be resolved;
 /// the caller then defers to [`parse_agg_item`], which declines it.
-fn parse_count_distinct(item: &Json, scan: ScanTranslator<'_>) -> Option<DistinctCount> {
-    if item.get("distinct").and_then(|d| d.as_bool()) != Some(true) {
+fn parse_count_distinct(item: &Expr, scan: ScanTranslator<'_>) -> Option<DistinctCount> {
+    let Expr::Aggregate(call) = item else {
+        return None;
+    };
+    if !call.distinct || call.name != "COUNT" {
         return None;
     }
-    let fn_name = item
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_uppercase();
-    if fn_name != "COUNT" {
-        return None;
-    }
-    let args = item.get("arguments").and_then(|a| a.as_array());
-    let (column, arg_expr) = arg_column_or_expr(args, scan)?;
+    let (column, arg_expr) = arg_column_or_expr(&call.arguments, scan)?;
     Some(DistinctCount { column, arg_expr })
 }
 

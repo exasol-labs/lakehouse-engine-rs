@@ -183,7 +183,7 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
             false,
             true
         )]))
-        .field("limit", serde_json::json!(5))
+        .limit(5)
         .column(col("REGION"))
         .build_scanned();
     assert!(

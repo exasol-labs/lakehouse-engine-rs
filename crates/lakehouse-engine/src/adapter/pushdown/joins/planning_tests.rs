@@ -1,35 +1,25 @@
 use super::super::tests::{
-    detected_join, equi_condition, join_request, nq3_join_request, resolved_side,
-    self_join_request, three_table_join_request,
+    equi_condition, join_request, nq3_join_request, resolved_side, self_join_request,
+    three_table_join_request,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
+use serde_json::Value as Json;
 
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
-    let request = join_request(Json::Null, equi_condition());
-    let pushdown = parsed_pushdown(&request);
+    let join = detected_join(&join_request(Json::Null, equi_condition()));
 
-    let shape = detect_join(&request, &pushdown).expect("both legs carry an identifier note");
-    match shape {
-        JoinShape::Join(join) => {
-            assert_eq!(join.tables.len(), 2);
-            assert_eq!(join.tables[0].table_name, "CUSTOMER");
-            assert_eq!(join.tables[1].table_name, "ORDERS");
-            assert_eq!(join.tables[0].table_identifier, "lh.customer");
-            assert_eq!(join.tables[1].table_identifier, "lh.orders");
-            assert_eq!(join.conditions, vec![equi_condition()]);
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    assert_eq!(
+        leg_identifiers(&join),
+        [("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")]
+    );
+    assert_eq!(join.conditions, vec![ast(&equi_condition())]);
 }
 
 #[test]
 fn plain_single_table_request_is_not_a_join() {
-    let request = nq4_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
-        .expect("not a join, no identifier lookup");
-    assert_eq!(shape, JoinShape::NotAJoin);
+    assert_eq!(join_shape(&nq4_request()), JoinShape::NotAJoin);
 }
 
 /// `ON c = o AND c < o` arrives as one `predicate_and` condition, and detection keeps it whole:
@@ -44,37 +34,25 @@ fn a_non_equi_conjunct_stays_in_the_one_join_condition() {
             table_col("ORDERS", "O_CUSTKEY"),
         ),
     ]);
-    let request = join_request(Json::Null, condition.clone());
-    match detect_join(&request, &parsed_pushdown(&request))
-        .expect("a join with a non-equi conjunct is detected")
-    {
-        JoinShape::Join(join) => {
-            assert_eq!(join.tables.len(), 2);
-            assert_eq!(join.conditions, vec![condition]);
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    let join = detected_join(&join_request(Json::Null, condition.clone()));
+
+    assert_eq!(join.tables.len(), 2);
+    assert_eq!(join.conditions, vec![ast(&condition)]);
 }
 
 #[test]
 fn three_table_inner_join_is_unified_join() {
-    let request = three_table_join_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
-        .expect("every leaf carries an identifier note");
-    match shape {
-        JoinShape::Join(join) => {
-            let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
-            assert_eq!(names, ["CUSTOMER", "ORDERS", "LINEITEM"]);
-            let idents: Vec<&str> = join
-                .tables
-                .iter()
-                .map(|t| t.table_identifier.as_str())
-                .collect();
-            assert_eq!(idents, ["lh.customer", "lh.orders", "lh.lineitem"]);
-            assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 tables");
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    let join = detected_join(&three_table_join_request());
+
+    assert_eq!(
+        leg_identifiers(&join),
+        [
+            ("CUSTOMER", "lh.customer"),
+            ("ORDERS", "lh.orders"),
+            ("LINEITEM", "lh.lineitem")
+        ]
+    );
+    assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 tables");
 }
 
 /// Scenario: Each join leg resolves its catalog identifier from its own identifier note
@@ -91,15 +69,8 @@ fn each_leg_reads_its_identifier_from_its_own_involved_table() {
         ],
     );
 
-    let join = detected_join(&request);
-
-    let idents: Vec<(&str, &str)> = join
-        .tables
-        .iter()
-        .map(|leaf| (leaf.table_name.as_str(), leaf.table_identifier.as_str()))
-        .collect();
     assert_eq!(
-        idents,
+        leg_identifiers(&detected_join(&request)),
         [
             ("CUSTOMER", "a.customer"),
             ("ORDERS", "b.orders"),
@@ -117,8 +88,8 @@ fn a_leg_without_an_identifier_note_is_err() {
         .unwrap()
         .remove("adapterNotes");
     let err = detect_join(
-        &request,
-        &PushdownRequest::parse(request["pushdownRequest"].clone()).expect("the request parses"),
+        &adapter_request(&request),
+        &parse_pushdown(&request["pushdownRequest"]).expect("the request parses"),
     )
     .expect_err("LINEITEM has no note: must be Err, not a decline");
     let message = err.to_string();
@@ -130,26 +101,26 @@ fn a_leg_without_an_identifier_note_is_err() {
 
 #[test]
 fn four_table_inner_join_is_unified_join() {
-    let request = nq3_join_request();
-    let shape = detect_join(&request, &parsed_pushdown(&request))
-        .expect("every leaf carries an identifier note");
-    match shape {
-        JoinShape::Join(join) => {
-            let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
-            assert_eq!(names, ["PART", "PARTSUPP", "SUPPLIER", "NATION"]);
-            let idents: Vec<&str> = join
-                .tables
-                .iter()
-                .map(|t| t.table_identifier.as_str())
-                .collect();
-            assert_eq!(
-                idents,
-                ["lh.part", "lh.partsupp", "lh.supplier", "lh.nation"]
-            );
-            assert_eq!(join.conditions.len(), 3, "N-1 conditions for N=4 tables");
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    let join = detected_join(&nq3_join_request());
+
+    assert_eq!(
+        leg_identifiers(&join),
+        [
+            ("PART", "lh.part"),
+            ("PARTSUPP", "lh.partsupp"),
+            ("SUPPLIER", "lh.supplier"),
+            ("NATION", "lh.nation")
+        ]
+    );
+    assert_eq!(join.conditions.len(), 3, "N-1 conditions for N=4 tables");
+}
+
+/// Each leg's table name and catalog identifier, in leg order.
+fn leg_identifiers(join: &DetectedJoin) -> Vec<(&str, &str)> {
+    join.tables
+        .iter()
+        .map(|leaf| (leaf.table_name.as_str(), leaf.table_identifier.as_str()))
+        .collect()
 }
 
 fn leaf_keys(join: &DetectedJoin) -> Vec<(&str, Option<&str>)> {

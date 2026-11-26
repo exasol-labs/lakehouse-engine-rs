@@ -1,9 +1,11 @@
-//! Builders for Exasol pushdown-request JSON nodes: columns, literals, predicates, scalar
-//! functions, CAST, EXTRACT, CASE, JSON_VALUE, and aggregates, plus the column types the typed renderers
-//! look up. Dependent crates enable `test-support`.
+//! Builders for Exasol pushdown-request JSON nodes (columns, literals, predicates, scalar
+//! functions, CAST, EXTRACT, CASE, JSON_VALUE, and aggregates), the binary literals the adapter
+//! builds as trees, [`ast`] to parse a node, and the column types the typed renderers look up.
+//! Dependent crates enable `test-support`.
 
 use crate::exasol_type::{ExasolType, exasol_type_to_json};
-use crate::{ColumnNode, ColumnTypeLookup};
+use crate::parse::parse_expression;
+use crate::{Column, ColumnTypeLookup, Expr, Literal};
 use serde_json::{Map, Value as Json, json};
 
 /// Column types by name, matched case-insensitively. The default knows no column.
@@ -25,18 +27,34 @@ pub fn ascii_varchar(size: u32) -> ExasolType {
 }
 
 impl ColumnTypeLookup for TypedColumns {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        let name = column.get("name")?.as_str()?.to_uppercase();
+    fn column_type(&self, column: &Column) -> Option<ExasolType> {
+        let name = column.name.to_uppercase();
         self.0.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
     }
 }
 
+/// The typed expression of a request node, which must parse.
+pub fn ast(node: &Json) -> Expr {
+    parse_expression(node, "expression").expect("a well-formed expression node")
+}
+
+fn column_node(name: &str, table_name: Option<&str>, table_alias: Option<&str>) -> Json {
+    let mut node = json!({"type": "column", "name": name});
+    if let Some(table) = table_name {
+        node["tableName"] = Json::String(table.to_string());
+    }
+    if let Some(alias) = table_alias {
+        node["tableAlias"] = Json::String(alias.to_string());
+    }
+    node
+}
+
 pub fn col(name: &str) -> Json {
-    ColumnNode::to_json(name, None, None)
+    column_node(name, None, None)
 }
 
 pub fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
-    ColumnNode::to_json(name, Some(table), alias)
+    column_node(name, Some(table), alias)
 }
 
 pub fn table_col(table: &str, name: &str) -> Json {
@@ -56,15 +74,21 @@ pub fn numbered_col(table: &str, column_nr: u32, name: &str) -> Json {
 
 /// A column node qualified by its relation alias only, as a rewritten join leg writes it.
 pub fn alias_col(alias: &str, name: &str) -> Json {
-    ColumnNode::to_json(name, None, Some(alias))
+    column_node(name, None, Some(alias))
 }
 
 pub fn lit(kind: &str, value: impl Into<Json>) -> Json {
     node(kind, [("value", value.into())])
 }
 
+/// Exasol sends a number's digits as a string, so a number given here is written as one.
 pub fn num_lit(value: impl Into<Json>) -> Json {
-    lit("literal_exactnumeric", value)
+    let digits = match value.into() {
+        Json::Number(number) => number.to_string(),
+        Json::String(digits) => digits,
+        other => panic!("{other} is no numeric literal value"),
+    };
+    lit("literal_exactnumeric", digits)
 }
 
 pub fn str_lit(value: &str) -> Json {
@@ -88,16 +112,20 @@ pub fn timestamp_lit(value: &str) -> Json {
 }
 
 /// A hex literal retyped as bytes, as the binary-filter rewrite writes it.
-pub fn binary_lit(hex: &str) -> Json {
-    lit("literal_binary", hex)
+/// Exasol never sends one, so it is built as a tree, not parsed from a node.
+pub fn binary_lit(hex: &str) -> Expr {
+    Expr::Literal(Literal::Binary {
+        hex: hex.into(),
+        width: None,
+    })
 }
 
 /// [`binary_lit`] for a fixed-length binary column `width` bytes wide.
-pub fn fixed_binary_lit(hex: &str, width: usize) -> Json {
-    node(
-        "literal_binary",
-        [("value", hex.into()), ("width", width.into())],
-    )
+pub fn fixed_binary_lit(hex: &str, width: u64) -> Expr {
+    Expr::Literal(Literal::Binary {
+        hex: hex.into(),
+        width: Some(width),
+    })
 }
 
 pub fn compare(kind: &str, left: Json, right: Json) -> Json {

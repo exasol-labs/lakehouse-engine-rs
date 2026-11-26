@@ -11,7 +11,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use vs_expression::exasol_type::ExasolType;
 use vs_expression::test_support::{
-    TypedColumns, cast_to, col, compare, num_lit, scalar_fn, str_lit,
+    TypedColumns, ast, cast_to, col, compare, num_lit, scalar_fn, str_lit,
 };
 
 /// Field names are uppercase because `render_expression` uppercases and
@@ -64,7 +64,7 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
-    .render_expression(&expr)
+    .render_expression(&ast(&expr))
     .expect("CAST must translate")
     .sql;
 
@@ -85,7 +85,7 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
-    .render_expression(&concat_expr)
+    .render_expression(&ast(&concat_expr))
     .expect("CONCAT must translate")
     .sql;
 
@@ -106,7 +106,7 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
         &TypedColumns::default(),
         vs_expression::ExasolVersion::Exasol2025,
     )
-    .render_expression(&concat_expr)
+    .render_expression(&ast(&concat_expr))
     .expect("CONCAT must translate")
     .sql;
 

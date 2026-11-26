@@ -1,25 +1,21 @@
 use crate::scan::spec::{AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered};
 use crate::types::exasol_type::ExasolType;
-use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment};
+use vs_expression::{Column, Expr, Literal, SqlFragment};
 
 use super::context::Shards;
 
 use super::request::{AggregationType, PushdownRequest};
 use super::scalar_over_agg::{
     TypedPlans, classify_scalar_over_aggregate, fold_aggregate_plan, fold_nested_plans,
-    is_aggregate_node, parse_agg_item, partial_column_type, render_scalar_over_merge,
-    substitute_subtrees, with_stat_grand_means,
+    parse_agg_item, partial_column_type, render_scalar_over_merge, with_stat_grand_means,
 };
 use super::support::{
     ColumnTypes, FanOut, ScanTranslator, build_fan_out_inner, output_select_list, quote_ident,
     render_limit_offset,
 };
-use super::topn::sort_flags;
 
 /// Each variant carries its original `selectList` ordinal: Exasol validates the
 /// outer wrapper SELECT positionally against `selectListDataTypes`.
-// No `Eq`: `ScalarOverAggregate` holds a `serde_json::Value`, which can hold floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupedSelectItem {
     /// `group_key_slot` also indexes the scan-side `GK_{slot}` EMITS column.
@@ -40,7 +36,7 @@ pub enum GroupedSelectItem {
     },
     /// Nested aggregates fold into the shared `plans`; the wrapper renders over the
     /// merged partials only.
-    ScalarOverAggregate { select_index: usize, node: Json },
+    ScalarOverAggregate { select_index: usize, node: Expr },
 }
 
 fn select_item_index(item: &GroupedSelectItem) -> usize {
@@ -65,20 +61,9 @@ pub struct GroupedAggregateDetection {
 
 /// Shared by `detect_group_by_aggregates` and `project_columns` so the two
 /// lists cannot drift apart (#52).
-const LITERAL_SELECTLIST_TYPES: &[&str] = &[
-    "literal_null",
-    "literal_bool",
-    "literal_string",
-    "literal_exactnumeric",
-    "literal_double",
-    "literal_date",
-    "literal_timestamp",
-    "literal_timestamp_utc",
-    "literal_timestamputc",
-];
-
-pub(super) fn is_literal_selectlist_item(item_type: &str) -> bool {
-    LITERAL_SELECTLIST_TYPES.contains(&item_type)
+pub(super) fn is_literal_selectlist_item(item: &Expr) -> bool {
+    item.as_literal()
+        .is_some_and(|literal| !matches!(literal, Literal::Binary { .. }))
 }
 
 /// `None` on any unsupported shape; the caller falls back to single-group detection
@@ -101,11 +86,7 @@ pub fn detect_group_by_aggregates(
     for node in group_by {
         let mut key = scan.expression(node)?;
         // A constant key is staged as text whatever type the literal has (#550).
-        if node
-            .get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(is_literal_selectlist_item)
-        {
+        if is_literal_selectlist_item(node) {
             key.ty = Some(CONSTANT_KEY_EMIT_TYPE);
         }
         key_fragments.push(key);
@@ -118,9 +99,8 @@ pub fn detect_group_by_aggregates(
     let mut plan_types = Vec::new();
     let mut select_items = Vec::with_capacity(list.len());
     for (select_index, item) in list.iter().enumerate() {
-        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match item_type {
-            "function_aggregate" => {
+        match item {
+            Expr::Aggregate(_) => {
                 let plan = parse_agg_item(item, scan)?;
                 let declared = pushdown.emittable_select_type(select_index)?;
                 let plan_slot =
@@ -131,8 +111,8 @@ pub fn detect_group_by_aggregates(
                 });
             }
             // Exasol dialect: the constant is projected by the Exasol-parsed merge (#550).
-            t if is_literal_selectlist_item(t) => {
-                let projection = scan.exasol_fragment(item);
+            item if is_literal_selectlist_item(item) => {
+                let projection = scan.exasol_fragment(item).ok()?;
                 select_items.push(GroupedSelectItem::Constant {
                     select_index,
                     projection,
@@ -230,8 +210,8 @@ pub(super) fn build_grouped_order_by_clause(
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
         // Flags only: an aggregate sort key yields no `SortKey`.
-        let (ascending, nulls_last) = sort_flags(element);
-        let Some(ordering) = render_merge_operand(Some(&element["expression"]), scope, scan) else {
+        let (ascending, nulls_last) = (element.ascending, element.nulls_last);
+        let Some(ordering) = render_merge_operand(&element.expression, scope, scan) else {
             return Some(GroupedOrderBy::Unresolvable);
         };
         parts.push(render_ordered(&ordering, ascending, nulls_last));
@@ -240,7 +220,7 @@ pub(super) fn build_grouped_order_by_clause(
 }
 
 /// The `GK_*` slot of an expression that renders to a group key.
-fn group_key_slot(expr: &Json, scope: &MergeScope<'_>, scan: ScanTranslator<'_>) -> Option<usize> {
+fn group_key_slot(expr: &Expr, scope: &MergeScope<'_>, scan: ScanTranslator<'_>) -> Option<usize> {
     if scope.group_keys.is_empty() {
         return None;
     }
@@ -356,94 +336,63 @@ pub(super) fn partial_emits_items(
 /// Rewrites each aggregate to its merged expression and each group key to its `GK_*` column.
 /// `None` for an aggregate not among the plans or an unsupported node, never a dropped HAVING.
 pub(super) fn render_having_over_merge(
-    node: &Json,
+    node: &Expr,
     scope: &MergeScope<'_>,
     scan: ScanTranslator<'_>,
 ) -> Option<String> {
-    if !node.is_object() {
-        return None;
-    }
-    let kind = node.get("type").and_then(|t| t.as_str())?;
-    let child = |key: &str| node.get(key);
-
-    if kind == "function_aggregate" {
-        let plan = parse_agg_item(node, scan)?;
-        let slot = scope.aggregates.slot_of(&plan)?;
-        return scope.aggregates.merged.get(slot).cloned();
-    }
-
-    match kind {
-        "predicate_and" => render_having_junction(child("expressions"), scope, " AND ", scan),
-        "predicate_or" => render_having_junction(child("expressions"), scope, " OR ", scan),
-        "predicate_not" => {
-            let inner = render_merge_operand(child("expression"), scope, scan)?;
-            Some(format!("(NOT {inner})"))
+    let operand = |node: &Expr| render_merge_operand(node, scope, scan);
+    match node {
+        Expr::Aggregate(_) => {
+            let plan = parse_agg_item(node, scan)?;
+            let slot = scope.aggregates.slot_of(&plan)?;
+            scope.aggregates.merged.get(slot).cloned()
         }
-        "predicate_equal"
-        | "predicate_notequal"
-        | "predicate_less"
-        | "predicate_lessequal"
-        | "predicate_greater"
-        | "predicate_greaterequal" => {
-            let op = match kind {
-                "predicate_equal" => "=",
-                "predicate_notequal" => "<>",
-                "predicate_less" => "<",
-                "predicate_lessequal" => "<=",
-                "predicate_greater" => ">",
-                "predicate_greaterequal" => ">=",
-                _ => unreachable!(),
-            };
-            let left = render_merge_operand(child("left"), scope, scan)?;
-            let right = render_merge_operand(child("right"), scope, scan)?;
-            Some(format!("({left} {op} {right})"))
-        }
-        "predicate_between" => {
-            let target = render_merge_operand(child("expression"), scope, scan)?;
-            let low = render_merge_operand(child("left"), scope, scan)?;
-            let high = render_merge_operand(child("right"), scope, scan)?;
-            Some(format!("({target} BETWEEN {low} AND {high})"))
-        }
-        "predicate_is_null" => {
-            let inner = render_merge_operand(child("expression"), scope, scan)?;
-            Some(format!("({inner} IS NULL)"))
-        }
-        "predicate_is_not_null" => {
-            let inner = render_merge_operand(child("expression"), scope, scan)?;
-            Some(format!("({inner} IS NOT NULL)"))
-        }
+        Expr::And(items) => render_having_junction(items, scope, " AND ", scan),
+        Expr::Or(items) => render_having_junction(items, scope, " OR ", scan),
+        Expr::Not(inner) => Some(format!("(NOT {})", operand(inner)?)),
+        Expr::Compare { op, left, right } => Some(format!(
+            "({} {} {})",
+            operand(left)?,
+            op.sql(),
+            operand(right)?
+        )),
+        Expr::Between {
+            expression,
+            low,
+            high,
+        } => Some(format!(
+            "({} BETWEEN {} AND {})",
+            operand(expression)?,
+            operand(low)?,
+            operand(high)?
+        )),
+        Expr::IsNull(inner) => Some(format!("({} IS NULL)", operand(inner)?)),
+        Expr::IsNotNull(inner) => Some(format!("({} IS NOT NULL)", operand(inner)?)),
         _ => None,
     }
 }
 
 /// A HAVING operand or ORDER BY key over the merge, which has only `GK_*` and `PARTIAL_*` columns.
 fn render_merge_operand(
-    node: Option<&Json>,
+    node: &Expr,
     scope: &MergeScope<'_>,
     scan: ScanTranslator<'_>,
 ) -> Option<String> {
-    let node = node.filter(|n| !n.is_null())?;
-    let kind = node.get("type").and_then(|t| t.as_str())?;
     // A group key operand reads its typed `GK_*` column; the merge has no source columns (#551).
-    if kind != "function_aggregate"
+    if !node.is_aggregate()
         && let Some(slot) = group_key_slot(node, scope, scan)
     {
         return Some(group_key_column(slot));
     }
-    match kind {
-        "function_aggregate"
-        | "predicate_and"
-        | "predicate_or"
-        | "predicate_not"
-        | "predicate_equal"
-        | "predicate_notequal"
-        | "predicate_less"
-        | "predicate_lessequal"
-        | "predicate_greater"
-        | "predicate_greaterequal"
-        | "predicate_between"
-        | "predicate_is_null"
-        | "predicate_is_not_null" => render_having_over_merge(node, scope, scan),
+    match node {
+        Expr::Aggregate(_)
+        | Expr::And(_)
+        | Expr::Or(_)
+        | Expr::Not(_)
+        | Expr::Compare { .. }
+        | Expr::Between { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => render_having_over_merge(node, scope, scan),
         // Rewrites every nested aggregate, so a scalar wrapping an aggregate never renders
         // over absent source columns (#82).
         _ => render_scalar_over_merge_with_keys(node, scope, scan),
@@ -453,19 +402,19 @@ fn render_merge_operand(
 /// A scalar over group keys and aggregates, such as `C_QTY + SUM(ID)`, with each key read from its
 /// `GK_*` column. `None` while another source column remains, because the merge has none (#551).
 fn render_scalar_over_merge_with_keys(
-    node: &Json,
+    node: &Expr,
     scope: &MergeScope<'_>,
     scan: ScanTranslator<'_>,
 ) -> Option<String> {
     let mut residual = false;
     // Stops at an aggregate: its argument runs in the scan, not over the merge.
-    let substituted = substitute_subtrees(node, &mut |subtree| {
-        if is_aggregate_node(subtree) {
+    let substituted = node.substitute(&mut |subtree| {
+        if subtree.is_aggregate() {
             return Some(subtree.clone());
         }
-        ColumnNode::parse(subtree)?;
+        subtree.as_column()?;
         Some(match group_key_slot(subtree, scope, scan) {
-            Some(slot) => ColumnNode::to_json(&group_key_name(slot), None, None),
+            Some(slot) => Expr::Column(Column::new(group_key_name(slot))),
             None => {
                 residual = true;
                 subtree.clone()
@@ -481,12 +430,11 @@ fn render_scalar_over_merge_with_keys(
 }
 
 fn render_having_junction(
-    expressions: Option<&Json>,
+    items: &[Expr],
     scope: &MergeScope<'_>,
     op: &str,
     scan: ScanTranslator<'_>,
 ) -> Option<String> {
-    let items = expressions?.as_array()?;
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
         parts.push(render_having_over_merge(item, scope, scan)?);

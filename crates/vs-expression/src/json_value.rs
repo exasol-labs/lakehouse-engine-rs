@@ -1,10 +1,11 @@
 //! The `JSON_VALUE` calls the scan computes: a path of member and array-index steps, a `RETURNING`
 //! type that needs no session setting, and constant `ON EMPTY` and `ON ERROR` results (#574).
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
 
-use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE, exasol_type_from_json};
-use crate::scan_typing::{decline, kind};
+use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE};
+use crate::expr::{JsonBehavior, JsonValueCall, Literal};
+use crate::scan_typing::decline;
+use crate::short;
 
 /// `(document, path, max_chars, on_empty, on_error)`, returning text.
 pub const JSON_VALUE_TEXT_FN: &str = "lakehouse_json_value_text";
@@ -75,36 +76,28 @@ pub(crate) enum Fallback {
     Boolean(bool),
 }
 
-pub(crate) struct JsonValueCall<'a> {
-    pub(crate) document: &'a Json,
+pub(crate) struct ScanJsonValue<'a> {
     pub(crate) path: &'a str,
     pub(crate) returning: Returning,
     pub(crate) on_empty: Fallback,
     pub(crate) on_error: Fallback,
 }
 
-impl<'a> JsonValueCall<'a> {
+impl<'a> ScanJsonValue<'a> {
     /// `Err` declines the call to Exasol.
-    pub(crate) fn parse(node: &'a Json) -> Result<Self, UdfError> {
+    pub(crate) fn of(call: &'a JsonValueCall) -> Result<Self, UdfError> {
         let refuse = |why: &str| Err(decline(format!("JSON_VALUE {why}")));
-        let [document, path] = node
-            .get("arguments")
-            .and_then(Json::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        else {
-            return refuse("takes a document and a path");
-        };
-        let Some(path) = path
-            .get("type")
-            .filter(|t| *t == "literal_string")
-            .and_then(|_| path.get("value"))
-            .and_then(Json::as_str)
+        let Some(path) = call
+            .path
+            .as_string_literal()
             .filter(|p| parse_json_path(p).is_some())
         else {
-            return refuse(&format!("path {path} is outside the evaluated subset"));
+            return refuse(&format!(
+                "path {} is outside the evaluated subset",
+                short(&call.path)
+            ));
         };
-        let returning = match returning_type(node)? {
+        let returning = match returning_type(call) {
             ExasolType::Varchar { size, ascii: false } => Returning::Text { max_chars: size },
             ExasolType::Boolean => Returning::Boolean,
             other => {
@@ -114,50 +107,50 @@ impl<'a> JsonValueCall<'a> {
             }
         };
         Ok(Self {
-            document,
             path,
             returning,
-            on_empty: fallback(node.get("emptyBehavior"), returning)?,
-            on_error: fallback(node.get("errorBehavior"), returning)?,
+            on_empty: fallback(call.on_empty.as_ref(), returning)?,
+            on_error: fallback(call.on_error.as_ref(), returning)?,
         })
     }
 }
 
-/// The type a `JSON_VALUE` node returns. Without a RETURNING clause Exasol returns
+/// The type a `JSON_VALUE` call returns. Without a RETURNING clause Exasol returns
 /// `VARCHAR(2000000) UTF8` (verified live with `TYPEOF`).
-pub(crate) fn returning_type(node: &Json) -> Result<ExasolType, UdfError> {
-    match node.get("returningDataType") {
-        Some(stated) => exasol_type_from_json(stated),
-        None => Ok(ExasolType::Varchar {
-            size: MAX_VARCHAR_SIZE,
-            ascii: false,
-        }),
-    }
+pub(crate) fn returning_type(call: &JsonValueCall) -> ExasolType {
+    call.returning.unwrap_or(ExasolType::Varchar {
+        size: MAX_VARCHAR_SIZE,
+        ascii: false,
+    })
 }
 
 /// Exasol casts a `DEFAULT` to the `RETURNING` type, failing the statement when it does not fit, so
 /// only a literal that is already of that type runs in the scan.
-fn fallback(behavior: Option<&Json>, returning: Returning) -> Result<Fallback, UdfError> {
-    let Some(behavior) = behavior else {
-        return Ok(Fallback::Null);
+fn fallback(behavior: Option<&JsonBehavior>, returning: Returning) -> Result<Fallback, UdfError> {
+    let expression = match behavior {
+        None | Some(JsonBehavior::Null) => return Ok(Fallback::Null),
+        Some(JsonBehavior::Error) => {
+            return Err(decline("JSON_VALUE behavior ERROR runs in Exasol".into()));
+        }
+        Some(JsonBehavior::Default(expression)) => expression,
     };
-    let expression = behavior.get("expression").unwrap_or(&Json::Null);
-    let value = expression.get("value");
-    let fallback = match (kind(behavior), kind(expression), returning) {
-        ("NULL", _, _) | ("DEFAULT", "literal_null", _) => Some(Fallback::Null),
-        ("DEFAULT", "literal_string", Returning::Text { max_chars }) => value
-            .and_then(Json::as_str)
-            .filter(|text| text.chars().count() <= max_chars as usize)
-            .map(|text| match text {
+    let fallback = match (expression.as_literal(), returning) {
+        (Some(Literal::Null), _) => Some(Fallback::Null),
+        (Some(Literal::String(text)), Returning::Text { max_chars }) => {
+            (text.chars().count() <= max_chars as usize).then(|| match text.as_str() {
                 "" => Fallback::Null,
                 text => Fallback::Text(text.to_string()),
-            }),
-        ("DEFAULT", "literal_bool", Returning::Boolean) => {
-            value.and_then(Json::as_bool).map(Fallback::Boolean)
+            })
         }
+        (Some(Literal::Bool(value)), Returning::Boolean) => Some(Fallback::Boolean(*value)),
         _ => None,
     };
-    fallback.ok_or_else(|| decline(format!("JSON_VALUE behavior {behavior} runs in Exasol")))
+    fallback.ok_or_else(|| {
+        decline(format!(
+            "JSON_VALUE behavior DEFAULT {} runs in Exasol",
+            short(expression)
+        ))
+    })
 }
 
 #[cfg(test)]

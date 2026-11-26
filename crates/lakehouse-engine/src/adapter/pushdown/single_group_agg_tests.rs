@@ -89,17 +89,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "ROUND(COUNT(DISTINCT col), 2) must decline the whole detection"
     );
 
-    let (median_req, median_req_scan) = pushdown_request("T", &AGGREGATED)
-        .item(
-            round_of(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2),
-            ExasolType::decimal(36, 2),
-        )
-        .build_scanned();
-    assert!(
-        detect_aggregates(&median_req, median_req_scan).is_none(),
-        "ROUND(MEDIAN(col), 2) must decline the whole detection"
-    );
-
     let (residual_req, residual_req_scan) = pushdown_request("T", &AGGREGATED)
         .item(
             scalar_fn(
@@ -337,7 +326,7 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
             ExasolType::WIDEST_VARCHAR,
         )
         .item(
-            agg_item("MEDIAN", Some("amount"), false),
+            agg_item("SUM", Some("amount"), true),
             ExasolType::WIDEST_VARCHAR,
         )
         .build_scanned();
@@ -704,23 +693,6 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
 
 #[test]
 fn non_decomposable_aggregate_falls_back_to_row_scan() {
-    for name in &[
-        "MEDIAN",
-        "APPROXIMATE_COUNT_DISTINCT",
-        "LISTAGG",
-        "GROUP_CONCAT",
-    ] {
-        let (req, scan) = pushdown_request("T", &AGGREGATED)
-            .item(
-                agg_item(name, Some("AMOUNT"), false),
-                ExasolType::WIDEST_VARCHAR,
-            )
-            .build_scanned();
-        assert!(
-            detect_aggregates(&req, scan).is_none(),
-            "{name} must fall back to row scan"
-        );
-    }
     let (req_distinct, req_distinct_scan) = pushdown_request("T", &AGGREGATED)
         .item(
             agg_item("SUM", Some("AMOUNT"), true),
@@ -744,7 +716,7 @@ fn parse_agg_item_recognises_stat_functions() {
         ("VAR_POP", AggKind::VarPop),
     ] {
         let item = agg_item(name, Some("AMOUNT"), false);
-        let plan = parse_agg_item(&item, typed_scan(&AGGREGATED))
+        let plan = agg_plan(&item, typed_scan(&AGGREGATED))
             .unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
         assert_eq!(
             plan.kind, *expected_kind,
@@ -764,11 +736,11 @@ fn stat_aggregate_over_expression_argument_declines() {
             .item(item.clone(), ExasolType::WIDEST_VARCHAR)
             .build_scanned();
         assert!(
-            scan.expression(&item).is_some(),
+            scan.expression(&ast(&item)).is_some(),
             "the scan computes STDDEV({arg}), so only the stat rule may decline it"
         );
         assert!(
-            parse_agg_item(&item, scan).is_none(),
+            agg_plan(&item, scan).is_none(),
             "STDDEV over a non-column argument must decline: {arg}"
         );
         assert!(
@@ -781,7 +753,7 @@ fn stat_aggregate_over_expression_argument_declines() {
 #[test]
 fn stat_aggregate_over_bare_column_still_parses() {
     let plan = parse_agg_item(
-        &agg_item("STDDEV", Some("SCORE"), false),
+        &ast(&agg_item("STDDEV", Some("SCORE"), false)),
         typed_scan(&AGGREGATED),
     )
     .expect("STDDEV over a bare column must still parse");

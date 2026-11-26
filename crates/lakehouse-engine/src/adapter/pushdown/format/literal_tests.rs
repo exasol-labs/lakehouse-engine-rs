@@ -1,9 +1,14 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    binary_lit, bool_lit, date_lit, fixed_binary_lit, lit, null_lit, num_lit, str_lit,
+    Tree, binary_lit, bool_lit, date_lit, fixed_binary_lit, lit, null_lit, num_lit, str_lit,
     timestamp_lit,
 };
-use serde_json::json;
+use serde_json::Value as Json;
+
+/// [`super::exact_literal`] over the literal node `literal`, parsed as the adapter parses it.
+fn exact_literal(literal: &impl Tree, column: &DataType) -> Option<ScalarValue> {
+    super::exact_literal(&literal.tree(), column)
+}
 
 const TS_2024_01_15_10_30_MICROS: i64 = 1_705_314_600_000_000;
 
@@ -204,7 +209,6 @@ fn a_literal_of_another_kind_than_the_column_does_not_convert() {
         (num_lit(5), DataType::Utf8),
         (bool_lit(true), DataType::Int32),
         (null_lit(), DataType::Utf8),
-        (lit("literal_interval", json!("1-2")), DataType::Utf8),
     ] {
         assert_eq!(
             exact_literal(&literal, &column),

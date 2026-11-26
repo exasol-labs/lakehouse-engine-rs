@@ -7,10 +7,11 @@ use super::super::super::test_support::{
 use super::super::ResolvedScan;
 use super::*;
 use crate::adapter::column_notes::TableNotes;
-use crate::adapter::pushdown::test_support::connection_storage;
+use crate::adapter::pushdown::test_support::{col, connection_storage, num_lit, predicate_equal};
 use crate::adapter::tuning::DEFAULT_METADATA_READ_CONCURRENCY;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
+use serde_json::Value as Json;
 
 fn name_mapped_load_table_body() -> Json {
     load_table_body(serde_json::json!({
@@ -1155,7 +1156,7 @@ async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metada
             ]}
         ],
     }));
-    let filter = serde_json::json!({"op": "eq", "column": "id", "value": 1});
+    let filter = predicate_equal(col("ID"), num_lit(1));
     for filter_json in [None, Some(&filter)] {
         let err = resolve_rest(
             body.to_string(),

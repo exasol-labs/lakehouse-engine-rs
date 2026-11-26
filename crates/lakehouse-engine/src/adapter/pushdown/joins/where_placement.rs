@@ -3,7 +3,7 @@
 //! wrapper's part only, and only a constructor here decides that part (#680).
 
 use exasol_udf_sdk::error::UdfError;
-use serde_json::Value as Json;
+use vs_expression::Expr;
 
 use super::super::context::PushdownContext;
 use super::super::request::PushdownRequest;
@@ -20,7 +20,7 @@ pub(in super::super) struct WherePlacement {
     /// Per fan-out in chain order, the rendered filter its scan applies.
     scans: Vec<Option<String>>,
     /// The raw conjuncts the wrapper applies, as Exasol sent them.
-    wrapper: Option<Json>,
+    wrapper: Option<Expr>,
 }
 
 impl WherePlacement {
@@ -37,7 +37,7 @@ impl WherePlacement {
         if let Some(sql) = scan.filter(raw) {
             return Self::one_scan(Some(sql), None);
         }
-        match scan.screen_conjuncts(raw, Json::clone) {
+        match scan.screen_conjuncts(raw, Expr::clone) {
             (Some(pushed), Some(declined)) => Self::one_scan(Some(pushed), Some(declined)),
             _ => Self::one_scan(None, Some(raw.clone())),
         }
@@ -82,7 +82,7 @@ impl WherePlacement {
         }
     }
 
-    fn one_scan(scan: Option<String>, wrapper: Option<Json>) -> Self {
+    fn one_scan(scan: Option<String>, wrapper: Option<Expr>) -> Self {
         Self {
             scans: vec![scan],
             wrapper,
@@ -95,7 +95,7 @@ impl WherePlacement {
     }
 
     /// The conjuncts the wrapper applies itself.
-    pub(in super::super) fn wrapper(&self) -> Option<&Json> {
+    pub(in super::super) fn wrapper(&self) -> Option<&Expr> {
         self.wrapper.as_ref()
     }
 }

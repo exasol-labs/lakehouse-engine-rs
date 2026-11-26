@@ -4,17 +4,19 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::SqlFragment;
+use vs_expression::{Expr, SqlFragment};
 
 use super::super::context::{PushdownContext, Shards};
-use super::super::request::{AggregationType, Clause, OutputContract, PushdownRequest};
+use super::super::request::{
+    AdapterRequest, AggregationType, Clause, OutputContract, PushdownRequest,
+};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     ColumnTypes, Emitted, ProjectedColumn, RowProjection, ScanTranslator, build_scan_driving_sql,
     output_select_list, project_columns, projection_items, pushdown_response, quote_ident,
     render_limit_offset,
 };
-use super::super::topn::{ParsedSortKey, sort_flags, wrap_declined_order_by};
+use super::super::topn::{ParsedSortKey, wrap_declined_order_by};
 use super::attribution::JoinLegs;
 use super::plan::{JoinPlan, LegGroup, exasol_runs_tail};
 use super::planning::{DetectedJoin, JoinWindowPlan, ResolvedJoinSide, classify_join_window};
@@ -68,7 +70,7 @@ pub(in super::super) fn render_join_plan(
 
     // A conjunct a fan-out's scan applies adds no column to it (#680). The pair keys, the only
     // conditions `on` and the residual lack, read only the pair's legs.
-    let above: Vec<&Json> = wrapper_reads(pushdown, &placement)
+    let above: Vec<&Expr> = wrapper_reads(pushdown, &placement)
         .chain(on.iter().flatten())
         .collect();
     let mut emitted: Vec<Option<Emitted>> = vec![None; sides.len()];
@@ -125,11 +127,11 @@ pub(in super::super) fn render_join_plan(
         outer_wrapper_clauses(pushdown, &legs, &emitted, &naming, context)?;
     let from = match fan_out_sqls.as_slice() {
         [single] => format!("({single})"),
-        _ => join_chain(plan, &fan_out_sqls, &on, &legs, &naming),
+        _ => join_chain(plan, &fan_out_sqls, &on, &legs, &naming)?,
     };
     let mut sql = format!("SELECT {select} FROM {from}");
     if let Some(residual) = placement.wrapper() {
-        sql.push_str(&format!(" WHERE ({})", naming.render(residual, &legs)));
+        sql.push_str(&format!(" WHERE ({})", naming.render(residual, &legs)?));
     }
     sql.push_str(&trailing);
     Ok(Some(sql))
@@ -158,7 +160,7 @@ pub(super) fn render_in_shards(
     }
     let pair = &plan.fan_outs()[0];
     let keys = conditions.pair_keys.as_ref().expect(PLACED_PAIR_KEYS);
-    let above: Vec<&Json> = pushdown.clauses(&[Clause::SelectList]).collect();
+    let above: Vec<&Expr> = pushdown.expressions(&[Clause::SelectList]);
     let emitted = pair_emission(pushdown.output(), &above, legs, sides, pair, keys)?;
     let filter = placement.scan_filter(0);
     render_pair(Some(pushdown), legs, sides, keys, filter, &emitted, context)
@@ -173,7 +175,7 @@ fn render_pair(
     in_shards: Option<&PushdownRequest>,
     legs: &JoinLegs,
     sides: &[ResolvedJoinSide],
-    keys: &Json,
+    keys: &Expr,
     filter: Option<String>,
     emitted: &[Emitted],
     context: &PushdownContext<'_>,
@@ -182,7 +184,7 @@ fn render_pair(
     let qualified = in_shards.map(|pushdown| legs.qualify_request(pushdown));
     let rendered_clauses = qualified
         .iter()
-        .flat_map(|qualified| qualified.clauses(&[Clause::SelectList, Clause::OrderBy]));
+        .flat_map(|qualified| qualified.expressions(&[Clause::SelectList, Clause::OrderBy]));
     let col_types = leg_column_types(legs, sides);
     let scan = ScanTranslator::over(
         &col_types,
@@ -220,12 +222,12 @@ fn render_pair(
 /// What the pair's fan-out emits per leg, empty for a leg outside it: the columns `above` names,
 /// or one join key of its first leg in FROM-tree order when they name none.
 fn pair_emission(
-    output: OutputContract,
-    above: &[&Json],
+    output: &OutputContract,
+    above: &[&Expr],
     legs: &JoinLegs,
     sides: &[ResolvedJoinSide],
     pair: &LegGroup,
-    keys: &Json,
+    keys: &Expr,
 ) -> Result<Vec<Emitted>, UdfError> {
     let pair_legs = pair.legs();
     let scanned: Vec<(usize, &ColumnTypes)> = pair_legs
@@ -269,10 +271,10 @@ fn exceeds_identifier_limit(item: &ProjectionItem) -> bool {
 fn join_chain(
     plan: &JoinPlan,
     fan_out_sqls: &[String],
-    on: &[Vec<Json>],
+    on: &[Vec<Expr>],
     legs: &JoinLegs,
     naming: &LegNaming,
-) -> String {
+) -> Result<String, UdfError> {
     let alias = |position: usize| quote_ident(&relation_alias(plan.fan_outs()[position].sharded));
     let mut from = format!("({}) AS {}", fan_out_sqls[0], alias(0));
     for (position, fan_out_sql) in fan_out_sqls.iter().enumerate().skip(1) {
@@ -281,8 +283,8 @@ fn join_chain(
         } else {
             on[position]
                 .iter()
-                .map(|condition| format!("({})", naming.render(condition, legs)))
-                .collect::<Vec<_>>()
+                .map(|condition| Ok(format!("({})", naming.render(condition, legs)?)))
+                .collect::<Result<Vec<_>, UdfError>>()?
                 .join(" AND ")
         };
         from.push_str(&format!(
@@ -290,7 +292,7 @@ fn join_chain(
             alias(position)
         ));
     }
-    from
+    Ok(from)
 }
 
 fn n_full_row_items(emitted: &[Emitted], naming: &LegNaming) -> Vec<ProjectionItem> {
@@ -336,15 +338,18 @@ fn n_scan_join_select_items(
             let row = n_full_row_items(emitted, naming);
             return Ok(row.into_iter().take(1).collect());
         }
-        OutputContract::Items => pushdown.select_items().unwrap_or_default(),
+        OutputContract::Items(items) => items,
     };
     let cols_per_leg: Vec<&ColumnTypes> = emitted.iter().map(Emitted::columns).collect();
-    let fragments = list.iter().map(|item| {
-        SqlFragment::new(
-            naming.render(item, legs),
-            select_item_type(item, legs, &cols_per_leg, context),
-        )
-    });
+    let fragments = list
+        .iter()
+        .map(|item| {
+            Ok(SqlFragment::new(
+                naming.render(item, legs)?,
+                select_item_type(item, legs, &cols_per_leg, context),
+            ))
+        })
+        .collect::<Result<Vec<_>, UdfError>>()?;
     let items = output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
         join_render_decline("the select list and its declared types differ in length")
     })?;
@@ -374,9 +379,9 @@ fn outer_wrapper_clauses(
             "internal adapter error: the pushdown wrapper selects no column".into(),
         ));
     }
-    let group_by = join_group_by(pushdown, legs, naming);
-    let having = join_having(pushdown, legs, naming);
-    let order_by = join_order_by(pushdown, legs, naming);
+    let group_by = join_group_by(pushdown, legs, naming)?;
+    let having = join_having(pushdown, legs, naming)?;
+    let order_by = join_order_by(pushdown, legs, naming)?;
     let limit = pushdown.limit();
     let offset = pushdown.offset();
     // Exasol withholds `limit` when it cannot delegate an ordering, so an offset never arrives
@@ -418,7 +423,7 @@ pub(in super::super) fn n_scan_emission(
     sides: &[ResolvedJoinSide],
 ) -> Result<Vec<Emitted>, UdfError> {
     let legs = join.legs();
-    let above: Vec<&Json> = join
+    let above: Vec<&Expr> = join
         .conditions
         .iter()
         .chain(wrapper_reads(pushdown, placement))
@@ -433,13 +438,13 @@ pub(in super::super) fn n_scan_emission(
 /// What the qualified single-table wrapper's fan-out emits under a wrapper that applies
 /// `placement`'s part of the WHERE: the columns a wrapper clause or that part names.
 pub(in super::super) fn single_table_emission(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     placement: &WherePlacement,
     col_types: &ColumnTypes,
 ) -> Result<Emitted, UdfError> {
     let legs = JoinLegs::for_single_scan(request);
-    let above: Vec<&Json> = wrapper_reads(pushdown, placement).collect();
+    let above: Vec<&Expr> = wrapper_reads(pushdown, placement).collect();
     leg_emission(pushdown.output(), &above, &legs, 0, col_types)
 }
 
@@ -447,9 +452,10 @@ pub(in super::super) fn single_table_emission(
 fn wrapper_reads<'a>(
     pushdown: &'a PushdownRequest,
     placement: &'a WherePlacement,
-) -> impl Iterator<Item = &'a Json> {
+) -> impl Iterator<Item = &'a Expr> {
     pushdown
-        .clauses(&Clause::WRAPPER)
+        .expressions(&Clause::WRAPPER)
+        .into_iter()
         .chain(placement.wrapper())
 }
 
@@ -629,48 +635,61 @@ fn join_group_by(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
     naming: &LegNaming,
-) -> Option<String> {
+) -> Result<Option<String>, UdfError> {
     let keys = match pushdown.group_by() {
         keys if !keys.is_empty() => keys,
         // Exasol may strip every aggregate from a single-group select list (#627).
         _ if pushdown.aggregation_type() == Some(AggregationType::SingleGroup) => {
-            return Some("()".to_string());
+            return Ok(Some("()".to_string()));
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    let parts: Vec<String> = keys.iter().map(|key| naming.render(key, legs)).collect();
-    Some(parts.join(", "))
+    let parts = keys
+        .iter()
+        .map(|key| naming.render(key, legs))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(parts.join(", ")))
 }
 
-fn join_having(pushdown: &PushdownRequest, legs: &JoinLegs, naming: &LegNaming) -> Option<String> {
-    pushdown.having().map(|having| naming.render(having, legs))
+fn join_having(
+    pushdown: &PushdownRequest,
+    legs: &JoinLegs,
+    naming: &LegNaming,
+) -> Result<Option<String>, UdfError> {
+    pushdown
+        .having()
+        .map(|having| naming.render(having, legs))
+        .transpose()
 }
 
 fn join_order_by(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
     naming: &LegNaming,
-) -> Option<String> {
+) -> Result<Option<String>, UdfError> {
     let elements = pushdown.order_by();
     if elements.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let parts: Vec<String> = elements
+    let parts = elements
         .iter()
         .map(|element| {
-            let (ascending, nulls_last) = sort_flags(element);
-            let rendered = naming.render(&element["expression"], legs);
-            render_ordered(&rendered, ascending, nulls_last)
+            let rendered = naming.render(&element.expression, legs)?;
+            Ok(render_ordered(
+                &rendered,
+                element.ascending,
+                element.nulls_last,
+            ))
         })
-        .collect();
-    Some(parts.join(", "))
+        .collect::<Result<Vec<_>, UdfError>>()?;
+    Ok(Some(parts.join(", ")))
 }
 
 /// The N-scan fallback at N = 1: Exasol computes the request over the raw fan-out. The wrapper's
 /// WHERE is `placement`'s wrapper part, and the fan-out emits only the columns the wrapper reads,
 /// so a conjunct the scan applies adds none.
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     fan_out: CommonScanSpec,
     columns: &ColumnTypes,
@@ -702,7 +721,10 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         None,
     );
 
-    let where_clause = placement.wrapper().map(|tree| naming.render(tree, &legs));
+    let where_clause = placement
+        .wrapper()
+        .map(|tree| naming.render(tree, &legs))
+        .transpose()?;
 
     let mut sql = format!(
         "SELECT {select} FROM ({fan_out}) AS {}",
@@ -718,7 +740,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 /// The qualified single-table wrapper over a fan-out that applies the pushed part of the WHERE.
 /// The fan-out ships every row, so its columns narrow to what the wrapper reads (#160).
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
-    request: &Json,
+    request: &AdapterRequest,
     pushdown: &PushdownRequest,
     base: &CommonScanSpec,
     placement: &WherePlacement,
@@ -749,7 +771,7 @@ pub(in super::super) struct EmptyRelation {
 }
 
 impl EmptyRelation {
-    pub(in super::super) fn single_scan(request: &Json, emitted: Emitted) -> Self {
+    pub(in super::super) fn single_scan(request: &AdapterRequest, emitted: Emitted) -> Self {
         Self {
             legs: JoinLegs::for_single_scan(request),
             emitted: vec![emitted],
