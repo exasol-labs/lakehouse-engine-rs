@@ -73,7 +73,9 @@ pub use raw_scan::{
 };
 
 mod join_scan;
-pub use join_scan::{build_join_physical_plan, run_join_scan_with_session};
+pub use join_scan::build_join_physical_plan;
+
+mod source;
 
 mod partial_agg;
 #[cfg(test)]
@@ -252,11 +254,10 @@ async fn run_scan_dispatch(
 ) -> Result<(), UdfError> {
     let mut timers = diagnostics::PhaseTimers::start();
 
-    let result = if spec.common.join.is_some() {
-        // The VS never combines a join with aggregates.
-        run_join_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await
-    } else if spec.common.aggregates.is_some() {
-        // Phase telemetry targets only the raw-row and join streaming paths.
+    // A join is a source either shape reads, never a shape of its own. The VS never combines
+    // one with aggregates, and registering the join's tables refuses that.
+    let result = if spec.common.aggregates.is_some() {
+        // Phase telemetry targets only the row streaming path.
         run_partial_aggregate(ctx, session_ctx, spec, storage).await
     } else {
         run_raw_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await

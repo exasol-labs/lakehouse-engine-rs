@@ -7,10 +7,15 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 
 use super::*;
-use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
-use crate::scan::raw_scan::register_nested_json_render_udf;
+use crate::scan::raw_scan::{
+    NESTED_JSON_RENDER_UDF_NAME, build_row_sql, register_nested_json_render_udf,
+};
 use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, SortKey};
 use crate::scan::test_support::{join_spec, minimal_spec};
+
+async fn build_join_sql(ctx: &SessionContext, spec: &ScanSpec) -> Result<String, UdfError> {
+    Ok(build_row_sql(&join_source(ctx, spec).await?, spec))
+}
 
 #[tokio::test]
 async fn build_join_sql_renders_a_nested_column_as_valid_json_end_to_end() {
@@ -104,9 +109,7 @@ fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
 }
 
 async fn run_join_sql(ctx: &SessionContext, spec: &ScanSpec) -> Vec<RecordBatch> {
-    let sql = build_join_sql(ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec)
-        .await
-        .expect("build_join_sql");
+    let sql = build_join_sql(ctx, spec).await.expect("build_join_sql");
     ctx.sql(&sql)
         .await
         .expect("plan join SQL")
@@ -122,14 +125,9 @@ async fn build_join_sql_renders_no_order_by_without_a_post_join_ordering() {
         Arc::new(Float64Array::from(vec![1.0])),
     ));
 
-    let sql = build_join_sql(
-        &ctx,
-        JOIN_FACT_TABLE,
-        JOIN_DIM_TABLE,
-        &post_join_spec("SCORE", Vec::new(), Some(3)),
-    )
-    .await
-    .expect("build_join_sql");
+    let sql = build_join_sql(&ctx, &post_join_spec("SCORE", Vec::new(), Some(3)))
+        .await
+        .expect("build_join_sql");
 
     assert!(
         !sql.contains("ORDER BY"),
@@ -278,9 +276,7 @@ async fn build_join_sql_resolves_a_shared_column_name_per_relation() {
         ProjectionItem::Column(ColumnRef::qualified(FACT_ALIAS, "X")),
     ];
 
-    let sql = build_join_sql(&ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, &spec)
-        .await
-        .expect("build_join_sql");
+    let sql = build_join_sql(&ctx, &spec).await.expect("build_join_sql");
 
     assert!(
         sql.contains(&format!(
@@ -324,7 +320,7 @@ async fn build_join_sql_rejects_an_empty_projection() {
     let mut spec = post_join_spec("X", Vec::new(), None);
     spec.common.projection = Vec::new();
 
-    let error = build_join_sql(&ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, &spec)
+    let error = build_join_sql(&ctx, &spec)
         .await
         .expect_err("an empty join projection must be refused");
 
@@ -340,7 +336,7 @@ async fn build_join_sql_rejects_a_column_without_a_relation_alias() {
     let mut spec = post_join_spec("X", Vec::new(), None);
     spec.common.projection = vec![ProjectionItem::from("X")];
 
-    let error = build_join_sql(&ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, &spec)
+    let error = build_join_sql(&ctx, &spec)
         .await
         .expect_err("an unqualified join column must be refused");
 
@@ -355,7 +351,7 @@ async fn build_join_sql_rejects_a_column_without_a_relation_alias() {
         ascending: true,
         nulls_last: true,
     }];
-    let error = build_join_sql(&ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, &spec)
+    let error = build_join_sql(&ctx, &spec)
         .await
         .expect_err("an unqualified sort key must be refused");
     assert!(
