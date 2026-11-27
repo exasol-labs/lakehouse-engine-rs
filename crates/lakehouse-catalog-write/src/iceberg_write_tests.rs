@@ -1327,3 +1327,38 @@ async fn a_table_exists_only_when_the_catalog_answers_its_head_request_with_succ
         assert_eq!(found, exists, "HTTP {status}");
     }
 }
+
+#[tokio::test]
+async fn an_adls_export_file_io_refuses_a_path_outside_the_tables_container() {
+    let credentials =
+        AdlsCredentials::connection(&AdlsCred::Sas("sv=2022-11-02&sig=SAS_SECRET".into())).unwrap();
+    let (file_io, _) =
+        adls_storage("abfss://c@acct.dfs.core.windows.net/wh/t", credentials).unwrap();
+
+    let refused = file_io
+        .exists("abfss://other@acct.dfs.core.windows.net/f")
+        .await
+        .unwrap_err();
+
+    let shown = format!("{refused:?}");
+    assert!(
+        shown.contains("lies outside the ADLS container abfss://c@acct.dfs.core.windows.net/"),
+        "{shown}"
+    );
+    assert!(!shown.contains("SAS_SECRET"), "{shown}");
+}
+
+#[test]
+fn an_adls_export_location_without_a_scheme_is_refused() {
+    let credentials =
+        AdlsCredentials::connection(&AdlsCred::Sas("sv=2022-11-02&sig=SAS_SECRET".into())).unwrap();
+
+    let Err(UdfError::User(refused)) = adls_storage("acct/wh/t", credentials) else {
+        panic!("a location without a scheme must be refused");
+    };
+
+    assert!(
+        refused.contains("the path acct/wh/t has no scheme"),
+        "{refused}"
+    );
+}

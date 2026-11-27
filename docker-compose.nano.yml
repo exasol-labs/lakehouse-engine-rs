@@ -1,7 +1,7 @@
 # Overlay that swaps docker-db, which is amd64-only, for the multi-arch Exasol Nano image.
 # scripts/e2e-stack.sh applies it last, over every stack, when EXASOL_FLAVOR is `nano`.
-# Nano's image holds no shell, so it keeps no /etc/hosts loop and no healthcheck: Docker's DNS
-# resolves the service names, and scripts/e2e-stack.sh probes readiness from a sidecar.
+# Nano's image holds no shell, so it needs no NameServers change and has no healthcheck: it keeps
+# Docker's DNS, and scripts/e2e-stack.sh probes readiness from a sidecar.
 
 services:
   exasol:

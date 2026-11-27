@@ -6,7 +6,9 @@ license.workspace = true
 publish = false
 
 # The suites deploy the cross-built `.so` and assert on SQL results, so this crate never depends on
-# lakehouse-engine or lakehouse-catalog (#443). Each suite is one `[[test]]` binary behind its feature.
+# lakehouse-engine or lakehouse-catalog (#443). The one exception is `common::object_storage`, which
+# compiles lakehouse-catalog's Iceberg storage source to write fixture tables, because iceberg-rust
+# ships no other S3 or ADLS storage. Each suite is one `[[test]]` binary behind its feature.
 autotests = false
 
 [features]
@@ -34,7 +36,10 @@ bytes        = "1"
 
 iceberg                 = { workspace = true }
 iceberg-catalog-rest    = { workspace = true }
-iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
+# The engine's iceberg storage, compiled in from `lakehouse-catalog`'s source (`common::object_storage`).
+typetag     = { workspace = true }
+async-trait = { workspace = true }
+serde       = { workspace = true }
 
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 futures    = { workspace = true }
@@ -50,8 +55,6 @@ hmac       = "0.12"
 sha2       = "0.10"
 
 reqwest = { workspace = true, features = ["blocking"] }
-# Seed harness forces static SeaweedFS admin credentials over Lakekeeper's vended STS token.
-reqsign-core = "3.0.1"
 tungstenite  = { version = "0.29.0", features = ["native-tls"] }
 native-tls   = "0.2"
 rsa          = { version = "0.9", features = ["sha2", "pkcs5"] }

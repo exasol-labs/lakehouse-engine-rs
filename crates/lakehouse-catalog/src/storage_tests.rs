@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::s3_payload;
-use iceberg_storage_opendal::{AwsCredential, ProvideCredential};
 
 const ENDPOINT: &str = "http://minio.local:9000";
 const REGION: &str = "us-east-1";
@@ -8,7 +7,6 @@ const ACCESS_KEY: &str = "AKIDEXAMPLE";
 const SECRET_KEY: &str = "wJalrXUtnFEMI_EXAMPLE_KEY";
 const SESSION_TOKEN: &str = "FwoGZXIvYXdzEXAMPLE_TOKEN";
 
-/// `allow_http` is ON so exact map comparisons pin that it is not an iceberg config key.
 fn populated_backend() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: ENDPOINT.into(),
@@ -19,37 +17,6 @@ fn populated_backend() -> StorageBackend {
         allow_http: true,
         path_style: true,
     })
-}
-
-fn expected_populated_config() -> HashMap<String, String> {
-    HashMap::from([
-        (S3_ENDPOINT.to_string(), ENDPOINT.to_string()),
-        (S3_REGION.to_string(), REGION.to_string()),
-        (S3_ACCESS_KEY_ID.to_string(), ACCESS_KEY.to_string()),
-        (S3_SECRET_ACCESS_KEY.to_string(), SECRET_KEY.to_string()),
-        (S3_SESSION_TOKEN.to_string(), SESSION_TOKEN.to_string()),
-        (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
-    ])
-}
-
-#[test]
-fn catalog_storage_props_emits_every_populated_s3_key_and_nothing_else() {
-    assert_eq!(
-        populated_backend().catalog_storage_props(),
-        expected_populated_config()
-    );
-}
-
-#[test]
-fn catalog_storage_props_omits_empty_connection_fields_and_an_absent_token() {
-    let backend = StorageBackend::S3(StorageProps::default());
-
-    assert_eq!(
-        backend.catalog_storage_props(),
-        HashMap::from([(S3_PATH_STYLE_ACCESS.to_string(), "true".to_string())]),
-        "only path-style access is unconditional; every empty credential field \
-         and the absent session token must be left out"
-    );
 }
 
 #[test]
@@ -102,81 +69,74 @@ fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
     assert!(!adls.addresses_scheme("gs"));
 }
 
-#[test]
-fn catalog_storage_props_emits_a_present_but_empty_session_token() {
-    let backend = StorageBackend::S3(StorageProps {
-        session_token: Some(String::new()),
-        path_style: false,
-        ..StorageProps::default()
-    });
-
-    assert_eq!(
-        backend.catalog_storage_props(),
-        HashMap::from([
-            (S3_SESSION_TOKEN.to_string(), String::new()),
-            (S3_PATH_STYLE_ACCESS.to_string(), "false".to_string()),
-        ])
-    );
-}
-
-#[test]
-fn file_io_is_configured_from_exactly_the_catalog_storage_props() {
-    assert_eq!(
-        populated_backend().file_io().config().props(),
-        &expected_populated_config()
-    );
-}
-
-/// A credential loader that has no credential to give.
+/// A credential source that has no credential to give.
 #[derive(Debug)]
 struct NoCredential;
 
-impl ProvideCredential for NoCredential {
-    type Credential = AwsCredential;
+#[async_trait::async_trait]
+impl CredentialProvider for NoCredential {
+    type Credential = object_store::aws::AwsCredential;
 
-    async fn provide_credential(
-        &self,
-        _ctx: &reqsign_core::Context,
-    ) -> reqsign_core::Result<Option<AwsCredential>> {
-        Ok(None)
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        Err(object_store::Error::Generic {
+            store: "S3",
+            source: "NO_CREDENTIAL_TO_GIVE".into(),
+        })
     }
 }
 
-fn no_credential_loader() -> CustomAwsCredentialLoader {
-    CustomAwsCredentialLoader::new(NoCredential)
-}
-
 #[tokio::test]
-async fn a_credential_loader_replaces_the_stored_keys_of_s3_requests() {
+async fn a_credential_source_replaces_the_stored_keys_of_s3_requests() {
     let file_io = populated_backend()
-        .file_io_with_credential_loader(no_credential_loader())
-        .expect("an S3 backend takes a credential loader");
+        .file_io_signed_by(Arc::new(NoCredential))
+        .expect("an S3 backend takes a credential source");
 
     let error = file_io.exists("s3://bucket/key").await.unwrap_err();
 
     assert!(
-        error
-            .to_string()
-            .contains("failed to load signing credential"),
-        "the request is signed by the loader, not by the stored keys: {error}"
+        format!("{error:?}").contains("NO_CREDENTIAL_TO_GIVE"),
+        "the request is signed by the source, not by the stored keys: {error:?}"
     );
-    assert_eq!(file_io.config().props(), &expected_populated_config());
 }
 
 #[test]
-fn a_credential_loader_is_refused_for_adls_storage() {
+fn a_credential_source_is_refused_for_adls_storage() {
     let backend = StorageBackend::Adls {
         account_name: "myaccount".into(),
         cred: AdlsCred::AccountKey("azure-static-key-secret".into()),
     };
 
-    let Err(UdfError::User(message)) =
-        backend.file_io_with_credential_loader(no_credential_loader())
-    else {
-        panic!("an ADLS backend must refuse an AWS credential loader");
+    let Err(UdfError::User(message)) = backend.file_io_signed_by(Arc::new(NoCredential)) else {
+        panic!("an ADLS backend must refuse an AWS credential source");
     };
 
     assert!(message.contains("ADLS"), "{message}");
+}
+
+/// Scenario: One enum names the storage backend and answers every backend-specific question
+#[tokio::test]
+async fn an_adls_file_io_refuses_a_path_of_another_account() {
+    let backend = StorageBackend::Adls {
+        account_name: "myaccount".into(),
+        cred: AdlsCred::Sas("sv=2022-11-02&sig=STATIC_SAS_SECRET".into()),
+    };
+    let path = "abfss://container@otheraccount.dfs.core.windows.net/t/metadata/v1.json";
+
+    let error = backend.file_io().exists(path).await.unwrap_err();
+
+    let shown = format!("{error:?}");
+    assert!(
+        shown.contains(&format!("could not address {path}")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "the storage account otheraccount of \
+             abfss://container@otheraccount.dfs.core.windows.net/ is not the account myaccount"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains("STATIC_SAS_SECRET"), "{shown}");
 }
 
 #[test]
@@ -239,52 +199,6 @@ fn only_matching_lowercase_variant_keys_decode() {
             "payload must not decode to a storage backend: {payload}"
         );
     }
-}
-
-#[test]
-fn adls_catalog_storage_props_emit_the_account_and_one_credential_key() {
-    let account_key_backend = StorageBackend::Adls {
-        account_name: "myaccount".into(),
-        cred: AdlsCred::AccountKey("azure-static-key-secret".into()),
-    };
-    assert_eq!(
-        account_key_backend.catalog_storage_props(),
-        HashMap::from([
-            (ADLS_ACCOUNT_NAME.to_string(), "myaccount".to_string()),
-            (
-                ADLS_ACCOUNT_KEY.to_string(),
-                "azure-static-key-secret".to_string()
-            ),
-        ])
-    );
-
-    let sas_backend = StorageBackend::Adls {
-        account_name: "myaccount".into(),
-        cred: AdlsCred::Sas("sv=2024&sig=azure-sas-secret".into()),
-    };
-    assert_eq!(
-        sas_backend.catalog_storage_props(),
-        HashMap::from([
-            (ADLS_ACCOUNT_NAME.to_string(), "myaccount".to_string()),
-            (
-                ADLS_SAS_TOKEN.to_string(),
-                "sv=2024&sig=azure-sas-secret".to_string()
-            ),
-        ])
-    );
-}
-
-#[test]
-fn adls_file_io_is_configured_from_exactly_the_catalog_storage_props() {
-    let backend = StorageBackend::Adls {
-        account_name: "myaccount".into(),
-        cred: AdlsCred::AccountKey("azure-static-key-secret".into()),
-    };
-
-    assert_eq!(
-        backend.file_io().config().props(),
-        &backend.catalog_storage_props()
-    );
 }
 
 #[test]

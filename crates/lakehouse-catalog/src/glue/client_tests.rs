@@ -63,6 +63,7 @@ fn session_at(address: &str) -> GlueCatalogSession {
         access_key: ACCESS_KEY.into(),
         secret_key: STORAGE_SECRET_KEY.into(),
         path_style: true,
+        allow_http: true,
         ..StorageProps::default()
     });
     let mut session = GlueCatalogSession::new(

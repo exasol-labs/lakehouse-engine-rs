@@ -5,11 +5,8 @@ use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use lakehouse_catalog::redact_error_text;
-use lakehouse_catalog_write::{adls_store_builder, caching_client_options, s3_store_builder};
+use lakehouse_catalog::{adls_builder, caching_client_options, redact_error_text, s3_builder};
 use object_store::ClientOptions;
-use object_store::aws::AmazonS3Builder;
-use object_store::azure::AzureConfigKey;
 use object_store::limit::LimitStore;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
@@ -24,9 +21,7 @@ use url::{Position, Url};
 use super::{CountArithmetic, scan_session_context, session_config_for_spec};
 use crate::scan::ObjectLocation;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
-use crate::scan::spec::{
-    AdlsCred, FileEntry, ScanSpec, StorageBackend, StorageProps, reconstruct_abs_uri,
-};
+use crate::scan::spec::{FileEntry, ScanSpec, StorageBackend, reconstruct_abs_uri};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::store_router::{PrefixRoutingObjectStore, RoutedSide, ScanSide};
 
@@ -187,7 +182,7 @@ fn build_undecorated_store(
                 UdfError::User(format!("file URI has no bucket/host: {store_url}"))
             })?;
 
-            let s3 = s3_builder(storage, bucket, connection_budget)
+            let s3 = s3_builder(storage, bucket, client_options_for(connection_budget))
                 .build()
                 .map_err(|e| {
                     // The raw error might contain credential fragments.
@@ -200,13 +195,11 @@ fn build_undecorated_store(
             Ok(apply_admission_limit(s3, admission_limit))
         }
         StorageBackend::Adls { cred, .. } => {
-            let builder = adls_store_builder()
-                .with_url(store_url.as_str())
-                .with_client_options(client_options_for(connection_budget));
-            let builder = match cred {
-                AdlsCred::AccountKey(key) => builder.with_access_key(key),
-                AdlsCred::Sas(sas) => builder.with_config(AzureConfigKey::SasKey, sas),
-            };
+            let builder = adls_builder(
+                store_url.as_str(),
+                cred,
+                client_options_for(connection_budget),
+            );
 
             let azure = builder.build().map_err(|e| {
                 UdfError::User(format!(
@@ -218,41 +211,6 @@ fn build_undecorated_store(
             Ok(apply_admission_limit(azure, admission_limit))
         }
     }
-}
-
-fn s3_builder(storage: &StorageProps, bucket: &str, connection_budget: usize) -> AmazonS3Builder {
-    // `with_client_options` REPLACES the whole `ClientOptions`, so it must precede
-    // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking SeaweedFS).
-    let mut builder = s3_store_builder()
-        .with_bucket_name(bucket)
-        .with_region(&storage.region)
-        .with_client_options(client_options_for(connection_budget))
-        .with_allow_http(storage.allow_http);
-
-    // Real AWS S3 must NOT get an endpoint: object_store derives the virtual-hosted URL
-    // from the region, and a regional endpoint without the bucket yields 403.
-    if storage.path_style {
-        builder = builder
-            .with_endpoint(&storage.endpoint)
-            .with_virtual_hosted_style_request(false);
-    }
-
-    // No credentials reads a public bucket unsigned (#590): an empty key is still signed and
-    // rejected, and unset keys make object_store fall back to ambient instance credentials.
-    if storage.access_key.is_empty()
-        && storage.secret_key.is_empty()
-        && storage.session_token.is_none()
-    {
-        return builder.with_skip_signature(true);
-    }
-
-    builder = builder
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key);
-    if let Some(token) = &storage.session_token {
-        builder = builder.with_token(token);
-    }
-    builder
 }
 
 /// Wraps before erasing: `LimitStore<T>` needs `T: ObjectStore`, which `Arc<dyn ObjectStore>` is not.

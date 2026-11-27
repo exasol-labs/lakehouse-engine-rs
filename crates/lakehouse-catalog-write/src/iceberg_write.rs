@@ -2,7 +2,6 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
-use crate::adls_storage::adls_file_io;
 use crate::retry::{
     DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, Waits, append_retries,
     commit_retries,
@@ -22,9 +21,10 @@ use iceberg_catalog_rest::{
 use lakehouse_catalog::{
     AssumedRole, CatalogResponse, CatalogSendError, CatalogSession, ConnectionCreds, EpochClock,
     RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, VendedBackendKind,
-    VendedCredentialSet, classify_vended_scheme, namespace_tables_path, resolve_vended_storage,
-    scheme_of, system_clock, table_ident_path,
+    VendedCredentialSet, adls_store_builder, classify_vended_scheme, namespace_tables_path,
+    object_file_io, resolve_vended_storage, root_of, scheme_of, system_clock, table_ident_path,
 };
+use object_store::ObjectStore;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -633,7 +633,7 @@ impl TableWriteSession {
     ) -> Result<(FileIO, TableCredentials), UdfError> {
         match &self.storage {
             WriteStorage::Static(StorageBackend::Adls { cred, .. }) => {
-                Ok(adls_storage(&location, AdlsCredentials::connection(cred)?))
+                adls_storage(&location, AdlsCredentials::connection(cred)?)
             }
             WriteStorage::Static(backend @ StorageBackend::S3(props)) => {
                 let keys = StorageCredentials::keys(
@@ -657,7 +657,7 @@ impl TableWriteSession {
                 if let Some(VendedBackendKind::Adls) = vended_kind {
                     let seed = set.adls_sas(&location)?;
                     let credentials = AdlsCredentials::vended(vended, seed, self.clock.clone())?;
-                    return Ok(adls_storage(&location, credentials));
+                    return adls_storage(&location, credentials);
                 }
                 let seed = set.s3(&location)?;
                 let credentials = StorageCredentials::vended(vended, seed, self.clock.clone())?;
@@ -711,15 +711,37 @@ fn s3_storage(
     backend: &StorageBackend,
     credentials: StorageCredentials,
 ) -> Result<(FileIO, TableCredentials), UdfError> {
-    let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
+    let file_io = backend.file_io_signed_by(Arc::new(credentials.clone()))?;
     Ok((file_io, TableCredentials::S3(credentials)))
 }
 
-fn adls_storage(location: &str, credentials: AdlsCredentials) -> (FileIO, TableCredentials) {
-    (
-        adls_file_io(location, credentials.clone()),
-        TableCredentials::Adls(credentials),
-    )
+/// The FileIO of the table at `location`, which addresses only the location's container, because
+/// a vended SAS covers no other.
+fn adls_storage(
+    location: &str,
+    credentials: AdlsCredentials,
+) -> Result<(FileIO, TableCredentials), UdfError> {
+    let container = root_of(location).map_err(|error| {
+        UdfError::User(format!(
+            "could not address the ADLS table location {location}: {error}"
+        ))
+    })?;
+    let provider = Arc::new(credentials.clone());
+    let file_io = object_file_io(Arc::new(move |root: &str| {
+        if root != container {
+            return Err(object_store::Error::Generic {
+                store: "MicrosoftAzure",
+                source: format!("{root} lies outside the ADLS container {container} of the table")
+                    .into(),
+            });
+        }
+        let store = adls_store_builder()
+            .with_url(root)
+            .with_credentials(provider.clone())
+            .build()?;
+        Ok(Arc::new(store) as Arc<dyn ObjectStore>)
+    }));
+    Ok((file_io, TableCredentials::Adls(credentials)))
 }
 
 /// What a writer's data files depend on: the field IDs of the current schema, and the partition

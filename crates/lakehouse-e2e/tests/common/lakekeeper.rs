@@ -57,7 +57,7 @@ fn keycloak_token_endpoint_host() -> String {
     )
 }
 
-/// Reached from inside the Exasol UDF container via the overlay's `extra_hosts`.
+/// Reached from inside the Exasol UDF container through Docker's DNS.
 fn keycloak_token_endpoint_internal() -> String {
     format!("http://keycloak:8080/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token")
 }

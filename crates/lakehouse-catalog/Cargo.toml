@@ -17,12 +17,16 @@ exasol-udf-sdk = { workspace = true }
 
 iceberg                 = { workspace = true }
 iceberg-catalog-rest    = { workspace = true }
-# `opendal-azdls`: ADLS Gen2 FileIO backend, in addition to the workspace `opendal-s3`.
-iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
+# The iceberg FileIO's storage, on the clients the scan uses too (#701).
+object_store = { workspace = true, features = ["azure"] }
+typetag      = { workspace = true }
+async-trait  = { workspace = true }
+bytes        = "1"
 
 futures    = { workspace = true }
 serde      = { workspace = true }
-tokio      = { workspace = true, features = ["sync", "time"] }
+# net: `lookup_host`, the system resolver of the DNS cache. io-util: closing a FileIO upload.
+tokio      = { workspace = true, features = ["sync", "time", "net", "io-util"] }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
@@ -34,7 +38,6 @@ aws-sdk-glue           = { workspace = true }
 aws-smithy-types       = { workspace = true }
 aws-smithy-http-client = { workspace = true }
 
-hickory-resolver = { workspace = true }
 rand             = { workspace = true }
 
 reqwest = { workspace = true }
@@ -45,6 +48,5 @@ http       = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }
-reqsign-core = { workspace = true }
 
 [dev-dependencies]

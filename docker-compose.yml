@@ -103,24 +103,20 @@ services:
     ports:
       - "${LH_EXASOL_PORT:-28563}:8563"
       - "${LH_BUCKETFS_PORT:-22581}:2581"
-    # exaconf rewrites /etc/hosts and /etc/resolv.conf on startup, wiping
-    # extra_hosts, so the entrypoint loop re-adds the static service entries.
-    extra_hosts:
-      - "seaweedfs:${LH_SUBNET_PREFIX:-10.84}.0.10"
-      - "iceberg-rest:${LH_SUBNET_PREFIX:-10.84}.0.11"
     entrypoint:
       - /bin/bash
       - -c
       - |
-        ( while true; do
-            if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts; then
-              printf '${LH_SUBNET_PREFIX:-10.84}.0.10 seaweedfs\n${LH_SUBNET_PREFIX:-10.84}.0.11 iceberg-rest\n' >> /etc/hosts
-            fi
-            sleep 2
+        # docker-db writes /etc/resolv.conf from its NameServers setting (8.8.8.8 by default),
+        # dropping Docker's DNS, which resolves every service name (#701); point it back once
+        # confd accepts jobs.
+        ( until bash -lc "confd_client general_settings changes: '{Global: {NameServers: 127.0.0.11}}'" >/dev/null 2>&1; do
+            sleep 5
           done ) &
         exec "$(ls /opt/exasol/cos-*/docker/entrypoint.sh | head -1)" init-sc
     healthcheck:
-      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8563' || exit 1"]
+      # Healthy only once Docker's DNS is in place, so `up --wait` never hands tests the 8.8.8.8 setup.
+      test: ["CMD-SHELL", "grep -q 127.0.0.11 /etc/resolv.conf && timeout 3 bash -c '</dev/tcp/localhost/8563'"]
       interval: 15s
       timeout: 10s
       retries: 40

@@ -4,6 +4,7 @@
 use super::cloud_fixture::{
     derive_run_segment, per_run_segment, require_var, run_teardown_off_runtime,
 };
+use super::object_storage::object_storage_factory;
 use super::raw_parquet::{encode_parquet, put_object};
 use super::seed::{
     all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
@@ -31,14 +32,9 @@ use aws_sdk_glue::types::{
 use futures::future::try_join_all;
 use futures::{StreamExt, TryStreamExt, stream, try_join};
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION,
-    S3_SECRET_ACCESS_KEY,
-};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use object_store::ObjectStore;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
@@ -1048,21 +1044,22 @@ fn orders_columns() -> Result<Vec<ArrayRef>> {
 async fn register_iceberg_orders(writer: &FixtureWriter<'_>) -> Result<()> {
     let run = writer.run;
     let env = run.env();
-    let props = HashMap::from([
-        (MEMORY_CATALOG_WAREHOUSE.to_string(), run.uri("iceberg")),
-        (S3_REGION.to_string(), env.region.clone()),
-        (S3_ACCESS_KEY_ID.to_string(), env.access_key_id.clone()),
-        (
-            S3_SECRET_ACCESS_KEY.to_string(),
-            env.secret_access_key.clone(),
-        ),
-        (S3_DISABLE_CONFIG_LOAD.to_string(), "true".to_string()),
-        (S3_DISABLE_EC2_METADATA.to_string(), "true".to_string()),
-    ]);
+    let props = HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), run.uri("iceberg"))]);
+    let (region, key, secret) = (
+        env.region.clone(),
+        env.access_key_id.clone(),
+        env.secret_access_key.clone(),
+    );
     let catalog = MemoryCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(object_storage_factory(Arc::new(move |root: &str| {
+            let store = AmazonS3Builder::new()
+                .with_url(root)
+                .with_region(&region)
+                .with_access_key_id(&key)
+                .with_secret_access_key(&secret)
+                .build()?;
+            Ok(Arc::new(store) as Arc<dyn ObjectStore>)
+        })))
         .load("glue-e2e-iceberg", props)
         .await
         .context("open the memory catalog")?;

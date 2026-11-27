@@ -1,7 +1,7 @@
 use super::*;
 use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
 use crate::scan::spec::{
-    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, ScanStorage, StorageProps,
+    AdlsCred, DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, ScanStorage, StorageProps,
 };
 use crate::scan::test_support::{inline_resolved, join_spec, minimal_spec};
 use ::object_store::ClientConfigKey;
@@ -217,7 +217,7 @@ fn s3_requests_go_unsigned_only_without_any_credential() {
             session_token: session_token.map(Into::into),
             ..Default::default()
         };
-        let builder = s3_builder(&storage, "bucket", 1);
+        let builder = s3_builder(&storage, "bucket", client_options_for(1));
         assert_eq!(
             builder.get_config_value(&AmazonS3ConfigKey::SkipSignature),
             Some(unsigned.to_string()),

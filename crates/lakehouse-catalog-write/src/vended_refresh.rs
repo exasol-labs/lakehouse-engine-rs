@@ -8,13 +8,12 @@
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
 use lakehouse_catalog::{
-    AdlsCred, AssumedRole, AtRenewalPoint, AwsCredential, CatalogSession,
-    CustomAwsCredentialLoader, EpochClock, ExpiringCredential, Lease, RenewalPoint, VendedAdlsSas,
-    VendedCredentialSet, VendedS3Credentials, aws_lease, redact_error_text, scheme_of,
+    AdlsCred, AssumedRole, AtRenewalPoint, AwsCredential, CatalogSession, EpochClock,
+    ExpiringCredential, Lease, RenewalPoint, VendedAdlsSas, VendedCredentialSet,
+    VendedS3Credentials, aws_lease, redact_error_text, scheme_of,
 };
 use object_store::CredentialProvider;
 use object_store::azure::{AzureAccessKey, AzureCredential, split_sas};
-use reqsign_core::{Context, ProvideCredential};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +67,7 @@ pub(crate) struct VendedTable {
     pub(crate) allow_http: bool,
 }
 
-/// The storage credentials of one table, as a `ProvideCredential` source for its FileIO. Vended
+/// The storage credentials of one table, as the credential provider of its FileIO. Vended
 /// credentials renew through `loadCredentials` on the CONNECTION's catalog address, so the catalog
 /// token never goes to an address the catalog chose. No error and no `Debug` output shows a
 /// credential value, and only the value held now is redacted.
@@ -125,11 +124,6 @@ impl StorageCredentials {
         })
     }
 
-    /// The source as the FileIO's credential hook.
-    pub(crate) fn loader(&self) -> CustomAwsCredentialLoader {
-        CustomAwsCredentialLoader::new(self.clone())
-    }
-
     /// The credential values held now, for value-based error redaction.
     pub(crate) fn secret_values(&self) -> Vec<String> {
         match &*self.inner {
@@ -175,14 +169,18 @@ fn aws_secret_values(credential: Option<AwsCredential>) -> Vec<String> {
         .collect()
 }
 
-impl ProvideCredential for StorageCredentials {
-    type Credential = AwsCredential;
+#[async_trait::async_trait]
+impl CredentialProvider for StorageCredentials {
+    type Credential = object_store::aws::AwsCredential;
 
-    async fn provide_credential(&self, _: &Context) -> reqsign_core::Result<Option<AwsCredential>> {
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
         self.credential()
             .await
-            .map(Some)
-            .map_err(reqsign_core::Error::unexpected)
+            .map(|credential| Arc::new(credential.into()))
+            .map_err(|cause| object_store::Error::Generic {
+                store: "S3",
+                source: cause.into(),
+            })
     }
 }
 

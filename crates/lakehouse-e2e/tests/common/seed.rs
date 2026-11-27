@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::object_storage::object_storage_factory;
 use super::pruning_fixture::{
     PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE,
     PRUNING_TYPED_PARTITION_COLUMN, decimal_unscaled, iceberg_file_prefix, pruning_batch,
@@ -27,10 +28,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema,
 use arrow::json::ReaderBuilder;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::io::{
-    ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS,
-    S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
-};
+use iceberg::io::StorageFactory;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, ListType,
     Literal, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
@@ -51,16 +49,15 @@ use iceberg::{
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
-use iceberg_storage_opendal::{
-    AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
-};
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::data_type::{
     ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type,
 };
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedRowGroupWriter;
-use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
 use serde_json::json;
 
 pub const E2E_NAMESPACE: &str = "e2e_lakehouse";
@@ -147,38 +144,13 @@ pub struct SeedCatalogAuth {
 // `iceberg-catalog-rest` exports no constant for this key.
 const REST_CATALOG_PROP_TOKEN: &str = "token";
 
-fn seed_storage_config() -> (String, String, String, String, bool) {
+fn seed_storage_config() -> (String, String, String, String) {
     (
         super::stack::seaweedfs_url(),
         "us-east-1".to_string(),
         "lhadmin".to_string(),
         "lhadminsecret123".to_string(),
-        true,
     )
-}
-
-/// Always returns the static admin credentials, regardless of per-table vended ones;
-/// see [`build_seed_catalog_with_auth`].
-#[derive(Debug)]
-struct StaticS3CredentialProvider {
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-impl ProvideCredential for StaticS3CredentialProvider {
-    type Credential = AwsCredential;
-
-    async fn provide_credential(
-        &self,
-        _ctx: &ReqsignContext,
-    ) -> ReqsignResult<Option<Self::Credential>> {
-        Ok(Some(AwsCredential {
-            access_key_id: self.access_key_id.clone(),
-            secret_access_key: self.secret_access_key.clone(),
-            // A `None` `expires_in` marks the credential permanently valid.
-            ..Default::default()
-        }))
-    }
 }
 
 fn seed_catalog_props(
@@ -192,24 +164,6 @@ fn seed_catalog_props(
         REST_CATALOG_PROP_WAREHOUSE.to_string(),
         warehouse.to_string(),
     );
-
-    match &auth.storage {
-        SeedStorage::SeaweedFs => {
-            let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
-            props.insert(S3_ENDPOINT.to_string(), endpoint);
-            props.insert(S3_REGION.to_string(), region);
-            props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
-            props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
-            props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
-        }
-        SeedStorage::Adls {
-            account_name,
-            account_key,
-        } => {
-            props.insert(ADLS_ACCOUNT_NAME.to_string(), account_name.clone());
-            props.insert(ADLS_ACCOUNT_KEY.to_string(), account_key.clone());
-        }
-    }
 
     if let Some(token) = auth.token.as_deref().filter(|v| !v.is_empty()) {
         props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
@@ -234,25 +188,39 @@ pub async fn build_seed_catalog_with_auth(
 ) -> Result<RestCatalog> {
     let props = seed_catalog_props(catalog_url, warehouse, &auth);
 
+    // Static credentials only: iceberg-catalog-rest merges each table's vended config over the
+    // static props, so writes to Lakekeeper's `sts-enabled` warehouse would otherwise sign with
+    // the vended session token, which SeaweedFS rejects.
     let storage_factory: Arc<dyn StorageFactory> = match &auth.storage {
-        // Force static S3 credentials: iceberg-catalog-rest merges each table's vended config
-        // over the static props, so writes to Lakekeeper's `sts-enabled` warehouse would sign
-        // with the vended session token, which SeaweedFS rejects. A custom
-        // credential loader replaces the config-derived credentials in opendal's S3 backend.
         SeedStorage::SeaweedFs => {
-            let (_, _, access_key, secret_key, _) = seed_storage_config();
-            Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: Some(CustomAwsCredentialLoader::new(
-                    StaticS3CredentialProvider {
-                        access_key_id: access_key,
-                        secret_access_key: secret_key,
-                    },
-                )),
-            })
+            let (endpoint, region, access_key, secret_key) = seed_storage_config();
+            object_storage_factory(Arc::new(move |root: &str| {
+                let store = AmazonS3Builder::new()
+                    .with_url(root)
+                    .with_endpoint(&endpoint)
+                    .with_region(&region)
+                    .with_access_key_id(&access_key)
+                    .with_secret_access_key(&secret_key)
+                    .with_allow_http(true)
+                    .with_virtual_hosted_style_request(false)
+                    .build()?;
+                Ok(Arc::new(store) as Arc<dyn ObjectStore>)
+            }))
         }
-        // No override needed: Lakekeeper vends ADLS creds under `adls.sas-token.<host>`, but
-        // `load_file_io` only reads the flat keys, so the account key is the only credential.
-        SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
+        SeedStorage::Adls {
+            account_name,
+            account_key,
+        } => {
+            let (account_name, account_key) = (account_name.clone(), account_key.clone());
+            object_storage_factory(Arc::new(move |root: &str| {
+                let store = MicrosoftAzureBuilder::new()
+                    .with_url(root)
+                    .with_account(&account_name)
+                    .with_access_key(&account_key)
+                    .build()?;
+                Ok(Arc::new(store) as Arc<dyn ObjectStore>)
+            }))
+        }
     };
 
     // The runtime runs only inside `block_on`, so a pooled connection never sees the server's

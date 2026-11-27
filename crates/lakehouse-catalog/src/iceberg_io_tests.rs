@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 #[test]
 fn disabled_sigv4_produces_no_auth_header_in_request() {
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .get("https://minio.local:9000/iceberg/v1/namespaces/db/tables/events")
         .build()
@@ -24,7 +24,7 @@ fn disabled_sigv4_produces_no_auth_header_in_request() {
 #[test]
 fn signed_request_does_not_leak_keys_in_headers() {
     let secret = "wJalrXUtnFEMI_EXAMPLE_KEY";
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .get("https://glue.us-east-1.amazonaws.com/iceberg/v1/123/namespaces/db/tables/t")
         .build()
@@ -46,7 +46,7 @@ fn signed_request_does_not_leak_keys_in_headers() {
 /// Scenario: Static bearer token is attached to unsigned catalog requests
 /// Scenario: Catalog requests carry no authorization when neither token nor OAuth credentials are supplied
 async fn authorization(auth: &CatalogAuth) -> Option<String> {
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
     let request = build_signed_request(client.get(url), auth, &creds_no_auth())
         .await

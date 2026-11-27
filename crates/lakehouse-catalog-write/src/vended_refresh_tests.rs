@@ -2,8 +2,6 @@ use super::*;
 use crate::test_support::requests_starting;
 use crate::test_support::{PREFIX_CONFIG, STAGED_LOCATION, assert_free_of, catalog, session};
 use lakehouse_catalog::exported_test_support::clock_reading;
-use reqsign_core::Context;
-use reqsign_core::time::Timestamp;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const LOAD_CREDENTIALS: &str = include_str!("testdata/load_credentials_staged.json");
@@ -69,11 +67,23 @@ async fn source_at(
 }
 
 async fn provide(source: &StorageCredentials) -> Result<AwsCredential, String> {
-    source
-        .provide_credential(&Context::new())
-        .await
-        .map(|credential| credential.expect("a credential"))
-        .map_err(|error| error.to_string())
+    source.credential().await
+}
+
+#[tokio::test]
+async fn the_credential_provider_signs_with_the_held_keys() {
+    let source = StorageCredentials::keys("KEY", "SECRET", Some("TOKEN"));
+
+    let held = source.get_credential().await.unwrap();
+
+    assert_eq!(
+        (
+            held.key_id.as_str(),
+            held.secret_key.as_str(),
+            held.token.as_deref()
+        ),
+        ("KEY", "SECRET", Some("TOKEN"))
+    );
 }
 
 /// Scenario: A writer that outlives its vended credentials refreshes them, or fails naming their expiry
@@ -118,7 +128,7 @@ async fn credentials_within_five_minutes_of_expiry_are_renewed_through_one_load_
 }
 
 #[tokio::test]
-async fn a_load_credentials_answer_yields_the_covering_credentials_and_their_expiry() {
+async fn a_load_credentials_answer_yields_the_covering_credentials() {
     let (uri, _) = catalog(OFFERING_CONFIG, fixture_answer).await;
     let time = Arc::new(AtomicU64::new(SEED_EXPIRES_AT_MS));
     let source = source_at(&uri, seed(Some(SEED_EXPIRES_AT_MS)), &time).await;
@@ -130,10 +140,6 @@ async fn a_load_credentials_answer_yields_the_covering_credentials_and_their_exp
     assert_eq!(
         renewed.session_token.as_deref(),
         Some(FIXTURE_PLACEHOLDERS[2])
-    );
-    assert_eq!(
-        renewed.expires_in,
-        Some(Timestamp::from_millisecond(REFRESHED_EXPIRES_AT_MS as i64).unwrap())
     );
 }
 
@@ -181,7 +187,6 @@ async fn connection_keys_never_expire_and_are_never_renewed() {
     let kept = provide(&source).await.unwrap();
 
     assert_eq!(kept.access_key_id, "KEY");
-    assert_eq!(kept.expires_in, None);
     assert_eq!(source.secret_values(), ["KEY", "SECRET", "TOKEN"]);
 }
 
@@ -390,7 +395,6 @@ async fn credentials_without_an_expiry_are_used_as_vended_and_never_renewed() {
     let adls_kept = signature(&adls).await.unwrap();
 
     assert_eq!(s3_kept.access_key_id, SEED_SECRETS[0]);
-    assert_eq!(s3_kept.expires_in, None);
     assert_eq!(adls_kept, "SEED_SAS_SIGNATURE");
     assert_eq!(credential_requests(&requests), Vec::<String>::new());
 }

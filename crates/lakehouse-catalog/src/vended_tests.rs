@@ -666,7 +666,7 @@ fn empty_connection_address_adopts_the_vended_transport_values_and_a_response_pl
 
 #[test]
 fn vended_request_sends_access_delegation_header() {
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
 
     let req_with_delegation = client

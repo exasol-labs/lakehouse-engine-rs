@@ -13,6 +13,7 @@ mod glue;
 mod iceberg_io;
 mod lakekeeper;
 mod namespace;
+mod object_storage;
 mod redaction;
 mod session;
 mod sigv4;
@@ -28,7 +29,7 @@ pub mod exported_test_support;
 #[path = "test_support_tests.rs"]
 mod test_support;
 
-pub use aws_credential::aws_lease;
+pub use aws_credential::{AwsCredential, aws_lease};
 pub use catalog_http::RepeatSafety;
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
@@ -37,24 +38,24 @@ pub use client::{
     TableFormat, catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
-pub use dns::CachingResolver;
+pub use dns::{adls_store_builder, caching_client_options};
 pub use error_chain::error_chain;
 pub use expiring::{
     AtRenewalPoint, EpochClock, ExpiringCredential, Lease, RenewalPoint, system_clock,
 };
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};
 pub use iceberg_io::read_iceberg_metadata_file;
-pub use iceberg_storage_opendal::{AwsCredential, CustomAwsCredentialLoader};
 pub use lakekeeper::{TableReadDecision, lakekeeper_batch_check, lakekeeper_management_url};
 pub use namespace::parse_table_ident;
+pub use object_storage::{StoreFor, object_file_io, object_storage_factory, root_of};
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{
     CatalogResponse, CatalogSendError, CatalogSession, load_table_any_auth, namespace_tables_path,
     table_ident_path,
 };
 pub use storage::{
-    AdlsCred, StaticStoreAddress, StorageBackend, VendedBackendKind, classify_vended_scheme,
-    scheme_of,
+    AdlsCred, StaticStoreAddress, StorageBackend, VendedBackendKind, adls_builder,
+    classify_vended_scheme, s3_builder, scheme_of,
 };
 pub use sts::{AssumedRole, ResolvedIdentity, resolve_aws_identity};
 

@@ -4,9 +4,10 @@ use crate::export::test_support::{date_columns, static_key_connection};
 use arrow::array::{ArrayRef, Decimal128Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use lakehouse_catalog::exported_test_support::spawn_server_with_headers;
 use lakehouse_catalog_write::CommitTag;
 use lakehouse_catalog_write::exported_test_support::{
-    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
+    LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, with_short_commit_waits,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,17 @@ fn data_file_paths(requests: &Mutex<Vec<String>>, method: &str) -> Vec<String> {
         .collect()
 }
 
+/// The recorded S3 DeleteObjects requests, which object_store sends for every delete.
+fn bulk_deletes(requests: &Mutex<Vec<String>>) -> Vec<String> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.starts_with("POST /warehouse?delete "))
+        .cloned()
+        .collect()
+}
+
 /// A sink that writes into a new unpartitioned table, whose catalog answers a commit with a 504,
 /// the requests the catalog received, and a batch of two rows for it.
 async fn new_table_sink() -> (
@@ -36,19 +48,23 @@ async fn new_table_sink() -> (
     RecordBatch,
 ) {
     let table = with_short_commit_waits(LOAD_TABLE_NO_SNAPSHOTS);
-    let (uri, requests) = catalog(PREFIX_CONFIG, move |line| {
-        if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
-            (504, "{}".into())
+    let (uri, requests) = spawn_server_with_headers("application/json", move |request| {
+        let line = request.lines().next().unwrap_or_default();
+        if line.starts_with("GET /v1/config") {
+            (200, Vec::new(), PREFIX_CONFIG.to_string())
+        } else if line.starts_with("POST /v1/p/namespaces/ns/tables/t ") {
+            (504, Vec::new(), "{}".into())
         } else if line.starts_with("POST /v1/p/namespaces/ns/tables ")
             || line.starts_with("GET /v1/p/namespaces/ns/tables/t?snapshots=all ")
         {
-            (200, table.clone())
+            (200, Vec::new(), table.clone())
         } else if line.starts_with("PUT /warehouse/") {
-            (200, String::new())
+            // S3 answers every PUT with the object's ETag, which object_store requires.
+            (200, vec![("ETag", "\"etag\"".to_string())], String::new())
         } else if line.starts_with("DELETE /warehouse/") {
-            (204, String::new())
+            (204, Vec::new(), String::new())
         } else {
-            (404, "{}".into())
+            (404, Vec::new(), "{}".into())
         }
     })
     .await;
@@ -87,7 +103,7 @@ async fn abort_keeps_the_data_files_while_the_commit_outcome_is_unknown() {
         "{finished}"
     );
     assert_eq!(data_file_paths(&requests, "PUT").len(), 1);
-    assert!(data_file_paths(&requests, "DELETE").is_empty());
+    assert!(bulk_deletes(&requests).is_empty());
 }
 
 fn properties(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -321,5 +337,12 @@ async fn abort_closes_the_open_data_file_before_deleting_it() {
 
     let written = data_file_paths(&requests, "PUT");
     assert_eq!(written.len(), 1);
-    assert_eq!(data_file_paths(&requests, "DELETE"), written);
+    let key = written[0].trim_start_matches("/warehouse/");
+    let deletes = bulk_deletes(&requests);
+    assert_eq!(deletes.len(), 1);
+    assert!(
+        deletes[0].contains(&format!("<Key>{key}</Key>")),
+        "{}",
+        deletes[0]
+    );
 }
