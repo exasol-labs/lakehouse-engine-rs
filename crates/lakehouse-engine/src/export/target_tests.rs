@@ -52,13 +52,8 @@ fn a_supported_connection_is_read_with_its_address_and_credentials() {
 }
 
 #[test]
-fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
+fn a_connection_the_shared_checks_refuse_is_refused_naming_the_connection_and_the_field() {
     let cases = [
-        (
-            "no warehouse",
-            serde_json::json!({ "token": "t" }),
-            vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "warehouse"],
-        ),
         (
             "a shared check: Azure storage with an IAM role",
             serde_json::json!({
@@ -71,11 +66,6 @@ fn an_unwritable_connection_is_refused_naming_the_connection_and_the_field() {
                 "CONNECTION 'LAKEHOUSE_CATALOG_CREDS'",
                 "aws_assume_role_arn",
             ],
-        ),
-        (
-            "SigV4 signing",
-            with(static_keys(), serde_json::json!({ "use_sigv4": true })),
-            vec!["CONNECTION 'LAKEHOUSE_CATALOG_CREDS'", "use_sigv4", "SigV4"],
         ),
         (
             "a shared check: half an OAuth2 client",

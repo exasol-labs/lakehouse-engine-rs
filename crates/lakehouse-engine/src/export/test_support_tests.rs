@@ -3,11 +3,10 @@
 
 use super::target::ExportConnection;
 use exasol_udf_sdk::connection::ConnectionObject;
-use iceberg::spec::{
-    NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Transform, Type,
-};
 use lakehouse_catalog::ConnectionCreds;
-use std::sync::Arc;
+pub(in crate::export) use lakehouse_catalog_write::exported_test_support::{
+    date_columns, partition_spec,
+};
 
 pub(in crate::export) const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 
@@ -60,39 +59,4 @@ pub(in crate::export) fn static_key_connection(
         },
         allow_http,
     }
-}
-
-/// A schema of the `date` columns `c0` to `c<count - 1>`.
-pub(in crate::export) fn date_columns(count: usize) -> SchemaRef {
-    let fields = (0..count).map(|index| {
-        let id = i32::try_from(index).expect("a few columns") + 1;
-        NestedField::optional(
-            id,
-            format!("c{index}"),
-            Type::Primitive(PrimitiveType::Date),
-        )
-        .into()
-    });
-    Arc::new(
-        Schema::builder()
-            .with_fields(fields)
-            .build()
-            .expect("a schema"),
-    )
-}
-
-/// The partition spec `spec_id` over `date_columns(transforms.len())` whose field `p<i>` applies
-/// `transforms[i]` to `c<i>`.
-pub(in crate::export) fn partition_spec(spec_id: i32, transforms: &[Transform]) -> PartitionSpec {
-    let builder = PartitionSpec::builder(date_columns(transforms.len())).with_spec_id(spec_id);
-    transforms
-        .iter()
-        .enumerate()
-        .fold(builder, |builder, (index, transform)| {
-            builder
-                .add_partition_field(format!("c{index}"), format!("p{index}"), *transform)
-                .expect("a partition field")
-        })
-        .build()
-        .expect("a partition spec")
 }

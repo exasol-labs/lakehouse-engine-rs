@@ -1,19 +1,20 @@
 //! Write-crate test inputs: answers recorded from Lakekeeper with every credential value replaced
 //! by a placeholder, tables over in-memory storage, data files, and a fake catalog session.
 
+use crate::WriteStorage;
 use iceberg::io::FileIO;
 use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
 use iceberg::table::Table;
 use iceberg::{Runtime, TableIdent};
 use iceberg_catalog_rest::LoadTableResult;
-use lakehouse_catalog::{CatalogSession, ConnectionCreds};
+use lakehouse_catalog::{CatalogSession, ConnectionCreds, StorageBackend, StorageProps};
 use std::sync::Mutex;
 
 pub(crate) use crate::exported_test_support::{
     LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
 };
 
-/// [`LOAD_TABLE_NO_SNAPSHOTS`] after `append_files` committed one snapshot tagged with
+/// [`LOAD_TABLE_NO_SNAPSHOTS`] after `commit` appended one snapshot tagged with
 /// [`TAGGED_EXPORT_ID`] and [`TAGGED_WRITER_ID`].
 pub(crate) const LOAD_TABLE_TAGGED: &str = include_str!("testdata/load_table_tagged_snapshot.json");
 /// The stage-create answer of a table on the vended warehouse.
@@ -102,4 +103,18 @@ pub(crate) fn assert_free_of(text: &str, secrets: &[&str]) {
     for secret in secrets {
         assert!(!text.contains(secret), "{secret} leaked into: {text}");
     }
+}
+
+/// The static S3 keys of [`static_storage`].
+pub(crate) const STATIC_SECRETS: [&str; 2] = ["STATIC_ACCESS_KEY", "STATIC_SECRET_KEY"];
+
+/// The CONNECTION's own S3 keys.
+pub(crate) fn static_storage() -> WriteStorage {
+    WriteStorage::Static(StorageBackend::S3(StorageProps {
+        endpoint: "https://storage.example".into(),
+        region: "us-east-1".into(),
+        access_key: STATIC_SECRETS[0].into(),
+        secret_key: STATIC_SECRETS[1].into(),
+        ..Default::default()
+    }))
 }

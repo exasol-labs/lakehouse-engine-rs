@@ -701,9 +701,8 @@ fn export_errors_carry_no_connection_password() {
         "table": new_table(),
         "export_id": "0".repeat(32),
         "columns": ["X"],
-        "single_commit": false,
+        "mode": "create",
         "allow_http": true,
-        "append": false,
         "partition_by": [],
     });
     let forged_writer_call =

@@ -1,13 +1,14 @@
-//! The export's Exasol-to-Arrow model: source schemas, and batches of the sink's table schema.
-//! Name binding, type acceptance, and value conversion live here together, so they cannot drift.
+//! The export's batches of the sink's table schema: source schemas, name binding, and value
+//! conversion. The type rules live in `types::export_mapping`.
 
 use super::refusal;
-use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
+use crate::types::exasol_type::{UdfColumnType, exasol_type_from_column_info};
+use crate::types::export_mapping::{exasol_to_arrow, writable};
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int32Builder,
     Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDate};
 use exasol_udf_sdk::context::UdfContext;
@@ -77,24 +78,17 @@ impl BatchBuilder {
             .collect();
         let source_names: Vec<&str> = source.names.iter().map(String::as_str).collect();
         let names = NameMatch::of(&table_names, &source_names);
-        let mut mismatches = Vec::new();
-        for &field in &names.missing {
-            mismatches.push(format!(
-                "table column {} has no export column",
-                table.described(field)
-            ));
+        let found = mismatches(table, source, &names);
+        if !found.is_empty() {
+            return Err(mismatch_error(table, &found));
         }
-        for &column in &names.extra {
-            mismatches.push(format!(
-                "export column {} has no table column",
-                source.described(column)
-            ));
-        }
-        let mut columns = Vec::new();
-        for (field, column) in names.bound.iter().enumerate() {
-            let Some(column) = *column else { continue };
-            match Values::filling(table.schema.field(field), &source.columns[column]) {
-                Some(values) => columns.push(ColumnBuilder {
+        let columns = bound_pairs(&names)
+            .map(|(field, column)| {
+                let values = Values::filling(table.schema.field(field), &source.columns[column])
+                    .ok_or_else(|| {
+                        mismatch_error(table, &[type_mismatch(table, source, field, column)])
+                    })?;
+                Ok(ColumnBuilder {
                     name: table_names[field].to_string(),
                     described: format!(
                         "column {} of table {}",
@@ -104,37 +98,9 @@ impl BatchBuilder {
                     required: !table.schema.field(field).is_nullable(),
                     input: column + 1,
                     values,
-                }),
-                None => mismatches.push(format!(
-                    "export column {} cannot fill table column {}",
-                    source.described(column),
-                    table.described(field)
-                )),
-            }
-        }
-        for (column, fields) in &names.ambiguous_sources {
-            let fields: Vec<String> = fields.iter().map(|&f| table.described(f)).collect();
-            mismatches.push(format!(
-                "export column {} matches table columns {} only by letter case",
-                source.described(*column),
-                listed(&fields)
-            ));
-        }
-        for (field, sources) in &names.ambiguous_fields {
-            let sources: Vec<String> = sources.iter().map(|&c| source.described(c)).collect();
-            mismatches.push(format!(
-                "table column {} matches export columns {} only by letter case",
-                table.described(*field),
-                listed(&sources)
-            ));
-        }
-        if !mismatches.is_empty() {
-            return Err(refusal(format_args!(
-                "the export columns do not match the columns of table {}: {}",
-                table.table,
-                mismatches.join("; ")
-            )));
-        }
+                })
+            })
+            .collect::<Result<_, UdfError>>()?;
         Ok(Self {
             schema: table.schema.clone(),
             columns,
@@ -251,6 +217,73 @@ impl NameMatch {
     }
 }
 
+/// Each table column and the source column bound to it.
+fn bound_pairs(names: &NameMatch) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let bound = names.bound.iter().enumerate();
+    bound.filter_map(|(field, column)| Some((field, (*column)?)))
+}
+
+/// Every mismatch of the source with the table: missing and extra columns, bound pairs of types
+/// that do not fill, and names that match only ambiguously, in that order.
+fn mismatches(table: &TableColumns, source: &SourceColumns, names: &NameMatch) -> Vec<String> {
+    let mut found = Vec::new();
+    for &field in &names.missing {
+        found.push(format!(
+            "table column {} has no export column",
+            table.described(field)
+        ));
+    }
+    for &column in &names.extra {
+        found.push(format!(
+            "export column {} has no table column",
+            source.described(column)
+        ));
+    }
+    for (field, column) in bound_pairs(names) {
+        if Values::filling(table.schema.field(field), &source.columns[column]).is_none() {
+            found.push(type_mismatch(table, source, field, column));
+        }
+    }
+    for (column, fields) in &names.ambiguous_sources {
+        let fields: Vec<String> = fields.iter().map(|&f| table.described(f)).collect();
+        found.push(format!(
+            "export column {} matches table columns {} only by letter case",
+            source.described(*column),
+            listed(&fields)
+        ));
+    }
+    for (field, sources) in &names.ambiguous_fields {
+        let sources: Vec<String> = sources.iter().map(|&c| source.described(c)).collect();
+        found.push(format!(
+            "table column {} matches export columns {} only by letter case",
+            table.described(*field),
+            listed(&sources)
+        ));
+    }
+    found
+}
+
+fn type_mismatch(
+    table: &TableColumns,
+    source: &SourceColumns,
+    field: usize,
+    column: usize,
+) -> String {
+    format!(
+        "export column {} cannot fill table column {}",
+        source.described(column),
+        table.described(field)
+    )
+}
+
+fn mismatch_error(table: &TableColumns, mismatches: &[String]) -> UdfError {
+    refusal(format_args!(
+        "the export columns do not match the columns of table {}: {}",
+        table.table,
+        mismatches.join("; ")
+    ))
+}
+
 /// `items` joined as an English list: `a`, `a and b`, `a, b, and c`.
 fn listed(items: &[String]) -> String {
     match items {
@@ -278,41 +311,28 @@ impl ColumnBuilder {
 }
 
 impl Values {
-    /// The builder of `field` for `source` values, `None` for a refused pair. Integer and
-    /// `timestamptz` fields accept by value, so rows read through a virtual schema fill them again.
+    /// The builder of `field` for `source` values, `None` for a refused pair.
     fn filling(field: &Field, source: &ColumnInfo) -> Option<Self> {
-        let source = arrow_type(field.name(), source).ok()?;
-        Some(match (field.data_type(), source) {
-            (DataType::Decimal128(precision, scale), DataType::Decimal128(p, s))
-                if s == *scale && p <= *precision =>
-            {
-                Self::Decimal {
-                    builder: Decimal128Builder::with_capacity(BATCH_ROWS)
-                        .with_precision_and_scale(*precision, *scale)
-                        .ok()?,
-                    scale: *scale,
-                }
-            }
-            (DataType::Int32, DataType::Decimal128(_, 0)) => {
-                Self::Int(Int32Builder::with_capacity(BATCH_ROWS))
-            }
-            (DataType::Int64, DataType::Decimal128(_, 0)) => {
-                Self::Long(Int64Builder::with_capacity(BATCH_ROWS))
-            }
-            (DataType::Float64, DataType::Float64) => {
-                Self::Double(Float64Builder::with_capacity(BATCH_ROWS))
-            }
-            (DataType::Boolean, DataType::Boolean) => {
-                Self::Boolean(BooleanBuilder::with_capacity(BATCH_ROWS))
-            }
-            (DataType::Utf8, DataType::Utf8) => Self::Text(StringBuilder::new()),
-            (DataType::Date32, DataType::Date32) => {
-                Self::Date(Date32Builder::with_capacity(BATCH_ROWS))
-            }
-            (
-                DataType::Timestamp(TimeUnit::Microsecond, zone),
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-            ) => Self::Timestamp(
+        let UdfColumnType::Known(source) = exasol_type_from_column_info(source) else {
+            return None;
+        };
+        if !writable(field.data_type(), &source) {
+            return None;
+        }
+        Some(match field.data_type() {
+            DataType::Decimal128(precision, scale) => Self::Decimal {
+                builder: Decimal128Builder::with_capacity(BATCH_ROWS)
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+                scale: *scale,
+            },
+            DataType::Int32 => Self::Int(Int32Builder::with_capacity(BATCH_ROWS)),
+            DataType::Int64 => Self::Long(Int64Builder::with_capacity(BATCH_ROWS)),
+            DataType::Float64 => Self::Double(Float64Builder::with_capacity(BATCH_ROWS)),
+            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(BATCH_ROWS)),
+            DataType::Utf8 => Self::Text(StringBuilder::new()),
+            DataType::Date32 => Self::Date(Date32Builder::with_capacity(BATCH_ROWS)),
+            DataType::Timestamp(_, zone) => Self::Timestamp(
                 TimestampMicrosecondBuilder::with_capacity(BATCH_ROWS)
                     .with_timezone_opt(zone.clone()),
             ),
@@ -427,9 +447,6 @@ fn unexpected(name: &str, value: &Value) -> UdfError {
     ))
 }
 
-/// Exasol truncates finer timestamps to microseconds before the writer reads them.
-const MAX_TIMESTAMP_PRECISION: u8 = 6;
-
 /// The Arrow schema of the source columns, named by `names`, in input order and every field
 /// nullable, so every writer of one export derives the same schema.
 pub(super) fn arrow_schema(names: &[String], columns: &[ColumnInfo]) -> Result<Schema, UdfError> {
@@ -442,23 +459,11 @@ pub(super) fn arrow_schema(names: &[String], columns: &[ColumnInfo]) -> Result<S
 }
 
 fn arrow_type(name: &str, column: &ColumnInfo) -> Result<DataType, UdfError> {
-    let exasol_type = match exasol_type_from_column_info(column) {
-        UdfColumnType::Known(exasol_type) => exasol_type,
-        UdfColumnType::Unrecognized { .. } => return Err(unwritable(name, &column.type_name)),
-    };
-    Ok(match exasol_type {
-        ExasolType::Decimal(decimal) => {
-            DataType::Decimal128(decimal.precision(), decimal.scale() as i8)
-        }
-        ExasolType::DoublePrecision => DataType::Float64,
-        ExasolType::Boolean => DataType::Boolean,
-        ExasolType::Varchar { .. } | ExasolType::Char { .. } => DataType::Utf8,
-        ExasolType::Date => DataType::Date32,
-        ExasolType::Timestamp { precision } if precision <= MAX_TIMESTAMP_PRECISION => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        _ => return Err(unwritable(name, &column.type_name)),
-    })
+    match exasol_type_from_column_info(column) {
+        UdfColumnType::Known(exasol_type) => exasol_to_arrow(&exasol_type),
+        UdfColumnType::Unrecognized { .. } => None,
+    }
+    .ok_or_else(|| unwritable(name, &column.type_name))
 }
 
 fn unwritable(name: &str, type_name: &str) -> UdfError {
