@@ -1,6 +1,6 @@
 name: E2E setup
 description: >
-  Common preparation shared by the e2e, e2e-azure and e2e-glue jobs: starts the job's stack, then
+  Common preparation shared by every E2E job: starts the job's stack, then
   installs Rust, restores the build cache, and downloads the .so while Exasol boots. Callers must
   run `actions/checkout` themselves before this action, and `make <stack>-wait` after it.
 inputs:

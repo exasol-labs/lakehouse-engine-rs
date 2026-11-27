@@ -86,18 +86,10 @@ export LH_REST_PORT
 # `<stack>-start` and `<stack>-wait` while Exasol boots.
 E2E_STACKS := e2e lakekeeper azure unity glue
 
-$(addsuffix -pull,$(E2E_STACKS)): %-pull:
-	./scripts/e2e-stack.sh $* pull
-$(addsuffix -logs,$(E2E_STACKS)): %-logs:
-	./scripts/e2e-stack.sh $* logs
-$(addsuffix -start,$(E2E_STACKS)): %-start:
-	./scripts/e2e-stack.sh $* start
-$(addsuffix -wait,$(E2E_STACKS)): %-wait:
-	./scripts/e2e-stack.sh $* wait
-$(addsuffix -up,$(E2E_STACKS)): %-up:
-	./scripts/e2e-stack.sh $* up
-$(addsuffix -down,$(E2E_STACKS)): %-down:
-	./scripts/e2e-stack.sh $* down
+# No stack or action name holds a hyphen, so a target splits into the script's two arguments.
+E2E_STACK_TARGETS := $(foreach s,$(E2E_STACKS),$(addprefix $(s)-,pull start wait up logs down))
+$(E2E_STACK_TARGETS):
+	./scripts/e2e-stack.sh $(subst -, ,$@)
 
 # `E2E_CARGO_FLAGS=--no-run` compiles a suite without running it, so CI builds it while Exasol boots.
 E2E_CARGO_FLAGS ?=
@@ -273,4 +265,4 @@ test-e2e-unity: cross-udf-build
 	cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 .PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts \
-	$(foreach s,$(E2E_STACKS),$(s)-pull $(s)-start $(s)-wait $(s)-up $(s)-logs $(s)-down)
+	$(E2E_STACK_TARGETS)

@@ -317,10 +317,9 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  # The local suite once per supported Exasol version, and on Nano (the arm64
-  # path of Apple Silicon contributors). `name:` comes from the matrix so the
-  # 2025.x leg keeps the exact required check name `E2E`. The 8.29.x leg is not
-  # yet in the ruleset (#364).
+  # `name:` comes from the matrix so the 2025.x leg keeps the exact required
+  # check name `E2E`. The 8.29.x leg is not yet in the ruleset (#364).
+  # The Nano leg runs the arm64 path that contributors on Apple Silicon use.
   e2e:
     name: ${{ matrix.check_name }}
     runs-on: ${{ matrix.runner }}
@@ -331,18 +330,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - check_name: E2E
-            image: exasol/docker-db:2025.1.16
-            runner: ubuntu-latest
+          - image: exasol/docker-db:2025.1.16
+            check_name: E2E
             log_artifact: exa-logs
-          - check_name: E2E (8.29.x)
-            image: exasol/docker-db:8.29.13
             runner: ubuntu-latest
+          - image: exasol/docker-db:8.29.13
+            check_name: E2E (8.29.x)
             log_artifact: exa-logs-8x
-          - check_name: E2E (Nano, arm64)
-            image: exasol/nano:2026.2.0-nano.8
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-latest
+          - image: exasol/nano:2026.2.0-nano.8
+            check_name: E2E (Nano, arm64)
             log_artifact: exa-logs-nano
+            runner: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
       EXASOL_IMAGE: ${{ matrix.image }}

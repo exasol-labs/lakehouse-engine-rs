@@ -1,6 +1,6 @@
 name: Dump Exasol logs
 description: >
-  Failure diagnostics shared by the e2e, e2e-azure and e2e-glue jobs: host dmesg, the stack's
+  Failure diagnostics shared by every E2E job: host dmesg, the stack's
   service logs, exasql crash logs, and the /exa/logs tree as an artifact.
   Callers must guard the step with `if: failure()`.
 inputs:
