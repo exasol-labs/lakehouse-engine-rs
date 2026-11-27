@@ -254,8 +254,7 @@ async fn run_scan_dispatch(
 ) -> Result<(), UdfError> {
     let mut timers = diagnostics::PhaseTimers::start();
 
-    // A join is a source either shape reads, never a shape of its own. The VS never combines
-    // one with aggregates, and registering the join's tables refuses that.
+    // A join is a source either shape reads, never a shape of its own.
     let result = if spec.common.aggregates.is_some() {
         // Phase telemetry targets only the row streaming path.
         run_partial_aggregate(ctx, session_ctx, spec, storage).await

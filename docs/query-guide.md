@@ -156,9 +156,10 @@ every other table on its own. A pair of tables is a broadcast join when:
   128 MiB by default.
 - The smaller table passes the column rule below, when that rule applies.
 
-The column rule applies when Exasol works on the joined rows further: the query has an aggregate,
-`GROUP BY`, `HAVING`, or a third table, or a filter the engine can't run (see [Filters](#filters)).
-Then every column Exasol reads from the smaller table must be one of these:
+The column rule applies when Exasol works on the joined rows further: the query has a third table,
+a filter the engine can't run (see [Filters](#filters)), or an aggregation the engine can't split
+(see [Aggregate over a join](#aggregate-over-a-join)). Then every column Exasol reads from the
+smaller table must be one of these:
 
 - a number, date, timestamp, or boolean
 - text that a filter limits to fixed values: `col = 'x'` or `col IN ('x', 'y')`
@@ -274,15 +275,22 @@ An aggregate that appears only in `ORDER BY`, as in
 keys, such as `GROUP BY qty * 2`, need a `CAST` to a fixed type. See
 [Aggregation](capabilities.md#aggregation).
 
-### Aggregate over a join with short columns
+### Aggregate over a join
 
-If the aggregation uses a text column of the smaller table, such as a name or a description, the
-join is not a broadcast join, because that text would be copied to every joined row. Group by a
-number column instead, or limit the text column to fixed values with a filter.
+Over a broadcast join of two tables the engine splits an aggregation the same way: every node
+joins and aggregates its own rows, and Exasol combines one row per group from each node. This
+needs aggregates the engine can split and only filters the engine can run. A query with a
+`COUNT(DISTINCT ...)` doesn't split over a join.
+
+Otherwise Exasol aggregates the joined rows. If the aggregation then uses a text column of the
+smaller table, such as a name or a description, the join is not a broadcast join, because that
+text would be copied to every joined row. Use an aggregate the engine can split, group by a number
+column, or limit the text column to fixed values with a filter.
 
 | Use | Avoid |
 |---|---|
-| `SELECT c.country, SUM(o.amount) FROM orders o JOIN customers c ON ... WHERE c.country IN ('DE', 'FR') GROUP BY c.country` | `SELECT c.name, SUM(o.amount) FROM orders o JOIN customers c ON ... GROUP BY c.name` |
+| `SELECT c.name, SUM(o.amount) FROM orders o JOIN customers c ON ... GROUP BY c.name` | `SELECT c.name, COUNT(DISTINCT o.product) FROM orders o JOIN customers c ON ... GROUP BY c.name` |
+| `SELECT c.country, COUNT(DISTINCT o.product) FROM orders o JOIN customers c ON ... WHERE c.country IN ('DE', 'FR') GROUP BY c.country` | The same query without the filter on `c.country` |
 
 ## `ORDER BY ... LIMIT`
 

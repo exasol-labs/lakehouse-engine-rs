@@ -3091,7 +3091,7 @@ fn refused_first_setup() -> ExaConn {
     conn
 }
 
-/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+/// Scenario: A splittable aggregation over a broadcast-eligible join is aggregated in the shards
 /// Scenario: A request that reads no column never emits a refused column
 #[test]
 fn no_route_emits_a_refused_column_the_request_does_not_name() {

@@ -63,7 +63,7 @@ use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
 pub use single_group_agg::{detect_aggregates, single_group_plans};
-use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_select};
+use single_group_agg::{has_distinct, is_lone_count_distinct};
 
 mod grouped_agg;
 pub use grouped_agg::{
@@ -75,7 +75,7 @@ mod scalar_over_agg;
 pub use scalar_over_agg::TypedPlans;
 
 mod request_shape;
-use request_shape::{RequestShape, classify_request_shape};
+use request_shape::{RequestShape, classify_request_shape, split_aggregate_sql};
 
 mod joins;
 // Several re-exports are consumed only by tests and the reachability probe.
@@ -221,53 +221,21 @@ fn build_dispatch_sql(
     }
     let filter = placement.scan_filter(0);
 
-    let (single_group_merge, mut projection) = match classify_request_shape(pushdown, scan) {
-        RequestShape::Grouped {
-            detection,
-            having,
-            order_by: grouped_order_by,
-        } => {
-            let GroupedAggregateDetection {
-                group_keys,
-                group_key_types,
-                aggregates,
-                select_items,
-            } = detection;
-            // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
-            // per-shard partial never carries a LIMIT (decision [4]).
-            let grouped_limit = limit;
-            // Empty `projection` is inert on an aggregate dispatch (#145).
-            let spec_template = ScanSpec {
-                common: CommonScanSpec {
-                    filter: filter.clone(),
-                    limit: grouped_limit,
-                    aggregates: Some(aggregates.plans.clone()),
-                    group_keys: Some(group_keys.clone()),
-                    ..base.clone()
-                },
-                files: vec![],
-            };
-            // Types come from detection, never a `selectList`-keyed lookup: nested aggregates
-            // would misalign it.
-            let sql = build_grouped_aggregate_scan_sql(
-                &spec_template,
-                shards,
-                &group_key_types,
-                &aggregates,
-                &select_items,
-                pushdown.select_types(),
-                grouped_limit,
-                pushdown.offset(),
-                scan,
-                having.as_deref(),
-                grouped_order_by.as_deref(),
-            );
-            let Some(sql) = sql else {
-                // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback();
-            };
-            return Ok(pushdown_response(sql));
+    let split = |shape: RequestShape, shard_limit: Option<u64>| {
+        let fan_out = CommonScanSpec {
+            filter: filter.clone(),
+            limit: shard_limit,
+            ..base.clone()
+        };
+        match split_aggregate_sql(shape, pushdown, scan, fan_out, shards, limit) {
+            Some(sql) => Ok(pushdown_response(sql)),
+            // Defensive: a shortened select list fails Exasol's positional validation.
+            None => fallback(),
         }
+    };
+
+    let mut projection = match classify_request_shape(pushdown, scan) {
+        shape @ RequestShape::Grouped { .. } => return split(shape, limit),
         RequestShape::GroupByWrapper | RequestShape::SingleGroupWrapper => {
             // Never fall through to the bare row scan: Exasol expects exactly the
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
@@ -280,17 +248,17 @@ fn build_dispatch_sql(
             aggregates,
             having,
         } => {
-            // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
-            // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
             // Exasol rejects OFFSET in an ungrouped aggregate (`42000`) before the adapter
             // is consulted.
+            debug_assert!(
+                pushdown.offset() == 0,
+                "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
+                 (sqlCode 42000) before the adapter is consulted, so this wrapper \
+                 can never see a non-zero offset"
+            );
+            // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
+            // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
             if is_lone_count_distinct(&items) {
-                debug_assert!(
-                    pushdown.offset() == 0,
-                    "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
-                     (sqlCode 42000) before the adapter is consulted, so this wrapper \
-                     can never see a non-zero offset"
-                );
                 let base_spec = ScanSpec {
                     common: CommonScanSpec {
                         filter: filter.clone(),
@@ -310,45 +278,34 @@ fn build_dispatch_sql(
             if has_distinct(&items) {
                 return fallback();
             }
-            let merge_select =
-                single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
-            let TypedPlans { plans, emits, .. } = aggregates;
-            let merge_inputs = merge_select.and_then(|merge_select| {
-                AggregateMergeInputs::new(emits, merge_select, limit)
-                    .map(|inputs| inputs.with_having(having))
-            });
-            let Some(merge_inputs) = merge_inputs else {
-                // Defensive: a shortened select list fails Exasol's positional validation.
-                return fallback();
-            };
-            (Some((plans, merge_inputs)), Vec::new())
+            // A limit never precedes an ordering the adapter did not render (decision [4]).
+            let shard_limit = if has_order_by { None } else { limit };
+            return split(
+                RequestShape::SingleGroupAgg {
+                    items,
+                    aggregates,
+                    having,
+                },
+                shard_limit,
+            );
         }
         // An item only Exasol computes goes to the qualified wrapper. `project_columns` decides
         // it, never a column-count comparison, which can coincide (#196).
         RequestShape::RowScan => match projection {
             RowProjection::Wrapped => return fallback(),
-            RowProjection::Direct(projection) => (None, projection),
+            RowProjection::Direct(projection) => projection,
         },
     };
-
-    // One Option, so an aggregate spec can never pair with absent merge inputs.
-    let (aggregates, merge_inputs) = single_group_merge
-        .map(|(plans, inputs)| (Some(plans), Some(inputs)))
-        .unwrap_or((None, None));
 
     // Must run before the declined-path sort-key extension below: an appended hidden
     // column could otherwise make a shape match top-N, whose output has no wrapping
     // SELECT to drop it (#225).
-    let topn = if aggregates.is_none() {
-        detect_topn(
-            pushdown,
-            &projection_items(&projection),
-            &base.logical_schema,
-        )
-    } else {
-        None
-    };
-    let order_by = topn.unwrap_or_default();
+    let order_by = detect_topn(
+        pushdown,
+        &projection_items(&projection),
+        &base.logical_schema,
+    )
+    .unwrap_or_default();
 
     // Exasol requires ORDER BY for a pushed OFFSET, and a non-zero offset declines
     // top-N, so `effective_limit` is nulled and no LIMIT/OFFSET renders without an
@@ -367,7 +324,7 @@ fn build_dispatch_sql(
     // Declined ORDER BY: missing sort-key columns are appended as hidden columns, and
     // the wrapper below drops them again (#225). Must run after `detect_topn`.
     let visible_count = projection.len();
-    let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
+    let declined_order_by = has_order_by && order_by.is_empty();
     let declined_sort_keys = if declined_order_by {
         let mut keys = parse_order_by_keys(pushdown)?;
         topn::sort_by_select_items(&mut keys, pushdown, &projection);
@@ -377,32 +334,18 @@ fn build_dispatch_sql(
         Vec::new()
     };
 
-    let has_aggregates = aggregates.is_some();
     let proj_items = projection_items(&projection);
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             filter,
             limit: effective_limit,
             order_by,
-            aggregates,
             ..base.clone()
         },
         files: vec![],
     };
 
-    debug_assert!(
-        !has_aggregates || pushdown.offset() == 0,
-        "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
-         (sqlCode 42000) before the adapter is consulted, so the single-group \
-         aggregate merge can never see a non-zero offset"
-    );
-    let sql = build_scan_driving_sql(
-        &spec_template,
-        shards,
-        &projection,
-        effective_limit,
-        merge_inputs.as_ref(),
-    );
+    let sql = build_scan_driving_sql(&spec_template, shards, &projection, effective_limit, None);
 
     // Exasol does not re-apply a delegated sort/limit, so wrap the unbounded fan-out
     // in a global ORDER BY naming only the visible columns; a wider row fails

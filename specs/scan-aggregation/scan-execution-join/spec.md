@@ -1,6 +1,6 @@
 # Feature: DataFusion Scan Execution, Broadcast Join
 
-The scan UDF executes a node-local broadcast inner equi-join. It registers the fact side's per-shard files and the dimension side's full file list in one DataFusion session, applies the pushed projection, filter, and post-join ordering and cap, and streams the joined rows as Arrow batches through the Arrow C Data Interface.
+The scan UDF executes a node-local broadcast inner equi-join. It registers the fact side's per-shard files and the dimension side's full file list in one DataFusion session, applies the pushed projection, filter, and post-join ordering and cap, and streams the joined rows as Arrow batches through the Arrow C Data Interface. A join spec that carries aggregates emits partial aggregates of the joined rows instead.
 
 ## Background
 
@@ -72,6 +72,17 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * *AND* the UDF MUST NOT register either side with an input-side fetch, and the executed plan MUST NOT carry a limit below the join node on either input
 * *AND* the UDF SHALL emit each result batch via the SDK Arrow-batch emit path (`emit_batch`), fetching one batch, emitting it, and dropping it before the next, never materializing the entire joined result set
 * *AND* no typed Arrow value SHALL cross the `.so` boundary, only the exported C Data Interface array and schema structs
+
+### Scenario: A join scan spec that carries aggregates emits partial aggregates of the joined rows
+
+* *GIVEN* a join scan spec that carries aggregates, with or without group keys, and an empty projection
+* *AND* each group key and each aggregate argument names its column as a pair qualified by its relation alias, `"<alias>"."<COLUMN>"`
+* *WHEN* the scan UDF runs
+* *THEN* the UDF SHALL aggregate the rows of the two tables joined on the join condition, after the filter
+* *AND* with group keys the UDF SHALL emit one row per group of its joined rows, the group keys first and then each aggregate's partial columns (`scan-aggregation/scan-execution-grouped-agg`)
+* *AND* without group keys the UDF SHALL emit exactly one row (`scan-aggregation/scan-execution-partial-agg`)
+* *AND* a fact row that matches no dimension row SHALL count in no group
+* *AND* the UDF MUST NOT emit a joined row
 
 ### Scenario: The bounded dimension side is the hash-join build side
 

@@ -2550,15 +2550,12 @@ fn broadcast_plan_sql(request: &Json) -> String {
         .expect("a renderable aggregating join must stay on the broadcast path")
 }
 
-#[test]
-fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
-    let request = built_join(
+/// `aggregate` of ORDERS' `O_ORDERDATE` per customer key, the last key first, one row.
+fn top_customer_request(aggregate: Json, exa_type: ExasolType) -> Json {
+    built_join(
         customer_orders_request(Json::Null, equi_condition())
             .column(table_col("CUSTOMER", "C_CUSTKEY"))
-            .item(
-                agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
-                ExasolType::Date,
-            )
+            .item(aggregate, exa_type)
             .group_by(vec![table_col("CUSTOMER", "C_CUSTKEY")])
             .order_by(serde_json::json!([order_by_element(
                 table_col("CUSTOMER", "C_CUSTKEY"),
@@ -2566,13 +2563,54 @@ fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
                 true
             )]))
             .limit(1),
+    )
+}
+
+#[test]
+fn a_splittable_aggregation_over_a_broadcast_pair_aggregates_in_the_shards() {
+    let order_date = table_col("ORDERS", "O_ORDERDATE");
+    let request = top_customer_request(agg_item_expr("MIN", order_date, false), ExasolType::Date);
+
+    let sql = broadcast_plan_sql(&request);
+
+    assert!(
+        sql.starts_with(r#"SELECT "GK_0", MIN("PARTIAL_min_0") FROM (SELECT SCAN("#),
+        "{sql}"
+    );
+    assert!(
+        sql.ends_with(r#") GROUP BY "GK_0" ORDER BY "GK_0" DESC NULLS LAST LIMIT 1"#),
+        "{sql}"
+    );
+    assert_eq!(
+        emits_clause(&sql),
+        r#""GK_0" DECIMAL(20,0), "PARTIAL_min_0" DATE"#
+    );
+    // Each column names its leg, so a name both legs carry stays unambiguous in the shard.
+    let common = broadcast_common_blob(&sql);
+    assert_eq!(
+        common["group_keys"],
+        serde_json::json!([r#""LHS_T0"."C_CUSTKEY""#])
+    );
+    assert_eq!(
+        common["aggregates"],
+        serde_json::json!([{"kind": "min", "arg_expr": r#""LHS_T1"."O_ORDERDATE""#}])
+    );
+    assert_shards_carry_no_window(&sql);
+}
+
+#[test]
+fn an_aggregation_that_does_not_split_aggregates_sorts_and_limits_only_in_exasol() {
+    let order_date = table_col("ORDERS", "O_ORDERDATE");
+    let request = top_customer_request(
+        agg_item_expr("COUNT", order_date, true),
+        ExasolType::decimal(18, 0),
     );
 
     let sql = broadcast_plan_sql(&request);
 
     assert!(
         sql.starts_with(
-            r#"SELECT "LHS_T0_C_CUSTKEY", MIN("LHS_T1_O_ORDERDATE") FROM (SELECT SCAN("#
+            r#"SELECT "LHS_T0_C_CUSTKEY", COUNT(DISTINCT "LHS_T1_O_ORDERDATE") FROM (SELECT SCAN("#
         ),
         "{sql}"
     );
@@ -2590,6 +2628,12 @@ fn aggregating_broadcast_aggregates_sorts_and_limits_only_in_exasol() {
     );
 }
 
+/// Exasol strips every aggregate from a single-group select list it needs no value of (#627),
+/// which leaves the shards nothing to aggregate.
+fn stripped_aggregate() -> Json {
+    num_lit(1)
+}
+
 /// The first declared column may be one the reader refuses, so the fan-out emits a join key.
 #[test]
 fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
@@ -2598,16 +2642,13 @@ fn aggregating_broadcast_reading_no_column_emits_a_join_key_of_the_first_leg() {
     for customer_columns in [[key, name], [name, key]] {
         let request = built_join(
             customer_orders_request_declaring(&customer_columns, Json::Null, equi_condition())
-                .count_star()
+                .item(stripped_aggregate(), ExasolType::decimal(1, 0))
                 .single_group(),
         );
 
         let sql = broadcast_plan_sql(&request);
 
-        assert!(
-            sql.starts_with("SELECT COUNT(*) FROM (SELECT SCAN("),
-            "{sql}"
-        );
+        assert!(sql.starts_with("SELECT 1 FROM (SELECT SCAN("), "{sql}");
         assert!(sql.ends_with(") GROUP BY ()"), "{sql}");
         assert_eq!(emits_clause(&sql), r#""LHS_T0_C_CUSTKEY" DECIMAL(20,0)"#);
     }
@@ -2662,16 +2703,22 @@ fn an_empty_select_list_over_a_declined_filter_emits_only_the_filter_column() {
     );
 }
 
+/// `aggregate` per `C_NAME`, an unbounded text column of CUSTOMER.
+fn per_customer_name_request(aggregate: Json) -> Json {
+    built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .item(aggregate, ExasolType::decimal(18, 0))
+            .group_by(vec![table_col("CUSTOMER", "C_NAME")]),
+    )
+}
+
 /// The fan-out repeats a dimension column once per joined row, so only an unbounded text column
 /// of the dimension, never of the fact side, keeps the N-scan.
 #[test]
 fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only() {
-    let request = built_join(
-        customer_orders_request(Json::Null, equi_condition())
-            .column(table_col("CUSTOMER", "C_NAME"))
-            .count_star()
-            .group_by(vec![table_col("CUSTOMER", "C_NAME")]),
-    );
+    let orders_key = table_col("ORDERS", "O_CUSTKEY");
+    let request = per_customer_name_request(agg_item_expr("COUNT", orders_key, true));
 
     assert_eq!(
         broadcast_plan(&request, 10, 100),
@@ -2684,6 +2731,19 @@ fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only
     );
 }
 
+/// Shards that aggregate emit the text column once per group, never once per joined row.
+#[test]
+fn a_splittable_aggregation_broadcasts_over_an_unbounded_text_column_of_the_dimension() {
+    let sql = broadcast_plan(&per_customer_name_request(count_star()), 10, 100)
+        .expect("CUSTOMER, the dimension, is broadcast");
+
+    assert_eq!(
+        emits_clause(&sql),
+        r#""GK_0" VARCHAR(100), "PARTIAL_count_0" DECIMAL(20,0)"#,
+        "{sql}"
+    );
+}
+
 /// The width rule judges the columns the aggregation reads, never the placeholder join key.
 #[test]
 fn aggregating_broadcast_keeps_a_column_free_aggregation_over_a_text_keyed_leading_dimension() {
@@ -2692,7 +2752,7 @@ fn aggregating_broadcast_keeps_a_column_free_aggregation_over_a_text_keyed_leadi
     let request = built_join(
         customer_orders_request_over(&code, &code, Json::Null, on_code)
             .single_group()
-            .count_star(),
+            .item(stripped_aggregate(), ExasolType::decimal(1, 0)),
     );
 
     let sql = broadcast_plan(&request, 10, 100)

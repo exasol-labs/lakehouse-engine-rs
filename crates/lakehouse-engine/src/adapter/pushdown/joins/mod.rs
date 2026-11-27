@@ -44,6 +44,7 @@ pub(super) use planning::JoinWindowPlan;
 pub(super) use planning::involved_table;
 use planning::resolve_one_join_side;
 use rendering::{fan_out_filter, leg_column_types, possible_side_column_names, screen_pair_filter};
+use sql_builders::ShardAggregate;
 use sql_builders::qualified_emission;
 
 /// Fails the request unless every `column` node of `pushdown` binds one table of the query, a
@@ -252,6 +253,8 @@ fn broadcast_candidates(
     let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
     let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
     let above: Vec<&Expr> = pushdown.expressions(&Clause::WRAPPER);
+    // Shards that aggregate emit one row per group, so no dimension column repeats per joined row.
+    let splits = ShardAggregate::of(pushdown, &legs, sides, context)?.is_some();
     Ok(group_legs(&JoinGraph {
         legs: &legs,
         bytes: &bytes,
@@ -260,7 +263,7 @@ fn broadcast_candidates(
         conjuncts: &conjuncts,
         above: &above,
         output: pushdown.output(),
-        aggregates: pushdown.aggregation_type().is_some(),
+        aggregates: pushdown.aggregation_type().is_some() && !splits,
         max_bytes: context.tuning.join_broadcast_max_bytes,
     }))
 }

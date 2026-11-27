@@ -108,11 +108,17 @@ impl JoinLegs {
         expr.with_table_aliases(&mut |column| self.leg_alias(self.leg(column)))
     }
 
-    /// The request with its select list, WHERE, and ORDER BY qualified by leg, as a broadcast scan
-    /// renders them.
+    /// The request with every clause over its FROM qualified by leg, as a broadcast scan renders
+    /// them.
     pub(super) fn qualify_request(&self, pushdown: &PushdownRequest) -> PushdownRequest {
         pushdown.map_expressions(
-            &[Clause::SelectList, Clause::Filter, Clause::OrderBy],
+            &[
+                Clause::SelectList,
+                Clause::Filter,
+                Clause::GroupBy,
+                Clause::Having,
+                Clause::OrderBy,
+            ],
             |tree| self.qualify(tree),
         )
     }

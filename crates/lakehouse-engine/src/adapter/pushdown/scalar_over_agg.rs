@@ -155,17 +155,17 @@ const STAT_AGG_KINDS: &[(&str, AggKind)] = &[
     ("VAR_POP", AggKind::VarPop),
 ];
 
-fn column_from_first_arg(args: &[Expr]) -> Option<String> {
-    args.first()?.as_column().map(Column::upper_name)
-}
-
-/// `None` when there is no argument or it cannot be rendered.
+/// `None` when there is no argument or it cannot be rendered. A column a join leg qualifies is a
+/// rendered fragment, because the plan's `column` is a bare name that two legs can share.
 pub(super) fn arg_column_or_expr(
     args: &[Expr],
     scan: ScanTranslator<'_>,
 ) -> Option<(Option<String>, Option<String>)> {
     let arg = args.first()?;
-    if let Some(column) = arg.as_column() {
+    if let Some(column) = arg
+        .as_column()
+        .filter(|column| column.table_alias.is_none())
+    {
         return Some((Some(column.upper_name()), None));
     }
     scan.expression(arg).map(|arg| (None, Some(arg.sql)))
@@ -185,8 +185,8 @@ fn aggregate_argument(
 }
 
 /// `None` for any `distinct: true` item, an unsupported function, or an aggregate the scan does
-/// not compute. STDDEV/VARIANCE accept only a bare column: their (cnt, mean, m2) decomposition
-/// has no rendered-argument form, and a plan with no argument would fail inside the scan.
+/// not compute. STDDEV/VARIANCE accept only a column argument, and a plan with no argument would
+/// fail inside the scan.
 pub(super) fn parse_agg_item(item: &Expr, scan: ScanTranslator<'_>) -> Option<AggregatePlan> {
     let Expr::Aggregate(call) = item else {
         return None;
@@ -231,10 +231,12 @@ pub(super) fn parse_agg_item(item: &Expr, scan: ScanTranslator<'_>) -> Option<Ag
     }
 
     if let Some((_, kind)) = STAT_AGG_KINDS.iter().find(|(name, _)| *name == fn_name) {
+        args.first()?.as_column()?;
+        let (column, arg_expr) = arg_column_or_expr(args, scan)?;
         return Some(AggregatePlan {
             kind: kind.clone(),
-            column: Some(column_from_first_arg(args)?),
-            arg_expr: None,
+            column,
+            arg_expr,
         });
     }
 

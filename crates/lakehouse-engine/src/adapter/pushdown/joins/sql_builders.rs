@@ -10,6 +10,7 @@ use super::super::context::{PushdownContext, Shards};
 use super::super::request::{
     AdapterRequest, AggregationType, Clause, OutputContract, PushdownRequest,
 };
+use super::super::request_shape::{RequestShape, classify_request_shape, split_aggregate_sql};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     ColumnTypes, Emitted, ProjectedColumn, RowProjection, ScanTranslator, build_scan_driving_sql,
@@ -65,6 +66,13 @@ pub(in super::super) fn render_join_plan(
         context,
     )? {
         return build_pair_fan_out_sql(sides, &plan.fan_outs()[0], &rendered, context);
+    }
+    if let ([pair], None) = (plan.fan_outs(), placement.wrapper())
+        && let Some(aggregate) = ShardAggregate::of(pushdown, &legs, sides, context)?
+    {
+        let keys = conditions.pair_keys.as_ref().expect(PLACED_PAIR_KEYS);
+        let filter = placement.scan_filter(0);
+        return aggregate.render(pair, keys, filter, &legs, sides, context);
     }
     let ConditionPlacement { pair_keys, on, .. } = conditions;
 
@@ -164,6 +172,72 @@ pub(super) fn render_in_shards(
     let emitted = pair_emission(pushdown.output(), &above, legs, sides, pair, keys)?;
     let filter = placement.scan_filter(0);
     render_pair(Some(pushdown), legs, sides, keys, filter, &emitted, context)
+}
+
+/// A two-leg request whose aggregation the shards of its broadcast pair split (#639): each shard
+/// aggregates its joined rows and Exasol merges the partial rows, as over one table. Every fact
+/// file lies in one shard and every shard joins the whole dimension, so the shards' joined rows
+/// partition the join.
+pub(super) struct ShardAggregate {
+    /// Qualified by leg, as the pair's scan binds each column.
+    qualified: PushdownRequest,
+    columns: ColumnTypes,
+    shape: RequestShape,
+}
+
+impl ShardAggregate {
+    /// `None` for a join of more legs, whose other fan-outs Exasol joins before it aggregates,
+    /// and for an aggregation that does not split ([`RequestShape::splits`]).
+    pub(super) fn of(
+        pushdown: &PushdownRequest,
+        legs: &JoinLegs,
+        sides: &[ResolvedJoinSide],
+        context: &PushdownContext<'_>,
+    ) -> Result<Option<Self>, UdfError> {
+        if sides.len() != 2 || pushdown.aggregation_type().is_none() {
+            return Ok(None);
+        }
+        let qualified = legs.qualify_request(pushdown);
+        let columns = leg_column_types(legs, sides);
+        let scan = ScanTranslator::over(
+            &columns,
+            context.version,
+            &qualified.expressions(&Clause::WRAPPER),
+        )?;
+        let shape = classify_request_shape(&qualified, scan);
+        Ok(shape.splits().then_some(Self {
+            qualified,
+            columns,
+            shape,
+        }))
+    }
+
+    /// `Ok(None)` declines the pair: the scan declines a join key (#587), or the merge select
+    /// declines.
+    fn render(
+        self,
+        pair: &LegGroup,
+        keys: &Expr,
+        filter: Option<String>,
+        legs: &JoinLegs,
+        sides: &[ResolvedJoinSide],
+        context: &PushdownContext<'_>,
+    ) -> Result<Option<String>, UdfError> {
+        let condition_tree = legs.qualify(keys);
+        let scan = ScanTranslator::over(&self.columns, context.version, &[&condition_tree])?;
+        let Some(condition) = scan.filter(&condition_tree) else {
+            return Ok(None);
+        };
+        let fan_out = pair_scan_spec(sides, pair, condition, filter, None, Vec::new(), context)?;
+        Ok(split_aggregate_sql(
+            self.shape,
+            &self.qualified,
+            scan,
+            fan_out.common,
+            &shard_side(&sides[pair.sharded], context),
+            self.qualified.limit(),
+        ))
+    }
 }
 
 /// The pair's scan: its join keys, `filter`, and what it projects of the columns it emits per
@@ -568,14 +642,41 @@ fn place_broadcast_window(
     }
 }
 
-/// The fan-out of a broadcast `pair`, `Ok(None)` when [`place_broadcast_window`] declines.
-///
-/// The fact leg is sharded; the dimension's full file list rides once in the common blob's
-/// [`JoinSpec`], so every shard joins node-locally with no exchange. Each leg carries its own
-/// storage because a vended credential is scoped to its table. The window always applies after
-/// the join; [`place_broadcast_window`] decides where it lands. The join block names each
-/// relation by the alias its leg was rendered with, so the scan binds every qualified column to
-/// the leg that owns it.
+/// The scan spec of a broadcast `pair`. The fact leg is sharded; the dimension's full file list
+/// rides once in the common blob's [`JoinSpec`], so every shard joins node-locally with no
+/// exchange. Each leg carries its own storage because a vended credential is scoped to its table.
+/// The join block names each relation by the alias its leg was rendered with, so the scan binds
+/// every qualified column to the leg that owns it.
+fn pair_scan_spec(
+    sides: &[ResolvedJoinSide],
+    pair: &LegGroup,
+    condition: String,
+    filter: Option<String>,
+    post_join_limit: Option<u64>,
+    post_join_order_by: Vec<SortKey>,
+    context: &PushdownContext<'_>,
+) -> Result<ScanSpec, UdfError> {
+    let (fact_leg, dimension_leg) = (pair.sharded, pair.broadcast[0]);
+    let dimension = &sides[dimension_leg];
+    let join = JoinSpec {
+        table_root: dimension.scan.table_root.clone(),
+        files: relativize_files_to_root(dimension.scan.files.clone(), &dimension.scan.table_root),
+        logical_schema: dimension.scan.logical_schema.clone(),
+        name_mapping: dimension.scan.name_mapping.clone(),
+        join_type: JoinType::Inner,
+        fact_alias: relation_alias(fact_leg),
+        dimension_alias: relation_alias(dimension_leg),
+        condition,
+        post_join_limit,
+        post_join_order_by,
+        partition_columns: dimension.scan.partition_columns.clone(),
+        storage: context.scan_storage(&dimension.scan.effective_storage)?,
+    };
+    join_fan_out_scan_spec(&sides[fact_leg], filter, Some(join), context)
+}
+
+/// The row fan-out of a broadcast `pair`, `Ok(None)` when [`place_broadcast_window`] declines.
+/// The window always applies after the join; [`place_broadcast_window`] decides where it lands.
 pub(in super::super) fn build_pair_fan_out_sql(
     sides: &[ResolvedJoinSide],
     pair: &LegGroup,
@@ -587,28 +688,16 @@ pub(in super::super) fn build_pair_fan_out_sql(
         return Ok(None);
     };
 
-    let (fact_leg, dimension_leg) = (pair.sharded, pair.broadcast[0]);
-    let fact = &sides[fact_leg];
-    let dimension = &sides[dimension_leg];
-
-    let shards = shard_side(fact, context);
-
-    let join = JoinSpec {
-        table_root: dimension.scan.table_root.clone(),
-        files: relativize_files_to_root(dimension.scan.files.clone(), &dimension.scan.table_root),
-        logical_schema: dimension.scan.logical_schema.clone(),
-        name_mapping: dimension.scan.name_mapping.clone(),
-        join_type: JoinType::Inner,
-        fact_alias: relation_alias(fact_leg),
-        dimension_alias: relation_alias(dimension_leg),
-        condition: rendered.condition.clone(),
-        post_join_limit: placement.shard_cap,
-        post_join_order_by: placement.shard_order_by,
-        partition_columns: dimension.scan.partition_columns.clone(),
-        storage: context.scan_storage(&dimension.scan.effective_storage)?,
-    };
-
-    let spec = join_fan_out_scan_spec(fact, rendered.filter.clone(), Some(join), context)?;
+    let shards = shard_side(&sides[pair.sharded], context);
+    let spec = pair_scan_spec(
+        sides,
+        pair,
+        rendered.condition.clone(),
+        rendered.filter.clone(),
+        placement.shard_cap,
+        placement.shard_order_by,
+        context,
+    )?;
 
     let fan_out = build_scan_driving_sql(
         &spec,

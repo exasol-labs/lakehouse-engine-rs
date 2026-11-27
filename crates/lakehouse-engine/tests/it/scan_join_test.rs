@@ -17,11 +17,11 @@ use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    ColumnRef, CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ProjectionItem,
-    ScanSpec, ScanStorage, ScanTuning, SortKey, StorageBackend, StorageProps,
+    AggKind, AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField,
+    ProjectionItem, ScanSpec, ScanStorage, ScanTuning, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_join_physical_plan, run_raw_scan_with_session, session_config_for_spec,
+    build_join_physical_plan, run_raw_scan_with_session, run_scan_one, session_config_for_spec,
 };
 
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -461,6 +461,82 @@ fn join_projection_filter_limit_streamed() {
         .expect("C_NAME must be Utf8");
     // Which order survives is nondeterministic, but both belong to Alice.
     assert_eq!(name.value(0), "Alice", "the custkey-10 customer is Alice");
+}
+
+/// The rows a join spec carrying `aggregates` emits, sorted by their debug text.
+fn run_join_aggregate(
+    group_keys: Option<Vec<String>>,
+    aggregates: Vec<AggregatePlan>,
+    emits: &[ExaType],
+) -> Vec<Vec<Value>> {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut spec = join_spec(
+        vec![write_orders(dir)],
+        vec![write_customer(dir)],
+        Vec::new(),
+        None,
+        None,
+    );
+    spec.common.group_keys = group_keys;
+    spec.common.aggregates = Some(aggregates);
+
+    let mut ctx =
+        TestContext::scalar(vec![]).with_output_columns(scan_fixture::output_columns(emits));
+    let storage = scan_fixture::resolved_storage(&spec);
+    block_on(run_scan_one(&mut ctx, spec, &storage, |spec, _, _, _| {
+        Ok(SessionContext::new_with_config(session_config_for_spec(
+            spec,
+        )))
+    }))
+    .expect("an aggregate over a join must run");
+    let mut rows = ctx.emitted().to_vec();
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+fn fact_aggregate(kind: AggKind, fact_column: &str) -> AggregatePlan {
+    AggregatePlan {
+        kind,
+        column: None,
+        arg_expr: Some(format!(r#""{FACT_ALIAS}"."{fact_column}""#)),
+    }
+}
+
+/// Scenario: A join scan spec that carries aggregates emits partial aggregates of the joined rows
+#[test]
+fn join_with_aggregates_emits_partial_aggregates_of_the_joined_rows() {
+    let aggregates = || {
+        vec![
+            fact_aggregate(AggKind::Sum, "O_TOTALPRICE"),
+            fact_aggregate(AggKind::CountCol, "O_ORDERKEY"),
+        ]
+    };
+    let group = |name: &str, sum: f64, count: i64| {
+        vec![
+            Value::String(name.into()),
+            Value::Double(sum),
+            Value::Int64(count),
+        ]
+    };
+
+    // Order 6 matches no customer, so no group counts it.
+    let grouped = run_join_aggregate(
+        Some(vec![format!(r#""{DIM_ALIAS}"."C_NAME""#)]),
+        aggregates(),
+        &[scan_fixture::varchar(), ExaType::Double, ExaType::Int64],
+    );
+    assert_eq!(
+        grouped,
+        [
+            group("Alice", 500.0, 2),
+            group("Bob", 700.0, 2),
+            group("Carol", 300.0, 1),
+        ]
+    );
+
+    let single_group = run_join_aggregate(None, aggregates(), &[ExaType::Double, ExaType::Int64]);
+    assert_eq!(single_group, [vec![Value::Double(1500.0), Value::Int64(5)]]);
 }
 
 /// Scenario: Each side of a broadcast join materializes its own partition columns
