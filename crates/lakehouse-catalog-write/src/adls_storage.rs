@@ -2,6 +2,7 @@
 //! request asks the table's ADLS credential source for the credential it signs with, so a SAS
 //! renewed while a writer runs signs every later request, each part of a multipart upload too.
 
+use crate::object_store_dns::adls_store_builder;
 use crate::vended_refresh::AdlsCredentials;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -12,7 +13,6 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use serde::{Deserialize, Serialize};
@@ -97,7 +97,7 @@ impl AdlsStorage {
             .map_or(rest, |(authority, _)| authority);
         let store = credentials
             .map(|credentials| {
-                MicrosoftAzureBuilder::new()
+                adls_store_builder()
                     .with_url(format!("{scheme}://{authority}/"))
                     .with_credentials(Arc::new(credentials))
                     .build()

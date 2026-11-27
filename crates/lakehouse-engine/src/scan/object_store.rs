@@ -6,9 +6,10 @@ use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_catalog::redact_error_text;
+use lakehouse_catalog_write::{adls_store_builder, caching_client_options, s3_store_builder};
 use object_store::ClientOptions;
 use object_store::aws::AmazonS3Builder;
-use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::azure::AzureConfigKey;
 use object_store::limit::LimitStore;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
@@ -199,7 +200,7 @@ fn build_undecorated_store(
             Ok(apply_admission_limit(s3, admission_limit))
         }
         StorageBackend::Adls { cred, .. } => {
-            let builder = MicrosoftAzureBuilder::new()
+            let builder = adls_store_builder()
                 .with_url(store_url.as_str())
                 .with_client_options(client_options_for(connection_budget));
             let builder = match cred {
@@ -222,7 +223,7 @@ fn build_undecorated_store(
 fn s3_builder(storage: &StorageProps, bucket: &str, connection_budget: usize) -> AmazonS3Builder {
     // `with_client_options` REPLACES the whole `ClientOptions`, so it must precede
     // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking SeaweedFS).
-    let mut builder = AmazonS3Builder::new()
+    let mut builder = s3_store_builder()
         .with_bucket_name(bucket)
         .with_region(&storage.region)
         .with_client_options(client_options_for(connection_budget))
@@ -286,7 +287,7 @@ pub(crate) fn build_admission_limited_store(
 /// `object_store` has no in-flight connection cap; `pool_max_idle_per_host` (unbounded by
 /// default in reqwest) is the closest knob, bounding warm connections per host.
 fn client_options_for(budget: usize) -> ClientOptions {
-    ClientOptions::new().with_pool_max_idle_per_host(budget.max(1))
+    caching_client_options().with_pool_max_idle_per_host(budget.max(1))
 }
 
 /// Keyed by the `ListingTableUrl` prefix DataFusion passes to `head`, so lookups need no network

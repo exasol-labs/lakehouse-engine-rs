@@ -214,7 +214,7 @@ async fn assume_role(
     if let Some(endpoint) = endpoint {
         config = config.endpoint_url(endpoint);
     }
-    let client = aws_sdk_sts::Client::from_conf(config.build());
+    let client = crate::dns::sts_client(config);
 
     let output = client
         .assume_role()
