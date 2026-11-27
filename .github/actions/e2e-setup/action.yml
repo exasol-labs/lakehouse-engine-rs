@@ -19,10 +19,6 @@ runs:
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         sysctl kernel.apparmor_restrict_unprivileged_userns
 
-    - name: Pull stack images
-      shell: bash
-      run: make ${{ inputs.stack }}-pull
-
     - name: Start stack
       shell: bash
       run: make ${{ inputs.stack }}-start

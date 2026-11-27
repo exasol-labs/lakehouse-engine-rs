@@ -87,7 +87,7 @@ export LH_REST_PORT
 E2E_STACKS := e2e lakekeeper azure unity glue
 
 # No stack or action name holds a hyphen, so a target splits into the script's two arguments.
-E2E_STACK_TARGETS := $(foreach s,$(E2E_STACKS),$(addprefix $(s)-,pull start wait up logs down))
+E2E_STACK_TARGETS := $(foreach s,$(E2E_STACKS),$(addprefix $(s)-,start wait up logs down))
 $(E2E_STACK_TARGETS):
 	./scripts/e2e-stack.sh $(subst -, ,$@)
 
