@@ -208,18 +208,13 @@ async fn assume_role(
     );
     let mut config = aws_sdk_sts::Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .http_client(crate::dns::aws_http_client())
         .region(Region::new(region))
         .credentials_provider(base)
         .timeout_config(TimeoutConfig::builder().operation_timeout(timeout).build());
     if let Some(endpoint) = endpoint {
         config = config.endpoint_url(endpoint);
     }
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the one STS client, built on `aws_http_client`"
-    )]
-    let client = aws_sdk_sts::Client::from_conf(config.build());
+    let client = crate::dns::sts_client(config);
 
     let output = client
         .assume_role()

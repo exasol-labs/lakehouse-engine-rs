@@ -46,12 +46,24 @@ impl ResolveDns for CachingResolver {
     }
 }
 
-/// The HTTP client of an AWS SDK client: the SDK's default one with a [`CachingResolver`].
+/// The Glue client of `config`, on the caching HTTP client.
+#[expect(clippy::disallowed_methods, reason = "the factory of Glue clients")]
+pub(crate) fn glue_client(config: aws_sdk_glue::config::Builder) -> aws_sdk_glue::Client {
+    aws_sdk_glue::Client::from_conf(config.http_client(aws_http_client()).build())
+}
+
+/// The STS client of `config`, on the caching HTTP client.
+#[expect(clippy::disallowed_methods, reason = "the factory of STS clients")]
+pub(crate) fn sts_client(config: aws_sdk_sts::config::Builder) -> aws_sdk_sts::Client {
+    aws_sdk_sts::Client::from_conf(config.http_client(aws_http_client()).build())
+}
+
+/// The SDK's default HTTP client with a [`CachingResolver`].
 #[expect(
     clippy::disallowed_methods,
-    reason = "the one place that builds an AWS SDK HTTP client"
+    reason = "the factory of AWS SDK HTTP clients"
 )]
-pub(crate) fn aws_http_client() -> SharedHttpClient {
+fn aws_http_client() -> SharedHttpClient {
     let resolver = CachingResolver::default();
     Builder::new().build_with_connector_fn(move |settings, components| {
         let mut connector =

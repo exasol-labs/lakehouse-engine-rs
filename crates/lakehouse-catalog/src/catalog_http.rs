@@ -107,10 +107,6 @@ impl CatalogHttp {
     }
 
     /// Panics where `reqwest::Client::new` panics: when the TLS backend cannot start.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the one reqwest client; its `hickory-dns` feature caches DNS answers"
-    )]
     pub(crate) fn with_policy(policy: RetryPolicy) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(policy.connect_timeout)

@@ -19,7 +19,7 @@ pub mod exported_test_support;
 #[path = "test_support_tests.rs"]
 mod test_support;
 
-pub use object_store_dns::caching_client_options;
+pub use object_store_dns::{adls_store_builder, caching_client_options, s3_store_builder};
 
 pub use iceberg_write::{
     CommitError, CommitTag, StagedTable, TableWriteSession, WriteStorage, WriteTable,

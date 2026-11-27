@@ -7,7 +7,7 @@ use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
 
 use crate::ConnectionCreds;
 use crate::aws_error::{SdkFailure, sdk_failure};
-use crate::dns::aws_http_client;
+use crate::dns;
 
 const MAX_ATTEMPTS: u32 = 5;
 /// Bounds each call, retries included, because it runs inside a pushdown.
@@ -15,10 +15,6 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CREDENTIALS_PROVIDER: &str = "exasol-connection";
 const NOT_FOUND_CODE: &str = "EntityNotFoundException";
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one Glue client, built on `aws_http_client`"
-)]
 pub(super) fn glue_client(
     address: &str,
     creds: &ConnectionCreds,
@@ -26,7 +22,6 @@ pub(super) fn glue_client(
 ) -> aws_sdk_glue::Client {
     let config = aws_sdk_glue::Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .http_client(aws_http_client())
         .credentials_provider(Credentials::new(
             creds.access_key.clone(),
             creds.secret_key.clone(),
@@ -42,7 +37,7 @@ pub(super) fn glue_client(
                 .operation_timeout(OPERATION_TIMEOUT)
                 .build(),
         );
-    aws_sdk_glue::Client::from_conf(config.build())
+    dns::glue_client(config)
 }
 
 /// Glue rejects an empty `CatalogId`, so a blank `warehouse` sends none and Glue uses the

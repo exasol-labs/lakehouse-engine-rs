@@ -1,8 +1,5 @@
 //! Iceberg REST and Unity Catalog access for the lakehouse engine, including AWS STS role assumption.
 
-// Tests build bare clients against fake servers, which resolve no host name.
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
-
 mod auth;
 mod aws_credential;
 mod aws_error;

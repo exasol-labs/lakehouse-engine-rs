@@ -2,7 +2,7 @@
 //! request asks the table's ADLS credential source for the credential it signs with, so a SAS
 //! renewed while a writer runs signs every later request, each part of a multipart upload too.
 
-use crate::object_store_dns::caching_client_options;
+use crate::object_store_dns::adls_store_builder;
 use crate::vended_refresh::AdlsCredentials;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,7 +13,6 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use serde::{Deserialize, Serialize};
@@ -86,10 +85,6 @@ impl fmt::Debug for AdlsStorage {
 impl AdlsStorage {
     /// The storage of the container `location` names. The account is the first label of the
     /// location's host, as on the read path.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the export's ADLS store, built with `caching_client_options`"
-    )]
     pub(crate) fn new(location: &str, credentials: Option<AdlsCredentials>) -> Result<Self> {
         let (scheme, rest) = location.split_once("://").ok_or_else(|| {
             Error::new(
@@ -102,10 +97,9 @@ impl AdlsStorage {
             .map_or(rest, |(authority, _)| authority);
         let store = credentials
             .map(|credentials| {
-                MicrosoftAzureBuilder::new()
+                adls_store_builder()
                     .with_url(format!("{scheme}://{authority}/"))
                     .with_credentials(Arc::new(credentials))
-                    .with_client_options(caching_client_options())
                     .build()
                     .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
                     .map_err(|error| {

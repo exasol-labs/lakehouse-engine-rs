@@ -74,7 +74,7 @@ fn session_at(address: &str) -> GlueCatalogSession {
     .expect("a signing region");
     let config = session.client.config();
     let retry = config.retry_config().expect("a retry policy").clone();
-    session.client = aws_sdk_glue::Client::from_conf(
+    session.client = crate::dns::glue_client(
         config
             .to_builder()
             .retry_config(retry.with_initial_backoff(Duration::from_millis(1)))
@@ -82,8 +82,7 @@ fn session_at(address: &str) -> GlueCatalogSession {
                 TimeoutConfig::builder()
                     .operation_timeout(Duration::from_secs(1))
                     .build(),
-            )
-            .build(),
+            ),
     );
     session
 }
