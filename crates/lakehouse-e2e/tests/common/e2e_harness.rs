@@ -997,7 +997,7 @@ pub fn map_cases<C: Sync, R: Send>(
     check: impl Fn(&mut ExaConn, &C) -> R + Sync,
 ) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = CASE_WORKERS.clamp(1, cases.len().max(1));
+    let workers = CASE_WORKERS.min(cases.len());
     let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
@@ -1022,11 +1022,11 @@ pub fn map_cases<C: Sync, R: Send>(
     results.into_iter().map(|(_, r)| r).collect()
 }
 
-/// The failures of [`map_cases`].
-pub fn case_failures<C: Sync>(
+/// The failures of [`map_cases`], where a case reports none, one, or several.
+pub fn case_failures<C: Sync, F: IntoIterator<Item = String> + Send>(
     cases: &[C],
     connect: impl Fn() -> ExaConn + Sync,
-    check: impl Fn(&mut ExaConn, &C) -> Option<String> + Sync,
+    check: impl Fn(&mut ExaConn, &C) -> F + Sync,
 ) -> Vec<String> {
     map_cases(cases, connect, check)
         .into_iter()

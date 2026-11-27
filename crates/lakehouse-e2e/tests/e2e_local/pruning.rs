@@ -4,7 +4,7 @@
 use crate::common::e2e_harness::runtime;
 use crate::common::e2e_harness::{
     SCAN_SCRIPT_NAME, VsProps, create_virtual_schema, create_virtual_schema_with_password,
-    exa_conn, exa_session, isolated_pushdown_statement, resolve_fixture_files,
+    exa_conn, isolated_pushdown_statement, resolve_fixture_files,
 };
 use crate::common::identity_partition_fixtures::TYPES_TABLE;
 use crate::common::pruning_cases::{
@@ -92,7 +92,7 @@ fn pruning_fixture_files_hold_the_row_groups_and_pages_the_cases_need() {
 #[test]
 fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
     setup();
-    assert_cases_hold(exa_conn, Format::Iceberg);
+    assert_cases_hold(Format::Iceberg);
 }
 
 /// Scenario: A predicate on partition columns prunes files before their footers are read
@@ -103,7 +103,7 @@ fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
 #[test]
 fn hive_partition_pruning_keeps_every_file_with_a_matching_row() {
     setup();
-    assert_cases_hold(exa_conn, Format::Hive);
+    assert_cases_hold(Format::Hive);
 }
 
 /// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
@@ -113,7 +113,7 @@ fn hive_partition_pruning_keeps_every_file_with_a_matching_row() {
 #[test]
 fn iceberg_single_group_aggregates_match_the_oracle() {
     setup();
-    assert_single_group_aggregates_match_oracle(exa_conn, Format::Iceberg);
+    assert_single_group_aggregates_match_oracle(Format::Iceberg);
 }
 
 /// Scenario: A nested aggregate over an expression declines the split
@@ -123,7 +123,7 @@ fn iceberg_single_group_aggregates_match_the_oracle() {
 #[test]
 fn iceberg_grouped_aggregates_match_the_oracle() {
     setup();
-    assert_grouped_aggregates_match_oracle(exa_conn, Format::Iceberg);
+    assert_grouped_aggregates_match_oracle(Format::Iceberg);
 }
 
 /// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
@@ -133,7 +133,7 @@ fn iceberg_grouped_aggregates_match_the_oracle() {
 #[test]
 fn hive_single_group_aggregates_match_the_oracle() {
     setup();
-    assert_single_group_aggregates_match_oracle(exa_conn, Format::Hive);
+    assert_single_group_aggregates_match_oracle(Format::Hive);
 }
 
 /// Scenario: A nested aggregate over an expression declines the split
@@ -143,7 +143,7 @@ fn hive_single_group_aggregates_match_the_oracle() {
 #[test]
 fn hive_grouped_aggregates_match_the_oracle() {
     setup();
-    assert_grouped_aggregates_match_oracle(exa_conn, Format::Hive);
+    assert_grouped_aggregates_match_oracle(Format::Hive);
 }
 
 /// Scenario: A filter on a clock function or a time zone literal prunes files at plan time
@@ -156,7 +156,7 @@ fn clock_and_tstz_filters_prune_files() {
     let db_timezone = db_timezone.as_str().expect("DBTIMEZONE is text");
     let zone = format!("TIME_ZONE = '{db_timezone}'");
     conn.execute(&format!("ALTER SESSION SET {zone}"));
-    assert_clock_cases_hold(|| exa_session(&zone), Format::Iceberg);
+    assert_clock_cases_hold(&zone, Format::Iceberg);
 
     // `dt` is an identity partition holding 2024-02-29 and NULL.
     lakehouse_vs();
