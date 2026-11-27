@@ -27,12 +27,6 @@ pub(super) async fn register_join_tables(
         .as_ref()
         .expect("register_join_tables called without a join block");
 
-    if spec.common.aggregates.is_some() || spec.common.group_keys.is_some() {
-        return Err(UdfError::User(
-            "join pushdown does not support aggregate or GROUP BY in the same scan spec".into(),
-        ));
-    }
-
     let dimension_backend = storage.join().ok_or_else(|| {
         UdfError::User(
             "the resolved scan storage carries no dimension-side backend for this join spec".into(),
@@ -114,11 +108,11 @@ pub(super) async fn join_source(
 }
 
 /// `project_columns` returns at least one item for every join select list, so an empty
-/// projection is a malformed spec, not a request for the full row. A column with no relation
-/// alias cannot be bound to one side, and a bare-name guess would pick the wrong relation of a
-/// shared column name.
+/// projection of the row shape is a malformed spec, not a request for the full row. The
+/// partial-aggregate shape projects nothing. A column with no relation alias cannot be bound to
+/// one side, and a bare-name guess would pick the wrong relation of a shared column name.
 fn ensure_join_columns_are_qualified(spec: &ScanSpec, join: &JoinSpec) -> Result<(), UdfError> {
-    if spec.common.projection.is_empty() {
+    if spec.common.aggregates.is_none() && spec.common.projection.is_empty() {
         return Err(UdfError::User(
             "join scan spec carries an empty projection; it must name at least one column".into(),
         ));

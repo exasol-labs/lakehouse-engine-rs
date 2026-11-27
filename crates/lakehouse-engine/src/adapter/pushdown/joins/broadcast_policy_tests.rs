@@ -97,6 +97,7 @@ impl Graph {
             above: &above,
             output: &OutputContract::Items(self.above.clone()),
             aggregates: self.aggregates,
+            shard_keys: None,
             max_bytes: 100,
         })
     }

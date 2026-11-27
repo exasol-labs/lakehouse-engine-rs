@@ -914,6 +914,9 @@ pub const BROADCAST_JOIN: &str = r#""join":{"#;
 pub const SCAN_ITEM: &str = "_LH_PROJ_";
 /// The scan's partial-aggregate columns, which Exasol merges.
 pub const PARTIAL: &str = "PARTIAL_";
+/// The scan spec key of a scan that aggregates. A `DISTINCT` carries it with no aggregate, so
+/// its plan holds no [`PARTIAL`] column.
+pub const SCAN_AGGREGATES: &str = r#""aggregates":["#;
 
 /// The path a query must take, read from its one pushdown statement.
 #[derive(Clone, Copy, Debug)]
@@ -930,6 +933,10 @@ pub enum PathCheck<'a> {
     Wrapper,
     /// The join takes the N-scan fallback over `n` scans instead of the broadcast plan.
     NScan(usize),
+    /// The shards of a broadcast join aggregate their joined rows, and Exasol merges them.
+    JoinSplit,
+    /// A broadcast join emits its joined rows, and Exasol computes the query over them.
+    JoinRows,
 }
 
 impl PathCheck<'_> {
@@ -944,6 +951,14 @@ impl PathCheck<'_> {
             }
             PathCheck::Wrapper => has_n_scan_wrapper(plan, 1) && !plan.contains(PARTIAL),
             PathCheck::NScan(n) => has_n_scan_wrapper(plan, n) && !has_broadcast_join_block(plan),
+            PathCheck::JoinSplit => {
+                has_broadcast_join_block(plan)
+                    && plan.contains(SCAN_AGGREGATES)
+                    && (!query.contains(" HAVING ") || plan.contains(" HAVING "))
+            }
+            PathCheck::JoinRows => {
+                has_broadcast_join_block(plan) && !plan.contains(SCAN_AGGREGATES)
+            }
         }
     }
 }

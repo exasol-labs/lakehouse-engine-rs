@@ -508,25 +508,55 @@ fn aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+const EVENTS_LABELS_JOIN: &str = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+/// A literal list bounds the text column's width.
+const NAMED_CUSTOMERS: &str = "c.C_NAME IN ('customer-01', 'customer-02', 'customer-03')";
+
+/// What differs from native when each query takes `broadcast` under the default threshold and
+/// the N-scan under the 1-byte threshold.
+fn aggregating_join_failures(queries: &[String], broadcast: PathCheck<'static>) -> Vec<String> {
+    let cases: Vec<_> = queries
+        .iter()
+        .flat_map(|query| {
+            [
+                (query, VS_NAME, broadcast),
+                (query, VS_NAME_LOW, PathCheck::NScan(2)),
+            ]
+        })
+        .collect();
+    case_failures(&cases, exa_conn, |conn, (query, vs_name, path)| {
+        native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, *path, Expect::Rows)
+    })
+}
+
+/// Scenario: A splittable aggregation over a broadcast-eligible join is aggregated in the shards
 #[test]
-fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
+fn e2e_splittable_aggregating_join_aggregates_in_the_shards_and_matches_native() {
     setup_e2e();
     let mut conn = exa_conn();
     copy_join_tables_natively(&mut conn, VS_NAME);
-    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
+    let orders = ORDERS_JOIN;
     let self_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
-    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
-    // A literal list bounds the text column's width, so the join stays broadcast.
-    let named = "c.C_NAME IN ('customer-01', 'customer-02', 'customer-03')";
-    let having_only = format!(
-        "SELECT c.C_NAME FROM {orders} WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
-         AND {named} GROUP BY c.C_NAME HAVING SUM(o.O_TOTALPRICE) > 100"
-    );
-    let broadcast = [
+    let events_labels = EVENTS_LABELS_JOIN;
+    let split = [
+        // Grouped by the dimension alone, its unbounded text column travels at most once per
+        // dimension row.
+        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
         format!(
-            "SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} WHERE {named} GROUP BY c.C_NAME"
+            "SELECT c.C_CUSTKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY c.C_CUSTKEY, c.C_NAME"
         ),
+        format!("SELECT COUNT(*), MAX(c.C_NAME) FROM {orders}"),
+        format!(
+            "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(*) FROM {orders} \
+             GROUP BY SUBSTR(c.C_NAME, 1, 10)"
+        ),
+        format!(
+            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE c.C_NAME LIKE 'customer-0%' \
+             GROUP BY c.C_NAME"
+        ),
+        // LABELS, the smaller side, declares SCORE as text, while EVENTS declares it DOUBLE.
+        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
         // Select items whose exact type the typed pass derives.
         format!(
             "SELECT MAX(CASE WHEN o.O_CUSTKEY > 3 THEN o.O_ORDERDATE ELSE DATE '1900-03-01' END), \
@@ -541,10 +571,12 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
              '{ORDERDATE_LOWER_BOUND}' GROUP BY c.C_CUSTKEY HAVING COUNT(*) > 1 \
              ORDER BY COUNT(*) DESC, c.C_CUSTKEY LIMIT 2"
         ),
+        // Group keys of both tables.
         format!(
             "SELECT c.C_NAME, o.O_ORDERDATE, MAX(c.C_CUSTKEY), MIN(o.O_TOTALPRICE) \
              FROM {orders} WHERE c.C_NAME = 'customer-02' GROUP BY c.C_NAME, o.O_ORDERDATE"
         ),
+        format!("SELECT o.O_CUSTKEY, AVG(o.O_TOTALPRICE) FROM {orders} GROUP BY o.O_CUSTKEY"),
         format!(
             "SELECT c.C_CUSTKEY, SUM(o.O_TOTALPRICE * c.C_CUSTKEY) FROM {orders} \
              GROUP BY c.C_CUSTKEY"
@@ -554,49 +586,72 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
              ORDER BY SUM(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 1"
         ),
         format!("SELECT COUNT(*), SUM(o.O_TOTALPRICE) FROM {orders}"),
+        // No joined row: every shard still emits its one partial row.
         format!(
             "SELECT COUNT(*), MAX(c.C_NAME) FROM {orders} \
-             WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0 AND {named}"
+             WHERE o.O_ORDERKEY + c.C_CUSTKEY < 0 AND {NAMED_CUSTOMERS}"
         ),
-        format!("SELECT COUNT(DISTINCT c.C_CUSTKEY) FROM {orders}"),
-        format!("SELECT COUNT(*) FROM (SELECT SUM(o.O_TOTALPRICE) FROM {orders})"),
+        // Both sides repeat the join key.
         format!(
             "SELECT a.O_CUSTKEY, COUNT(*), SUM(b.O_TOTALPRICE) FROM {self_join} GROUP BY a.O_CUSTKEY"
         ),
-        format!(
-            "SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} \
-             WHERE l.SCORE IN ('score-01', 'score-07') GROUP BY l.SCORE"
-        ),
         format!("SELECT e.ID, MIN(l.ID) FROM {events_labels} GROUP BY e.ID HAVING MIN(l.ID) > 3"),
         format!("SELECT COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY"),
-        having_only.clone(),
         format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY \
              ORDER BY MAX(o.O_TOTALPRICE) DESC, c.C_CUSTKEY LIMIT 2"
         ),
-        format!("SELECT DISTINCT * FROM {orders} WHERE {named}"),
         format!(
             "SELECT c.C_NAME, COUNT(*) FROM {orders} AND o.O_ORDERKEY > c.C_CUSTKEY \
-             WHERE {named} GROUP BY c.C_NAME"
+             WHERE {NAMED_CUSTOMERS} GROUP BY c.C_NAME"
         ),
-        // Exasol's WHERE applies the conjunct the scan declines.
+        format!(
+            "SELECT c.C_CUSTKEY, STDDEV(o.O_TOTALPRICE), VAR_POP(o.O_CUSTKEY) FROM {orders} \
+             GROUP BY c.C_CUSTKEY"
+        ),
+        // Exasol sends a DISTINCT as a GROUP BY of every selected column, with no aggregate.
+        format!("SELECT DISTINCT * FROM {orders} WHERE {NAMED_CUSTOMERS}"),
+        format!(
+            "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY \
+             ORDER BY c.C_CUSTKEY LIMIT 2 OFFSET 1"
+        ),
+    ];
+
+    let failures = aggregating_join_failures(&split, PathCheck::JoinSplit);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // Several shards, so the rows above prove the merge and not one shard's aggregate.
+    let pushed = explain_virtual_sql(&mut conn, &split[0].replace("{T}", VS_NAME));
+    assert!(
+        pushed.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+        "the fact files must span several shards:\n{pushed}"
+    );
+}
+
+/// Scenario: An aggregation that does not split over a broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+#[test]
+fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn, VS_NAME);
+    let orders = ORDERS_JOIN;
+    let named = NAMED_CUSTOMERS;
+    let having_only = format!(
+        "SELECT c.C_NAME FROM {orders} WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
+         AND {named} GROUP BY c.C_NAME HAVING COUNT(DISTINCT o.O_TOTALPRICE) > 1"
+    );
+    let joined_rows = [
+        format!("SELECT COUNT(DISTINCT c.C_CUSTKEY) FROM {orders}"),
+        format!("SELECT COUNT(*) FROM (SELECT SUM(o.O_TOTALPRICE) FROM {orders})"),
+        having_only.clone(),
+        // Exasol's WHERE applies the conjunct the scan declines, before it aggregates.
         format!(
             "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE {SECOND_IS_ZERO} \
              AND {named} GROUP BY c.C_NAME"
         ),
     ];
-    let cases: Vec<_> = broadcast
-        .iter()
-        .flat_map(|query| {
-            [
-                (query, VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
-                (query, VS_NAME_LOW, PathCheck::NScan(2)),
-            ]
-        })
-        .collect();
-    let failures = case_failures(&cases, exa_conn, |conn, (query, vs_name, path)| {
-        native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, *path, Expect::Rows)
-    });
+
+    let failures = aggregating_join_failures(&joined_rows, PathCheck::JoinRows);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     // The scan applies the condition and WHERE, so it emits only the HAVING's and select list's.
@@ -619,29 +674,34 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
     }
 }
 
-/// Scenario: An aggregating join that reads an unbounded text column of the small side keeps the N-scan
+/// Scenario: An aggregation that does not split keeps the N-scan when it reads an unbounded text column of the small side
+/// Scenario: A splittable aggregation with a fact-side group key keeps the N-scan when it reads an unbounded text column of the small side
 #[test]
 fn e2e_aggregating_join_reading_a_wide_dimension_text_column_keeps_the_n_scan() {
     setup_e2e();
     let mut conn = exa_conn();
     copy_join_tables_natively(&mut conn, VS_NAME);
-    let orders = "{T}.FACT_ORDERS o JOIN {T}.DIM_CUSTOMER c ON o.O_CUSTKEY = c.C_CUSTKEY";
-    let events_labels = "{T}.EVENTS e JOIN {T}.LABELS l ON e.ID = l.ID";
+    let orders = ORDERS_JOIN;
     let n_scan = [
-        format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
-        format!("SELECT COUNT(*), MAX(c.C_NAME) FROM {orders}"),
         format!("SELECT COUNT(DISTINCT c.C_NAME) FROM {orders}"),
+        format!("SELECT c.C_NAME, COUNT(DISTINCT o.O_ORDERKEY) FROM {orders} GROUP BY c.C_NAME"),
         format!(
-            "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(*) FROM {orders} \
+            "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(DISTINCT o.O_ORDERKEY) FROM {orders} \
              GROUP BY SUBSTR(c.C_NAME, 1, 10)"
         ),
+        // The declined conjunct keeps the aggregation in Exasol.
+        format!("SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE {SECOND_IS_ZERO} GROUP BY c.C_NAME"),
+        // A fact-side group key leaves up to one group per joined row.
         format!(
-            "SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE c.C_NAME LIKE 'customer-0%' \
-             GROUP BY c.C_NAME"
+            "SELECT o.O_ORDERKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY o.O_ORDERKEY, c.C_NAME"
         ),
+        format!(
+            "SELECT o.O_CUSTKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY o.O_CUSTKEY, c.C_NAME"
+        ),
+        format!("SELECT o.O_ORDERKEY, MAX(c.C_NAME) FROM {orders} GROUP BY o.O_ORDERKEY"),
         format!("SELECT DISTINCT * FROM {orders}"),
-        // LABELS, the smaller side, declares SCORE as text, while EVENTS declares it DOUBLE.
-        format!("SELECT l.SCORE, MAX(e.SCORE), COUNT(e.ID) FROM {events_labels} GROUP BY l.SCORE"),
     ];
 
     let mut failures = Vec::new();
@@ -808,7 +868,7 @@ fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<
     fetch_rows_as_vecs(&cols)
 }
 
-/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+/// Scenario: A splittable aggregation over a broadcast-eligible join is aggregated in the shards
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     setup_e2e();
@@ -818,8 +878,8 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_broadcast_join_block(&pushed),
-        "a scalar-over-aggregate grouped join must aggregate over the broadcast fan-out:\n{pushed}"
+        has_broadcast_join_block(&pushed) && pushed.contains(SCAN_AGGREGATES),
+        "a scalar-over-aggregate grouped join must aggregate in the broadcast shards:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);
@@ -1873,7 +1933,7 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     }
 }
 
-/// Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+/// Scenario: A splittable aggregation over a broadcast-eligible join is aggregated in the shards
 #[test]
 fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
     setup_e2e();
@@ -1888,8 +1948,8 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
 
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(
-        has_broadcast_join_block(&pushed),
-        "an ungrouped scalar-over-aggregate join must aggregate over the broadcast fan-out:\n{pushed}"
+        has_broadcast_join_block(&pushed) && pushed.contains(SCAN_AGGREGATES),
+        "an ungrouped scalar-over-aggregate join must aggregate in the broadcast shards:\n{pushed}"
     );
 
     ensure_ground_truth_lineitem_table(&mut conn);
@@ -2380,8 +2440,8 @@ fn e2e_join_with_on_filters_takes_the_broadcast_path_and_matches_native() {
         format!("{select} AND c.C_NAME <> 'customer-01' WHERE o.O_ORDERKEY > 2"),
         // The moved literal filter bounds C_NAME's width, so the aggregate stays broadcast.
         format!(
-            "SELECT c.C_NAME, COUNT(*) FROM {ORDERS_JOIN} AND c.C_NAME = 'customer-02' \
-             GROUP BY c.C_NAME"
+            "SELECT c.C_NAME, COUNT(DISTINCT o.O_ORDERKEY) FROM {ORDERS_JOIN} \
+             AND c.C_NAME = 'customer-02' GROUP BY c.C_NAME"
         ),
         format!("SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {SELF_JOIN} AND b.O_ORDERKEY > 5"),
         declined.clone(),
@@ -2515,6 +2575,13 @@ fn e2e_multi_way_join_broadcasts_one_pair_and_matches_native() {
             if let Some(key) = SHARD_WINDOW.iter().find(|key| pushed.contains(*key)) {
                 failures.push(format!(
                     "{vs_name} `{query}`: no fan-out carries {key}: {pushed}"
+                ));
+            }
+            // Exasol joins the other fan-out first, so no shard aggregates.
+            if pushed.contains(SCAN_AGGREGATES) {
+                failures.push(format!(
+                    "{vs_name} `{query}`: a three-leg join must not aggregate in the shards: \
+                     {pushed}"
                 ));
             }
             if let Some((_, window)) = query.split_once(" LIMIT ")

@@ -1,30 +1,58 @@
 # Feature: Pushdown Planning, Aggregation over a Join
 
-Plans a join request that requires Exasol postprocessing. A broadcast-eligible join whose aggregation reads only width-bounded dimension columns is aggregated by Exasol over the broadcast fan-out (`pushdown-joins/pushdown-planning-join`), and every other such join is aggregated by Exasol over the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`).
+Plans a join request that requires Exasol postprocessing. A two-leg broadcast join whose aggregation splits is aggregated in the shards, and Exasol merges the partial rows. A broadcast-eligible join whose aggregation does not split and reads only width-bounded dimension columns is aggregated by Exasol over the broadcast fan-out (`pushdown-joins/pushdown-planning-join`), and every other such join is aggregated by Exasol over the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`).
 
 ## Background
 
 * The broadcast contract, Exasol postprocessing, and width-bounded columns are defined in `pushdown-joins/pushdown-planning-join`. The qualified wrapper and its entry points are defined in `pushdown-joins/pushdown-planning-join-fallback`.
 
+* An aggregation splits when its select list, `GROUP BY`, `HAVING`, and `ORDER BY` decompose into per-shard partial aggregates and an Exasol merge, as over one table (`pushdown-grouped-agg/pushdown-planning-grouped-agg`, `pushdown-aggregates/pushdown-planning-single-group-agg`). A select list that holds a `COUNT(DISTINCT ...)` does not split over a join.
+* Every fact file lies in exactly one shard and every shard joins the whole dimension, so the shards' joined rows partition the join, also when a join key repeats on either side.
+* A join of three or more legs does not aggregate in the shards, because Exasol joins the other fan-outs first (`pushdown-joins/pushdown-planning-join-multi-way`).
+
 ## Scenarios
 
-### Scenario: An aggregating broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
+### Scenario: A splittable aggregation over a broadcast-eligible join is aggregated in the shards
+
+* *GIVEN* a two-leg inner equi-join `pushdown` request that requires Exasol postprocessing, whose smaller side is at or below the broadcast threshold
+* *AND* its aggregation splits, and the scan renders its join keys and every WHERE conjunct
+* *WHEN* Exasol sends the `pushdown` request
+* *THEN* the adapter SHALL emit one broadcast fan-out whose scan spec carries the join block together with the aggregates, and with the group keys when the request groups
+* *AND* each group key and each aggregate argument in the scan spec SHALL name its column as a pair qualified by its relation alias, `"<alias>"."<COLUMN>"`, so a column name both legs carry stays one leg's column
+* *AND* the fan-out SHALL emit the `GK_*` and `PARTIAL_*` columns that the same aggregation emits over one table, and no joined row
+* *AND* one outer Exasol `SELECT` SHALL merge the partial rows and apply `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`, as over one table
+* *AND* when every group key reads only the dimension, or the request has no group key, a dimension column that is not width-bounded SHALL NOT keep the request off the broadcast path, because a shard then emits at most one row per dimension row
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query, for a group key of either table, a single group, an aggregate over an expression that reads both tables, and a self-join whose join key repeats on both sides
+
+### Scenario: An aggregation that does not split over a broadcast-eligible join is aggregated by Exasol over the broadcast fan-out
 
 * *GIVEN* a `pushdown` request that meets the broadcast contract and requires Exasol postprocessing
+* *AND* its aggregation does not split, such as a `COUNT(DISTINCT ...)`
 * *AND* every dimension column that its select list, `GROUP BY`, `HAVING`, and `ORDER BY` read is width-bounded
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL emit the broadcast fan-out, projecting only the columns that the select list, `GROUP BY`, `HAVING`, and `ORDER BY` read, and one join-key column of the first leg when they read none
 * *AND* one outer Exasol `SELECT` SHALL render the select list, `GROUP BY`, `HAVING`, `ORDER BY`, and `LIMIT` over the fan-out's `<alias>_<column>` output names, so no shard aggregates, sorts, or truncates
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
-### Scenario: An aggregating join that reads an unbounded text column of the small side keeps the N-scan
+### Scenario: An aggregation that does not split keeps the N-scan when it reads an unbounded text column of the small side
 
 * *GIVEN* a two-leg inner equi-join `pushdown` request that requires Exasol postprocessing, whose smaller side is at or below the broadcast threshold
-* *AND* its select list, `GROUP BY`, `HAVING`, or `ORDER BY` reads a dimension column that is not width-bounded, such as `GROUP BY d.DESCRIPTION` or `MAX(d.DESCRIPTION)` with no literal condition on it
+* *AND* its aggregation does not split, or the scan declines a WHERE conjunct
+* *AND* its select list, `GROUP BY`, `HAVING`, or `ORDER BY` reads a dimension column that is not width-bounded, such as `GROUP BY d.DESCRIPTION` or `COUNT(DISTINCT d.DESCRIPTION)` with no literal condition on it
 * *WHEN* the adapter plans the request, after the size check
 * *THEN* the adapter SHALL route the request to the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`), because the broadcast fan-out repeats that column once per joined row while the fallback sends each dimension row once
 * *AND* a column the request wraps in an expression, such as `SUBSTR(d.DESCRIPTION, 1, 3)`, SHALL count as read, because the fan-out emits only plain columns
 * *AND* a fact column of any type SHALL NOT keep the fallback, because both plans send each fact row once
+* *AND* the returned rows SHALL equal native Exasol evaluation of the same query
+
+### Scenario: A splittable aggregation with a fact-side group key keeps the N-scan when it reads an unbounded text column of the small side
+
+* *GIVEN* a two-leg inner equi-join `pushdown` request that requires Exasol postprocessing, whose smaller side is at or below the broadcast threshold
+* *AND* its aggregation splits, and a group key reads a column of the fact side, such as `GROUP BY f.ORDER_ID, d.DESCRIPTION`
+* *AND* its select list, `GROUP BY`, `HAVING`, or `ORDER BY` reads a dimension column that is not width-bounded
+* *WHEN* the adapter plans the request, after the size check
+* *THEN* the adapter SHALL route the request to the unified unaccelerated fallback (`pushdown-joins/pushdown-planning-join-fallback`), because the shards can emit one group per joined row and would then repeat that column once per joined row
+* *AND* the same request SHALL be aggregated in the shards when every dimension column it reads is width-bounded
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same query
 
 ### Scenario: Aggregate over a join routes through the unified qualified wrapper
