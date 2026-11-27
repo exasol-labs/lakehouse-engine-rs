@@ -7,7 +7,7 @@ The scan UDF renders pushed select-list expressions in its DataFusion SELECT lis
 * The projection may carry rendered DataFusion SQL select-list expressions, not only bare column names.
 * A partial statistical aggregate is emitted as `(count, mean, m2)`. The outer wrapper reconstructs variance and standard deviation from them.
 * A rendered expression may call a function the scan session registers instead of a DataFusion built-in. `crates/vs-expression` emits `vs_checked_float_div` for every DataFusion-dialect `FLOAT_DIV` node.
-* `build_session_context` is the one place production builds a scan session. `run_scan_one` hands that session to `run_raw_scan_with_session`, `run_join_scan_with_session`, and `run_partial_aggregate`, so a function registered there reaches every pushed expression: projection item, `WHERE` filter, `ORDER BY` key, `GROUP BY` key, broadcast-join fact-leg filter, and aggregate argument.
+* `build_session_context` is the one place production builds a scan session. Every scan runs in that session, whatever its source and shape, so a function registered there reaches every pushed expression: projection item, `WHERE` filter, `ORDER BY` key, `GROUP BY` key, broadcast-join fact-leg filter, and aggregate argument.
 * Exasol has no non-finite `DOUBLE`, so a non-finite value computed inside the scan is never a correct answer.
 * The checked division is a different check from the `is_nan()` guard in `arrow_value_at`. That guard sees a value read from a column and cannot tell a computed non-finite from a stored one.
 
