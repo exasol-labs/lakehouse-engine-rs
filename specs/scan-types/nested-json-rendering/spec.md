@@ -94,7 +94,7 @@ Renders every list, struct, and map column as one valid JSON document per value,
 * *WHEN* the scan builds its SQL for the single-table path or the broadcast-join path
 * *THEN* the generated SELECT item for a JSON-RENDERED NESTED column SHALL invoke the JSON encoder and MUST NOT emit `CAST(col AS VARCHAR)`, which fails outright for `Struct` and `Map` and produces display text for `List`
 * *AND* the generated SELECT item for every NON-NESTED incompatible column other than a binary one SHALL keep emitting `CAST(col AS VARCHAR)` byte-identically, so an out-of-range `Decimal128` column is unaffected
-* *AND* the single-table path and the broadcast-join path SHALL make that choice through the SAME predicate and the SAME rendering helper, so the two select-list builders cannot disagree about a column
+* *AND* the single-table path and the broadcast-join path SHALL make that choice through the SAME predicate and the SAME rendering helper, so the two paths cannot disagree about a column
 * *AND* the encoder itself SHALL have exactly ONE implementation, reached both as the expression the binding adapter substitutes and as the function the generated SQL invokes, so the rendered document for a given value is identical whichever path produced it
 
 ### Scenario: A predicate over a rendered nested column is evaluated, never silently dropped
