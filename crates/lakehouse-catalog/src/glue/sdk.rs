@@ -7,6 +7,7 @@ use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
 
 use crate::ConnectionCreds;
 use crate::aws_error::{SdkFailure, sdk_failure};
+use crate::dns;
 
 const MAX_ATTEMPTS: u32 = 5;
 /// Bounds each call, retries included, because it runs inside a pushdown.
@@ -36,7 +37,7 @@ pub(super) fn glue_client(
                 .operation_timeout(OPERATION_TIMEOUT)
                 .build(),
         );
-    aws_sdk_glue::Client::from_conf(config.build())
+    dns::glue_client(config)
 }
 
 /// Glue rejects an empty `CatalogId`, so a blank `warehouse` sends none and Glue uses the

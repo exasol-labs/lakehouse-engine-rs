@@ -1,0 +1,83 @@
+//! The DNS resolver of every client that does not resolve through reqwest's own (#693).
+
+use std::error::Error;
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
+use aws_smithy_http_client::{Builder, ConnectorBuilder};
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::LookupIpStrategy;
+use rand::seq::SliceRandom;
+use tokio::sync::OnceCell;
+
+/// Caches each answer for its DNS TTL and shuffles it, so connections spread over a host's
+/// addresses. A clone shares the cache.
+#[derive(Clone, Debug, Default)]
+pub struct CachingResolver {
+    // Built on first lookup, because a client can be built outside the Tokio runtime it runs on.
+    resolver: Arc<OnceCell<TokioResolver>>,
+}
+
+impl CachingResolver {
+    /// The addresses of `host`, in random order.
+    pub async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, Box<dyn Error + Send + Sync>> {
+        let resolver = self
+            .resolver
+            .get_or_try_init(|| async {
+                let mut builder = TokioResolver::builder_tokio()?;
+                // Both families, as reqwest's own hickory resolver asks, for happy eyeballs.
+                builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
+                builder.build()
+            })
+            .await?;
+        let mut addresses: Vec<IpAddr> = resolver.lookup_ip(host).await?.iter().collect();
+        addresses.shuffle(&mut rand::thread_rng());
+        Ok(addresses)
+    }
+}
+
+impl ResolveDns for CachingResolver {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        DnsFuture::new(async move { self.lookup(name).await.map_err(ResolveDnsError::new) })
+    }
+}
+
+/// The Glue client of `config`, on the caching HTTP client.
+#[expect(clippy::disallowed_methods, reason = "the factory of Glue clients")]
+pub(crate) fn glue_client(config: aws_sdk_glue::config::Builder) -> aws_sdk_glue::Client {
+    aws_sdk_glue::Client::from_conf(config.http_client(aws_http_client()).build())
+}
+
+/// The STS client of `config`, on the caching HTTP client.
+#[expect(clippy::disallowed_methods, reason = "the factory of STS clients")]
+pub(crate) fn sts_client(config: aws_sdk_sts::config::Builder) -> aws_sdk_sts::Client {
+    aws_sdk_sts::Client::from_conf(config.http_client(aws_http_client()).build())
+}
+
+/// The SDK's default HTTP client with a [`CachingResolver`].
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the factory of AWS SDK HTTP clients"
+)]
+fn aws_http_client() -> SharedHttpClient {
+    let resolver = CachingResolver::default();
+    Builder::new().build_with_connector_fn(move |settings, components| {
+        let mut connector =
+            ConnectorBuilder::default().tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc));
+        connector.set_connector_settings(settings.cloned());
+        if let Some(components) = components {
+            connector.set_sleep_impl(components.sleep_impl());
+        }
+        // Only the SDK's default client reads the proxy variables by itself (#539).
+        connector.set_proxy_config(Some(ProxyConfig::from_env()));
+        connector.build_with_resolver(resolver.clone())
+    })
+}
+
+#[cfg(test)]
+#[path = "dns_tests.rs"]
+mod tests;

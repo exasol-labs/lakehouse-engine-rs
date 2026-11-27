@@ -73,9 +73,14 @@ aws-smithy-runtime-api = { version = "1.18", features = ["client"] }
 aws-sdk-glue           = { version = "1.170", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # The `Retry-After` HTTP-date parser; aws-sdk-glue already compiles this crate.
 aws-smithy-types       = { version = "1.8" }
+# The HTTP client under both AWS SDKs, named to give it the caching DNS resolver.
+aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-aws-lc"] }
 
 # The line iceberg, delta_kernel, and object_store link, so the `.so` carries one HTTP stack.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+# `hickory-dns` makes every reqwest client cache DNS answers, OpenDAL's included (#693).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "hickory-dns"] }
+# The line reqwest's `hickory-dns` links, for the resolver of the object_store and AWS SDK clients.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 # The TLS stack under reqwest, for typed handshake errors.
 rustls  = { version = "0.23", default-features = false }
 # The HTTP stack under reqwest, for its typed incomplete-message error.

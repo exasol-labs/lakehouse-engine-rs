@@ -1,0 +1,2 @@
+# Shadows the workspace `clippy.toml`: its HTTP client ban covers the engine's network paths, and
+# this harness never ships in the `.so`.
