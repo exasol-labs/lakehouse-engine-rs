@@ -46,8 +46,8 @@ pub(super) fn classify_request_shape(
             aggregates: &detection.aggregates,
             group_keys: &detection.group_keys,
         };
-        // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
-        // from the select list cannot be sorted on there (#198).
+        // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so a sort key over an
+        // undecomposable aggregate cannot be sorted on there (#198).
         let order_by = match build_grouped_order_by_clause(pushdown, &scope, scan) {
             Some(GroupedOrderBy::Clause(clause)) => Some(clause),
             Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,

@@ -2016,6 +2016,7 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     );
 }
 
+/// Scenario: A grouped ORDER BY over an aggregate absent from the select list keeps the partial/merge path
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     lakehouse_vs();
@@ -2025,6 +2026,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
         "SELECT id FROM {} GROUP BY id ORDER BY SUM(c_qty) DESC LIMIT 4",
         typed_table()
     );
+    assert_sorts_on_merged_partial(&mut conn, &sql);
 
     let (names, cols) = query_named_columns(&mut conn, &sql);
     assert_no_hidden_columns(&names, &sql);
@@ -2053,8 +2055,24 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
         "the two groups above the tie are unambiguously ordered: id 7 \
          (SUM=6) then id 3 (SUM=5), got ids={ids:?}"
     );
+
+    // A HAVING over the sort-only aggregate merges over the same partial column.
+    let having = format!(
+        "SELECT id FROM {} GROUP BY id HAVING SUM(c_qty) > 3 ORDER BY SUM(c_qty) DESC",
+        typed_table()
+    );
+    assert_sorts_on_merged_partial(&mut conn, &having);
+    let (_, cols) = query_named_columns(&mut conn, &having);
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(&ids[..2], &[7, 3], "HAVING SUM(c_qty) > 3, got ids={ids:?}");
+    assert_eq!(
+        int_set(&cols[0][2..]),
+        std::collections::HashSet::from([8, 12]),
+        "the groups with SUM(c_qty) 4 must follow, got ids={ids:?}"
+    );
 }
 
+/// Scenario: A grouped ORDER BY over an aggregate absent from the select list keeps the partial/merge path
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     lakehouse_vs();
@@ -2064,6 +2082,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
         "SELECT c_bool, COUNT(*) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
         typed_table()
     );
+    assert_sorts_on_merged_partial(&mut conn, &sql);
 
     let (names, cols) = query_named_columns(&mut conn, &sql);
     assert_no_hidden_columns(&names, &sql);
@@ -2093,18 +2112,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
         typed_table()
     );
 
-    let pushed2 = explain_virtual_sql(&mut conn, &sql2);
-    assert!(
-        pushed2.contains("\"group_keys\":["),
-        "a sort key matching a select-list aggregate must KEEP the \
-         partial/merge path — the scan spec must carry group_keys, not fall \
-         back to the raw-row wrapper, got:\n{pushed2}"
-    );
-    assert!(
-        pushed2.contains("ORDER BY CAST(SUM(\"PARTIAL_sum_"),
-        "the merge ORDER BY must reference the merged partial column, not a \
-         base column, got:\n{pushed2}"
-    );
+    assert_sorts_on_merged_partial(&mut conn, &sql2);
 
     let (names2, cols2) = query_named_columns(&mut conn, &sql2);
     assert_no_hidden_columns(&names2, &sql2);
@@ -2126,6 +2134,50 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
             "SUM(c_price) per group must be 25 / 7 / 4, got {sums:?}"
         );
     }
+}
+
+/// The scan aggregates per shard, and the merge sorts on the merged partial column.
+fn assert_sorts_on_merged_partial(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        pushed.contains("\"group_keys\":["),
+        "the scan spec must carry group_keys, not a raw-row scan, got:\n{pushed}"
+    );
+    assert!(
+        pushed.contains("ORDER BY CAST(SUM(\"PARTIAL_sum_"),
+        "the merge ORDER BY must sort on the merged partial column, got:\n{pushed}"
+    );
+}
+
+/// Scenario: A grouped ORDER BY the merge cannot express routes to the qualified single-table wrapper instead of erroring
+#[test]
+fn e2e_grouped_order_by_distinct_aggregate_not_selected_routes_to_wrapper() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    // Distinct c_qty per c_bool group: true 5, false 2, NULL 2; the c_bool tie-break puts
+    // false before NULL, so the LIMIT cuts the NULL group.
+    let sql = format!(
+        "SELECT c_bool FROM {} GROUP BY c_bool \
+         ORDER BY COUNT(DISTINCT c_qty) DESC, c_bool LIMIT 2",
+        typed_table()
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("COUNT(DISTINCT \"LHS_T0\"") && !pushed.contains("\"group_keys\""),
+        "a DISTINCT sort aggregate must route to the qualified single-table wrapper, \
+         got:\n{pushed}"
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    let bools: Vec<Option<bool>> = cols[0].iter().map(|v| v.as_bool()).collect();
+    assert_eq!(
+        bools,
+        vec![Some(true), Some(false)],
+        "the top 2 groups by COUNT(DISTINCT c_qty) must be true (5) then false (2)"
+    );
 }
 
 #[test]

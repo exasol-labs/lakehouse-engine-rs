@@ -6,8 +6,9 @@ use super::context::Shards;
 
 use super::request::{AggregationType, PushdownRequest};
 use super::scalar_over_agg::{
-    TypedPlans, classify_scalar_over_aggregate, fold_aggregate_plan, fold_nested_plans,
-    parse_agg_item, partial_column_type, render_scalar_over_merge, with_stat_grand_means,
+    TypedPlans, classify_scalar_over_aggregate, decomposable_aggregates, fold_aggregate_plan,
+    fold_nested_plans, parse_agg_item, partial_column_type, render_scalar_over_merge,
+    with_stat_grand_means,
 };
 use super::support::{
     ColumnTypes, FanOut, ScanTranslator, build_fan_out_inner, output_select_list, quote_ident,
@@ -141,6 +142,13 @@ pub fn detect_group_by_aggregates(
                 });
             }
         }
+    }
+
+    // A sort aggregate the select list lacks gets a hidden `PARTIAL_*` column, typed as native
+    // Exasol types it, so the merge can sort on it (#249).
+    for element in pushdown.order_by() {
+        let sort_aggregates = decomposable_aggregates(&element.expression, scan);
+        fold_nested_plans(&mut plans, &mut plan_types, &sort_aggregates, scan);
     }
 
     // Typed here, before the shape is chosen, so a key or nested aggregate without an exact

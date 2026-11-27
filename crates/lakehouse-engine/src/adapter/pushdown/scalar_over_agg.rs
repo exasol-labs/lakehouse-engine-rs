@@ -102,6 +102,20 @@ pub(super) fn classify_scalar_over_aggregate(
         .collect()
 }
 
+/// Every aggregate inside `node` that decomposes, beside any group-key column. An undecomposable
+/// one, such as a DISTINCT, is left out, so a clause over it stays unresolvable.
+pub(super) fn decomposable_aggregates(
+    node: &Expr,
+    scan: ScanTranslator<'_>,
+) -> Vec<(AggregatePlan, Expr)> {
+    let mut aggregates = Vec::new();
+    sentinelize_aggregates(node, &mut aggregates, &mut false);
+    aggregates
+        .into_iter()
+        .filter_map(|agg| Some((parse_agg_item(&agg, scan)?, agg)))
+        .collect()
+}
+
 /// Renders through the translator with sentinel columns, then substitutes each `merged` slot, so
 /// it cannot drift from the translator. A sentinel column has no type, so the scalar gets an exact
 /// type only where it does not depend on an aggregate's, such as under its own CAST.

@@ -465,24 +465,40 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
 }
 
 #[test]
-fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
-    let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
-        .column(col("ID"))
-        .item(count_star(), ExasolType::decimal(20, 0))
-        .order_by(serde_json::json!([order_by_element(
+fn grouped_order_by_aggregate_absent_from_select_list_sorts_on_its_own_partial() {
+    let cases = [
+        (
             agg_item("SUM", Some("AMOUNT"), false),
-            false,
-            true
-        )]))
-        .declare(&[("AMOUNT", ExasolType::decimal(18, 2))])
-        .build_scanned();
+            Some(GroupedOrderBy::Clause(
+                r#"CAST(SUM("PARTIAL_sum_1") AS DECIMAL(29,2)) DESC NULLS LAST"#.to_string(),
+            )),
+        ),
+        // A DISTINCT aggregate has no partial/merge decomposition.
+        (
+            agg_item("COUNT", Some("AMOUNT"), true),
+            Some(GroupedOrderBy::Unresolvable),
+        ),
+    ];
+    for (sort_key, expected) in cases {
+        let (req, scan) = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
+            .column(col("ID"))
+            .item(count_star(), ExasolType::decimal(20, 0))
+            .order_by(serde_json::json!([order_by_element(
+                sort_key.clone(),
+                false,
+                true
+            )]))
+            .declare(&[("AMOUNT", ExasolType::decimal(18, 2))])
+            .build_scanned();
 
-    let detection = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
-    assert_eq!(
-        order_by_over_merge(&req, &detection, scan.columns()),
-        Some(GroupedOrderBy::Unresolvable),
-        "an aggregate with no matching plan must not resolve to a fabricated partial"
-    );
+        let detection = detect_group_by_aggregates(&req, scan).expect("grouped aggregate");
+        assert_eq!(
+            order_by_over_merge(&req, &detection, scan.columns()),
+            expected,
+            "{sort_key}: an unselected sort aggregate sorts on its own partial, typed as \
+             native Exasol types it"
+        );
+    }
 }
 
 #[test]
