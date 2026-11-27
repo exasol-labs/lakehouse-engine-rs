@@ -1,11 +1,15 @@
 //! Iceberg REST and Unity Catalog access for the lakehouse engine, including AWS STS role assumption.
 
+// Tests build bare clients against fake servers, which resolve no host name.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod auth;
 mod aws_credential;
 mod aws_error;
 mod catalog_http;
 mod client;
 mod creds;
+mod dns;
 mod error_chain;
 mod expiring;
 mod glue;
@@ -36,6 +40,7 @@ pub use client::{
     TableFormat, catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
+pub use dns::CachingResolver;
 pub use error_chain::error_chain;
 pub use expiring::{
     AtRenewalPoint, EpochClock, ExpiringCredential, Lease, RenewalPoint, system_clock,

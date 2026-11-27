@@ -6,6 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_catalog::redact_error_text;
+use lakehouse_catalog_write::caching_client_options;
 use object_store::ClientOptions;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
@@ -199,6 +200,10 @@ fn build_undecorated_store(
             Ok(apply_admission_limit(s3, admission_limit))
         }
         StorageBackend::Adls { cred, .. } => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the scan's ADLS store, built with `client_options_for`"
+            )]
             let builder = MicrosoftAzureBuilder::new()
                 .with_url(store_url.as_str())
                 .with_client_options(client_options_for(connection_budget));
@@ -219,6 +224,10 @@ fn build_undecorated_store(
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the scan's S3 store, built with `client_options_for`"
+)]
 fn s3_builder(storage: &StorageProps, bucket: &str, connection_budget: usize) -> AmazonS3Builder {
     // `with_client_options` REPLACES the whole `ClientOptions`, so it must precede
     // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking SeaweedFS).
@@ -286,7 +295,7 @@ pub(crate) fn build_admission_limited_store(
 /// `object_store` has no in-flight connection cap; `pool_max_idle_per_host` (unbounded by
 /// default in reqwest) is the closest knob, bounding warm connections per host.
 fn client_options_for(budget: usize) -> ClientOptions {
-    ClientOptions::new().with_pool_max_idle_per_host(budget.max(1))
+    caching_client_options().with_pool_max_idle_per_host(budget.max(1))
 }
 
 /// Keyed by the `ListingTableUrl` prefix DataFusion passes to `head`, so lookups need no network

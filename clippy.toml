@@ -1,0 +1,17 @@
+# Every HTTP client resolves host names through a DNS cache (#693). A constructor listed here
+# builds a client that skips it, so each is called at one site, which carries the `#[expect]`.
+# Clippy cannot name a `Default::default` impl, so `Type::default()` of these types is not caught.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "send through `CatalogHttp`, which owns timeouts and retries" },
+    { path = "reqwest::Client::builder", reason = "send through `CatalogHttp`, which owns timeouts and retries" },
+    { path = "reqwest::ClientBuilder::new", reason = "send through `CatalogHttp`, which owns timeouts and retries" },
+    { path = "reqwest::ClientBuilder::no_hickory_dns", reason = "it turns the DNS cache off" },
+    { path = "object_store::ClientOptions::new", reason = "start from `lakehouse_catalog_write::caching_client_options`" },
+    { path = "object_store::aws::AmazonS3Builder::new", reason = "a store takes `lakehouse_catalog_write::caching_client_options`" },
+    { path = "object_store::aws::AmazonS3Builder::from_env", reason = "a store takes `lakehouse_catalog_write::caching_client_options`" },
+    { path = "object_store::azure::MicrosoftAzureBuilder::new", reason = "a store takes `lakehouse_catalog_write::caching_client_options`" },
+    { path = "object_store::azure::MicrosoftAzureBuilder::from_env", reason = "a store takes `lakehouse_catalog_write::caching_client_options`" },
+    { path = "aws_smithy_http_client::Builder::new", reason = "use `dns::aws_http_client`" },
+    { path = "aws_sdk_glue::Client::from_conf", reason = "build it in `glue::sdk::glue_client`, with `dns::aws_http_client`" },
+    { path = "aws_sdk_sts::Client::from_conf", reason = "build it in `sts`, with `dns::aws_http_client`" },
+]
