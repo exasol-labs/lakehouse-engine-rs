@@ -14,28 +14,8 @@ use crate::scan::emit::{
 use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
 use crate::scan::storage_ref::ResolvedScanStorage;
 
-use super::raw_scan::register_files;
-use super::sql_support::{aliased_select, append_where, quote_ident};
-
-/// The returned string is spliced verbatim as the inner table, so its text is part of the emitted SQL.
-async fn register_aliased_scan_target(
-    session_ctx: &SessionContext,
-    spec: &ScanSpec,
-    storage: &ResolvedScanStorage,
-) -> Result<String, UdfError> {
-    let table_name = "scan_target";
-    register_files(session_ctx, table_name, spec, storage).await?;
-
-    let table = session_ctx
-        .table(table_name)
-        .await
-        .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
-    Ok(aliased_select(
-        table_name,
-        table.schema(),
-        spec.common.binary_as_string,
-    ))
-}
+use super::source::ScanSource;
+use super::sql_support::{append_where, quote_ident};
 
 /// Emits exactly one row per shard on the single-group path.
 pub(super) async fn run_partial_aggregate(
@@ -57,10 +37,13 @@ pub(super) async fn run_partial_aggregate(
         .as_deref()
         .expect("run_partial_aggregate called without aggregates");
 
-    let aliased_table = register_aliased_scan_target(session_ctx, spec, storage).await?;
+    let source = ScanSource::register(session_ctx, spec, storage).await?;
 
-    let sql =
-        build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.common.filter.as_deref());
+    let sql = build_partial_agg_sql_filtered(
+        aggregates,
+        source.relation(),
+        spec.common.filter.as_deref(),
+    );
 
     let df = session_ctx
         .sql(&sql)
@@ -107,12 +90,12 @@ async fn run_grouped_partial_aggregate(
         .as_deref()
         .expect("run_grouped_partial_aggregate called without aggregates");
 
-    let aliased_table = register_aliased_scan_target(session_ctx, spec, storage).await?;
+    let source = ScanSource::register(session_ctx, spec, storage).await?;
 
     let sql = build_grouped_partial_agg_sql(
         group_keys,
         aggregates,
-        &aliased_table,
+        source.relation(),
         spec.common.filter.as_deref(),
     );
 
@@ -147,12 +130,12 @@ async fn run_grouped_partial_aggregate(
     Ok(())
 }
 
-/// Group-key expressions are already-rendered DataFusion fragments, inserted verbatim. No LIMIT:
-/// the outer wrapper applies it after re-grouping.
+/// Group-key expressions are already-rendered DataFusion fragments, inserted verbatim, and so is
+/// `from`, the source's FROM clause. No LIMIT: the outer wrapper applies it after re-grouping.
 pub fn build_grouped_partial_agg_sql(
     group_keys: &[String],
     aggregates: &[AggregatePlan],
-    aliased_table: &str,
+    from: &str,
     filter: Option<&str>,
 ) -> String {
     let mut select_items: Vec<String> = group_keys.to_vec();
@@ -163,11 +146,7 @@ pub fn build_grouped_partial_agg_sql(
         .collect();
     select_items.extend(partial_items);
 
-    let mut sql = format!(
-        "SELECT {} FROM ({})",
-        select_items.join(", "),
-        aliased_table
-    );
+    let mut sql = format!("SELECT {} FROM {from}", select_items.join(", "));
 
     append_where(&mut sql, filter);
 
@@ -231,10 +210,11 @@ fn counter_zero(declared: &ColumnInfo) -> Result<Value, UdfError> {
 /// COLUMN CONTRACT: each plan at index `i` contributes the columns
 /// [`crate::scan::spec::AggKind::partial_columns`] lists, named by [`partial_column_name`]. The
 /// scan SELECT list, the fan-out EMITS clause (`partial_emits_items` in `adapter::pushdown`), and
-/// the outer merge SELECT MUST agree on this order and count.
+/// the outer merge SELECT MUST agree on this order and count. `from` is the source's FROM clause,
+/// spliced verbatim.
 pub fn build_partial_agg_sql_filtered(
     aggregates: &[AggregatePlan],
-    aliased_table: &str,
+    from: &str,
     filter: Option<&str>,
 ) -> String {
     let select_items: Vec<String> = aggregates
@@ -243,11 +223,7 @@ pub fn build_partial_agg_sql_filtered(
         .flat_map(|(i, plan)| partial_select_items(plan, i))
         .collect();
 
-    let mut sql = format!(
-        "SELECT {} FROM ({})",
-        select_items.join(", "),
-        aliased_table
-    );
+    let mut sql = format!("SELECT {} FROM {from}", select_items.join(", "));
 
     append_where(&mut sql, filter);
 

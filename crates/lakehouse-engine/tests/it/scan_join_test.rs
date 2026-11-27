@@ -21,7 +21,7 @@ use lakehouse_engine::scan::spec::{
     ScanSpec, ScanStorage, ScanTuning, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
+    build_join_physical_plan, run_raw_scan_with_session, session_config_for_spec,
 };
 
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -211,7 +211,7 @@ fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
         );
         let session = SessionContext::new_with_config(session_config_for_spec(spec));
         let mut timers = PhaseTimers::start();
-        run_join_scan_with_session(
+        run_raw_scan_with_session(
             &mut ctx,
             &session,
             spec,
@@ -1143,7 +1143,7 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
         );
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         let mut timers = PhaseTimers::start();
-        run_join_scan_with_session(
+        run_raw_scan_with_session(
             &mut ctx,
             &session,
             &spec,

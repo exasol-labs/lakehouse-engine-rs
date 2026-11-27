@@ -23,8 +23,8 @@ use lakehouse_engine::scan::spec::{
     ScanSpec, ScanStorage, ScanTuning, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_raw_scan_physical_plan, register_files, run_join_scan_with_session,
-    run_raw_scan_with_session, session_config_for_spec,
+    build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
+    session_config_for_spec,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
@@ -1069,7 +1069,7 @@ fn scan_delete_reads_of_a_join_stay_within_the_connection_budget() {
         let mut timers = PhaseTimers::start();
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
-            run_join_scan_with_session(
+            run_raw_scan_with_session(
                 &mut ctx,
                 &session,
                 &spec,
