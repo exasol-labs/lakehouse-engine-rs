@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{
-    ColumnRef, FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
+    FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
 };
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
@@ -25,13 +25,16 @@ use crate::scan::{diagnostics, emit_phase_telemetry};
 use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanGroups;
-use super::sql_support::{aliased_select, append_where, render_projection, render_sort_target};
+use super::source::ScanSource;
+use super::sql_support::{append_where, render_projection, render_sort_target};
 
-const SCAN_TARGET: &str = "scan_target";
+pub(super) const SCAN_TARGET: &str = "scan_target";
 const RAW_SQL_ERROR: &str = "DataFusion SQL error";
+const JOIN_SQL_ERROR: &str = "join SQL error";
 
-/// Exposed so a host integration test can drive the production streaming + telemetry path
-/// against a local Parquet file.
+/// Streams the rows of the spec's source, one table or a broadcast join. Exposed so a host
+/// integration test can drive the production streaming + telemetry path against a local Parquet
+/// file.
 pub async fn run_raw_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -43,8 +46,7 @@ pub async fn run_raw_scan_with_session(
     emit_dataframe(ctx, df, storage, timers).await
 }
 
-/// The streaming tail the raw and join paths share.
-pub(super) async fn emit_dataframe(
+async fn emit_dataframe(
     ctx: &mut dyn UdfContext,
     df: DataFrame,
     storage: &ResolvedScanStorage,
@@ -85,14 +87,18 @@ pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(spec.common.tuning.s3_max_connections.max(1)))
 }
 
-async fn build_dataframe(
+pub(super) async fn build_dataframe(
     ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
 ) -> Result<DataFrame, UdfError> {
-    register_files(ctx, SCAN_TARGET, spec, storage).await?;
-    let sql = build_scan_sql(ctx, SCAN_TARGET, spec).await?;
-    let df = plan_sql(ctx, &sql, RAW_SQL_ERROR).await?;
+    let source = ScanSource::register(ctx, spec, storage).await?;
+    let label = if spec.common.join.is_some() {
+        JOIN_SQL_ERROR
+    } else {
+        RAW_SQL_ERROR
+    };
+    let df = plan_sql(ctx, &build_row_sql(&source, spec), label).await?;
     // COUNT(DISTINCT) fan-out: each shard streams its distinct projected values and the outer
     // wrapper counts the union. The fan-out spec carries no LIMIT/ORDER BY, so this is exact.
     if spec.common.distinct {
@@ -321,64 +327,56 @@ pub(super) fn register_nested_json_render_udf(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(NestedJsonRenderUdf::new()));
 }
 
+/// The row SQL over a table already registered as `table_name`.
 pub(super) async fn build_scan_sql(
     ctx: &SessionContext,
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<String, UdfError> {
-    let table = ctx
-        .table(table_name)
-        .await
-        .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
-    let schema = table.schema();
+    let source = ScanSource::table(ctx, table_name, spec.common.binary_as_string).await?;
+    Ok(build_row_sql(&source, spec))
+}
 
-    // DataFusion matches quoted identifiers case-sensitively, while the adapter speaks Exasol's
-    // uppercase and Parquet keeps Iceberg casing.
-    let inner = aliased_select(table_name, schema, spec.common.binary_as_string);
-
-    let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
-        schema
-            .fields()
-            .iter()
-            .map(|f| ProjectionItem::from(f.name().to_uppercase()))
-            .collect()
+/// The row shape over any source: the projection, the filter, and the per-shard window, which
+/// runs after a join and its `WHERE`, never on either side's scan.
+pub(super) fn build_row_sql(source: &ScanSource, spec: &ScanSpec) -> String {
+    let all_columns: Vec<ProjectionItem>;
+    let projection = if spec.common.projection.is_empty() {
+        all_columns = source
+            .columns()
+            .cloned()
+            .map(ProjectionItem::Column)
+            .collect();
+        &all_columns
     } else {
-        spec.common.projection.clone()
+        &spec.common.projection
     };
 
-    let column_type = |column: &ColumnRef| {
-        let lower = column.name.to_lowercase();
-        schema
-            .fields()
-            .iter()
-            .find(|f| f.name().to_lowercase() == lower)
-            .map(|f| f.data_type())
-    };
-    let select_clause = render_projection(&proj_items, column_type);
-    let mut sql = format!("SELECT {select_clause} FROM ({inner})");
+    let select_clause = render_projection(projection, |column| source.column_type(column));
+    let mut sql = format!("SELECT {select_clause} FROM {}", source.relation());
     append_where(&mut sql, spec.common.filter.as_deref());
 
     // Direction and NULL placement render through the same seam as the adapter's outer merge
     // SQL, so shard and merge sorts rank identically. Before LIMIT so DataFusion folds it into a
     // bounded TopK.
-    if !spec.common.order_by.is_empty() {
-        let elements: Vec<String> = spec
-            .common
-            .order_by
+    let (order_by, limit) = spec.common.row_window();
+    if !order_by.is_empty() {
+        let elements: Vec<String> = order_by
             .iter()
             .map(|key| {
-                key.render_ordered(&render_sort_target(&key.column, column_type(&key.column)))
+                let data_type = source.column_type(&key.column);
+                key.render_ordered(&render_sort_target(&key.column, data_type))
             })
             .collect();
         sql.push_str(" ORDER BY ");
         sql.push_str(&elements.join(", "));
     }
 
-    if let Some(limit) = spec.common.limit {
+    if let Some(limit) = limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 
-    Ok(sql)
+    sql
 }
 
 #[cfg(test)]

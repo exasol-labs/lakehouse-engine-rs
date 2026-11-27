@@ -986,6 +986,15 @@ pub struct CommonScanSpec {
 }
 
 impl CommonScanSpec {
+    /// The per-shard ordering and row cap of the row shape. A join carries its own, because
+    /// [`Self::limit`] caps a table's scan and a join's window must run after the join.
+    pub(crate) fn row_window(&self) -> (&[SortKey], Option<u64>) {
+        match &self.join {
+            Some(join) => (&join.post_join_order_by, join.post_join_limit),
+            None => (&self.order_by, self.limit),
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("CommonScanSpec serialization is infallible")
     }

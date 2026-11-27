@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Also reached by `grouped_agg_tests` and `scan_surface_probe` via `crate::scan::`.
 pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
-    build_partial_agg_sql_filtered(aggregates, aliased_table, None)
+    build_partial_agg_sql_filtered(aggregates, &format!("({aliased_table})"), None)
 }
 
 /// Same order as the `dispatch_golden` all-agg-kinds fixtures; the mixed arities (1, 1, 1, 1, 1,
@@ -81,7 +81,7 @@ fn grouped_partial_agg_sql_all_agg_kinds_matches_golden() {
     let actual = build_grouped_partial_agg_sql(
         &[r#""REGION""#.to_string()],
         &all_agg_kinds_plans(),
-        "aliased",
+        "(aliased)",
         None,
     );
     let expected =
@@ -232,7 +232,7 @@ fn partial_agg_sql_applies_filter() {
         column: None,
         arg_expr: None,
     }];
-    let sql = build_partial_agg_sql_filtered(&plans, "aliased", Some("\"ID\" > 5"));
+    let sql = build_partial_agg_sql_filtered(&plans, "(aliased)", Some("\"ID\" > 5"));
     assert!(
         sql.contains("WHERE"),
         "filter must produce WHERE clause: {sql}"
@@ -304,7 +304,8 @@ fn grouped_partial_agg_sql_single_key_count() {
         column: None,
         arg_expr: None,
     }];
-    let sql = build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
+    let sql =
+        build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "(aliased)", None);
     assert!(
         sql.contains(r#""REGION""#),
         "group key must appear in SQL: {sql}"
@@ -334,7 +335,7 @@ fn grouped_partial_agg_sql_layout_matches_emits() {
     let sql = build_grouped_partial_agg_sql(
         &[r#""REGION""#.to_string(), r#""CATEGORY""#.to_string()],
         &plans,
-        "aliased",
+        "(aliased)",
         None,
     );
     let region_pos = sql.find(r#""REGION""#).expect("REGION must appear");
@@ -363,7 +364,8 @@ fn grouped_partial_agg_sql_no_limit() {
         column: None,
         arg_expr: None,
     }];
-    let sql = build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
+    let sql =
+        build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "(aliased)", None);
     assert!(
         !sql.contains("LIMIT"),
         "grouped partial SQL must not contain LIMIT: {sql}"
@@ -379,7 +381,7 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
     }];
     let expr_key = r#"YEAR("ORDER_DATE")"#.to_string();
     let sql =
-        build_grouped_partial_agg_sql(std::slice::from_ref(&expr_key), &plans, "aliased", None);
+        build_grouped_partial_agg_sql(std::slice::from_ref(&expr_key), &plans, "(aliased)", None);
     assert!(
         sql.contains(&expr_key),
         "expression key must appear verbatim in SQL: {sql}"
