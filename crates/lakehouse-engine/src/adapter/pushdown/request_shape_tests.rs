@@ -175,58 +175,39 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
 }
 
 #[test]
-fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
-    let (req, scan) = pushdown_request("T", &T_COLUMNS)
-        .group_by(vec![col("REGION")])
-        .order_by(serde_json::json!([order_by_element(
-            agg_item("SUM", Some("AMOUNT"), false),
-            false,
-            true
-        )]))
-        .limit(5)
-        .column(col("REGION"))
-        .build_scanned();
-    assert!(
-        detect_group_by_aggregates(&req, scan)
-            .expect("a group-key-only select list still detects as grouped")
-            .aggregates
-            .plans
-            .is_empty(),
-        "the group-key-only shape must reach the classifier with an EMPTY plan list"
-    );
-    let shape = classify_request_shape(&req, scan);
-    assert!(
-        matches!(shape, RequestShape::GroupByWrapper),
-        "an aggregate sort key resolvable against no plan must route to the wrapper, not Err: {shape:?}"
-    );
-}
-
-#[test]
-fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
-    let (req, scan) = pushdown_request("T", &T_COLUMNS)
-        .group_by(vec![col("REGION")])
-        .order_by(serde_json::json!([order_by_element(
-            agg_item("SUM", Some("AMOUNT"), false),
-            false,
-            true
-        )]))
-        .column(col("REGION"))
-        .count_star()
-        .build_scanned();
-    assert_eq!(
-        detect_group_by_aggregates(&req, scan)
-            .expect("grouped aggregate")
-            .aggregates
-            .plans
-            .len(),
-        1,
-        "this shape must reach the classifier with a NON-empty plan list"
-    );
-    let shape = classify_request_shape(&req, scan);
-    assert!(
-        matches!(shape, RequestShape::GroupByWrapper),
-        "a sort key matching none of the non-empty plans must route to the wrapper: {shape:?}"
-    );
+fn grouped_order_by_aggregate_absent_from_select_list_classifies_grouped() {
+    let sorted_by_unselected_sum = || {
+        pushdown_request("T", &T_COLUMNS)
+            .group_by(vec![col("REGION")])
+            .order_by(serde_json::json!([order_by_element(
+                agg_item("SUM", Some("AMOUNT"), false),
+                false,
+                true
+            )]))
+            .column(col("REGION"))
+    };
+    for (label, builder) in [
+        (
+            "group-key-only select list",
+            sorted_by_unselected_sum().limit(5),
+        ),
+        (
+            "different select-list aggregate",
+            sorted_by_unselected_sum().count_star(),
+        ),
+    ] {
+        let (req, scan) = builder.build_scanned();
+        match classify_request_shape(&req, scan) {
+            RequestShape::Grouped {
+                order_by: Some(order_by),
+                ..
+            } => assert!(
+                order_by.starts_with(r#"CAST(SUM("PARTIAL_sum_"#),
+                "{label}: the merge must sort on the hidden partial: {order_by}"
+            ),
+            other => panic!("{label}: expected Grouped with a merge ORDER BY, got {other:?}"),
+        }
+    }
 }
 
 #[test]

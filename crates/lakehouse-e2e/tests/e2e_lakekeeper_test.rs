@@ -1431,7 +1431,7 @@ fn permission_check_decides_every_single_table_shape() {
             true,
         ),
         (
-            "SELECT event_date FROM {table} GROUP BY event_date ORDER BY SUM(score)",
+            "SELECT event_date FROM {table} GROUP BY event_date ORDER BY COUNT(DISTINCT name)",
             &["LHS_T0"],
             &[],
             true,

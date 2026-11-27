@@ -97,6 +97,15 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *AND* the per-shard partial scan SHALL still carry no `LIMIT` and no sort keys, so the anti-wrong-truncation invariant holds unchanged
 * *AND* the merged result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 
+### Scenario: A grouped ORDER BY over an aggregate absent from the select list keeps the partial/merge path
+
+* *GIVEN* a grouped `pushdown` request that decomposes into the partial/merge grouped shape, whose `orderBy` sorts on an aggregate that has a partial/merge decomposition and an exact type (`pushdown-aggregates/pushdown-planning-split-aggregate-types`) and that the select list does not carry, such as `SELECT c_nationkey FROM customer GROUP BY c_nationkey ORDER BY SUM(c_acctbal) DESC LIMIT 5` or `SELECT c_bool, COUNT(*) FROM t GROUP BY c_bool ORDER BY SUM(c_price) DESC`
+* *WHEN* the adapter plans the request
+* *THEN* the scan spec SHALL carry `group_keys` and a `PARTIAL_*` column for the sort aggregate, typed as native Exasol types that aggregate
+* *AND* the merge `ORDER BY` element, and a `HAVING` over the same aggregate, SHALL use that aggregate's merged expression cast to its native type, for example `CAST(SUM("PARTIAL_sum_1") AS DOUBLE PRECISION)`
+* *AND* the request's `LIMIT` SHALL apply after the merge `ORDER BY`, so a "top N groups" request returns exactly the top `n` groups by the sort aggregate
+* *AND* the result SHALL hold only the select-list columns and equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
+
 ### Scenario: The grouped merge wrapper renders the request's OFFSET alongside its LIMIT
 
 * *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m`, for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`

@@ -61,9 +61,10 @@ result in the correct order:
 - The single-table, no-join, no-`GROUP BY` row-scan wrapper adds the base columns of the
   expression as hidden columns, then renders the sort expression in the Exasol dialect over them.
   This path gives correctness only, as an unbounded full scan, not a per-shard top-N.
-- The grouped-merge path renders an aggregate `ORDER BY` over the partial and merge columns. When
-  the sort key is not an aggregate or a group key, this path routes to the plain `GROUP BY`
-  wrapper instead.
+- The grouped-merge path renders an aggregate `ORDER BY` over the partial and merge columns. A
+  sort aggregate that the select list does not carry gets a partial column of its own. When the
+  sort key is neither a group key nor an aggregate that splits, such as `COUNT(DISTINCT x)`, this
+  path routes to the plain `GROUP BY` wrapper instead.
 - The qualified single-table, N-scan join wrapper renders any sortable expression directly,
   because it already qualifies column references.
 

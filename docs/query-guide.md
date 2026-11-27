@@ -265,6 +265,8 @@ row per group from each node. `MEDIAN`, `LISTAGG`, `GROUP_CONCAT`, `APPROXIMATE_
 `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` send every row to Exasol. `COUNT(DISTINCT col)` runs
 in the engine only when it is the only aggregate and the query has no `GROUP BY`. `STDDEV`,
 `VARIANCE`, and their variants run in the engine on a plain column.
+An aggregate that appears only in `ORDER BY`, as in
+`SELECT k FROM t GROUP BY k ORDER BY SUM(v) DESC LIMIT 10`, splits the same way.
 
 ### Select a calculated group key, or cast it
 
