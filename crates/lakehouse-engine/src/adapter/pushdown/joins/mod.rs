@@ -253,8 +253,7 @@ fn broadcast_candidates(
     let bytes: Vec<u64> = sides.iter().map(|side| side.total_bytes).collect();
     let columns: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
     let above: Vec<&Expr> = pushdown.expressions(&Clause::WRAPPER);
-    // Shards that aggregate emit one row per group, so no dimension column repeats per joined row.
-    let splits = ShardAggregate::of(pushdown, &legs, sides, context)?.is_some();
+    let shards_aggregate = ShardAggregate::of(pushdown, &legs, sides, context)?.is_some();
     Ok(group_legs(&JoinGraph {
         legs: &legs,
         bytes: &bytes,
@@ -263,7 +262,8 @@ fn broadcast_candidates(
         conjuncts: &conjuncts,
         above: &above,
         output: pushdown.output(),
-        aggregates: pushdown.aggregation_type().is_some() && !splits,
+        aggregates: pushdown.aggregation_type().is_some(),
+        shard_keys: shards_aggregate.then(|| pushdown.group_by()),
         max_bytes: context.tuning.join_broadcast_max_bytes,
     }))
 }

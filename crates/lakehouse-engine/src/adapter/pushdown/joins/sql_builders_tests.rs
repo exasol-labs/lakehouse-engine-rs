@@ -2731,7 +2731,7 @@ fn aggregating_broadcast_declines_an_unbounded_text_column_of_the_dimension_only
     );
 }
 
-/// Shards that aggregate emit the text column once per group, never once per joined row.
+/// Grouped by the dimension alone, a shard emits the text column at most once per dimension row.
 #[test]
 fn a_splittable_aggregation_broadcasts_over_an_unbounded_text_column_of_the_dimension() {
     let sql = broadcast_plan(&per_customer_name_request(count_star()), 10, 100)
@@ -2741,6 +2741,32 @@ fn a_splittable_aggregation_broadcasts_over_an_unbounded_text_column_of_the_dime
         emits_clause(&sql),
         r#""GK_0" VARCHAR(100), "PARTIAL_count_0" DECIMAL(20,0)"#,
         "{sql}"
+    );
+}
+
+/// A fact-side group key leaves up to one group per joined row, so the shards would repeat the
+/// text column as the fan-out of the rows does.
+#[test]
+fn a_fact_side_group_key_declines_an_unbounded_text_column_of_the_dimension() {
+    let request = built_join(
+        customer_orders_request(Json::Null, equi_condition())
+            .column(table_col("ORDERS", "O_CUSTKEY"))
+            .column(table_col("CUSTOMER", "C_NAME"))
+            .item(count_star(), ExasolType::decimal(18, 0))
+            .group_by(vec![
+                table_col("ORDERS", "O_CUSTKEY"),
+                table_col("CUSTOMER", "C_NAME"),
+            ]),
+    );
+
+    assert_eq!(
+        broadcast_plan(&request, 10, 100),
+        None,
+        "CUSTOMER is the dimension"
+    );
+    assert!(
+        broadcast_plan(&request, 100, 10).is_some(),
+        "CUSTOMER is the fact side"
     );
 }
 

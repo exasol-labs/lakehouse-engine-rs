@@ -539,8 +539,13 @@ fn e2e_splittable_aggregating_join_aggregates_in_the_shards_and_matches_native()
     let self_join = "{T}.FACT_ORDERS a JOIN {T}.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
     let events_labels = EVENTS_LABELS_JOIN;
     let split = [
-        // An unbounded text column of the dimension travels once per group.
+        // Grouped by the dimension alone, its unbounded text column travels at most once per
+        // dimension row.
         format!("SELECT c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} GROUP BY c.C_NAME"),
+        format!(
+            "SELECT c.C_CUSTKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY c.C_CUSTKEY, c.C_NAME"
+        ),
         format!("SELECT COUNT(*), MAX(c.C_NAME) FROM {orders}"),
         format!(
             "SELECT SUBSTR(c.C_NAME, 1, 10), COUNT(*) FROM {orders} \
@@ -605,7 +610,7 @@ fn e2e_splittable_aggregating_join_aggregates_in_the_shards_and_matches_native()
              GROUP BY c.C_CUSTKEY"
         ),
         // Exasol sends a DISTINCT as a GROUP BY of every selected column, with no aggregate.
-        format!("SELECT DISTINCT * FROM {orders}"),
+        format!("SELECT DISTINCT * FROM {orders} WHERE {NAMED_CUSTOMERS}"),
         format!(
             "SELECT c.C_CUSTKEY, COUNT(*) FROM {orders} GROUP BY c.C_CUSTKEY \
              ORDER BY c.C_CUSTKEY LIMIT 2 OFFSET 1"
@@ -670,6 +675,7 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
 }
 
 /// Scenario: An aggregation that does not split keeps the N-scan when it reads an unbounded text column of the small side
+/// Scenario: A splittable aggregation with a fact-side group key keeps the N-scan when it reads an unbounded text column of the small side
 #[test]
 fn e2e_aggregating_join_reading_a_wide_dimension_text_column_keeps_the_n_scan() {
     setup_e2e();
@@ -685,6 +691,17 @@ fn e2e_aggregating_join_reading_a_wide_dimension_text_column_keeps_the_n_scan() 
         ),
         // The declined conjunct keeps the aggregation in Exasol.
         format!("SELECT c.C_NAME, COUNT(*) FROM {orders} WHERE {SECOND_IS_ZERO} GROUP BY c.C_NAME"),
+        // A fact-side group key leaves up to one group per joined row.
+        format!(
+            "SELECT o.O_ORDERKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY o.O_ORDERKEY, c.C_NAME"
+        ),
+        format!(
+            "SELECT o.O_CUSTKEY, c.C_NAME, SUM(o.O_TOTALPRICE) FROM {orders} \
+             GROUP BY o.O_CUSTKEY, c.C_NAME"
+        ),
+        format!("SELECT o.O_ORDERKEY, MAX(c.C_NAME) FROM {orders} GROUP BY o.O_ORDERKEY"),
+        format!("SELECT DISTINCT * FROM {orders}"),
     ];
 
     let mut failures = Vec::new();

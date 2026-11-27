@@ -193,7 +193,7 @@ When several pairs qualify, the adapter prefers, in order: a smaller table with 
 A filter or select-list item that the scan cannot compute runs in Exasol SQL over the broadcast scan, and the join stays broadcast. Exasol also aggregates, sorts, and applies the `LIMIT` over the joined rows, with two exceptions, both in a two-table broadcast join that leaves Exasol nothing to filter:
 
 - Without aggregation, each shard sorts and limits its own rows.
-- An aggregation that splits over one table ([Aggregation](#aggregation)) splits over the join too. Each shard joins its rows and computes the partial aggregate, so it emits one row per group, and Exasol SQL merges them and applies `HAVING`, `ORDER BY`, and `LIMIT`. The column rule above does not apply, because no smaller-table column repeats on every joined row. A select list with a `COUNT(DISTINCT ...)` does not split over a join.
+- An aggregation that splits over one table ([Aggregation](#aggregation)) splits over the join too. Each shard joins its rows and computes the partial aggregate, so it emits one row per group, and Exasol SQL merges them and applies `HAVING`, `ORDER BY`, and `LIMIT`. The column rule above does not apply when every `GROUP BY` key is a smaller-table column, or the query has no `GROUP BY`, because a shard then emits at most one row per smaller-table row. With a group key of the larger table the rule applies, because there can be one group per joined row. A select list with a `COUNT(DISTINCT ...)` does not split over a join.
 
 ## Handled by Exasol
 

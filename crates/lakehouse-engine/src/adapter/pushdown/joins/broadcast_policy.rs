@@ -30,9 +30,10 @@ pub(super) struct JoinGraph<'a> {
     /// The select list, `GROUP BY`, `HAVING`, and `ORDER BY`.
     pub above: &'a [&'a Expr],
     pub output: &'a OutputContract,
-    /// Exasol aggregates the fan-outs' rows: the request aggregates, groups, or carries a HAVING,
-    /// and no shard aggregates for it.
+    /// The request aggregates, groups, or carries a HAVING.
     pub aggregates: bool,
+    /// The request's group keys when the shards of a broadcast pair aggregate for it.
+    pub shard_keys: Option<&'a [Expr]>,
     pub max_bytes: u64,
 }
 
@@ -81,14 +82,20 @@ fn has_own_filter(graph: &JoinGraph<'_>, leg: usize) -> bool {
 }
 
 /// The dimension is within `JOIN_BROADCAST_MAX_BYTES`, and every column Exasol reads of it over
-/// the pair is width-bounded when Exasol stores the pair's rows before it aggregates them, joins
-/// them with another leg, or filters them.
+/// the pair is width-bounded when the pair emits up to one row per joined row and Exasol
+/// aggregates those rows, joins them with another leg, or filters them.
 fn eligible(graph: &JoinGraph<'_>, pair: &LegGroup) -> bool {
     let dimension = pair.broadcast[0];
     let plan = JoinPlan::broadcasting(graph.bytes.len(), pair);
     let declined = graph.conjuncts.iter().any(|conjunct| !conjunct.renders);
+    // Shards that group by the dimension alone emit at most one row per dimension row (#632).
+    let shards_bound_rows = graph.shard_keys.is_some_and(|keys| {
+        let legs = keys.iter().flat_map(|key| graph.legs.legs_referenced(key));
+        legs.into_iter().all(|leg| leg == dimension)
+    });
+    let aggregates = graph.aggregates && !shards_bound_rows;
     graph.bytes[dimension] <= graph.max_bytes
-        && (!exasol_runs_tail(plan.fan_outs().len(), graph.aggregates, declined)
+        && (!exasol_runs_tail(plan.fan_outs().len(), aggregates, declined)
             || width_bounded(graph, dimension, &dimension_reads(graph, &plan, dimension)))
 }
 

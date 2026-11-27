@@ -157,9 +157,9 @@ every other table on its own. A pair of tables is a broadcast join when:
 - The smaller table passes the column rule below, when that rule applies.
 
 The column rule applies when Exasol works on the joined rows further: the query has a third table,
-a filter the engine can't run (see [Filters](#filters)), or an aggregation the engine can't split
-(see [Aggregate over a join](#aggregate-over-a-join)). Then every column Exasol reads from the
-smaller table must be one of these:
+a filter the engine can't run (see [Filters](#filters)), or an aggregation that can leave about one
+row per joined row (see [Aggregate over a join](#aggregate-over-a-join)). Then every column Exasol
+reads from the smaller table must be one of these:
 
 - a number, date, timestamp, or boolean
 - text that a filter limits to fixed values: `col = 'x'` or `col IN ('x', 'y')`
@@ -282,14 +282,19 @@ joins and aggregates its own rows, and Exasol combines one row per group from ea
 needs aggregates the engine can split and only filters the engine can run. A query with a
 `COUNT(DISTINCT ...)` doesn't split over a join.
 
-Otherwise Exasol aggregates the joined rows. If the aggregation then uses a text column of the
-smaller table, such as a name or a description, the join is not a broadcast join, because that
-text would be copied to every joined row. Use an aggregate the engine can split, group by a number
-column, or limit the text column to fixed values with a filter.
+A text column of the smaller table, such as a name or a description, stops the broadcast join
+when the aggregation would copy it to about every joined row. That happens in two cases:
+
+- Exasol aggregates the joined rows, because the engine can't split the aggregation.
+- The query groups by a column of the larger table, because there can be one group per joined row.
+
+Use an aggregate the engine can split and group only by columns of the smaller table, or limit the
+text column to fixed values with a filter.
 
 | Use | Avoid |
 |---|---|
 | `SELECT c.name, SUM(o.amount) FROM orders o JOIN customers c ON ... GROUP BY c.name` | `SELECT c.name, COUNT(DISTINCT o.product) FROM orders o JOIN customers c ON ... GROUP BY c.name` |
+| `SELECT c.id, c.name, SUM(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id, c.name` | `SELECT o.customer_id, c.name, SUM(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY o.customer_id, c.name` |
 | `SELECT c.country, COUNT(DISTINCT o.product) FROM orders o JOIN customers c ON ... WHERE c.country IN ('DE', 'FR') GROUP BY c.country` | The same query without the filter on `c.country` |
 
 ## `ORDER BY ... LIMIT`
