@@ -6,6 +6,7 @@
 
 mod adls_storage;
 mod iceberg_write;
+mod object_store_dns;
 mod retry;
 mod snapshot_capture;
 mod vended_refresh;
@@ -17,6 +18,8 @@ pub mod exported_test_support;
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
 mod test_support;
+
+pub use object_store_dns::{adls_store_builder, caching_client_options, s3_store_builder};
 
 pub use iceberg_write::{
     CommitError, CommitTag, StagedTable, TableWriteSession, WriteStorage, WriteTable,
