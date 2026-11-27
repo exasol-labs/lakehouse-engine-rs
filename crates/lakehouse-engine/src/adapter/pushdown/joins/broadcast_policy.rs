@@ -30,7 +30,8 @@ pub(super) struct JoinGraph<'a> {
     /// The select list, `GROUP BY`, `HAVING`, and `ORDER BY`.
     pub above: &'a [&'a Expr],
     pub output: &'a OutputContract,
-    /// Exasol postprocessing: the request aggregates, groups, or carries a HAVING.
+    /// Exasol aggregates the fan-outs' rows: the request aggregates, groups, or carries a HAVING,
+    /// and no shard aggregates for it.
     pub aggregates: bool,
     pub max_bytes: u64,
 }
