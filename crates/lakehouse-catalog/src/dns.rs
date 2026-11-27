@@ -9,10 +9,8 @@ use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use aws_smithy_http_client::{Builder, ConnectorBuilder};
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use hickory_resolver::config::{LookupIpStrategy, ResolverConfig};
-use hickory_resolver::net::NetError;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::{ResolverBuilder, TokioResolver};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::LookupIpStrategy;
 use rand::seq::SliceRandom;
 use tokio::sync::OnceCell;
 
@@ -29,28 +27,17 @@ impl CachingResolver {
     pub async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, Box<dyn Error + Send + Sync>> {
         let resolver = self
             .resolver
-            .get_or_try_init(|| async { resolver_from(TokioResolver::builder_tokio()) })
+            .get_or_try_init(|| async {
+                let mut builder = TokioResolver::builder_tokio()?;
+                // Both families, as reqwest's own hickory resolver asks, for happy eyeballs.
+                builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
+                builder.build()
+            })
             .await?;
         let mut addresses: Vec<IpAddr> = resolver.lookup_ip(host).await?.iter().collect();
         addresses.shuffle(&mut rand::thread_rng());
         Ok(addresses)
     }
-}
-
-/// The resolver of the node's `/etc/resolv.conf`. A node whose file names no DNS server still
-/// resolves the names of its `/etc/hosts`, as it did through glibc.
-fn resolver_from(
-    system: Result<ResolverBuilder<TokioRuntimeProvider>, NetError>,
-) -> Result<TokioResolver, NetError> {
-    let mut builder = system.unwrap_or_else(|_| {
-        TokioResolver::builder_with_config(
-            ResolverConfig::from_parts(None, vec![], vec![]),
-            TokioRuntimeProvider::default(),
-        )
-    });
-    // Both families, as reqwest's own hickory resolver asks, for happy eyeballs.
-    builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
-    builder.build()
 }
 
 impl ResolveDns for CachingResolver {

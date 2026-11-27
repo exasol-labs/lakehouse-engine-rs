@@ -1,12 +1,8 @@
-use std::io;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use aws_smithy_runtime_api::client::dns::ResolveDns;
-use hickory_resolver::net::NetError;
-use tokio::sync::OnceCell;
 
-use super::{CachingResolver, resolver_from};
+use super::CachingResolver;
 
 fn assert_loopback(addresses: &[IpAddr]) {
     assert!(!addresses.is_empty());
@@ -19,20 +15,6 @@ async fn localhost_resolves_to_loopback_addresses() {
 
     assert_loopback(&resolver.lookup("localhost").await.unwrap());
     assert_loopback(&resolver.resolve_dns("localhost").await.unwrap());
-}
-
-#[tokio::test]
-async fn a_node_without_a_dns_server_still_resolves_localhost() {
-    let no_dns_server = Err(NetError::from(io::Error::other(
-        "no nameservers found in config",
-    )));
-    let resolver = CachingResolver {
-        resolver: Arc::new(OnceCell::new_with(Some(
-            resolver_from(no_dns_server).unwrap(),
-        ))),
-    };
-
-    assert_loopback(&resolver.lookup("localhost").await.unwrap());
 }
 
 /// `.invalid` never resolves and never reaches a DNS server (RFC 6761).
