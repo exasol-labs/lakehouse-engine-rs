@@ -1,17 +1,16 @@
-//! Object-storage backend and credentials. Sole owner of the iceberg storage config
-//! keys ([`StorageBackend::catalog_storage_props`]) and of the vended-storage policy
-//! both catalog kinds share, so neither can drift. Credential values never appear in
-//! a returned error.
+//! Object-storage backend and credentials. Sole owner of how a backend configures an object_store
+//! client and of the vended-storage policy both catalog kinds share, so neither can drift.
+//! Credential values never appear in a returned error.
 
+use crate::dns::{adls_store_builder, caching_client_options, s3_store_builder};
+use crate::object_storage::object_file_io;
 use crate::{ConnectionCreds, StorageProps};
 use exasol_udf_sdk::error::UdfError;
-use iceberg::io::{
-    ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_SAS_TOKEN, FileIOBuilder, S3_ACCESS_KEY_ID,
-    S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
-};
-use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
+use iceberg::io::FileIO;
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::{ClientOptions, CredentialProvider, ObjectStore};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// An enum rather than two `Option`s: `MicrosoftAzureBuilder::build()` silently prefers
@@ -39,8 +38,8 @@ impl std::fmt::Debug for AdlsCred {
 pub enum StorageBackend {
     S3(StorageProps),
     Adls {
-        /// Used only by the iceberg `FileIO` manifest-read path; the DataFusion scan
-        /// derives the account from each file URI's host instead.
+        /// Used only by the iceberg `FileIO`, which refuses a path of another account; the
+        /// DataFusion scan derives the account from each file URI's host instead.
         account_name: String,
         cred: AdlsCred,
     },
@@ -78,76 +77,51 @@ impl StorageBackend {
         }
     }
 
-    pub(crate) fn catalog_storage_props(&self) -> HashMap<String, String> {
-        let mut props = HashMap::new();
-        match self {
+    /// The FileIO that signs with the stored credentials. An ADLS FileIO addresses only the
+    /// stored account, so a path of another account never receives its credential.
+    pub fn file_io(&self) -> FileIO {
+        let backend = self.clone();
+        object_file_io(Arc::new(move |root: &str| match &backend {
             Self::S3(storage) => {
-                for (key, value) in [
-                    (S3_ENDPOINT, &storage.endpoint),
-                    (S3_REGION, &storage.region),
-                    (S3_ACCESS_KEY_ID, &storage.access_key),
-                    (S3_SECRET_ACCESS_KEY, &storage.secret_key),
-                ] {
-                    if !value.is_empty() {
-                        props.insert(key.to_string(), value.clone());
-                    }
-                }
-                if let Some(token) = &storage.session_token {
-                    props.insert(S3_SESSION_TOKEN.to_string(), token.clone());
-                }
-                props.insert(
-                    S3_PATH_STYLE_ACCESS.to_string(),
-                    storage.path_style.to_string(),
-                );
+                let builder = s3_builder(storage, location_host(root), caching_client_options());
+                Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
             }
             Self::Adls { account_name, cred } => {
-                if !account_name.is_empty() {
-                    props.insert(ADLS_ACCOUNT_NAME.to_string(), account_name.clone());
+                let account = location_host(root).split('.').next().unwrap_or_default();
+                if account != account_name {
+                    return Err(object_store::Error::Generic {
+                        store: "MicrosoftAzure",
+                        source: format!(
+                            "the storage account {account} of {root} is not the account \
+                             {account_name} the credential belongs to"
+                        )
+                        .into(),
+                    });
                 }
-                let (key, value) = match cred {
-                    AdlsCred::AccountKey(key) => (ADLS_ACCOUNT_KEY, key),
-                    AdlsCred::Sas(sas) => (ADLS_SAS_TOKEN, sas),
-                };
-                if !value.is_empty() {
-                    props.insert(key.to_string(), value.clone());
-                }
+                let builder = adls_builder(root, cred, caching_client_options());
+                Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
             }
-        }
-        props
-    }
-
-    pub fn file_io(&self) -> iceberg::io::FileIO {
-        let factory = match self {
-            Self::S3(_) => OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
-            },
-            Self::Adls { .. } => OpenDalStorageFactory::Azdls,
-        };
-        self.file_io_from(factory)
-    }
-
-    /// [`Self::file_io`] whose S3 requests are signed with the credentials `loader` provides,
-    /// which replace the stored keys, so a writer's credentials can be renewed while it runs.
-    /// Fails on ADLS storage, whose requests the loader cannot sign.
-    pub fn file_io_with_credential_loader(
-        &self,
-        loader: CustomAwsCredentialLoader,
-    ) -> Result<iceberg::io::FileIO, UdfError> {
-        let Self::S3(_) = self else {
-            return Err(UdfError::User(
-                "an AWS credential loader signs only S3 storage requests, but the storage is ADLS"
-                    .into(),
-            ));
-        };
-        Ok(self.file_io_from(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(loader),
         }))
     }
 
-    fn file_io_from(&self, factory: OpenDalStorageFactory) -> iceberg::io::FileIO {
-        FileIOBuilder::new(Arc::new(factory))
-            .with_props(self.catalog_storage_props())
-            .build()
+    /// [`Self::file_io`] whose S3 requests sign with the credential `credentials` gives for each
+    /// request, so a writer's credentials can be renewed while it runs. Fails on ADLS storage.
+    pub fn file_io_signed_by(
+        &self,
+        credentials: Arc<dyn CredentialProvider<Credential = object_store::aws::AwsCredential>>,
+    ) -> Result<FileIO, UdfError> {
+        let Self::S3(storage) = self else {
+            return Err(UdfError::User(
+                "an AWS credential source signs only S3 storage requests, but the storage is ADLS"
+                    .into(),
+            ));
+        };
+        let storage = storage.clone();
+        Ok(object_file_io(Arc::new(move |root: &str| {
+            let builder = s3_address(&storage, location_host(root), caching_client_options())
+                .with_credentials(credentials.clone());
+            Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
+        })))
     }
 
     /// Azure accepts only `abfss`, never plaintext `abfs`.
@@ -156,6 +130,58 @@ impl StorageBackend {
             Self::S3(_) => matches!(scheme, "s3" | "s3a"),
             Self::Adls { .. } => scheme == "abfss",
         }
+    }
+}
+
+/// The S3 client builder of `bucket`, signing with the stored keys, or unsigned when none are
+/// stored. `options` replace the builder's whole `ClientOptions`.
+pub fn s3_builder(storage: &StorageProps, bucket: &str, options: ClientOptions) -> AmazonS3Builder {
+    let builder = s3_address(storage, bucket, options);
+    // No credentials reads a public bucket unsigned (#590): an empty key is still signed and
+    // rejected, and unset keys make object_store fall back to ambient instance credentials.
+    if storage.access_key.is_empty()
+        && storage.secret_key.is_empty()
+        && storage.session_token.is_none()
+    {
+        return builder.with_skip_signature(true);
+    }
+    let builder = builder
+        .with_access_key_id(&storage.access_key)
+        .with_secret_access_key(&storage.secret_key);
+    match &storage.session_token {
+        Some(token) => builder.with_token(token),
+        None => builder,
+    }
+}
+
+fn s3_address(storage: &StorageProps, bucket: &str, options: ClientOptions) -> AmazonS3Builder {
+    // `with_client_options` REPLACES the whole `ClientOptions`, so it must precede
+    // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking SeaweedFS).
+    let builder = s3_store_builder()
+        .with_bucket_name(bucket)
+        .with_region(&storage.region)
+        .with_client_options(options)
+        .with_allow_http(storage.allow_http);
+    // Real AWS S3 must NOT get an endpoint: object_store derives the virtual-hosted URL
+    // from the region, and a regional endpoint without the bucket yields 403.
+    if storage.path_style {
+        builder
+            .with_endpoint(&storage.endpoint)
+            .with_virtual_hosted_style_request(false)
+    } else {
+        builder
+    }
+}
+
+/// The ADLS Gen2 client builder of the container `url` names, signing with `cred`. `options`
+/// replace the builder's whole `ClientOptions`.
+pub fn adls_builder(url: &str, cred: &AdlsCred, options: ClientOptions) -> MicrosoftAzureBuilder {
+    let builder = adls_store_builder()
+        .with_url(url)
+        .with_client_options(options);
+    match cred {
+        AdlsCred::AccountKey(key) => builder.with_access_key(key),
+        AdlsCred::Sas(sas) => builder.with_config(AzureConfigKey::SasKey, sas),
     }
 }
 
@@ -195,8 +221,8 @@ pub(crate) fn location_host(location: &str) -> &str {
         .map_or(authority, |(_, host)| host)
 }
 
-/// Never case-folded: iceberg-storage-opendal's `adls.account-name` guard compares it
-/// byte-for-byte against the account parsed from each file URI.
+/// Never case-folded: [`StorageBackend::file_io`] compares it byte-for-byte against the account
+/// of each path.
 fn adls_account_name(location: &str) -> Result<&str, UdfError> {
     let host = location_host(location);
     host.split('.')

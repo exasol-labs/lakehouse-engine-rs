@@ -601,7 +601,12 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         .expect("a 503 on the grant and the config lookup is retried to success");
     let (_, carried) = oauth_session
         .auth
-        .apply(reqwest::Client::new().get("http://catalog.example/v1/config"))
+        .apply(
+            crate::dns::http_client_builder()
+                .build()
+                .unwrap()
+                .get("http://catalog.example/v1/config"),
+        )
         .await
         .expect("the granted token needs no renewal");
     assert_eq!(carried.as_deref(), Some(OAUTH_ACCESS_TOKEN));

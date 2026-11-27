@@ -987,7 +987,7 @@ async fn a_connection_closed_cleanly_after_the_request_is_retried() {
 #[tokio::test]
 async fn an_http2_connection_closed_cleanly_is_transient() {
     let (closing, _) = spawn_listener(|stream, _| close_after_request(stream)).await;
-    let client = reqwest::Client::builder()
+    let client = crate::dns::http_client_builder()
         .http2_prior_knowledge()
         .build()
         .unwrap();
@@ -1063,7 +1063,7 @@ async fn an_unresolvable_host_fails_at_the_first_attempt() {
 /// Scenario: A failure that is not transient fails the request at the first attempt
 #[tokio::test]
 async fn transport_failures_are_classified_by_their_typed_cause() {
-    let client = reqwest::Client::builder()
+    let client = crate::dns::http_client_builder()
         .connect_timeout(TLS_HANDSHAKE_POLICY.connect_timeout)
         .read_timeout(TLS_HANDSHAKE_POLICY.read_timeout)
         .build()

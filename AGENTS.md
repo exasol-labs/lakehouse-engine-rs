@@ -43,7 +43,7 @@ Project specifics:
 ## Architecture rules
 
 - The Virtual Schema (VS) stays thin: query translation, pushdown analysis, parallelization planning, and result schema mapping. Execution logic lives in DataFusion.
-- UDFs are stateless and disposable. They hold no cache, persist no metadata, and keep no state across calls. The one exception is the adapter: it keeps each virtual schema's catalog client and loaded tables for the pushdown requests of one statement, keyed by the virtual schema name, because Exasol runs one adapter VM per statement. It keeps nothing across statements. The scan UDF keeps no such state.
+- UDFs are stateless and disposable. They hold no cache, persist no metadata, and keep no state across calls. Two exceptions: the adapter it keeps each virtual schema's catalog client and loaded tables for the pushdown requests of one statement, keyed by the virtual schema name, because Exasol runs one adapter VM per statement. It keeps nothing across statements. The scan UDF keeps no such state. Every UDF VM process also keeps one DNS cache for its whole life (`specs/connection/dns-cache/spec.md`).
 - The VS loads each table's metadata once per statement, never once per node, and passes each UDF an explicit file list. A UDF never discovers files itself.
 - Each node scans only its assigned files. Assignments never overlap.
 - `ScanSpec`, `FileEntry`, and `LogicalField` stay format-neutral. Widen an existing field before adding one, and never add a format-specific struct or `Option<FormatXSpec>`. Format knowledge lives in each table format's plan-time `LoadedTable`, and the scan side dispatches on field content, never on format identity.

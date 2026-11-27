@@ -82,7 +82,7 @@ Test code gets the same design care as production code. A test reads as the one 
 - A test reads a failing statement's error text only through `error_text`, which asserts the error status and names the statement or case.
 - Async fixture work runs on the harness's one shared Tokio runtime. Only a teardown that runs from `Drop` builds its own runtime, on its own thread.
 - Every seed writes through the one shared seed-catalog configuration, which selects the storage backend. No suite forks the table create, write, and commit logic.
-- No E2E code uses `lakehouse-engine`, `lakehouse-catalog`, or `vs-expression`, because the suites treat the deployed `.so` as a black box. A name the engine emits into pushed SQL is a test-owned constant, so renaming it in the engine fails the test.
+- No E2E code uses `lakehouse-engine`, `lakehouse-catalog`, or `vs-expression`, because the suites treat the deployed `.so` as a black box. A name the engine emits into pushed SQL is a test-owned constant, so renaming it in the engine fails the test. One exception: the harness compiles `crates/lakehouse-catalog/src/object_storage.rs` as `common::object_storage` to write fixture tables, because iceberg-rust ships no other S3 or ADLS storage.
 - The harness resolves fixture file lists in the test process through iceberg-rust's scan planner (`resolve_fixture_files`) and returns harness-owned types.
 
 ### Exasol session client
@@ -188,7 +188,7 @@ Test code gets the same design care as production code. A test reads as the one 
 
 - `exasol/docker-db` publishes amd64-only images, so every suite runs on one of two flavors. `docker-db` runs on x86_64 hosts. `nano` runs the multi-arch `exasol/nano` image, the default on arm64 hosts such as Apple Silicon.
 - `EXASOL_FLAVOR` (`docker-db` or `nano`) selects the flavor. When it is unset, the Makefile and `scripts/e2e-stack.sh` derive it from `EXASOL_IMAGE`, else from the host architecture. The harness reads `EXASOL_FLAVOR`, else the running container's image.
-- On `nano`, `scripts/e2e-stack.sh` applies `docker-compose.nano.yml` last, over every stack. It replaces docker-db's entrypoint, its `/etc/hosts` loop, and its healthcheck, because the Nano image holds no shell. Docker's DNS resolves the service names, and `wait` probes the SQL port from a sidecar in the container's network namespace.
+- On `nano`, `scripts/e2e-stack.sh` applies `docker-compose.nano.yml` last, over every stack. It replaces docker-db's entrypoint, which points docker-db's `NameServers` setting at Docker's DNS through confd, and its healthcheck, because the Nano image holds no shell. Docker's DNS resolves the service names in both flavors, and `wait` probes the SQL port from a sidecar in the container's network namespace.
 - Nano has no BucketFS HTTP endpoint. It serves each bucket from `/exa/bucketfs/bfsdefault/<bucket>/`, so the harness and `make install-slc bucketfs-upload-so` copy files in with `docker cp`, and unpack the SLC archive there.
 - The harness installs the SLC tarball of the host architecture, because Docker runs the host's native image.
 - A harness probe that needs a shell or `getent` inside the Exasol container runs on `nano` in a throwaway container that joins the Exasol container's network namespace.

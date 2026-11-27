@@ -150,7 +150,7 @@ fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
     );
 }
 
-/// Scenario: A host name of the node's hosts file resolves on every network path
+/// Scenario: A host name the node's resolver knows resolves on every network path
 #[test]
 fn role_connection_reads_the_rows_the_base_identity_was_denied() {
     setup();

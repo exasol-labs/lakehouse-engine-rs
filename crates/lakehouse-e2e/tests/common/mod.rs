@@ -48,6 +48,15 @@ pub mod lakekeeper;
 pub mod lakekeeper_authz;
 #[cfg(feature = "exasol-e2e")]
 pub mod name_mapping_fixtures;
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e",
+    feature = "unity-e2e",
+    feature = "glue-e2e"
+))]
+#[path = "../../../lakehouse-catalog/src/object_storage.rs"]
+pub mod object_storage;
 #[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
 #[cfg(any(feature = "exasol-e2e", feature = "unity-e2e"))]

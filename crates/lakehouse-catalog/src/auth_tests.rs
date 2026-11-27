@@ -55,7 +55,12 @@ async fn oauth2_grant_built_from_client_credentials() {
         .expect("grant must succeed");
 
     let (builder, carried) = auth
-        .apply(reqwest::Client::new().get("http://catalog.example/v1/config"))
+        .apply(
+            crate::dns::http_client_builder()
+                .build()
+                .unwrap()
+                .get("http://catalog.example/v1/config"),
+        )
         .await
         .expect("a seeded token needs no renewal");
     assert_eq!(

@@ -3,7 +3,7 @@ use super::*;
 /// Scenario: Catalog REST requests to Glue are SigV4-signed when enabled
 #[test]
 fn signed_request_carries_sigv4_header() {
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .get("https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/my-catalog/namespaces/db/tables/my_table")
         .build()
@@ -52,7 +52,7 @@ fn signed_request_carries_sigv4_header() {
 #[test]
 fn secret_key_absent_from_signed_headers() {
     let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .get("https://glue.us-east-1.amazonaws.com/iceberg/v1/namespaces")
         .build()
@@ -99,7 +99,7 @@ fn credentials_debug_redacts_secret() {
 
 #[test]
 fn disabled_sigv4_produces_unsigned_request() {
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .get("https://minio.local:9000/iceberg/v1/namespaces")
         .build()
@@ -272,7 +272,7 @@ fn signed_post_commits_to_the_payload_hash_of_its_body() {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const BRACES_PAYLOAD_SHA256: &str =
         "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
-    let client = reqwest::Client::new();
+    let client = crate::dns::http_client_builder().build().unwrap();
     let request = client
         .post("https://glue.us-east-1.amazonaws.com/iceberg/v1/echo")
         .body("{}")

@@ -1,16 +1,19 @@
-# Every HTTP client resolves host names through a DNS cache (#693). Each call listed here builds
-# a client that skips it, so only the factories in `lakehouse-catalog`'s `dns.rs` and
-# `lakehouse-catalog-write`'s `object_store_dns.rs` make it, each under an `#[expect]`.
+# Every HTTP client resolves host names through the process's DNS cache (#701). Each call listed
+# here builds a client that skips it, so only the factories in `lakehouse-catalog`'s `dns.rs` make
+# it, each under an `#[expect]`.
 # Clippy cannot name a `Default::default` impl, so `Type::default()` of these types is not caught.
 disallowed-methods = [
-    { path = "reqwest::ClientBuilder::no_hickory_dns", reason = "it turns the DNS cache off" },
-    { path = "reqwest::ClientBuilder::hickory_dns", reason = "it can turn the DNS cache off" },
+    { path = "reqwest::Client::new", reason = "use `dns::http_client_builder`" },
+    { path = "reqwest::Client::builder", reason = "use `dns::http_client_builder`" },
+    { path = "reqwest::ClientBuilder::new", reason = "use `dns::http_client_builder`" },
     { path = "reqwest::ClientBuilder::dns_resolver", reason = "it replaces the caching resolver" },
-    { path = "object_store::ClientOptions::new", reason = "start from `lakehouse_catalog_write::caching_client_options`" },
-    { path = "object_store::aws::AmazonS3Builder::new", reason = "use `lakehouse_catalog_write::s3_store_builder`" },
-    { path = "object_store::aws::AmazonS3Builder::from_env", reason = "use `lakehouse_catalog_write::s3_store_builder`" },
-    { path = "object_store::azure::MicrosoftAzureBuilder::new", reason = "use `lakehouse_catalog_write::adls_store_builder`" },
-    { path = "object_store::azure::MicrosoftAzureBuilder::from_env", reason = "use `lakehouse_catalog_write::adls_store_builder`" },
+    { path = "reqwest::get", reason = "use `dns::http_client_builder`" },
+    { path = "object_store::ClientOptions::new", reason = "start from `lakehouse_catalog::caching_client_options`" },
+    { path = "object_store::ClientOptions::with_dns_resolver", reason = "it replaces the caching resolver" },
+    { path = "object_store::aws::AmazonS3Builder::new", reason = "use `lakehouse_catalog::s3_store_builder`" },
+    { path = "object_store::aws::AmazonS3Builder::from_env", reason = "use `lakehouse_catalog::s3_store_builder`" },
+    { path = "object_store::azure::MicrosoftAzureBuilder::new", reason = "use `lakehouse_catalog::adls_store_builder`" },
+    { path = "object_store::azure::MicrosoftAzureBuilder::from_env", reason = "use `lakehouse_catalog::adls_store_builder`" },
     { path = "aws_smithy_http_client::Builder::new", reason = "use `dns::glue_client` or `dns::sts_client`" },
     { path = "aws_sdk_glue::Client::from_conf", reason = "use `dns::glue_client`" },
     { path = "aws_sdk_sts::Client::from_conf", reason = "use `dns::sts_client`" },

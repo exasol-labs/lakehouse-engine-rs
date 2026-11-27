@@ -1,113 +1,90 @@
 use super::*;
-use lakehouse_catalog::AdlsCred;
 use object_store::memory::InMemory;
 
+const ROOT: &str = "abfss://container@account.dfs.core.windows.net/";
 const LOCATION: &str = "abfss://container@account.dfs.core.windows.net/warehouse/ns/t";
-const SAS: &str = "sv=2022-11-02&sr=c&sp=racwdl&sig=SAS_SIGNATURE_SECRET";
 
-fn credentials() -> AdlsCredentials {
-    AdlsCredentials::connection(&AdlsCred::Sas(SAS.into())).unwrap()
+/// A FileIO's storage over in-memory clients, which addresses only [`ROOT`].
+fn memory_storage() -> ObjectStorage {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    ObjectStorage::new(Arc::new(move |root| {
+        if root == ROOT {
+            Ok(store.clone())
+        } else {
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: format!("{root} is outside {ROOT}").into(),
+            })
+        }
+    }))
 }
 
-fn storage() -> AdlsStorage {
-    AdlsStorage::new(LOCATION, Some(credentials())).unwrap()
+fn at(name: &str) -> String {
+    format!("{LOCATION}/{name}")
 }
 
 #[test]
-fn a_path_in_the_locations_container_is_its_object_key() {
-    let storage = storage();
-
+fn a_path_splits_into_its_root_with_a_lowercase_scheme_and_its_object_key() {
     let cases = [
+        (at("data/f.parquet"), ROOT, "warehouse/ns/t/data/f.parquet"),
         (
-            format!("{LOCATION}/data/f.parquet"),
-            "warehouse/ns/t/data/f.parquet",
+            "ABFSS://container@account.dfs.core.windows.net/warehouse/m.json".to_string(),
+            ROOT,
+            "warehouse/m.json",
         ),
-        (
-            "ABFSS://container@account.dfs.core.windows.net/warehouse/ns/t/metadata/m.json"
-                .to_string(),
-            "warehouse/ns/t/metadata/m.json",
-        ),
-        (
-            "abfss://container@account.dfs.core.windows.net/elsewhere".to_string(),
-            "elsewhere",
-        ),
+        ("s3://bucket//a/b".to_string(), "s3://bucket/", "a/b"),
+        ("s3://bucket".to_string(), "s3://bucket/", ""),
     ];
 
-    for (path, key) in cases {
-        assert_eq!(storage.key(&path).unwrap().as_ref(), key, "{path}");
-    }
-}
-
-#[test]
-fn a_path_outside_the_locations_container_is_refused_naming_the_path() {
-    let storage = storage();
-
-    for path in [
-        "abfss://other@account.dfs.core.windows.net/warehouse/ns/t/f",
-        "abfss://container@other.dfs.core.windows.net/warehouse/ns/t/f",
-        "abfss://container@account.dfs.core.windows.netx/f",
-        "s3://container/warehouse/ns/t/f",
-        "warehouse/ns/t/f",
-    ] {
-        let refused = storage.key(path).unwrap_err().to_string();
-
-        assert!(
-            refused.contains(&format!(
-                "the path {path} lies outside the ADLS container \
-                 abfss://container@account.dfs.core.windows.net of the table"
-            )),
-            "{refused}"
+    for (path, root, key) in cases {
+        let (split_root, split_key) = split_path(&path).unwrap();
+        assert_eq!(
+            (split_root.as_str(), split_key.as_ref()),
+            (root, key),
+            "{path}"
         );
     }
 }
 
 #[tokio::test]
+async fn a_path_without_a_scheme_or_outside_the_addressed_roots_is_refused_naming_it() {
+    let storage = memory_storage();
+
+    let no_scheme = storage.exists("warehouse/ns/t/f").await.unwrap_err();
+    let outside = storage
+        .exists("abfss://other@account.dfs.core.windows.net/f")
+        .await
+        .unwrap_err();
+
+    assert!(
+        no_scheme
+            .to_string()
+            .contains("the path warehouse/ns/t/f has no scheme"),
+        "{no_scheme}"
+    );
+    assert!(
+        outside
+            .to_string()
+            .contains("could not address abfss://other@account.dfs.core.windows.net/f"),
+        "{outside}"
+    );
+}
+
+#[tokio::test]
 async fn a_storage_restored_from_its_serialized_form_refuses_every_request() {
-    let factory = AdlsStorageFactory {
-        location: LOCATION.into(),
-        credentials: Some(credentials()),
+    let factory = ObjectStorageFactory {
+        storage: memory_storage(),
     };
     let serialized = serde_json::to_string(&factory).unwrap();
-    let restored: AdlsStorageFactory = serde_json::from_str(&serialized).unwrap();
+    let restored: ObjectStorageFactory = serde_json::from_str(&serialized).unwrap();
     let storage = restored.build(&StorageConfig::new()).unwrap();
 
-    let refused = storage
-        .exists(&format!("{LOCATION}/f"))
-        .await
-        .unwrap_err()
-        .to_string();
+    let refused = storage.exists(&at("f")).await.unwrap_err().to_string();
 
-    assert!(!serialized.contains("SAS_SIGNATURE_SECRET"), "{serialized}");
     assert!(
         refused.contains("has no credentials and sends no request"),
         "{refused}"
     );
-}
-
-#[test]
-fn debug_shows_the_container_and_no_credential() {
-    let factory = AdlsStorageFactory {
-        location: LOCATION.into(),
-        credentials: Some(credentials()),
-    };
-
-    let shown = format!("{factory:?} {:?}", storage());
-
-    assert!(shown.contains(LOCATION), "{shown}");
-    assert!(!shown.contains("SAS_SIGNATURE_SECRET"), "{shown}");
-}
-
-/// The storage of [`LOCATION`]'s container over an in-memory store.
-fn memory_storage() -> AdlsStorage {
-    AdlsStorage {
-        scheme: "abfss".into(),
-        authority: "container@account.dfs.core.windows.net".into(),
-        store: Some(Arc::new(InMemory::new())),
-    }
-}
-
-fn at(name: &str) -> String {
-    format!("{LOCATION}/{name}")
 }
 
 #[tokio::test]
@@ -129,6 +106,7 @@ async fn a_written_file_reads_back_whole_and_by_range() {
         storage.new_input(&path).unwrap().read().await.unwrap(),
         "hello world"
     );
+    assert!(format!("{storage:?}").contains(ROOT));
 }
 
 #[tokio::test]
@@ -151,7 +129,7 @@ async fn a_missing_file_does_not_exist_reads_fail_naming_it_and_its_delete_succe
     ];
     for (refused, action) in refused.iter().zip(["look up", "read", "read"]) {
         assert!(
-            refused.contains(&format!("could not {action} {path} on ADLS")),
+            refused.contains(&format!("could not {action} {path}")),
             "{refused}"
         );
     }
@@ -178,7 +156,7 @@ async fn a_writer_uploads_its_parts_as_one_file_of_their_total_size_and_then_ref
         assert!(
             refused
                 .to_string()
-                .contains(&format!("the ADLS file {path} is already closed")),
+                .contains(&format!("the file {path} is already closed")),
             "{refused}"
         );
     }

@@ -1,14 +1,14 @@
 //! Redaction and the `aws_sts_endpoint` consent rule wrap the official `aws-sdk-sts` client.
 
+use crate::ConnectionCreds;
+use crate::aws_credential::{AwsCredential, aws_lease};
 use crate::aws_error::{SdkFailure, sdk_failure};
 use crate::creds::non_empty;
 use crate::expiring::{ExpiringCredential, Lease, system_clock};
 use crate::redaction::redact_error_text;
-use crate::{ConnectionCreds, aws_credential::aws_lease};
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region, timeout::TimeoutConfig};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
 use exasol_udf_sdk::error::UdfError;
-use iceberg_storage_opendal::AwsCredential;
 use std::sync::Arc;
 use std::time::Duration;
 

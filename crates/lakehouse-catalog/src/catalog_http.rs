@@ -108,7 +108,7 @@ impl CatalogHttp {
 
     /// Panics where `reqwest::Client::new` panics: when the TLS backend cannot start.
     pub(crate) fn with_policy(policy: RetryPolicy) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::dns::http_client_builder()
             .connect_timeout(policy.connect_timeout)
             .read_timeout(policy.read_timeout)
             .build()
