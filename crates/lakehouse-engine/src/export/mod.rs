@@ -17,13 +17,12 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::ExportSpec;
 use exasol_udf_sdk::value::ColumnInfo;
 use iceberg::metadata_columns::is_metadata_column_name;
-use lakehouse_catalog_write::CommitTag;
-use options::{ExportOptions, WriterLayout, check_table_name};
+use options::{ExportOptions, WriterLayout};
 use partition_by::{PARTITION_BY, PartitionField};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use serde::Deserialize;
-use target::{ExportConnection, ExportSink, ExportTarget, TableMode, read_connection};
+use serde::{Deserialize, Serialize};
+use target::{ExportConnection, ExportSink, WriterIdentity, read_connection};
 use tokio::runtime::Runtime;
 
 /// The script name the installer creates and the writer SELECT calls.
@@ -32,14 +31,10 @@ pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
 /// Answers `generate_sql_for_export_spec` with the writer SELECT, which holds no CONNECTION value.
 /// Before any row is read, it checks the statement and CONNECTION, and whether the table exists.
 pub fn generate_export_sql(ctx: &mut dyn UdfContext, json: &str) -> Result<String, UdfError> {
-    let ExportPlan {
-        connection,
-        mut spec,
-        select,
-    } = plan_export(ctx, json)?;
-    let target = iceberg_rest::target(connection, &spec.table)?;
-    spec.set_mode(export_runtime()?.block_on(target.prepare())?)?;
-    Ok(select.render(&spec.render()))
+    let plan = plan_export(ctx, json)?;
+    let target = target::of(plan.connection.clone(), &plan.table)?;
+    let spec = plan.writer_spec(export_runtime()?.block_on(target.prepare())?)?;
+    Ok(plan.select.render(&spec.render()))
 }
 
 /// Runs one writer over its SET group and returns its row count. It reads the CONNECTION again,
@@ -52,22 +47,62 @@ pub fn run_writer(ctx: &mut dyn UdfContext) -> Result<i64, UdfError> {
     }
     let plan = plan_writer(ctx)?;
     let runtime = export_runtime()?;
-    let target = iceberg_rest::target(plan.connection, &plan.spec.table)?;
-    let tag = CommitTag {
+    let target = target::of(plan.connection, &plan.spec.table)?;
+    let writer = WriterIdentity {
         export_id: plan.spec.export_id.clone(),
         writer_id: new_writer_id(),
     };
     let budget = fanout::buffer_budget(ctx.memory_limit());
-    let mut sink = runtime.block_on(plan.table.open(target.as_ref(), &tag, budget))?;
+    let partition_by = &plan.spec.partition_by;
+    let opened = match (&plan.schema, plan.spec.mode) {
+        (Some(schema), WriterMode::CreateWithData) => {
+            target.create_with_data(schema, partition_by, &writer, budget)
+        }
+        (Some(schema), _) => target.create(schema, partition_by, &writer, budget),
+        (None, _) => target.append(&writer, budget),
+    };
+    let mut sink = runtime.block_on(opened)?;
     write_rows(ctx, &runtime, sink.as_mut(), &plan.source)
 }
 
 /// What the hook decides before its first network call.
 struct ExportPlan {
     connection: ExportConnection,
-    /// The writer spec, complete once the catalog check sets `append`.
-    spec: WriterSpec,
+    connection_name: String,
+    table: String,
+    export_id: String,
+    columns: Vec<String>,
+    allow_http: bool,
+    partition_by: Vec<PartitionField>,
     select: WriterSelect,
+}
+
+impl ExportPlan {
+    /// The writer spec once the catalog check found whether the table exists, refusing
+    /// `PARTITION_BY` for a table that exists.
+    fn writer_spec(&self, table_exists: bool) -> Result<WriterSpec, UdfError> {
+        let mode = match (table_exists, self.select.writers) {
+            (true, _) if !self.partition_by.is_empty() => {
+                return Err(refusal(format_args!(
+                    "table {} exists, and {PARTITION_BY} applies only to a table the export \
+                     creates; remove {PARTITION_BY} to append to the table",
+                    self.table
+                )));
+            }
+            (true, _) => WriterMode::Append,
+            (false, WriterLayout::SingleCommit) => WriterMode::CreateWithData,
+            (false, WriterLayout::PerNode(_)) => WriterMode::Create,
+        };
+        Ok(WriterSpec {
+            connection: self.connection_name.clone(),
+            table: self.table.clone(),
+            export_id: self.export_id.clone(),
+            columns: self.columns.clone(),
+            mode,
+            allow_http: self.allow_http,
+            partition_by: self.partition_by.clone(),
+        })
+    }
 }
 
 fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfError> {
@@ -79,16 +114,6 @@ fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfEr
         None => Vec::new(),
     };
     let connection = read_connection(ctx, &options.connection_name, options.allow_http)?;
-    let writer_spec = WriterSpec {
-        connection: options.connection_name,
-        table: options.table_name,
-        export_id: new_export_id(),
-        columns,
-        single_commit: options.writers == WriterLayout::SingleCommit,
-        allow_http: options.allow_http,
-        append: false,
-        partition_by,
-    };
     let select = WriterSelect {
         script_schema: ctx.script_schema(),
         source_columns: spec.source_column_names,
@@ -97,7 +122,12 @@ fn plan_export(ctx: &mut dyn UdfContext, json: &str) -> Result<ExportPlan, UdfEr
     };
     Ok(ExportPlan {
         connection,
-        spec: writer_spec,
+        connection_name: options.connection_name,
+        table: options.table_name,
+        export_id: new_export_id(),
+        columns,
+        allow_http: options.allow_http,
+        partition_by,
         select,
     })
 }
@@ -108,40 +138,8 @@ struct WriterPlan {
     spec: WriterSpec,
     connection: ExportConnection,
     source: SourceColumns,
-    table: WriterTable,
-}
-
-/// The table a writer opens: a new one of the source's schema and partition fields, or the one
-/// the hook found.
-enum WriterTable {
-    New {
-        schema: Schema,
-        partition_by: Vec<PartitionField>,
-        single_commit: bool,
-    },
-    Existing,
-}
-
-impl WriterTable {
-    async fn open(
-        &self,
-        target: &dyn ExportTarget,
-        tag: &CommitTag,
-        budget: usize,
-    ) -> Result<Box<dyn ExportSink>, UdfError> {
-        match self {
-            Self::New {
-                schema,
-                partition_by,
-                single_commit,
-            } => {
-                target
-                    .open_new_table(schema, partition_by, tag, *single_commit, budget)
-                    .await
-            }
-            Self::Existing => target.open_existing_table(tag, budget).await,
-        }
-    }
+    /// The schema of the table a create mode creates, `None` for an append.
+    schema: Option<Schema>,
 }
 
 fn plan_writer(ctx: &dyn UdfContext) -> Result<WriterPlan, UdfError> {
@@ -152,23 +150,32 @@ fn plan_writer(ctx: &dyn UdfContext) -> Result<WriterPlan, UdfError> {
         columns: source_columns(ctx, spec.columns.len())?,
     };
     // An existing table's columns, not the source's, decide what the writer accepts.
-    let table = if spec.append {
-        WriterTable::Existing
-    } else {
-        let schema = arrow_schema(&source.names, &source.columns)?;
-        partition_by::check_types(&spec.partition_by, &source)?;
-        WriterTable::New {
-            schema,
-            partition_by: spec.partition_by.clone(),
-            single_commit: spec.single_commit,
+    let schema = match spec.mode {
+        WriterMode::Append => None,
+        WriterMode::Create | WriterMode::CreateWithData => {
+            let schema = arrow_schema(&source.names, &source.columns)?;
+            partition_by::check_types(&spec.partition_by, &source)?;
+            Some(schema)
         }
     };
     Ok(WriterPlan {
         spec,
         connection,
         source,
-        table,
+        schema,
     })
+}
+
+/// How the writers open the table, decided by the hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WriterMode {
+    /// Each writer creates the table, or takes the one another writer of the export created.
+    Create,
+    /// The one writer of `SINGLE_COMMIT` stages the table, which appears only with its data.
+    CreateWithData,
+    /// The table existed when the hook checked it, so the writers append to it.
+    Append,
 }
 
 /// The first argument of every writer call. A direct `SELECT` call can forge it, so the
@@ -182,10 +189,8 @@ struct WriterSpec {
     export_id: String,
     /// The source column names, in input order after the writer spec.
     columns: Vec<String>,
-    single_commit: bool,
+    mode: WriterMode,
     allow_http: bool,
-    /// Whether the table existed when the hook checked it, so the writers append to it.
-    append: bool,
     /// The partition fields of a table the writers create, empty for an unpartitioned one.
     partition_by: Vec<PartitionField>,
 }
@@ -197,25 +202,11 @@ impl WriterSpec {
             "table": self.table,
             "export_id": self.export_id,
             "columns": self.columns,
-            "single_commit": self.single_commit,
+            "mode": self.mode,
             "allow_http": self.allow_http,
-            "append": self.append,
             "partition_by": self.partition_by,
         })
         .to_string()
-    }
-
-    /// Records whether the writers append, refusing `PARTITION_BY` for a table that exists.
-    fn set_mode(&mut self, mode: TableMode) -> Result<(), UdfError> {
-        self.append = mode == TableMode::Append;
-        if self.append && !self.partition_by.is_empty() {
-            return Err(refusal(format_args!(
-                "table {} exists, and {PARTITION_BY} applies only to a table the export creates; \
-                 remove {PARTITION_BY} to append to the table",
-                self.table
-            )));
-        }
-        Ok(())
     }
 
     fn read(ctx: &dyn UdfContext) -> Result<Self, UdfError> {
@@ -224,7 +215,7 @@ impl WriterSpec {
             .map_err(|_| not_an_export_target())?
             .ok_or_else(not_an_export_target)?;
         let spec: Self = serde_json::from_str(text).map_err(|_| not_an_export_target())?;
-        check_table_name(Some(&spec.table))?;
+        target::check_table_name(&spec.table)?;
         Ok(spec)
     }
 }

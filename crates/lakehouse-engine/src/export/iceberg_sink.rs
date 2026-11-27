@@ -11,7 +11,6 @@ use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::compression::CompressionCodec;
 use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, Schema, SchemaRef, TableProperties};
-use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -20,32 +19,9 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use lakehouse_catalog::{error_chain, redact_error_text};
-use lakehouse_catalog_write::{CommitTag, StagedTable, TableWriteSession, WriteTable};
+use lakehouse_catalog_write::{CommitTag, TableWriteSession, WriteTable};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-
-/// The table a writer's files go into: one the catalog lists, created or loaded, or one staged for
-/// `SINGLE_COMMIT`.
-pub(super) enum OpenedTable {
-    Listed(WriteTable),
-    Staged(StagedTable),
-}
-
-impl OpenedTable {
-    fn table(&self) -> &Table {
-        match self {
-            Self::Listed(listed) => listed.table(),
-            Self::Staged(staged) => staged.table(),
-        }
-    }
-
-    fn secret_values(&self) -> Vec<String> {
-        match self {
-            Self::Listed(listed) => listed.secret_values(),
-            Self::Staged(staged) => staged.secret_values(),
-        }
-    }
-}
 
 type DataWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, RecordedLocations, DefaultFileNameGenerator>;
@@ -64,7 +40,7 @@ enum Rows {
 
 pub(super) struct IcebergSink {
     session: TableWriteSession,
-    opened: OpenedTable,
+    opened: WriteTable,
     tag: CommitTag,
     columns: TableColumns,
     rows: Rows,
@@ -82,7 +58,7 @@ impl IcebergSink {
     /// partition of a partitioned table stay within `budget` bytes of Arrow memory.
     pub(super) async fn open(
         session: TableWriteSession,
-        opened: OpenedTable,
+        opened: WriteTable,
         tag: CommitTag,
         budget: usize,
     ) -> Result<Self, UdfError> {
@@ -172,14 +148,7 @@ impl IcebergSink {
     /// Appends to the table reloaded with every writer's commits so far, under the schema and
     /// partition spec the files were written with, or creates the staged table with the files.
     async fn commit(&mut self, files: Vec<DataFile>) -> Result<(), UdfError> {
-        let committed = match &self.opened {
-            OpenedTable::Listed(listed) => {
-                self.session.append_files(listed, files, &self.tag).await
-            }
-            OpenedTable::Staged(staged) => {
-                self.session.commit_staged(staged, files, &self.tag).await
-            }
-        };
+        let committed = self.session.commit(&self.opened, files, &self.tag).await;
         let Err(error) = committed else {
             return Ok(());
         };

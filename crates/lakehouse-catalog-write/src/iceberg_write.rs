@@ -2,28 +2,25 @@
 //! writer's data files exactly once. A commit whose answer was lost is checked by reloading the
 //! table and looking for the writer's tag before it is sent again (decision [2]).
 
-use crate::adls_storage::adls_file_io;
 use crate::retry::{
     DEFAULT_RETRIES, EXPORT_RETRIES, NUM_RETRIES_PROPERTY, Retries, Waits, append_retries,
     commit_retries,
 };
 use crate::snapshot_capture::{CapturedCommit, capture_fast_append, creation_updates};
-use crate::vended_refresh::{AdlsCredentials, StorageCredentials, TableCredentials, VendedTable};
+use crate::unappendable::{Refusal, refuse_unappendable};
+use crate::vended_refresh::TableCredentials;
+use crate::write_storage::{WriteStorage, storage_of};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::io::FileIO;
-use iceberg::spec::{
-    DataFile, FormatVersion, Schema, TableMetadata, TableProperties, UnboundPartitionSpec,
-};
+use iceberg::spec::{DataFile, Schema, TableMetadata, TableProperties, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, Runtime, TableIdent, TableRequirement};
 use iceberg_catalog_rest::{
     CommitTableRequest, CreateNamespaceRequest, CreateTableRequest, LoadTableResult,
 };
 use lakehouse_catalog::{
-    AssumedRole, CatalogResponse, CatalogSendError, CatalogSession, ConnectionCreds, EpochClock,
-    RepeatSafety, StaticStoreAddress, StorageBackend, StorageCreds, VendedBackendKind,
-    VendedCredentialSet, classify_vended_scheme, namespace_tables_path, resolve_vended_storage,
-    scheme_of, system_clock, table_ident_path,
+    CatalogResponse, CatalogSendError, CatalogSession, EpochClock, RepeatSafety,
+    namespace_tables_path, system_clock, table_ident_path,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -32,38 +29,6 @@ use std::sync::Arc;
 
 const EXPORT_ID_PROPERTY: &str = "lakehouse.export-id";
 const EXPORT_WRITER_PROPERTY: &str = "lakehouse.export-writer";
-
-/// Where an export table's storage credentials come from. Every kind reaches the table's FileIO
-/// through one credential source, which renews the credentials its own way.
-pub enum WriteStorage {
-    /// The CONNECTION's own storage credentials, S3 keys or an Azure account key or SAS, which
-    /// do not expire.
-    Static(StorageBackend),
-    /// The credentials of an IAM role the CONNECTION names, assumed again before they expire.
-    /// `backend` carries the store's address.
-    AssumedRole {
-        backend: StorageBackend,
-        role: AssumedRole,
-    },
-    /// Credentials the catalog vends per table, renewed before they expire. The CONNECTION
-    /// contributes at most the store's address.
-    Vended(StaticStoreAddress),
-}
-
-impl WriteStorage {
-    /// Vended per table when the CONNECTION sets `use_vended_credentials`, else the credentials of
-    /// `role` when the CONNECTION names one, else its own keys.
-    pub fn of(creds: &ConnectionCreds, allow_http: bool, role: Option<AssumedRole>) -> Self {
-        if creds.use_vended_credentials {
-            return Self::Vended(StaticStoreAddress::from(creds));
-        }
-        let backend = StorageCreds::from(creds).backend(allow_http);
-        match role {
-            Some(role) => Self::AssumedRole { backend, role },
-            None => Self::Static(backend),
-        }
-    }
-}
 
 /// Identifies one writer's commit: the export statement's ID and the writer's own ID. The snapshot
 /// a writer commits carries both in its summary, so a writer that lost a commit's answer can tell
@@ -93,16 +58,15 @@ impl CommitTag {
     }
 }
 
-/// A table the catalog holds, opened for a writer: its FileIO signs with the table's storage
-/// credentials, which renew themselves when the catalog vends them.
+/// A table opened for a writer: one the catalog holds, or one staged for `SINGLE_COMMIT`, which
+/// stays invisible in the catalog until [`TableWriteSession::commit`] creates it together with its
+/// first snapshot. Its FileIO signs with the table's storage credentials, which renew themselves
+/// when the catalog vends them.
 pub struct WriteTable {
     table: Table,
     credentials: TableCredentials,
+    staged: bool,
 }
-
-/// A table staged for `SINGLE_COMMIT`: invisible in the catalog until [`TableWriteSession::
-/// commit_staged`] creates it together with its first snapshot.
-pub struct StagedTable(WriteTable);
 
 impl WriteTable {
     /// The iceberg table, whose FileIO signs with the table's storage credentials.
@@ -114,18 +78,6 @@ impl WriteTable {
     /// redaction.
     pub fn secret_values(&self) -> Vec<String> {
         self.credentials.secret_values()
-    }
-}
-
-impl StagedTable {
-    /// The staged table, which the catalog does not list until `commit_staged` creates it.
-    pub fn table(&self) -> &Table {
-        self.0.table()
-    }
-
-    /// See [`WriteTable::secret_values`].
-    pub fn secret_values(&self) -> Vec<String> {
-        self.0.secret_values()
     }
 }
 
@@ -309,7 +261,7 @@ impl TableWriteSession {
         schema: Schema,
         partition_spec: Option<UnboundPartitionSpec>,
         export_id: &str,
-    ) -> Result<StagedTable, UdfError> {
+    ) -> Result<WriteTable, UdfError> {
         let mut request = creation_request(table, schema, partition_spec, export_id);
         request.stage_create = Some(true);
         let body = encoded(table, &request)?;
@@ -329,32 +281,35 @@ impl TableWriteSession {
             | Sent::Unsent(cause) => return Err(staged_creation_error(table, cause)),
         };
         let staged = self.read_table(table, &answer)?;
-        if self.session.table_exists(table).await? {
-            return Err(self.ignored_staging(table, export_id).await);
+        match self.session.load_table_if_exists(table).await? {
+            None => Ok(WriteTable {
+                staged: true,
+                ..self.open(table, staged)?
+            }),
+            Some(created) => Err(self.ignored_staging(table, &created, export_id).await),
         }
-        Ok(StagedTable(self.open(table, staged)?))
     }
 
     /// The error for a catalog that ignored `stage-create`. A table this export created is dropped,
     /// so the failed export leaves no empty table behind; else the error says to drop it.
-    async fn ignored_staging(&self, table: &TableIdent, export_id: &str) -> UdfError {
+    async fn ignored_staging(
+        &self,
+        table: &TableIdent,
+        created: &LoadTableResult,
+        export_id: &str,
+    ) -> UdfError {
         let ignored = format!(
             "the catalog {} ignored staged creation (stage-create): table {} became visible \
              before its commit, so SINGLE_COMMIT cannot make it appear only with its data",
             self.catalog_uri(),
             table
         );
-        let created_by_export = match self.session.load_table_with_all_snapshots(table).await {
-            Ok(created) => {
-                created
-                    .metadata
-                    .properties()
-                    .get(EXPORT_ID_PROPERTY)
-                    .map(String::as_str)
-                    == Some(export_id)
-            }
-            Err(_) => false,
-        };
+        let created_by_export = created
+            .metadata
+            .properties()
+            .get(EXPORT_ID_PROPERTY)
+            .map(String::as_str)
+            == Some(export_id);
         let dropped = created_by_export && self.session.drop_table(table).await.is_ok();
         let outcome = if dropped {
             "the table was dropped again"
@@ -364,6 +319,22 @@ impl TableWriteSession {
         UdfError::User(format!("{ignored}; {outcome}"))
     }
 
+    /// Commits `files`, written under `written`, in one snapshot tagged with `tag`: appends them
+    /// to a table the catalog holds, or creates a staged table with them.
+    pub async fn commit(
+        &self,
+        written: &WriteTable,
+        files: Vec<DataFile>,
+        tag: &CommitTag,
+    ) -> Result<(), CommitError> {
+        // Boxed: one more unboxed level overflows the compiler's query depth on the release build.
+        if written.staged {
+            Box::pin(self.commit_staged(written, files, tag)).await
+        } else {
+            Box::pin(self.append_files(written, files, tag)).await
+        }
+    }
+
     /// Adds `files`, written under `written`, to the table in one snapshot tagged with `tag`. The
     /// table is reloaded first, so the snapshot holds every commit of other writers so far. A
     /// conflict (HTTP 409), a busy catalog (429, 503), a request that never reached the catalog,
@@ -371,7 +342,7 @@ impl TableWriteSession {
     /// with the tag means the commit landed, else the snapshot is rebuilt on the reloaded metadata
     /// and sent again, up to the table's `commit.retry.num-retries` times, and at least 20. Every
     /// other answer fails at once.
-    pub async fn append_files(
+    async fn append_files(
         &self,
         written: &WriteTable,
         files: Vec<DataFile>,
@@ -434,13 +405,13 @@ impl TableWriteSession {
     /// conflict, a busy catalog, a request that never reached the catalog, or a lost answer, a
     /// table that holds the tag means the commit landed, a table without it was created by another
     /// statement, and no table means the commit is sent again.
-    pub async fn commit_staged(
+    async fn commit_staged(
         &self,
-        staged: &StagedTable,
+        staged: &WriteTable,
         files: Vec<DataFile>,
         tag: &CommitTag,
     ) -> Result<(), CommitError> {
-        let table = staged.table();
+        let table = &staged.table;
         let ident = table.identifier();
         let body = staged_commit(table, files, tag)
             .await
@@ -533,10 +504,9 @@ impl TableWriteSession {
         table: &TableIdent,
         export_id: &str,
     ) -> Result<Option<WriteTable>, UdfError> {
-        if !self.session.table_exists(table).await? {
+        let Some(existing) = self.session.load_table_if_exists(table).await? else {
             return Ok(None);
-        }
-        let existing = self.session.load_table_with_all_snapshots(table).await?;
+        };
         if existing
             .metadata
             .properties()
@@ -556,10 +526,9 @@ impl TableWriteSession {
         table: &TableIdent,
         tag: &CommitTag,
     ) -> Result<StagedOutcome, UdfError> {
-        if !self.session.table_exists(table).await? {
+        let Some(created) = self.session.load_table_if_exists(table).await? else {
             return Ok(StagedOutcome::Absent);
-        }
-        let created = self.session.load_table_with_all_snapshots(table).await?;
+        };
         Ok(if tag.is_on(&created.metadata) {
             StagedOutcome::Created
         } else {
@@ -575,9 +544,10 @@ impl TableWriteSession {
         }
     }
 
+    /// Iceberg Java's `CommitErrorHandler` reads 500, 502, 503, and 504 as a commit of unknown
+    /// state, and the REST spec marks 500, 502, and 504 so.
     fn classify(&self, answer: CatalogResponse) -> Sent {
-        let outcome = classify(answer.status);
-        if outcome == Outcome::Applied {
+        if (200..=299).contains(&answer.status) {
             return Sent::Applied(answer.body);
         }
         let cause = format!(
@@ -586,11 +556,11 @@ impl TableWriteSession {
             answer.status,
             self.session.quote(&answer)
         );
-        match outcome {
-            Outcome::Applied | Outcome::Refused => Sent::Refused(cause),
-            Outcome::Conflict => Sent::Conflict(cause),
-            Outcome::Busy => Sent::Busy(cause),
-            Outcome::MayHaveApplied => Sent::NoAnswer(cause),
+        match answer.status {
+            409 => Sent::Conflict(cause),
+            429 => Sent::Busy(cause),
+            500 | 502 | 503 | 504 => Sent::NoAnswer(cause),
+            _ => Sent::Refused(cause),
         }
     }
 
@@ -609,117 +579,24 @@ impl TableWriteSession {
         })
     }
 
-    /// The table of a load, create, or stage answer, with a FileIO over its location. A location
-    /// the storage cannot address is refused before any storage is configured.
+    /// The table of a load, create, or stage answer, with a FileIO over its location.
     fn open(&self, table: &TableIdent, answer: LoadTableResult) -> Result<WriteTable, UdfError> {
-        let location = answer.metadata.location().to_string();
-        let vended_kind = refuse_unaddressable(&self.storage, self.allow_http, table, &location)?;
-        let (file_io, credentials) = self.storage_of(table, &answer, location, vended_kind)?;
+        let (file_io, credentials) = storage_of(
+            &self.session,
+            &self.storage,
+            self.allow_http,
+            &self.clock,
+            table,
+            &answer,
+        )?;
         let table = iceberg_table(table, answer, file_io)
             .map_err(|error| UdfError::User(format!("could not open table {}: {error}", table)))?;
-        Ok(WriteTable { table, credentials })
+        Ok(WriteTable {
+            table,
+            credentials,
+            staged: false,
+        })
     }
-
-    /// The FileIO of the table at `location` and the credential source it signs with: the
-    /// CONNECTION's own credentials, the credentials of its role, or the credentials `answer`
-    /// vends, of the backend `vended_kind` selects. Each is seeded into a source that renews it its
-    /// own way.
-    fn storage_of(
-        &self,
-        table: &TableIdent,
-        answer: &LoadTableResult,
-        location: String,
-        vended_kind: Option<VendedBackendKind>,
-    ) -> Result<(FileIO, TableCredentials), UdfError> {
-        match &self.storage {
-            WriteStorage::Static(StorageBackend::Adls { cred, .. }) => {
-                Ok(adls_storage(&location, AdlsCredentials::connection(cred)?))
-            }
-            WriteStorage::Static(backend @ StorageBackend::S3(props)) => {
-                let keys = StorageCredentials::keys(
-                    &props.access_key,
-                    &props.secret_key,
-                    props.session_token.as_deref(),
-                );
-                s3_storage(backend, keys)
-            }
-            WriteStorage::AssumedRole { backend, role } => {
-                s3_storage(backend, StorageCredentials::role(role.clone()))
-            }
-            WriteStorage::Vended(address) => {
-                let vended = VendedTable {
-                    session: self.session.clone(),
-                    table: table.clone(),
-                    location: location.clone(),
-                    allow_http: self.allow_http,
-                };
-                let set = VendedCredentialSet::of(answer, &location);
-                if let Some(VendedBackendKind::Adls) = vended_kind {
-                    let seed = set.adls_sas(&location)?;
-                    let credentials = AdlsCredentials::vended(vended, seed, self.clock.clone())?;
-                    return Ok(adls_storage(&location, credentials));
-                }
-                let seed = set.s3(&location)?;
-                let credentials = StorageCredentials::vended(vended, seed, self.clock.clone())?;
-                let backend = resolve_vended_storage(answer, &location, self.allow_http, address)?;
-                s3_storage(&backend, credentials)
-            }
-        }
-    }
-}
-
-/// Refuses a location the storage cannot address: the CONNECTION's S3 storage, by keys or a role,
-/// addresses `s3` and `s3a`, its Azure storage `abfss`, and vended storage all four schemes,
-/// `abfs` only under the export's `ALLOW_HTTP`. Returns the backend a vended location selects.
-fn refuse_unaddressable(
-    storage: &WriteStorage,
-    allow_http: bool,
-    table: &TableIdent,
-    location: &str,
-) -> Result<Option<VendedBackendKind>, UdfError> {
-    let scheme = scheme_of(location);
-    let storage = match storage {
-        WriteStorage::Static(backend) | WriteStorage::AssumedRole { backend, .. } => {
-            if backend.addresses_scheme(&scheme) {
-                return Ok(None);
-            }
-            match backend {
-                StorageBackend::S3(_) => "the CONNECTION's S3 storage",
-                StorageBackend::Adls { .. } => "the CONNECTION's Azure storage",
-            }
-        }
-        WriteStorage::Vended(_) => match classify_vended_scheme(&scheme) {
-            // object_store writes `abfs` over HTTPS too; ALLOW_HTTP acknowledges the upgrade, as
-            // the virtual schema's property does.
-            Some(VendedBackendKind::Adls) if scheme == "abfs" && !allow_http => {
-                return Err(UdfError::User(format!(
-                    "table {table} has the location {location}, whose plaintext scheme abfs needs \
-                     the export option ALLOW_HTTP = 'true', which acknowledges that the export \
-                     writes the location over HTTPS"
-                )));
-            }
-            Some(kind) => return Ok(Some(kind)),
-            None => "vended storage",
-        },
-    };
-    Err(UdfError::User(format!(
-        "table {table} has the location {location}, whose scheme {scheme} {storage} cannot address"
-    )))
-}
-
-fn s3_storage(
-    backend: &StorageBackend,
-    credentials: StorageCredentials,
-) -> Result<(FileIO, TableCredentials), UdfError> {
-    let file_io = backend.file_io_with_credential_loader(credentials.loader())?;
-    Ok((file_io, TableCredentials::S3(credentials)))
-}
-
-fn adls_storage(location: &str, credentials: AdlsCredentials) -> (FileIO, TableCredentials) {
-    (
-        adls_file_io(location, credentials.clone()),
-        TableCredentials::Adls(credentials),
-    )
 }
 
 /// What a writer's data files depend on: the field IDs of the current schema, and the partition
@@ -751,18 +628,19 @@ impl TableShape {
 }
 
 /// Why the writer's files cannot go onto `reloaded`: a schema or partition spec other than the one
-/// it checked, or format version 3 or later, whose row lineage the export does not maintain. No
-/// Iceberg REST requirement asserts the format version, so only a reload can see an upgrade.
+/// it checked, or a table the export cannot append to. No Iceberg REST requirement asserts the
+/// format version, so only a reload can see an upgrade.
 fn refuse_reloaded(checked: TableShape, reloaded: &TableMetadata) -> Result<(), String> {
     refuse_changed(checked, TableShape::of(reloaded))?;
-    let version = reloaded.format_version();
-    if version > FormatVersion::V2 {
-        return Err(format!(
-            "it was upgraded to format version {} after the writer checked the table",
-            version as u8
-        ));
-    }
-    Ok(())
+    refuse_unappendable(reloaded).map_err(|refused| match refused {
+        Refusal::FormatVersion(version) => format!(
+            "it was upgraded to format version {version} after the writer checked the table"
+        ),
+        Refusal::FieldsNamedLikeColumns(fields) => format!(
+            "it keeps the dropped partition field {} under the name of a column",
+            fields.join(", ")
+        ),
+    })
 }
 
 /// What changed in `reloaded` since the writer checked `checked`, if anything that its data files
@@ -788,28 +666,6 @@ fn refuse_changed(checked: TableShape, reloaded: TableShape) -> Result<(), Strin
         "{} after the writer checked the table",
         changes.join(" and ")
     ))
-}
-
-/// What an HTTP status says about a state-changing request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
-    Applied,
-    Conflict,
-    Busy,
-    MayHaveApplied,
-    Refused,
-}
-
-/// Iceberg Java's `CommitErrorHandler` reads 500, 502, 503, and 504 as a commit of unknown state,
-/// and the REST spec marks 500, 502, and 504 so.
-fn classify(status: u16) -> Outcome {
-    match status {
-        200..=299 => Outcome::Applied,
-        409 => Outcome::Conflict,
-        429 => Outcome::Busy,
-        500 | 502 | 503 | 504 => Outcome::MayHaveApplied,
-        _ => Outcome::Refused,
-    }
 }
 
 const MIB: usize = 1024 * 1024;

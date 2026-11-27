@@ -634,29 +634,6 @@ fn refusal_of(type_names: &[&str]) -> String {
 }
 
 #[test]
-fn each_writable_type_maps_to_its_arrow_type() {
-    let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
-    let cases = [
-        ("DECIMAL(9,0)", DataType::Decimal128(9, 0)),
-        ("DECIMAL(18,0)", DataType::Decimal128(18, 0)),
-        ("DECIMAL(36,6)", DataType::Decimal128(36, 6)),
-        ("DOUBLE", DataType::Float64),
-        ("BOOLEAN", DataType::Boolean),
-        ("VARCHAR(20) UTF8", DataType::Utf8),
-        ("VARCHAR(10) ASCII", DataType::Utf8),
-        ("CHAR(5) UTF8", DataType::Utf8),
-        ("DATE", DataType::Date32),
-        ("TIMESTAMP(0)", micros.clone()),
-        ("TIMESTAMP(3)", micros.clone()),
-        ("TIMESTAMP(6)", micros),
-    ];
-    for (type_name, expected) in cases {
-        let schema = schema_of(&[type_name]).unwrap_or_else(|e| panic!("{type_name}: {e}"));
-        assert_eq!(schema.field(0).data_type(), &expected, "{type_name}");
-    }
-}
-
-#[test]
 fn fields_keep_the_writer_spec_names_in_input_order_and_are_nullable() {
     let schema = schema_of(&["DATE", "DOUBLE", "BOOLEAN"]).expect("writable types");
 

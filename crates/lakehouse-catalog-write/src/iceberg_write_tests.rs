@@ -3,34 +3,24 @@ use crate::retry::Waits;
 use crate::test_support::{
     COMMIT_CONFLICT, CREATE_CONFLICT, LOAD_TABLE_NO_SNAPSHOTS, LOAD_TABLE_TAGGED, PREFIX_CONFIG,
     RECORDED_PLACEHOLDERS, STAGE_TABLE, TAGGED_EXPORT_ID, TAGGED_WRITER_ID, assert_free_of,
-    catalog, data_file, ident, memory_table, requests_starting, session, with_short_commit_waits,
+    catalog, data_file, ident, memory_table, requests_starting, session, static_storage,
+    with_short_commit_waits,
 };
+use crate::vended_refresh::StorageCredentials;
 use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
+use lakehouse_catalog::StaticStoreAddress;
 use lakehouse_catalog::exported_test_support::{request_body, spawn_server_with_headers};
-use lakehouse_catalog::{AdlsCred, StorageProps};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const STATIC_SECRETS: [&str; 2] = ["STATIC_ACCESS_KEY", "STATIC_SECRET_KEY"];
 const TABLES: &str = "POST /v1/p/namespaces/ns/tables ";
 const COMMIT_T: &str = "POST /v1/p/namespaces/ns/tables/t ";
 const LOAD_T: &str = "GET /v1/p/namespaces/ns/tables/t?snapshots=all ";
 const EXISTS_T: &str = "HEAD /v1/p/namespaces/ns/tables/t ";
 const COMMIT_STAGED: &str = "POST /v1/p/namespaces/ns/tables/staged ";
 const LOAD_STAGED: &str = "GET /v1/p/namespaces/ns/tables/staged?snapshots=all ";
-const EXISTS_STAGED: &str = "HEAD /v1/p/namespaces/ns/tables/staged ";
 const DROP_STAGED: &str = "DELETE /v1/p/namespaces/ns/tables/staged";
-
-fn static_storage() -> WriteStorage {
-    WriteStorage::Static(StorageBackend::S3(StorageProps {
-        endpoint: "https://storage.example".into(),
-        region: "us-east-1".into(),
-        access_key: STATIC_SECRETS[0].into(),
-        secret_key: STATIC_SECRETS[1].into(),
-        ..Default::default()
-    }))
-}
 
 async fn static_writes(uri: &str) -> TableWriteSession {
     TableWriteSession::new(session(uri, false).await, static_storage(), false)
@@ -70,19 +60,21 @@ fn load_table_with_retries(retries: u32) -> String {
 }
 
 /// A table of [`LOAD_TABLE_NO_SNAPSHOTS`] over in-memory storage. Its commit retries come from the
-/// table that `append_files` reloads.
+/// table that `commit` reloads.
 fn memory_write_table() -> WriteTable {
     WriteTable {
         table: memory_table(LOAD_TABLE_NO_SNAPSHOTS, &ident("ns", "t")),
         credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
+        staged: false,
     }
 }
 
-fn memory_staged_table() -> StagedTable {
-    StagedTable(WriteTable {
+fn memory_staged_table() -> WriteTable {
+    WriteTable {
         table: memory_table(STAGE_TABLE, &ident("ns", "staged")),
         credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
-    })
+        staged: true,
+    }
 }
 
 /// Answers each request line that starts with a key of `answers` with its value, and every
@@ -167,7 +159,6 @@ async fn a_conflicting_create_returns_the_table_only_when_this_export_created_it
         PREFIX_CONFIG,
         routes(vec![
             (TABLES, (409, CREATE_CONFLICT.into())),
-            (EXISTS_T, (200, String::new())),
             (LOAD_T, (200, LOAD_TABLE_NO_SNAPSHOTS.into())),
         ]),
     )
@@ -214,7 +205,7 @@ async fn a_create_without_an_answer_and_without_a_table_is_sent_again() {
         .unwrap();
 
     assert_eq!(requests_starting(&requests, TABLES).len(), 2);
-    assert_eq!(requests_starting(&requests, EXISTS_T).len(), 1);
+    assert_eq!(requests_starting(&requests, LOAD_T).len(), 1);
 }
 
 #[tokio::test]
@@ -360,120 +351,6 @@ async fn a_vended_plaintext_endpoint_needs_allow_http() {
     assert_eq!(secrets, RECORDED_PLACEHOLDERS[..3]);
 }
 
-fn azure_storage() -> WriteStorage {
-    WriteStorage::Static(StorageBackend::Adls {
-        account_name: "account".into(),
-        cred: AdlsCred::AccountKey("c2VjcmV0LWtleQ==".into()),
-    })
-}
-
-fn vended_storage() -> WriteStorage {
-    WriteStorage::Vended(StaticStoreAddress::default())
-}
-
-#[test]
-fn a_location_its_storage_cannot_address_is_refused_naming_the_table_and_the_scheme() {
-    let abfss = "abfss://warehouse@account.dfs.core.windows.net/ns/t";
-    let abfs = "abfs://warehouse@account.dfs.core.windows.net/ns/t";
-    let abfs_needs_allow_http = "plaintext scheme abfs needs the export option ALLOW_HTTP = \
-                                 'true', which acknowledges that the export writes the location \
-                                 over HTTPS";
-    // (case, storage, ALLOW_HTTP, location, the vended backend it selects or the refusal's tail)
-    type Case<'a> = (
-        &'a str,
-        WriteStorage,
-        bool,
-        &'a str,
-        Result<&'a str, &'a str>,
-    );
-    let cases: [Case; 10] = [
-        (
-            "static S3 on abfss",
-            static_storage(),
-            false,
-            abfss,
-            Err("scheme abfss the CONNECTION's S3 storage cannot address"),
-        ),
-        (
-            "static S3 on s3a",
-            static_storage(),
-            false,
-            "s3a://warehouse/ns/t",
-            Ok("none"),
-        ),
-        (
-            "static Azure on s3",
-            azure_storage(),
-            true,
-            "s3://warehouse/ns/t",
-            Err("scheme s3 the CONNECTION's Azure storage cannot address"),
-        ),
-        (
-            "static Azure on abfs",
-            azure_storage(),
-            true,
-            abfs,
-            Err("scheme abfs the CONNECTION's Azure storage cannot address"),
-        ),
-        (
-            "static Azure on abfss",
-            azure_storage(),
-            false,
-            abfss,
-            Ok("none"),
-        ),
-        (
-            "vended on gs",
-            vended_storage(),
-            true,
-            "gs://warehouse/ns/t",
-            Err("scheme gs vended storage cannot address"),
-        ),
-        (
-            "vended on abfs without ALLOW_HTTP",
-            vended_storage(),
-            false,
-            abfs,
-            Err(abfs_needs_allow_http),
-        ),
-        (
-            "vended on abfs with ALLOW_HTTP",
-            vended_storage(),
-            true,
-            abfs,
-            Ok("ADLS"),
-        ),
-        (
-            "vended on abfss",
-            vended_storage(),
-            false,
-            abfss,
-            Ok("ADLS"),
-        ),
-        (
-            "vended on s3a",
-            vended_storage(),
-            false,
-            "s3a://warehouse/ns/t",
-            Ok("S3"),
-        ),
-    ];
-
-    for (case, storage, allow_http, location, expected) in cases {
-        let checked = refuse_unaddressable(&storage, allow_http, &ident("ns", "t"), location)
-            .map(|kind| match kind {
-                None => "none",
-                Some(VendedBackendKind::S3) => "S3",
-                Some(VendedBackendKind::Adls) => "ADLS",
-            })
-            .map_err(|error| error.to_string());
-
-        let expected = expected
-            .map_err(|tail| format!("table ns.t has the location {location}, whose {tail}"));
-        assert_eq!(checked, expected, "{case}");
-    }
-}
-
 #[tokio::test]
 async fn a_refused_stage_fails_quoting_the_status_and_naming_the_catalog() {
     let (uri, _) = catalog(PREFIX_CONFIG, |_| {
@@ -534,7 +411,6 @@ async fn a_stage_answer_followed_by_a_table_this_export_created_drops_it() {
         PREFIX_CONFIG,
         routes(vec![
             (TABLES, (200, STAGE_TABLE.into())),
-            (EXISTS_STAGED, (204, String::new())),
             (LOAD_STAGED, (200, STAGE_TABLE.into())),
             (DROP_STAGED, (204, String::new())),
         ]),
@@ -566,7 +442,6 @@ async fn a_stage_answer_followed_by_a_table_it_cannot_drop_says_the_table_must_b
         PREFIX_CONFIG,
         routes(vec![
             (TABLES, (200, STAGE_TABLE.into())),
-            (EXISTS_STAGED, (204, String::new())),
             (LOAD_STAGED, (200, STAGE_TABLE.into())),
             (DROP_STAGED, (403, "{}".into())),
         ]),
@@ -593,7 +468,6 @@ async fn a_stage_answer_followed_by_another_exports_table_leaves_it_and_says_so(
         PREFIX_CONFIG,
         routes(vec![
             (TABLES, (200, STAGE_TABLE.into())),
-            (EXISTS_STAGED, (204, String::new())),
             (LOAD_STAGED, (200, STAGE_TABLE.into())),
         ]),
     )
@@ -712,26 +586,53 @@ fn a_stage_request_asks_for_staged_creation() {
     assert_eq!(sent["stage-create"], true);
 }
 
-#[test]
-fn a_status_maps_to_what_it_says_about_the_request() {
+#[tokio::test]
+async fn a_status_maps_to_what_it_says_about_the_request() {
+    let (uri, _) = catalog(PREFIX_CONFIG, |line| {
+        let status = line
+            .split("/s")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next());
+        (
+            status.map_or(404, |status| status.parse().unwrap()),
+            "{}".into(),
+        )
+    })
+    .await;
+    let writes = static_writes(&uri).await;
     let cases = [
-        (200, Outcome::Applied),
-        (204, Outcome::Applied),
-        (409, Outcome::Conflict),
-        (429, Outcome::Busy),
-        (500, Outcome::MayHaveApplied),
-        (502, Outcome::MayHaveApplied),
-        (503, Outcome::MayHaveApplied),
-        (504, Outcome::MayHaveApplied),
-        (400, Outcome::Refused),
-        (401, Outcome::Refused),
-        (403, Outcome::Refused),
-        (404, Outcome::Refused),
-        (501, Outcome::Refused),
+        (200, "Applied"),
+        (204, "Applied"),
+        (409, "Conflict"),
+        (429, "Busy"),
+        (500, "NoAnswer"),
+        (502, "NoAnswer"),
+        (503, "NoAnswer"),
+        (504, "NoAnswer"),
+        (400, "Refused"),
+        (401, "Refused"),
+        (403, "Refused"),
+        (404, "Refused"),
+        (501, "Refused"),
     ];
 
     for (status, expected) in cases {
-        assert_eq!(classify(status), expected, "HTTP {status}");
+        let sent = writes
+            .send(
+                &format!("s{status}"),
+                &serde_json::json!({}),
+                RepeatSafety::Unsafe,
+            )
+            .await;
+        let kind = match sent {
+            Sent::Applied(_) => "Applied",
+            Sent::Conflict(_) => "Conflict",
+            Sent::Busy(_) => "Busy",
+            Sent::NoAnswer(_) => "NoAnswer",
+            Sent::Refused(_) => "Refused",
+            Sent::Unsent(_) => "Unsent",
+        };
+        assert_eq!(kind, expected, "HTTP {status}");
     }
 }
 
@@ -780,29 +681,6 @@ async fn a_staged_commit_requires_the_table_not_to_exist_and_ends_with_the_snaps
     );
 }
 
-#[test]
-fn a_connection_that_vends_gets_vended_storage_and_one_with_keys_its_own() {
-    let mut creds = ConnectionCreds {
-        endpoint: "https://storage.example".into(),
-        access_key: STATIC_SECRETS[0].into(),
-        secret_key: STATIC_SECRETS[1].into(),
-        ..Default::default()
-    };
-
-    let own = WriteStorage::of(&creds, false, None);
-    creds.use_vended_credentials = true;
-    let vended = WriteStorage::of(&creds, false, None);
-
-    let WriteStorage::Static(backend) = own else {
-        panic!("a CONNECTION with keys writes with them");
-    };
-    assert_eq!(backend.secret_values(), STATIC_SECRETS);
-    let WriteStorage::Vended(address) = vended else {
-        panic!("a vending CONNECTION writes with vended credentials");
-    };
-    assert_eq!(address.endpoint(), "https://storage.example");
-}
-
 /// Scenario: A commit retried after an unknown outcome adds its rows once
 #[tokio::test]
 async fn unknown_outcome_with_tagged_reload_commits_once() {
@@ -823,7 +701,7 @@ async fn unknown_outcome_with_tagged_reload_commits_once() {
         let table = memory_write_table();
         let files = vec![data_file(table.table(), "w0")];
 
-        writes.append_files(&table, files, &tag()).await.unwrap();
+        writes.commit(&table, files, &tag()).await.unwrap();
 
         assert_eq!(
             requests_starting(&requests, COMMIT_T).len(),
@@ -845,7 +723,6 @@ async fn staged_unknown_outcome_with_created_table_commits_once() {
         PREFIX_CONFIG,
         routes(vec![
             (COMMIT_STAGED, (504, "<html>gateway timeout</html>".into())),
-            (EXISTS_STAGED, (204, String::new())),
             (LOAD_STAGED, (200, LOAD_TABLE_TAGGED.into())),
         ]),
     )
@@ -854,7 +731,7 @@ async fn staged_unknown_outcome_with_created_table_commits_once() {
     let staged = memory_staged_table();
     let files = vec![data_file(staged.table(), "w0")];
 
-    writes.commit_staged(&staged, files, &tag()).await.unwrap();
+    writes.commit(&staged, files, &tag()).await.unwrap();
 
     assert_eq!(requests_starting(&requests, COMMIT_STAGED).len(), 1);
 }
@@ -877,7 +754,7 @@ async fn conflict_with_untagged_reload_commits_again() {
     let table = memory_write_table();
     let files = vec![data_file(table.table(), "w0")];
 
-    writes.append_files(&table, files, &tag()).await.unwrap();
+    writes.commit(&table, files, &tag()).await.unwrap();
 
     let commits = requests_starting(&requests, COMMIT_T);
     assert_eq!(commits.len(), 2);
@@ -916,7 +793,7 @@ async fn a_conflicting_commit_reloads_the_table_after_its_wait() {
     let table = memory_write_table();
 
     writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap();
 
@@ -948,7 +825,7 @@ async fn a_commit_the_catalog_refuses_fails_at_once_without_a_retry() {
     let table = memory_write_table();
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap_err();
 
@@ -980,7 +857,7 @@ async fn a_commit_answered_with_http_500_commits_again_when_the_reload_holds_no_
     let table = memory_write_table();
 
     writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap();
 
@@ -1012,7 +889,7 @@ async fn a_commit_that_keeps_failing_stops_after_at_least_20_retries_stating_the
         let table = memory_write_table();
 
         let failed = writes
-            .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+            .commit(&table, vec![data_file(table.table(), "w0")], &tag())
             .await
             .unwrap_err();
 
@@ -1045,7 +922,7 @@ async fn a_failed_reload_after_a_lost_answer_keeps_the_outcome_unknown() {
     let table = memory_write_table();
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap_err();
 
@@ -1063,7 +940,6 @@ async fn a_staged_table_that_another_statement_created_fails_naming_the_table() 
             PREFIX_CONFIG,
             routes(vec![
                 (COMMIT_STAGED, (status, answer.into())),
-                (EXISTS_STAGED, (204, String::new())),
                 (LOAD_STAGED, (200, LOAD_TABLE_NO_SNAPSHOTS.into())),
             ]),
         )
@@ -1072,7 +948,7 @@ async fn a_staged_table_that_another_statement_created_fails_naming_the_table() 
         let staged = memory_staged_table();
 
         let failed = writes
-            .commit_staged(&staged, vec![data_file(staged.table(), "w0")], &tag())
+            .commit(&staged, vec![data_file(staged.table(), "w0")], &tag())
             .await
             .unwrap_err();
 
@@ -1102,7 +978,7 @@ async fn a_staged_commit_whose_table_is_still_absent_is_sent_again() {
     let staged = memory_staged_table();
 
     writes
-        .commit_staged(&staged, vec![data_file(staged.table(), "w0")], &tag())
+        .commit(&staged, vec![data_file(staged.table(), "w0")], &tag())
         .await
         .unwrap();
 
@@ -1150,6 +1026,7 @@ fn memory_write_table_with_ids(schema_id: i32, spec_id: i32) -> WriteTable {
     WriteTable {
         table: memory_table(&load_table_with_ids(schema_id, spec_id), &ident("ns", "t")),
         credentials: TableCredentials::S3(StorageCredentials::keys("", "", None)),
+        staged: false,
     }
 }
 
@@ -1169,7 +1046,7 @@ async fn every_append_commit_asserts_the_schema_and_partition_spec_the_writer_ch
     let table = memory_write_table_with_ids(3, 2);
 
     writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap();
 
@@ -1209,7 +1086,7 @@ async fn a_conflict_whose_reload_shows_another_schema_fails_without_another_comm
     let table = memory_write_table();
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap_err();
 
@@ -1236,7 +1113,7 @@ async fn a_table_that_changed_before_the_first_commit_fails_without_a_commit() {
     let table = memory_write_table();
 
     let failed = writes
-        .append_files(&table, vec![data_file(table.table(), "w0")], &tag())
+        .commit(&table, vec![data_file(table.table(), "w0")], &tag())
         .await
         .unwrap_err();
 
@@ -1309,6 +1186,22 @@ fn a_reloaded_table_upgraded_to_format_version_3_takes_no_files() {
     assert_eq!(
         refuse_reloaded(checked, &reloaded(3)),
         Err("it was upgraded to format version 3 after the writer checked the table".into())
+    );
+}
+
+#[test]
+fn a_reloaded_table_with_a_partition_field_named_like_a_column_takes_no_files() {
+    let mut answer: serde_json::Value = serde_json::from_str(LOAD_TABLE_NO_SNAPSHOTS).unwrap();
+    answer["metadata"]["partition-specs"][0]["fields"] = serde_json::json!([
+        {"name": "V", "transform": "void", "source-id": 2, "field-id": 1000}
+    ]);
+    let reloaded = serde_json::from_value::<LoadTableResult>(answer)
+        .unwrap()
+        .metadata;
+
+    assert_eq!(
+        refuse_reloaded(TableShape::of(&reloaded), &reloaded),
+        Err("it keeps the dropped partition field V (void) under the name of a column".into())
     );
 }
 

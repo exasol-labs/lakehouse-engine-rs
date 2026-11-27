@@ -309,6 +309,10 @@ impl CatalogRequestError {
         self.status == Some(StatusCode::NOT_FOUND)
     }
 
+    pub(crate) fn status(&self) -> Option<StatusCode> {
+        self.status
+    }
+
     pub(crate) fn is_bad_request(&self) -> bool {
         self.status == Some(StatusCode::BAD_REQUEST)
     }

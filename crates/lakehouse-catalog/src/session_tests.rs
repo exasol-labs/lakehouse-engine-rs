@@ -837,3 +837,29 @@ fn a_quoted_answer_is_stripped_of_the_session_secrets_and_the_bearer_it_carried(
     assert!(!quoted.contains(CLIENT_SECRET), "{quoted}");
     assert!(quoted.contains("truncated"), "{quoted}");
 }
+
+#[tokio::test]
+async fn a_table_loads_if_it_exists_is_absent_on_404_and_any_other_answer_fails() {
+    let table = TableIdent::from_strs(["ns", "t"]).unwrap();
+    for (status, answer, expected) in [
+        (200, LOAD_TABLE_BODY, Ok(true)),
+        (404, "{}", Ok(false)),
+        (
+            403,
+            "{}",
+            Err("checking whether table 'ns.t' exists failed: the catalog {uri} answered HTTP 403"),
+        ),
+    ] {
+        let (uri, _) = spawn_server("application/json", move |_| (status, answer.into())).await;
+        let session = session_over(CatalogHttp::new(), &uri);
+
+        let loaded = session
+            .load_table_if_exists(&table)
+            .await
+            .map(|table| table.is_some())
+            .map_err(|error| error.to_string());
+
+        let expected = expected.map_err(|text| text.replace("{uri}", &uri));
+        assert_eq!(loaded, expected, "HTTP {status}");
+    }
+}

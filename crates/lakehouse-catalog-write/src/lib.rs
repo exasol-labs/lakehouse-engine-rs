@@ -9,7 +9,9 @@ mod iceberg_write;
 mod object_store_dns;
 mod retry;
 mod snapshot_capture;
+mod unappendable;
 mod vended_refresh;
+mod write_storage;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "exported_test_support_tests.rs"]
@@ -21,6 +23,6 @@ mod test_support;
 
 pub use object_store_dns::{adls_store_builder, caching_client_options, s3_store_builder};
 
-pub use iceberg_write::{
-    CommitError, CommitTag, StagedTable, TableWriteSession, WriteStorage, WriteTable,
-};
+pub use iceberg_write::{CommitError, CommitTag, TableWriteSession, WriteTable};
+pub use unappendable::{Refusal, refuse_unappendable};
+pub use write_storage::WriteStorage;

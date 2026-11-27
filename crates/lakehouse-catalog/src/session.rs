@@ -361,6 +361,35 @@ impl CatalogSession {
         .map_err(UdfError::from)
     }
 
+    /// Table `ident` with every snapshot, `None` when the catalog answers 404. Any other answer
+    /// fails as the existence check does.
+    pub async fn load_table_if_exists(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<LoadTableResult>, UdfError> {
+        let loaded = self
+            .load_table(
+                &ident.namespace,
+                &ident.name,
+                self.creds.use_vended_credentials,
+                Snapshots::All,
+            )
+            .await;
+        match loaded {
+            Ok(table) => Ok(Some(table)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(match error.status() {
+                Some(status) => UdfError::User(format!(
+                    "checking whether table '{}' exists failed: the catalog {} answered HTTP {}",
+                    ident,
+                    self.catalog_uri,
+                    status.as_u16()
+                )),
+                None => error.into(),
+            }),
+        }
+    }
+
     /// The S3 credentials that the catalog's `loadCredentials` endpoint vends for table `ident`:
     /// those of the `storage-credentials` entry that covers `location`. No error quotes the
     /// answer, because it carries credentials.

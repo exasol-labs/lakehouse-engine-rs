@@ -2,6 +2,7 @@
 
 use super::partition_by::PARTITION_BY;
 use super::refusal;
+use super::target;
 use crate::exasol::{
     CATALOG_CONNECTION, catalog_connection_name, parse_boolean, parse_whole_number,
 };
@@ -9,7 +10,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::{ExportSpec, Parameter};
 use std::num::NonZeroUsize;
 
-const TABLE_NAME: &str = "TABLE_NAME";
+pub(super) const TABLE_NAME: &str = "TABLE_NAME";
 const WRITERS_PER_NODE: &str = "WRITERS_PER_NODE";
 const SINGLE_COMMIT: &str = "SINGLE_COMMIT";
 pub(super) const ALLOW_HTTP: &str = "ALLOW_HTTP";
@@ -44,7 +45,8 @@ impl ExportOptions {
         refuse_at_clause(spec)?;
         let with_options = WithOptions::collect(&spec.parameters)?;
         let connection_name = with_options.connection_name()?;
-        let table_name = check_table_name(with_options.table_name)?.to_string();
+        let table_name = with_options.table_name()?;
+        target::check_table_name(&table_name)?;
         let writers = with_options.writer_layout()?;
         let allow_http = with_options
             .allow_http
@@ -134,6 +136,15 @@ impl<'a> WithOptions<'a> {
             })
     }
 
+    fn table_name(&self) -> Result<String, UdfError> {
+        self.table_name.map(str::to_string).ok_or_else(|| {
+            let form = target::table_name_form();
+            refusal(format_args!(
+                "option {TABLE_NAME} is required; set {TABLE_NAME} = {form}"
+            ))
+        })
+    }
+
     fn writer_layout(&self) -> Result<WriterLayout, UdfError> {
         let per_node = self
             .writers_per_node
@@ -151,23 +162,6 @@ impl<'a> WithOptions<'a> {
             (_, per_node) => Ok(WriterLayout::PerNode(per_node.unwrap_or(1))),
         }
     }
-}
-
-/// The `TABLE_NAME` value, when it is a namespace and a table name joined by `.`.
-pub(super) fn check_table_name(value: Option<&str>) -> Result<&str, UdfError> {
-    let form = "'<namespace>.<table>', a namespace of one or more '.'-separated levels and a table name, with no empty part";
-    let Some(value) = value else {
-        return Err(refusal(format_args!(
-            "option {TABLE_NAME} is required; set {TABLE_NAME} = {form}"
-        )));
-    };
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
-        return Err(refusal(format_args!(
-            "{TABLE_NAME} = '{value}' is not of the form {form}"
-        )));
-    }
-    Ok(value)
 }
 
 fn parse_writers_per_node(value: &str) -> Result<usize, UdfError> {

@@ -3,6 +3,7 @@
 //! Also the export's CONNECTION, read and checked before any request.
 
 use super::batch::TableColumns;
+use super::iceberg_rest;
 use super::options::ALLOW_HTTP;
 use super::partition_by::PartitionField;
 use super::{EXPORT_SCRIPT_NAME, refusal};
@@ -13,40 +14,48 @@ use async_trait::async_trait;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{ConnectionCreds, scheme_of};
-use lakehouse_catalog_write::CommitTag;
 
-/// Whether the writers create the table or append to the one the catalog holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TableMode {
-    Create,
-    Append,
+/// One writer of one export statement, as the snapshots and data files it writes name it.
+pub(super) struct WriterIdentity {
+    /// The export statement's ID, drawn once by the hook.
+    pub(super) export_id: String,
+    /// The writer's own ID, drawn once per writer invocation.
+    pub(super) writer_id: String,
 }
 
 /// Where an export writes: one catalog and table format.
 #[async_trait(?Send)]
 pub(super) trait ExportTarget {
-    /// Connects and authenticates and checks whether the table exists, with catalog calls only.
+    /// Connects and authenticates and answers whether the table exists, with catalog calls only.
     /// For a missing table it also creates the missing namespace levels.
-    async fn prepare(&self) -> Result<TableMode, UdfError>;
+    async fn prepare(&self) -> Result<bool, UdfError>;
 
     /// Creates the table, partitioned by `partition_by`, or takes the one another writer of the
-    /// same export created, so every writer's sink commits into the one table. With
-    /// `single_commit` it prepares the table without creating it: the table appears only when the
-    /// sink commits its data. The sink buffers at most `budget` bytes of rows.
-    async fn open_new_table(
+    /// same export created, so every writer's sink commits into the one table. The sink buffers
+    /// at most `budget` bytes of rows.
+    async fn create(
         &self,
         schema: &Schema,
         partition_by: &[PartitionField],
-        tag: &CommitTag,
-        single_commit: bool,
+        writer: &WriterIdentity,
+        budget: usize,
+    ) -> Result<Box<dyn ExportSink>, UdfError>;
+
+    /// Prepares the table as `create` does without creating it: the table appears only when the
+    /// sink commits its data.
+    async fn create_with_data(
+        &self,
+        schema: &Schema,
+        partition_by: &[PartitionField],
+        writer: &WriterIdentity,
         budget: usize,
     ) -> Result<Box<dyn ExportSink>, UdfError>;
 
     /// Loads the existing table and refuses one the export cannot append to, before any data is
     /// written. With `SINGLE_COMMIT` the one writer appends the same way, in its one commit.
-    async fn open_existing_table(
+    async fn append(
         &self,
-        tag: &CommitTag,
+        writer: &WriterIdentity,
         budget: usize,
     ) -> Result<Box<dyn ExportSink>, UdfError>;
 }
@@ -69,6 +78,7 @@ pub(super) trait ExportSink {
 /// A CONNECTION the export can write through: an Iceberg REST catalog that needs no SigV4
 /// signing, on S3-compatible storage or ADLS Gen2, with plain HTTP only under the export's
 /// `ALLOW_HTTP`.
+#[derive(Clone)]
 pub(super) struct ExportConnection {
     /// The catalog address.
     pub(super) address: String,
@@ -88,7 +98,7 @@ pub(super) fn read_connection(
         .connection(name)
         .map_err(|cause| missing_access(ctx, name, cause))?;
     let creds = parse_creds(&password_object(name, &object.password).map_err(refusal)?);
-    refuse_unwritable(name, &creds)?;
+    check_connection(name, &creds)?;
     validate_shared_creds(name, &creds, &object.address).map_err(refusal)?;
     let connection = ExportConnection {
         address: object.address,
@@ -109,20 +119,27 @@ fn missing_access(ctx: &dyn UdfContext, connection: &str, cause: UdfError) -> Ud
     ))
 }
 
-fn refuse_unwritable(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    if creds.warehouse.is_empty() {
-        return Err(refusal(format_args!(
-            "CONNECTION '{name}' password is missing required field: warehouse, the Iceberg REST \
-             warehouse the export writes into"
-        )));
-    }
-    if creds.use_sigv4 {
-        return Err(refusal(format_args!(
-            "CONNECTION '{name}' sets use_sigv4, but the export does not sign catalog requests \
-             with AWS SigV4, so it cannot write through AWS Glue's Iceberg REST endpoint"
-        )));
-    }
-    Ok(())
+/// The target of `table_name` through `connection`, which the hook and every writer open alike.
+pub(super) fn of(
+    connection: ExportConnection,
+    table_name: &str,
+) -> Result<Box<dyn ExportTarget>, UdfError> {
+    iceberg_rest::target(connection, table_name)
+}
+
+/// Refuses a `TABLE_NAME` value of a form the target does not take.
+pub(super) fn check_table_name(value: &str) -> Result<(), UdfError> {
+    iceberg_rest::check_table_name(value)
+}
+
+/// The form of a `TABLE_NAME` value, for the error of a missing one.
+pub(super) fn table_name_form() -> &'static str {
+    iceberg_rest::TABLE_NAME_FORM
+}
+
+/// The checks of the CONNECTION fields that the export's one target needs.
+pub(super) fn check_connection(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    iceberg_rest::refuse_unwritable(name, creds)
 }
 
 /// The export's plaintext gate. The catalog crate's own checks cover only vended storage and

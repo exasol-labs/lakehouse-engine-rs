@@ -15,7 +15,8 @@ fn granted(ctx: TestContext) -> TestContext {
 
 /// The writer SELECT the hook plans before it makes any catalog call, as for a new table.
 fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
-    plan_export(ctx, json).map(|plan| plan.select.render(&plan.spec.render()))
+    let plan = plan_export(ctx, json)?;
+    Ok(plan.select.render(&plan.writer_spec(false)?.render()))
 }
 
 /// The writer plan of a group, with the context standing on its first row as in a real run.
@@ -186,10 +187,7 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
             "JSON of another shape",
             Value::String(r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","extra":1}"#.to_string()),
         ),
-        (
-            "a spec without append",
-            Value::String(spec_without("append")),
-        ),
+        ("a spec without mode", Value::String(spec_without("mode"))),
     ];
 
     for (case, first) in cases {
@@ -244,14 +242,13 @@ fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
             "table": "ns.t",
             "export_id": export_id,
             "columns": ["ID", "a\"b"],
-            "single_commit": false,
+            "mode": "create",
             "allow_http": false,
-            "append": false,
             "partition_by": [],
         })
     );
     let mut appending = first.clone();
-    appending["append"] = true.into();
+    appending["mode"] = "append".into();
     for spec in [first, appending] {
         let mut writer = writer_context(vec![writer_row(&spec.to_string(), 1)]);
         writer.next().unwrap();
@@ -304,30 +301,30 @@ fn the_hook_refuses_an_invalid_partition_by_before_any_catalog_call() {
 /// Scenario: PARTITION_BY into an existing table is refused
 #[test]
 fn partition_by_is_refused_for_a_table_that_exists() {
-    let fields = vec![partition_by::PartitionField {
-        transform: iceberg::spec::Transform::Identity,
-        column: "ID".into(),
-        name: "ID".into(),
-    }];
+    let partitioned = export_spec_partitioned_by("id");
+    let unpartitioned = export_spec_with_columns(&[r#""T"."ID""#]);
     let cases = [
-        (TableMode::Create, fields.clone(), Ok(false)),
-        (TableMode::Append, vec![], Ok(true)),
+        (false, &partitioned, Ok(WriterMode::Create)),
+        (true, &unpartitioned, Ok(WriterMode::Append)),
         (
-            TableMode::Append,
-            fields,
+            true,
+            &partitioned,
             Err("LAKEHOUSE_EXPORT: table ns.t exists, and PARTITION_BY applies only to a table the \
                  export creates; remove PARTITION_BY to append to the table"
                 .to_string()),
         ),
     ];
 
-    for (mode, partition_by, expected) in cases {
-        let mut spec: WriterSpec = serde_json::from_str(&writer_spec(false)).unwrap();
-        spec.partition_by = partition_by;
+    for (exists, export, expected) in cases {
+        let plan = plan_export(&mut granted(hook_context()), export).unwrap();
 
-        let set = spec.set_mode(mode).map(|()| spec.append);
+        let mode = plan.writer_spec(exists).map(|spec| spec.mode);
 
-        assert_eq!(set.map_err(|error| error.to_string()), expected, "{mode:?}");
+        assert_eq!(
+            mode.map_err(|error| error.to_string()),
+            expected,
+            "{exists}"
+        );
     }
 }
 
@@ -471,14 +468,18 @@ mod sql {
 }
 
 fn writer_spec(single_commit: bool) -> String {
+    let mode = if single_commit {
+        "create_with_data"
+    } else {
+        "create"
+    };
     serde_json::json!({
         "connection": CONNECTION,
         "table": "ns.t",
         "export_id": "00ff",
         "columns": ["ID"],
-        "single_commit": single_commit,
+        "mode": mode,
         "allow_http": false,
-        "append": false,
         "partition_by": [],
     })
     .to_string()
@@ -532,8 +533,8 @@ fn a_matching_spec_plans_the_writer_with_nullable_fields_in_input_order() {
         .expect("the spec matches the input");
 
     assert_eq!(plan.spec.export_id, "00ff");
-    assert!(plan.spec.single_commit);
-    let WriterTable::New { schema, .. } = plan.table else {
+    assert_eq!(plan.spec.mode, WriterMode::CreateWithData);
+    let Some(schema) = plan.schema else {
         panic!("a spec that does not append creates its table");
     };
     let fields: Vec<_> = schema
@@ -561,10 +562,11 @@ fn a_new_table_writer_checks_each_partition_field_against_its_column_type() {
         .expect("hour does not take a DECIMAL")
         .to_string();
 
-    let WriterTable::New { partition_by, .. } = plan.table else {
-        panic!("a spec that does not append creates its table");
-    };
-    assert_eq!(partition_by[0].name, "P");
+    assert!(
+        plan.schema.is_some(),
+        "a spec that does not append creates its table"
+    );
+    assert_eq!(plan.spec.partition_by[0].name, "P");
     assert!(
         error.contains("applies hour to column ID of type DECIMAL(18,0)"),
         "{error}"
@@ -573,12 +575,12 @@ fn a_new_table_writer_checks_each_partition_field_against_its_column_type() {
 
 #[test]
 fn an_appending_writer_derives_no_table_schema_from_its_source() {
-    let appending = writer_spec(false).replace(r#""append":false"#, r#""append":true"#);
+    let appending = writer_spec(false).replace(r#""mode":"create""#, r#""mode":"append""#);
 
     let plan = writer_plan(&mut group(&appending, 1, "TIMESTAMP(9)"))
         .expect("the table's columns, not the source's types, decide an append");
 
-    assert!(matches!(plan.table, WriterTable::Existing));
+    assert!(plan.schema.is_none());
 }
 
 #[test]

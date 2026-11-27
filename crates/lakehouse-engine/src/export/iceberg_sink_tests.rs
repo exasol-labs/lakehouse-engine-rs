@@ -1,10 +1,10 @@
 use super::super::iceberg_rest::target;
+use super::super::target::WriterIdentity;
 use super::data_file_settings;
 use crate::export::test_support::{date_columns, static_key_connection};
 use arrow::array::{ArrayRef, Decimal128Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use lakehouse_catalog_write::CommitTag;
 use lakehouse_catalog_write::exported_test_support::{
     LOAD_TABLE_NO_SNAPSHOTS, PREFIX_CONFIG, catalog, with_short_commit_waits,
 };
@@ -53,15 +53,12 @@ async fn new_table_sink() -> (
     })
     .await;
     let schema = Schema::new(vec![Field::new("ID", DataType::Int64, true)]);
-    let tag = CommitTag {
+    let writer = WriterIdentity {
         export_id: "e1".into(),
         writer_id: "w1".into(),
     };
     let target = target(static_key_connection(&uri, true), "ns.t").unwrap();
-    let mut sink = target
-        .open_new_table(&schema, &[], &tag, false, 1 << 20)
-        .await
-        .unwrap();
+    let mut sink = target.create(&schema, &[], &writer, 1 << 20).await.unwrap();
     let ids: ArrayRef = Arc::new(
         Decimal128Array::from(vec![1, 2])
             .with_precision_and_scale(18, 0)
