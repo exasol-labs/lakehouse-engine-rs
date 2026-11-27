@@ -206,8 +206,13 @@ pub fn vs_lineitem_table() -> String {
 pub const JOIN_ORACLE: &str = "JOIN_ORACLE";
 
 /// Copies the fact, dimension, lineitem, supplier, events, and labels tables of `source_vs` into
-/// [`JOIN_ORACLE`].
+/// [`JOIN_ORACLE`], once per run: every source virtual schema maps the same unmutated namespace.
 pub fn copy_join_tables_natively(conn: &mut ExaConn, source_vs: &str) {
+    static COPIED: OnceLock<()> = OnceLock::new();
+    COPIED.get_or_init(|| copy_join_tables(conn, source_vs));
+}
+
+fn copy_join_tables(conn: &mut ExaConn, source_vs: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
     for table in [
         E2E_FACT_TABLE,

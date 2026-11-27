@@ -985,6 +985,55 @@ pub fn native_copy_mismatch(
     (!path.holds(query, &plan)).then(|| format!("`{query}` must take {path:?}: {plan}"))
 }
 
+/// Sessions that one test's independent cases spread over. A case's cost is mostly the wait for
+/// Exasol's UDF VMs, so several sessions overlap those waits; past 4 the gain flattens.
+const CASE_WORKERS: usize = 4;
+
+/// `check` over every case, each case on one of several sessions that `connect` opens. The cases
+/// must be independent: none may change state that another case reads. Results keep case order.
+pub fn map_cases<C: Sync, R: Send>(
+    cases: &[C],
+    connect: impl Fn() -> ExaConn + Sync,
+    check: impl Fn(&mut ExaConn, &C) -> R + Sync,
+) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = CASE_WORKERS.min(cases.len());
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut conn = connect();
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(case) = cases.get(i) else { break };
+                        done.push((i, check(&mut conn, case)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    results.sort_by_key(|(i, _)| *i);
+    results.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The failures of [`map_cases`], where a case reports none, one, or several.
+pub fn case_failures<C: Sync, F: IntoIterator<Item = String> + Send>(
+    cases: &[C],
+    connect: impl Fn() -> ExaConn + Sync,
+    check: impl Fn(&mut ExaConn, &C) -> F + Sync,
+) -> Vec<String> {
+    map_cases(cases, connect, check)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 pub fn value_to_string(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)
@@ -1321,13 +1370,13 @@ pub fn assert_filters_match_native_copy(
             })
             .unwrap_or_default()
     };
-    for filter in filters {
-        assert_eq!(
-            ids(conn, table, filter),
-            ids(conn, NATIVE_COPY, filter),
-            "WHERE {filter} on {table} must select the rows native Exasol selects"
-        );
-    }
+    let failures = case_failures(filters, exa_conn, |conn, filter| {
+        let (actual, native) = (ids(conn, table, filter), ids(conn, NATIVE_COPY, filter));
+        (actual != native).then(|| {
+            format!("WHERE {filter} on {table} selects {actual:?}, native Exasol {native:?}")
+        })
+    });
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Each query names its table as `{T}`. It must return over the virtual `table` what it returns
@@ -1339,23 +1388,20 @@ pub fn assert_queries_match_native_copy(
     queries: &[&str],
 ) {
     create_native_copy(conn, table, columns);
-    assert_no_native_mismatch(conn, table, queries);
+    assert_no_native_mismatch(table, queries);
 }
 
-fn assert_no_native_mismatch(conn: &mut ExaConn, table: &str, queries: &[&str]) {
-    let failures: Vec<String> = queries
-        .iter()
-        .filter_map(|query| {
-            native_copy_mismatch(
-                conn,
-                table,
-                NATIVE_COPY,
-                query,
-                PathCheck::Unchecked,
-                Expect::Rows,
-            )
-        })
-        .collect();
+fn assert_no_native_mismatch(table: &str, queries: &[&str]) {
+    let failures = case_failures(queries, exa_conn, |conn, query| {
+        native_copy_mismatch(
+            conn,
+            table,
+            NATIVE_COPY,
+            query,
+            PathCheck::Unchecked,
+            Expect::Rows,
+        )
+    });
     assert!(
         failures.is_empty(),
         "over {table}, {} queries differ from native Exasol:\n{}",
@@ -1430,7 +1476,7 @@ pub fn assert_binary_columns_match_native_copy(
         })
         .collect();
     let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
-    assert_no_native_mismatch(conn, table, &queries);
+    assert_no_native_mismatch(table, &queries);
 }
 
 /// A lowercase hex `literal` of the column's width compares `column`'s raw bytes, which Parquet

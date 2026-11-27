@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <e2e|lakekeeper|azure|unity|glue> <start|wait|up|down>" >&2
+  echo "usage: $0 <e2e|lakekeeper|azure|unity|glue> <start|wait|up|logs|down>" >&2
   exit 2
 }
 [[ $# -eq 2 ]] || usage
@@ -47,6 +47,11 @@ compose() {
   docker compose "${files[@]}" "$@"
 }
 
+# Pulls the images of exactly the services it starts.
+up() {
+  compose up -d --quiet-pull "$@"
+}
+
 # `up --wait` fails on a one-shot container even after a clean exit, so
 # one-shots are `docker wait`-ed.
 await_exit() {
@@ -60,30 +65,30 @@ await_exit() {
 }
 
 lakekeeper_start() {
-  compose up -d exasol
-  compose up -d openfga-migrate
+  up exasol
+  up openfga-migrate
   await_exit openfga-migrate
-  compose up -d lakekeeper-migrate
+  up lakekeeper-migrate
   await_exit lakekeeper-migrate
-  compose up -d "$@"
+  up "$@"
 }
 
 start() {
   case "$stack" in
     e2e)
-      compose up -d exasol proxy
-      compose up -d --wait seaweedfs iceberg-rest
-      compose up -d spark-iceberg-fixtures
+      up exasol proxy
+      up --wait seaweedfs iceberg-rest
+      up spark-iceberg-fixtures
       ;;
     # iceberg-rest holds the source tables of `make test-lakekeeper-local`.
     lakekeeper) lakekeeper_start seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     azure) lakekeeper_start keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     unity)
-      compose up -d exasol
-      compose up -d --wait seaweedfs unitycatalog proxy
+      up exasol
+      up --wait seaweedfs unitycatalog proxy
       ./scripts/unity/seed.sh
       ;;
-    glue) compose up -d exasol proxy ;;
+    glue) up exasol proxy ;;
     *) usage ;;
   esac
 }
@@ -94,13 +99,13 @@ up_wait() {
   local services=() service
   for service in "$@"; do
     if [[ "$EXASOL_FLAVOR" == nano && "$service" == exasol ]]; then
-      compose up -d exasol
+      up exasol
     else
       services+=("$service")
     fi
   done
   if ((${#services[@]})); then
-    compose up -d --wait "${services[@]}"
+    up --wait "${services[@]}"
   fi
 }
 
@@ -138,6 +143,12 @@ wait_services() {
   esac
 }
 
+# Failure diagnostics: the state and the log tail of every service the stack ran.
+logs() {
+  compose ps -a
+  compose logs --tail 100
+}
+
 case "$action" in
   start) start ;;
   wait) wait_healthy ;;
@@ -145,6 +156,7 @@ case "$action" in
     start
     wait_healthy
     ;;
+  logs) logs ;;
   down) compose down -v ;;
   *) usage ;;
 esac

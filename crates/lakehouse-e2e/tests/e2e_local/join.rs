@@ -585,22 +585,18 @@ fn e2e_aggregating_join_takes_the_broadcast_path_and_matches_native() {
              AND {named} GROUP BY c.C_NAME"
         ),
     ];
-    let mut failures = Vec::new();
-    for query in &broadcast {
-        for (vs_name, path) in [
-            (VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
-            (VS_NAME_LOW, PathCheck::NScan(2)),
-        ] {
-            failures.extend(native_copy_mismatch(
-                &mut conn,
-                vs_name,
-                JOIN_ORACLE,
-                query,
-                path,
-                Expect::Rows,
-            ));
-        }
-    }
+    let cases: Vec<_> = broadcast
+        .iter()
+        .flat_map(|query| {
+            [
+                (query, VS_NAME, PathCheck::Has(BROADCAST_JOIN)),
+                (query, VS_NAME_LOW, PathCheck::NScan(2)),
+            ]
+        })
+        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (query, vs_name, path)| {
+        native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, *path, Expect::Rows)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     // The scan applies the condition and WHERE, so it emits only the HAVING's and select list's.
@@ -934,16 +930,16 @@ fn e2e_broadcast_join_declined_conjunct_runs_in_exasol_where() {
             format!("SELECT c.C_CUSTKEY, l.L_LINENUMBER FROM {CHAIN} WHERE {dated}"),
         ),
     ];
-    let mut failures = Vec::new();
-    for (legs, query) in &cases {
+    let failures = case_failures(&cases, exa_conn, |conn, (legs, query)| {
+        let mut failures = Vec::new();
         // SECOND(O_ORDERDATE, 3) = 1 holds for no row, so a dropped conjunct would return rows.
         let native_rows = conn.query_row_count(&query.replace("{T}", JOIN_ORACLE));
         if (native_rows == 0) != query.contains(SECOND_IS_ONE) {
             failures.push(format!("`{query}` returns {native_rows} rows natively"));
         }
-        failures.extend(broadcast_mismatches(&mut conn, *legs, query));
+        failures.extend(broadcast_mismatches(conn, *legs, query));
         for vs_name in [VS_NAME, VS_NAME_LOW] {
-            let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", vs_name));
+            let pushed = isolated_pushdown_statement(conn, &query.replace("{T}", vs_name));
             if !exasol_where_holds(&pushed, "SECOND(") {
                 failures.push(format!(
                     "{vs_name} `{query}`: Exasol's WHERE must apply SECOND: {pushed}"
@@ -961,7 +957,8 @@ fn e2e_broadcast_join_declined_conjunct_runs_in_exasol_where() {
                 ));
             }
         }
-    }
+        failures
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -2320,10 +2317,9 @@ fn e2e_composite_key_join_takes_the_broadcast_path_and_matches_native() {
              ORDER BY a.O_ORDERKEY DESC, b.O_ORDERKEY LIMIT 3"
         ),
     ];
-    let failures: Vec<String> = queries
-        .iter()
-        .flat_map(|query| broadcast_mismatches(&mut conn, 2, query))
-        .collect();
+    let failures = case_failures(&queries, exa_conn, |conn, query| {
+        broadcast_mismatches(conn, 2, query)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     assert!(
@@ -2359,10 +2355,9 @@ fn e2e_expression_key_join_takes_the_broadcast_path_and_matches_native() {
              AND c.C_NAME <> 'customer-01'"
         ),
     ];
-    let failures: Vec<String> = queries
-        .iter()
-        .flat_map(|query| broadcast_mismatches(&mut conn, 2, query))
-        .collect();
+    let failures = case_failures(&queries, exa_conn, |conn, query| {
+        broadcast_mismatches(conn, 2, query)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -2391,10 +2386,9 @@ fn e2e_join_with_on_filters_takes_the_broadcast_path_and_matches_native() {
         format!("SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {SELF_JOIN} AND b.O_ORDERKEY > 5"),
         declined.clone(),
     ];
-    let mut failures: Vec<String> = broadcast
-        .iter()
-        .flat_map(|query| broadcast_mismatches(&mut conn, 2, query))
-        .collect();
+    let mut failures = case_failures(&broadcast, exa_conn, |conn, query| {
+        broadcast_mismatches(conn, 2, query)
+    });
     let pushed = isolated_pushdown_statement(&mut conn, &declined.replace("{T}", VS_NAME));
     if !exasol_where_holds(&pushed, "SECOND(") {
         failures.push(format!(
@@ -2510,14 +2504,14 @@ fn e2e_multi_way_join_broadcasts_one_pair_and_matches_native() {
             ),
         ),
     ];
-    let mut failures: Vec<String> = Vec::new();
-    for (legs, query) in &cases {
+    let mut failures = case_failures(&cases, exa_conn, |conn, (legs, query)| {
+        let mut failures = Vec::new();
         if conn.query_row_count(&query.replace("{T}", JOIN_ORACLE)) == 0 {
             failures.push(format!("`{query}` must return rows natively"));
         }
-        failures.extend(broadcast_mismatches(&mut conn, *legs, query));
+        failures.extend(broadcast_mismatches(conn, *legs, query));
         for vs_name in [VS_NAME, VS_NAME_LOW] {
-            let pushed = isolated_pushdown_statement(&mut conn, &query.replace("{T}", vs_name));
+            let pushed = isolated_pushdown_statement(conn, &query.replace("{T}", vs_name));
             if let Some(key) = SHARD_WINDOW.iter().find(|key| pushed.contains(*key)) {
                 failures.push(format!(
                     "{vs_name} `{query}`: no fan-out carries {key}: {pushed}"
@@ -2532,7 +2526,8 @@ fn e2e_multi_way_join_broadcasts_one_pair_and_matches_native() {
                 ));
             }
         }
-    }
+        failures
+    });
     // Every ORDERS file is pruned, so the join is empty before any plan.
     failures.extend(native_copy_mismatch(
         &mut conn,

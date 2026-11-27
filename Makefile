@@ -86,36 +86,35 @@ export LH_REST_PORT
 # `<stack>-start` and `<stack>-wait` while Exasol boots.
 E2E_STACKS := e2e lakekeeper azure unity glue
 
-$(addsuffix -start,$(E2E_STACKS)): %-start:
-	./scripts/e2e-stack.sh $* start
-$(addsuffix -wait,$(E2E_STACKS)): %-wait:
-	./scripts/e2e-stack.sh $* wait
-$(addsuffix -up,$(E2E_STACKS)): %-up:
-	./scripts/e2e-stack.sh $* up
-$(addsuffix -down,$(E2E_STACKS)): %-down:
-	./scripts/e2e-stack.sh $* down
+# No stack or action name holds a hyphen, so a target splits into the script's two arguments.
+E2E_STACK_TARGETS := $(foreach s,$(E2E_STACKS),$(addprefix $(s)-,start wait up logs down))
+$(E2E_STACK_TARGETS):
+	./scripts/e2e-stack.sh $(subst -, ,$@)
+
+# `E2E_CARGO_FLAGS=--no-run` compiles a suite without running it, so CI builds it while Exasol boots.
+E2E_CARGO_FLAGS ?=
 
 # E2E suites FAIL (not skip) when their stack is unavailable, and run serially
 # because all tests share one VS. `--workspace` keeps dependency features identical to the
 # plain workspace build, so a suite compiles only lakehouse-e2e; `-p lakehouse-e2e` rebuilds deps.
 # Requires: make e2e-up
 test-e2e: cross-udf-build
-	cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 # Requires: make lakekeeper-up
 test-e2e-lakekeeper: cross-udf-build
-	cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 # Requires: make azure-up, plus real Azure Blob Storage credentials from ./test.env or the environment.
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
-	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test -- --test-threads=1
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 # Requires: make glue-up, plus a real AWS Glue Data Catalog and S3 fixture bucket
 # (GLUE_* in ./test.env or the environment).
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-glue: cross-udf-build
-	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/glue-e2e --test e2e_glue_test -- --test-threads=1
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/glue-e2e --test e2e_glue_test $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 # Manual equivalent of the E2E harness's in-process `setup_e2e` SLC install.
 # Set BUCKETFS_WRITE_PASS to skip extracting it from EXAConf via docker exec.
@@ -263,7 +262,7 @@ bench: cross-udf-build
 
 # Requires: make unity-up
 test-e2e-unity: cross-udf-build
-	cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test $(E2E_CARGO_FLAGS) -- --test-threads=1
 
 .PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts \
-	$(foreach s,$(E2E_STACKS),$(s)-start $(s)-wait $(s)-up $(s)-down)
+	$(E2E_STACK_TARGETS)

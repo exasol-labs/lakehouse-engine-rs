@@ -60,6 +60,7 @@ Test code gets the same design care as production code. A test reads as the one 
 
 - A new test module of the Local Docker suite is declared in `crates/lakehouse-e2e/tests/e2e_local/main.rs`. A module file the suite does not declare never compiles and never runs.
 - Each suite runs with `--test-threads=1`, because all tests of one binary share one provisioning.
+- Within one test, the cases of a case table run on several sessions at once through `case_failures` or `map_cases`, because a case mostly waits for Exasol's UDF VMs. Such a case changes nothing another case reads. A case that writes shared state, counts proxy-log lines, reads its own session's profile, or runs an export stays in a serial loop.
 
 ### Failure contract
 
@@ -176,8 +177,8 @@ Test code gets the same design care as production code. A test reads as the one 
 ### Make targets and CI
 
 - Every E2E Make target depends on `cross-udf-build`, so no suite runs against a stale `.so`. With `REBUILD_SO=0`, a missing or stale `.so` fails the target instead of rebuilding it.
-- Each stack in § E2E suites has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
-- Every E2E CI job needs only `build-so`, so a draft pull request skips it. It sets `REBUILD_SO=0` and runs its suite and stack through the Make targets. It compiles the suite between `<stack>-start` and `<stack>-wait`, with the same cargo flags as the Make test target, so compilation overlaps Exasol's boot.
+- Each stack in § E2E suites has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, `<stack>-logs` for failure diagnostics, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
+- Every E2E CI job needs only `build-so`, so a draft pull request skips it. Every one runs the same steps through the Make targets: the shared setup starts its stack, which pulls the images of the services it starts, then installs Rust, restores the build cache, and downloads the `.so` with `REBUILD_SO=0` while Exasol boots. The job compiles the suite through its Make test target with `E2E_CARGO_FLAGS=--no-run`, waits for the stack, and runs the suite.
 - The `e2e` job runs the local suite once per supported Exasol major version, each leg selecting its image through `EXASOL_IMAGE`. The leg on the newest docker-db version carries the required check name `E2E`, and `release` needs every leg. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
 - A further `e2e` leg, `E2E (Nano, arm64)`, runs the local suite on Exasol Nano on an arm64 runner with the aarch64 `.so`.
 - `E2E (Azure)` and `E2E (Glue)` are neither required nor in `release`'s needs, so a cloud outage or a rotated key blocks no merge and no release.

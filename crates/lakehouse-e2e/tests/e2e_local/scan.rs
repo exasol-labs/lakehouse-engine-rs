@@ -793,10 +793,15 @@ fn e2e_unreadable_initial_default_refuses_only_its_column() {
 
 #[test]
 fn e2e_fails_when_stack_unavailable() {
-    let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));
+    // A port nothing listens on refuses at once, where an unroutable host waits out the timeout.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free local port")
+        .port();
+    let result = std::panic::catch_unwind(|| ExaConn::connect("127.0.0.1", port, "sys", "exasol"));
     assert!(
         result.is_err(),
-        "ExaConn::connect to an unreachable host must panic, not return Ok"
+        "ExaConn::connect to a port nothing listens on must panic, not return Ok"
     );
 }
 
@@ -3779,12 +3784,9 @@ fn e2e_integer_div_matches_native_over_a_native_copy() {
             PathCheck::Has(CHECKED_INT_DIV_FN),
         ),
     ];
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(query, path)| {
-            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
-        })
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (query, path)| {
+        native_copy_mismatch(conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
+    });
 
     assert!(
         failures.is_empty(),

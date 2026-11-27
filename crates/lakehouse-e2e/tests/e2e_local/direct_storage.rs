@@ -6,10 +6,10 @@ use crate::common::e2e_harness::{
     assert_binary_columns_match_native_copy, assert_decimal_orders_numerically,
     assert_filters_match_native_copy, assert_hex_literal_compares_bytes, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_text_columns, assert_type_matrix,
-    column_adapter_notes, create_native_copy, create_virtual_schema_with_password, declared_type,
-    error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block, identifier_note,
-    native_copy_mismatch, note_of, nullable_text, parse_int, parse_numeric, partition_positions,
-    reads, refuses, skip_reason, skipped_entries, text_column,
+    case_failures, column_adapter_notes, create_native_copy, create_virtual_schema_with_password,
+    declared_type, error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block,
+    identifier_note, map_cases, native_copy_mismatch, note_of, nullable_text, parse_int,
+    parse_numeric, partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
     try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
@@ -2176,7 +2176,7 @@ fn numeric_expressions_match_native_exasol() {
         "the DOUBLE = DECIMAL join must take the broadcast path"
     );
 
-    for template in [
+    let templates = [
         "SELECT K FROM {T} WHERE X = 0.1 ORDER BY K",
         "SELECT K FROM {T} WHERE D < X ORDER BY K",
         "SELECT K FROM {T} WHERE W > X AND K < 10 ORDER BY K",
@@ -2225,9 +2225,10 @@ fn numeric_expressions_match_native_exasol() {
          AND K BETWEEN 299 AND 302 ORDER BY K",
         "SELECT K, W - 123456789012345678901234567890.1 FROM {T} \
          WHERE K BETWEEN 1501 AND 1503 ORDER BY K",
-    ] {
-        assert_same_as_native(&mut conn, template, false);
-    }
+    ];
+    map_cases(&templates, exa_conn, |conn, template| {
+        assert_same_as_native(conn, template, false)
+    });
     // Native AVG over DECIMAL is not correctly rounded and the split merge sums in another
     // order, so the two agree only to a few ULPs.
     assert_matches_native(&mut conn, "AVG(W)", "WHERE K <= 50", 0, 1e-15);
@@ -2390,12 +2391,9 @@ fn placeholder_dates_meet_timestamps_like_native() {
             broadcast,
         ),
     ];
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(query, path)| {
-            native_copy_mismatch(&mut conn, &table, oracle, query, *path, Expect::Rows)
-        })
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (query, path)| {
+        native_copy_mismatch(conn, &table, oracle, query, *path, Expect::Rows)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -2432,19 +2430,16 @@ fn a_finer_timestamp_literal_compares_outside_the_nanosecond_range_like_native()
         "CASE WHEN ID > 0 THEN STORED_TS END <= TIMESTAMP '9999-12-31 23:59:59.9999995'",
         "DATE_TRUNC('second', STORED_TS) <> TIMESTAMP '9999-12-31 23:59:59.0000005'",
     ];
-    let failures: Vec<String> = filters
-        .iter()
-        .filter_map(|filter| {
-            native_copy_mismatch(
-                &mut conn,
-                &table,
-                NATIVE_COPY,
-                &format!("SELECT ID FROM {{T}} WHERE {filter}"),
-                PathCheck::Has("\"filter\":\""),
-                Expect::Rows,
-            )
-        })
-        .collect();
+    let failures = case_failures(&filters, exa_conn, |conn, filter| {
+        native_copy_mismatch(
+            conn,
+            &table,
+            NATIVE_COPY,
+            &format!("SELECT ID FROM {{T}} WHERE {filter}"),
+            PathCheck::Has("\"filter\":\""),
+            Expect::Rows,
+        )
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -2474,12 +2469,9 @@ fn floor_and_ceil_over_a_decimal_match_native() {
             PathCheck::Has("ceil("),
         ),
     ];
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(query, path)| {
-            native_copy_mismatch(&mut conn, &table, NATIVE_COPY, query, *path, Expect::Rows)
-        })
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (query, path)| {
+        native_copy_mismatch(conn, &table, NATIVE_COPY, query, *path, Expect::Rows)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -3103,7 +3095,7 @@ fn refused_first_setup() -> ExaConn {
 /// Scenario: A request that reads no column never emits a refused column
 #[test]
 fn no_route_emits_a_refused_column_the_request_does_not_name() {
-    let mut conn = refused_first_setup();
+    refused_first_setup();
     const JOIN: &str = "{T}.FACT a JOIN {T}.DIMS b ON a.ID = b.DIM_ID";
     // The scan declines a CAST of a DECIMAL to text, so Exasol applies it in the wrapper.
     const DECLINED: &str = "CAST(X AS VARCHAR(10)) <> '20'";
@@ -3280,19 +3272,9 @@ fn no_route_emits_a_refused_column_the_request_does_not_name() {
             no_scan,
         ),
     ];
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(vs, query, path)| {
-            native_copy_mismatch(
-                &mut conn,
-                vs,
-                REFUSED_FIRST_ORACLE,
-                query,
-                *path,
-                Expect::Rows,
-            )
-        })
-        .collect();
+    let failures = case_failures(&cases, exa_conn, |conn, (vs, query, path)| {
+        native_copy_mismatch(conn, vs, REFUSED_FIRST_ORACLE, query, *path, Expect::Rows)
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
