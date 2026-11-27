@@ -330,28 +330,6 @@ pub(crate) fn scalar(
             arity(fn_name, args, args.len() >= 2, "2 arguments")?;
             format!("{CHECKED_FLOAT_DIV_FN}({}, {})", args[0], args[1])
         }
-        "ABS" | "FLOOR" | "CEIL" | "SQRT" | "EXP" | "LN" | "SIGN" | "DEGREES" | "RADIANS"
-        | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "SINH" | "COSH" | "TANH" | "COT" => {
-            arity(fn_name, args, args.len() == 1, "1 argument")?;
-            let df_name = match fn_name {
-                "SIGN" => "signum".to_string(),
-                other => other.to_lowercase(),
-            };
-            format!("{df_name}({})", args[0])
-        }
-        "ROUND" | "TRUNC" | "LOG" => {
-            arity(
-                fn_name,
-                args,
-                !args.is_empty() && args.len() <= 2,
-                "1 or 2 arguments",
-            )?;
-            format!("{}({})", fn_name.to_lowercase(), args.join(", "))
-        }
-        "POWER" | "ATAN2" => {
-            arity(fn_name, args, args.len() == 2, "2 arguments")?;
-            format!("{}({})", fn_name.to_lowercase(), args.join(", "))
-        }
         "MOD" => {
             arity(fn_name, args, args.len() == 2, "2 arguments")?;
             format!("({} % {})", args[0], args[1])

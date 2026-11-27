@@ -192,30 +192,78 @@ pub(crate) const SCALAR_FUNCTIONS: &[ScalarFunction] = {
         F::shaped("CASE", 2..=MANY),
         // VerbatimCall: applied to every remaining name uniformly, not only where the
         // DataFusion form fails on Exasol, as `signum` does.
-        F::verbatim("ABS", 1..=1).typed(T::Never, R::Arithmetic),
-        F::verbatim("FLOOR", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("CEIL", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("SQRT", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("EXP", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("LN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("SIGN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("DEGREES", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("RADIANS", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("SIN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("COS", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("TAN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("ASIN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("ACOS", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("ATAN", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("SINH", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("COSH", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("TANH", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("COT", 1..=1).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("ROUND", 1..=2).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("TRUNC", 1..=2).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("LOG", 2..=2).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("POWER", 2..=2).typed(T::Never, R::NumberOverNumbers),
-        F::verbatim("ATAN2", 2..=2).typed(T::Never, R::NumberOverNumbers),
+        F::verbatim("ABS", 1..=1)
+            .typed(T::Never, R::Arithmetic)
+            .datafusion_call("abs"),
+        F::verbatim("FLOOR", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("floor"),
+        F::verbatim("CEIL", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("ceil"),
+        F::verbatim("SQRT", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("sqrt"),
+        F::verbatim("EXP", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("exp"),
+        F::verbatim("LN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("ln"),
+        F::verbatim("SIGN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("signum"),
+        F::verbatim("DEGREES", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("degrees"),
+        F::verbatim("RADIANS", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("radians"),
+        F::verbatim("SIN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("sin"),
+        F::verbatim("COS", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("cos"),
+        F::verbatim("TAN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("tan"),
+        F::verbatim("ASIN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("asin"),
+        F::verbatim("ACOS", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("acos"),
+        F::verbatim("ATAN", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("atan"),
+        F::verbatim("SINH", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("sinh"),
+        F::verbatim("COSH", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("cosh"),
+        F::verbatim("TANH", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("tanh"),
+        F::verbatim("COT", 1..=1)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("cot"),
+        F::verbatim("ROUND", 1..=2)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("round"),
+        F::verbatim("TRUNC", 1..=2)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("trunc"),
+        F::verbatim("LOG", 2..=2)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("log"),
+        F::verbatim("POWER", 2..=2)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("power"),
+        F::verbatim("ATAN2", 2..=2)
+            .typed(T::Never, R::NumberOverNumbers)
+            .datafusion_call("atan2"),
         F::verbatim("LOWER", 1..=1)
             .typed(T::First, R::Text)
             .datafusion_call("lower"),
