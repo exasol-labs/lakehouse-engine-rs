@@ -333,6 +333,16 @@ pub fn proxy_log_mark() -> String {
 }
 
 pub fn proxy_log_since(since: &str) -> String {
+    let (out, err) = proxy_logs(&["--since", since]);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    )
+}
+
+/// The proxy container's log, as its stdout and stderr streams.
+fn proxy_logs(args: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let network = network_name();
     let out = std::process::Command::new("docker")
         .args([
@@ -354,14 +364,12 @@ pub fn proxy_log_since(since: &str) -> String {
         .unwrap_or_else(|| panic!("no running `proxy` Compose service on the {network} network"))
         .to_string();
     let out = std::process::Command::new("docker")
-        .args(["logs", "--since", since, &container])
+        .arg("logs")
+        .args(args)
+        .arg(&container)
         .output()
         .unwrap_or_else(|e| panic!("docker logs {container}: {e}"));
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
+    (out.stdout, out.stderr)
 }
 
 /// Runs `statement` and counts, for each `requests` entry, the proxy-log lines it produced that
@@ -374,13 +382,20 @@ pub fn count_proxy_requests<const N: usize>(
     requests.map(|request| request_count(&log, request))
 }
 
-/// The proxy-log lines that `statement` produced. It first waits past one second, because the
-/// log's `since` has second granularity and an earlier statement's lines must fall before the mark.
+/// The proxy-log lines that `statement` produced: what each log stream grew by, so no clock is
+/// involved.
 pub fn proxy_log_during(statement: impl FnOnce()) -> String {
-    std::thread::sleep(Duration::from_millis(1100));
-    let mark = proxy_log_mark();
+    let (out_before, err_before) = proxy_logs(&[]);
     statement();
-    proxy_log_since(&mark)
+    let (out, err) = proxy_logs(&[]);
+    let grown = |after: &[u8], before: &[u8]| {
+        assert!(
+            after.starts_with(before),
+            "the proxy log must only grow while a statement runs"
+        );
+        String::from_utf8_lossy(&after[before.len()..]).into_owned()
+    };
+    format!("{}{}", grown(&out, &out_before), grown(&err, &err_before))
 }
 
 /// How many of `log`'s lines contain `request`.

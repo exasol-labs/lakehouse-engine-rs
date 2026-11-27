@@ -25,23 +25,21 @@ fn scan_filter(sql: &str) -> String {
 /// Each `(query, marker)` names its table `{T}`, must return the native copy's rows, and must
 /// push a statement that holds `marker`.
 #[track_caller]
-fn assert_match_native<Q: AsRef<str>, M: AsRef<str>>(cases: &[(Q, M)]) {
+fn assert_match_native<Q: AsRef<str> + Sync, M: AsRef<str> + Sync>(cases: &[(Q, M)]) {
     empty_string_vs();
     let mut conn = exa_conn();
     create_native_copy(&mut conn, &table(), "S, K, B");
-    let failures: Vec<String> = cases
-        .iter()
-        .filter_map(|(query, marker)| {
-            native_copy_mismatch(
-                &mut conn,
-                &table(),
-                NATIVE_COPY,
-                query.as_ref(),
-                Has(marker.as_ref()),
-                Expect::Rows,
-            )
-        })
-        .collect();
+    let table = table();
+    let failures = case_failures(cases, exa_conn, |conn, (query, marker)| {
+        native_copy_mismatch(
+            conn,
+            &table,
+            NATIVE_COPY,
+            query.as_ref(),
+            Has(marker.as_ref()),
+            Expect::Rows,
+        )
+    });
     assert!(
         failures.is_empty(),
         "{} of {} cases differ:\n{}",

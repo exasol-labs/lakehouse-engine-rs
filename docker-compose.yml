@@ -24,6 +24,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+      start_interval: 1s
     networks:
       lakehouse:
         ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.10
@@ -49,6 +50,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+      start_interval: 1s
     networks:
       lakehouse:
         ipv4_address: ${LH_SUBNET_PREFIX:-10.84}.0.11

@@ -18,6 +18,9 @@ const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds the wait for Exasol's answer to a close.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The exception text of a response that must be an error. `context` names the statement or
 /// case, as SQL or a label.
 #[track_caller]
@@ -370,8 +373,15 @@ impl ExaConn {
 }
 
 impl Drop for ExaConn {
+    /// Completes the WebSocket close handshake. On Exasol 2025.1 a session that disconnects
+    /// without it makes the next login wait about 5 s.
     fn drop(&mut self) {
+        if let MaybeTlsStream::NativeTls(tls) = self.ws.get_ref() {
+            let _ = tls.get_ref().set_read_timeout(Some(CLOSE_TIMEOUT));
+        }
         let _ = self.ws.close(None);
+        let _ = self.ws.flush();
+        while self.ws.read().is_ok() {}
     }
 }
 
